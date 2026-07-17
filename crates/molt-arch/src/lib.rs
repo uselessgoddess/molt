@@ -81,6 +81,95 @@ pub enum MemoryRegionKind {
     Firmware(u32),
 }
 
+pub const FRAME_SIZE: u64 = 4096;
+
+/// One aligned 4 KiB physical frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalFrame(u64);
+
+impl PhysicalFrame {
+    pub const fn start(self) -> u64 {
+        self.0
+    }
+}
+
+/// Allocation-free iterator over firmware regions marked usable.
+pub struct FrameAllocator<'map> {
+    map: &'map dyn MemoryMap,
+    region: usize,
+    next: u64,
+}
+
+impl<'map> FrameAllocator<'map> {
+    pub const fn new(map: &'map dyn MemoryMap) -> Self {
+        Self { map, region: 0, next: 0 }
+    }
+
+    pub fn allocate(&mut self) -> Option<PhysicalFrame> {
+        while self.region < self.map.len() {
+            let Some(region) = self.map.region(self.region) else {
+                self.region += 1;
+                self.next = 0;
+                continue;
+            };
+            if region.kind() != MemoryRegionKind::Usable {
+                self.region += 1;
+                self.next = 0;
+                continue;
+            }
+            if self.next == 0 {
+                self.next = align_up(region.start(), FRAME_SIZE)?;
+            }
+            let end = self.next.checked_add(FRAME_SIZE)?;
+            if end <= region.end() {
+                let frame = PhysicalFrame(self.next);
+                self.next = end;
+                return Some(frame);
+            }
+            self.region += 1;
+            self.next = 0;
+        }
+        None
+    }
+}
+
+fn align_up(value: u64, alignment: u64) -> Option<u64> {
+    value.checked_add(alignment - 1).map(|value| value & !(alignment - 1))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MappingError {
+    WritableExecutable,
+    InvalidAddress,
+    OutOfFrames,
+    Backend,
+}
+
+/// Page permissions that enforce W^X at construction time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MapPermissions {
+    writable: bool,
+    executable: bool,
+}
+
+impl MapPermissions {
+    pub const fn new(writable: bool, executable: bool) -> Result<Self, MappingError> {
+        if writable && executable {
+            Err(MappingError::WritableExecutable)
+        } else {
+            Ok(Self { writable, executable })
+        }
+    }
+
+    pub const fn is_writable(self) -> bool {
+        self.writable
+    }
+
+    pub const fn is_executable(self) -> bool {
+        self.executable
+    }
+}
+
 /// A byte-oriented diagnostic console.
 pub trait SerialPort {
     fn init(&mut self) {}
