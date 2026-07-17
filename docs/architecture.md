@@ -28,6 +28,28 @@ Molt adopts small ownership-scoped cells and compiler-visible interfaces. The
 MVP stops before runtime ELF loading: static linking gives one compiler and one
 Rust ABI while the basic ownership model is tested.
 
+## Hardware boundary
+
+Molt keeps three layers distinct:
+
+- `molt-arch` contains only portable data and traits such as `BootInfo`,
+  `MemoryMap`, `SerialPort`, `InterruptController`, and `Platform`;
+- `molt-x86_64` and `molt-riscv` contain target-specific assembly, firmware
+  adaptation, and device implementations;
+- `molt-kernel` composes those services with `molt-core` and does not perform
+  port I/O or consume a bootloader-owned type.
+
+The x86_64 crate translates `bootloader_api::BootInfo` into Molt's borrowed,
+read-only boot contract at the entry boundary. Consequently a future RISC-V
+boot path can supply the same contract without emulating a third-party x86
+bootloader API. Platform selection is compile-time, and serial calls are
+statically dispatched.
+
+Unsafe assembly belongs to the architecture crate that owns the corresponding
+register or firmware contract. Its safe surface is exercised with host-side
+mocks where possible and with a target-specific compile check; the x86_64 UART
+and exit path are additionally covered by the QEMU smoke test.
+
 ### Redox
 
 Redox is a Rust microkernel with processes, page-table isolation, userspace

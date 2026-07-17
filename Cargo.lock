@@ -421,6 +421,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "molt-arch"
+version = "0.1.0"
+
+[[package]]
 name = "molt-core"
 version = "0.1.0"
 dependencies = [
@@ -431,8 +435,25 @@ dependencies = [
 name = "molt-kernel"
 version = "0.1.0"
 dependencies = [
- "bootloader_api",
+ "molt-arch",
  "molt-core",
+ "molt-riscv",
+ "molt-x86_64",
+]
+
+[[package]]
+name = "molt-riscv"
+version = "0.1.0"
+dependencies = [
+ "molt-arch",
+]
+
+[[package]]
+name = "molt-x86_64"
+version = "0.1.0"
+dependencies = [
+ "bootloader_api",
+ "molt-arch",
 ]
 
 [[package]]

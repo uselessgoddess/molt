@@ -1,0 +1,9 @@
+[package]
+name = "molt-riscv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+molt-arch.workspace = true
