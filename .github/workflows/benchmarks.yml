@@ -1,0 +1,26 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "crates/molt-core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+jobs:
+  ring:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - run: cargo bench --package molt-core
+      - uses: actions/upload-artifact@v7
+        with:
+          name: criterion-ring-results
+          path: target/criterion
+          if-no-files-found: error

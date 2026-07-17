@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main, issue-1-b7f957eed036]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Format, lint, test, benchmark build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo bench --package molt-core --no-run
+
+  boot:
+    name: Build images and boot in QEMU
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qemu-system-x86
+      - run: cargo smoke
+      - uses: actions/upload-artifact@v7
+        with:
+          name: molt-x86_64-images
+          path: target/molt/*.img
+          if-no-files-found: error

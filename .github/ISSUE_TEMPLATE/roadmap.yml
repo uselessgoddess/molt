@@ -1,0 +1,35 @@
+name: Roadmap item
+description: Track one scoped Molt architecture milestone
+title: "[Roadmap] "
+labels: ["C-roadmap", "S-needs-design"]
+body:
+  - type: markdown
+    attributes:
+      value: Link the parent tracking issue and keep acceptance criteria observable.
+  - type: input
+    id: parent
+    attributes:
+      label: Parent tracking issue
+      placeholder: "#3"
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and constraints
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      placeholder: "- [ ] A testable outcome"
+    validations:
+      required: true
+  - type: textarea
+    id: unsafe
+    attributes:
+      label: Unsafe or hardware invariants
+      description: Write “None” if the item introduces neither.
+    validations:
+      required: true
