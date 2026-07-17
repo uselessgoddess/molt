@@ -4,7 +4,7 @@ The stages are ordered by dependency, not calendar date. A stage is complete
 only when its acceptance checks run in CI and its unsafe invariants are
 documented.
 
-## Stage 0 — Bootable MVP (this pull request)
+## Stage 0 — Bootable MVP
 
 - [x] pinned Rust toolchain and reproducible Cargo workspace
 - [x] host-tested `no_std` bounded SPSC and paired I/O rings
@@ -25,21 +25,26 @@ documented.
 
 ## Stage 1 — Kernel foundations (`P0-stage-1`)
 
-- [ ] GDT/IDT and exception diagnostics with double-fault protection
-- [ ] physical frame allocator sourced from the boot memory map
-- [ ] owned virtual mappings with W^X policy
-- [ ] local APIC timer and monotonic tick source
-- [ ] interrupt-safe completion publication
-- [ ] minimal executor with a bounded ready queue and no lost-wakeup race
-- [ ] registered buffer capabilities; no raw DMA pointer in public operations
-- [ ] cell IDs, generations, typed capability rights, and revocation
-- [ ] per-cell arena ownership and deterministic restart sequence
-- [ ] QEMU tests for exception, timer, cancellation, stale completion, and restart
+- [x] GDT/IDT and exception diagnostics with double-fault protection
+- [x] physical frame allocator sourced from the boot memory map
+- [x] owned virtual mappings with W^X policy
+- [x] local APIC timer and monotonic tick source
+- [x] interrupt-safe completion publication
+- [x] minimal executor with a bounded ready queue and no lost-wakeup race
+- [x] registered buffer capabilities; no raw DMA pointer in public operations
+- [x] cell IDs, generations, typed capability rights, and revocation
+- [x] per-cell arena ownership and deterministic restart sequence
+- [x] QEMU tests for exception, timer, cancellation, stale completion, and restart
 - [ ] documented real-hardware boot on one named x86_64 machine
 
 Acceptance: the kernel boots without polling for device work, completes timer
 futures through a ring, recovers a test cell without accepting stale results,
 and passes all host/QEMU tests with no unreviewed unsafe block.
+
+The remaining unchecked item requires a run on the named physical machine. Its
+reproducible procedure and result fields live in the
+[hardware validation record](hardware/amd-ryzen-9-9900x-gigabyte.md); no
+successful hardware run is claimed before those fields are completed.
 
 ## Stage 2 — First useful asynchronous I/O (`P1-stage-2`)
 

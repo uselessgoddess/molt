@@ -1,4 +1,6 @@
-use molt_core::cell::{Cell, Supervisor};
+use std::sync::{Arc, Mutex};
+
+use molt_core::cell::{Cell, CellId, RestartHooks, Supervisor};
 
 #[derive(Default)]
 struct CounterState {
@@ -33,4 +35,46 @@ fn supervisor_lifecycle() {
     supervisor.restart(CounterState { value: 40 });
     assert_eq!(supervisor.generation(), 1);
     assert_eq!(supervisor.call(2), 42);
+}
+
+struct Arena(Arc<Mutex<Vec<&'static str>>>);
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().push("drop arena");
+    }
+}
+
+struct Hooks(Arc<Mutex<Vec<&'static str>>>);
+
+impl RestartHooks for Hooks {
+    fn stop_submissions(&mut self) {
+        self.0.lock().unwrap().push("stop");
+    }
+
+    fn cancel_requests(&mut self) {
+        self.0.lock().unwrap().push("cancel");
+    }
+
+    fn revoke_capabilities(&mut self) {
+        self.0.lock().unwrap().push("revoke");
+    }
+}
+
+#[test]
+fn managed_restart_is_ordered_and_replaces_the_owned_arena() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut supervisor = Supervisor::<Counter, Arena>::with_arena(
+        CellId::new(9),
+        CounterState { value: 3 },
+        Arena(events.clone()),
+    );
+    let mut hooks = Hooks(events.clone());
+
+    supervisor.restart_managed(CounterState { value: 10 }, Arena(events.clone()), &mut hooks);
+
+    assert_eq!(*events.lock().unwrap(), ["stop", "cancel", "revoke", "drop arena"]);
+    assert_eq!(supervisor.identity().id(), CellId::new(9));
+    assert_eq!(supervisor.identity().generation(), 1);
+    assert_eq!(supervisor.call(2), 12);
 }
