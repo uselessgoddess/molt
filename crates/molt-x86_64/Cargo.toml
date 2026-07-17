@@ -8,3 +8,5 @@ publish = false
 [dependencies]
 bootloader_api.workspace = true
 molt-arch.workspace = true
+spin.workspace = true
+x86_64.workspace = true

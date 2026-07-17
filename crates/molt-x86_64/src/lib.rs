@@ -1,28 +1,43 @@
 #![no_std]
+#![feature(abi_x86_interrupt)]
 
 //! x86_64 boot adaptation and hardware implementations.
+
+mod apic;
+mod interrupts;
+mod memory;
 
 use core::arch::asm;
 use core::fmt::Write;
 use core::panic::PanicInfo;
 
+#[doc(hidden)]
+pub use bootloader_api::config::Mapping as BootMapping;
 use bootloader_api::info::{MemoryRegionKind as BootMemoryRegionKind, MemoryRegions};
 #[doc(hidden)]
-pub use bootloader_api::{BootInfo as BootloaderInfo, entry_point as __bootloader_entry_point};
+pub use bootloader_api::{
+    BootInfo as BootloaderInfo, BootloaderConfig, entry_point as __bootloader_entry_point,
+};
 use molt_arch::{
-    BootInfo, ExitStatus, MemoryMap, MemoryRegion, MemoryRegionKind, Platform, SerialPort,
-    SerialWriter,
+    BootInfo, ExitStatus, MemoryMap, MemoryRegion, MemoryRegionKind, Platform, PlatformError,
+    SerialPort, SerialWriter,
 };
 
 /// Defines the bootloader-specific entry wrapper outside `molt-kernel`.
 #[macro_export]
 macro_rules! entry_point {
     ($path:path) => {
+        static __MOLT_BOOT_CONFIG: $crate::BootloaderConfig = {
+            let mut config = $crate::BootloaderConfig::new_default();
+            config.mappings.physical_memory = Some($crate::BootMapping::Dynamic);
+            config
+        };
+
         fn __molt_x86_64_entry(boot_info: &'static mut $crate::BootloaderInfo) -> ! {
             $crate::start(boot_info, $path)
         }
 
-        $crate::__bootloader_entry_point!(__molt_x86_64_entry);
+        $crate::__bootloader_entry_point!(__molt_x86_64_entry, config = &__MOLT_BOOT_CONFIG);
     };
 }
 
@@ -98,6 +113,33 @@ impl Platform for X86_64 {
         &mut self.serial
     }
 
+    fn initialize(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+        interrupts::init();
+        let offset =
+            boot_info.physical_memory_offset().ok_or(PlatformError::MissingPhysicalMemoryMap)?;
+        apic::init(offset)
+    }
+
+    fn verify_exception_path(&mut self) -> bool {
+        interrupts::verify_breakpoint()
+    }
+
+    fn verify_owned_mapping(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+        memory::verify_owned_mapping(boot_info)
+    }
+
+    fn arm_timer(&mut self, initial_count: u32) -> Result<(), PlatformError> {
+        apic::arm(initial_count)
+    }
+
+    fn monotonic_ticks(&self) -> u64 {
+        apic::ticks()
+    }
+
+    fn wait_for_timer_change(&mut self, previous: u64) {
+        apic::wait_for_change(previous);
+    }
+
     fn terminate(&mut self, status: ExitStatus) -> ! {
         let code = match status {
             ExitStatus::Success => 0x10,
@@ -139,12 +181,28 @@ impl SerialPort for Com1 {
     }
 }
 
-fn halt_forever() -> ! {
+pub(crate) fn halt_forever() -> ! {
     loop {
         // SAFETY: the kernel has no work after reporting its terminal state.
         unsafe {
             asm!("hlt", options(nomem, nostack));
         }
+    }
+}
+
+pub(crate) fn emergency_write(text: &str) {
+    for byte in text.bytes() {
+        emergency_byte(byte);
+    }
+}
+
+pub(crate) fn emergency_byte(byte: u8) {
+    // SAFETY: fatal exception diagnostics use the already-initialized COM1 UART exclusively.
+    unsafe {
+        while in_u8(0x3fd) & 0x20 == 0 {
+            core::hint::spin_loop();
+        }
+        out_u8(0x3f8, byte);
     }
 }
 

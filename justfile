@@ -9,7 +9,10 @@ fmt-check:
     cargo fmt --all -- --check
 
 lint:
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --workspace --exclude molt-kernel --all-targets -- -D warnings
+
+x86-check:
+    cargo clippy --package molt-kernel --target x86_64-unknown-none -- -D warnings
 
 test:
     cargo nextest run --workspace
@@ -21,7 +24,7 @@ riscv-check:
 bench-check:
     cargo bench --package molt-core --no-run
 
-check: fmt-check lint test riscv-check bench-check
+check: fmt-check lint test x86-check riscv-check bench-check
 
 image:
     cargo image

@@ -209,10 +209,39 @@ pub enum ExitStatus {
     Failure,
 }
 
+/// Failure while enabling a platform's Stage 1 hardware services.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlatformError {
+    Unsupported,
+    MissingPhysicalMemoryMap,
+    InvalidHardware,
+    Mapping(MappingError),
+}
+
 /// Hardware services used directly by architecture-independent kernel code.
 pub trait Platform {
     type Serial: SerialPort;
 
     fn serial(&mut self) -> &mut Self::Serial;
+    fn initialize(&mut self, _boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+        Ok(())
+    }
+    fn verify_exception_path(&mut self) -> bool {
+        false
+    }
+    fn verify_owned_mapping(&mut self, _boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+    fn arm_timer(&mut self, _initial_count: u32) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+    fn monotonic_ticks(&self) -> u64 {
+        0
+    }
+    fn wait_for_timer_change(&mut self, previous: u64) {
+        while self.monotonic_ticks() == previous {
+            core::hint::spin_loop();
+        }
+    }
     fn terminate(&mut self, status: ExitStatus) -> !;
 }
