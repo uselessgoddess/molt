@@ -20,10 +20,10 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo bench --package molt-core --no-run
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest
+      - run: just check
 
   boot:
     name: Build images and boot in QEMU
@@ -34,11 +34,14 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
       - name: Install QEMU
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86
-      - run: cargo smoke
+      - run: just smoke
       - uses: actions/upload-artifact@v7
         with:
           name: molt-x86_64-images

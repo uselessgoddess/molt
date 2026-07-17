@@ -7,9 +7,17 @@ use std::{env, fs, thread};
 use bootloader::{BiosBoot, UefiBoot};
 
 const TARGET: &str = "x86_64-unknown-none";
-const BOOT_MARKER: &str = "MOLT_BOOT_OK";
+const BOOT_MARKERS: &[&str] = &[
+    "MOLT_EXCEPTION_OK",
+    "MOLT_MAPPING_OK",
+    "MOLT_TIMER_OK",
+    "MOLT_CANCELLATION_OK",
+    "MOLT_STALE_COMPLETION_OK",
+    "MOLT_RESTART_OK",
+    "MOLT_BOOT_OK",
+];
 const QEMU_SUCCESS: i32 = (0x10 << 1) | 1;
-const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
+const SMOKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn main() -> ExitCode {
     match run() {
@@ -104,14 +112,20 @@ fn smoke_test() -> Result<(), String> {
     }
 
     require_qemu_success(status)?;
-    if !serial.contains(BOOT_MARKER) {
-        return Err(format!("QEMU exited without the {BOOT_MARKER} serial marker"));
+    for marker in BOOT_MARKERS {
+        if !serial.contains(marker) {
+            return Err(format!("QEMU exited without the {marker} serial marker"));
+        }
     }
     Ok(())
 }
 
 fn qemu_command(image: &Path) -> Command {
-    let mut command = Command::new("qemu-system-x86_64");
+    let qemu = env::var_os("MOLT_QEMU").unwrap_or_else(|| OsString::from("qemu-system-x86_64"));
+    let mut command = Command::new(qemu);
+    if let Some(firmware) = env::var_os("MOLT_QEMU_FIRMWARE") {
+        command.arg("-L").arg(firmware);
+    }
     command.args([
         "-display",
         "none",

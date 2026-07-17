@@ -5,14 +5,15 @@ Molt uses the toolchain declared in `rust-toolchain.toml`.
 Before opening a pull request, run:
 
 ```console
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo bench -p molt-core --no-run
-cargo image
+just check
+just image
 ```
 
-When QEMU is installed, also run `cargo smoke`. Any change to unsafe code must
-document its safety invariant and add a test that exercises the safe API around
-that invariant. Performance changes should include the benchmark command,
-machine details, and before/after distributions rather than a single timing.
+`just check` uses cargo-nextest for the host suite and separately checks both
+bare-metal kernel targets. The kernel is deliberately excluded from the host
+workspace lint because it defines a freestanding panic handler and has no host
+entry point. When QEMU is installed, also run `just smoke`. Any change to unsafe
+code must document its safety invariant and add a test that exercises the safe
+API around that invariant. Performance changes should include the benchmark
+command, machine details, and before/after distributions rather than a single
+timing.

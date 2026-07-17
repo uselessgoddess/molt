@@ -1,6 +1,6 @@
 # Architecture direction
 
-Status: MVP decision record, July 2026.
+Status: Stage 1 decision record, July 2026.
 
 This document turns the constraints in issue #1 into testable design rules. It
 is a direction, not a claim that the hard isolation, evolution, and driver work
@@ -27,6 +27,53 @@ another component's state is the main long-term reference.
 Molt adopts small ownership-scoped cells and compiler-visible interfaces. The
 MVP stops before runtime ELF loading: static linking gives one compiler and one
 Rust ABI while the basic ownership model is tested.
+
+## Hardware boundary
+
+Molt keeps three layers distinct:
+
+- `molt-arch` contains only portable data and traits such as `BootInfo`,
+  `MemoryMap`, `SerialPort`, `InterruptController`, and `Platform`;
+- `molt-x86_64` and `molt-riscv` contain target-specific assembly, firmware
+  adaptation, and device implementations;
+- `molt-kernel` composes those services with `molt-core` and does not perform
+  port I/O or consume a bootloader-owned type.
+
+The x86_64 crate translates `bootloader_api::BootInfo` into Molt's borrowed,
+read-only boot contract at the entry boundary. Consequently a future RISC-V
+boot path can supply the same contract without emulating a third-party x86
+bootloader API. Platform selection is compile-time, and serial calls are
+statically dispatched.
+
+Unsafe assembly belongs to the architecture crate that owns the corresponding
+register or firmware contract. Its safe surface is exercised with host-side
+mocks where possible and with a target-specific compile check; the x86_64
+exception, page-table, local-APIC, UART, and exit paths are additionally covered
+by the QEMU smoke test.
+
+## Stage 1 hardware foundations
+
+The x86_64 initialization path installs a kernel GDT, reloads the code and data
+segment registers, and loads a TSS whose first interrupt-stack-table entry owns
+a dedicated 20 KiB double-fault stack. The IDT has returning breakpoint
+diagnostics, fatal page-fault diagnostics, a double-fault handler on that
+separate stack, and local-APIC timer and spurious vectors. Both legacy PICs are
+masked before interrupts are enabled, so firmware IRQ vectors cannot collide
+with CPU exception vectors.
+
+The boot memory map feeds a monotonic 4 KiB physical-frame allocator. An
+`OwnedPage` maps one fresh frame into a dedicated virtual page, enforces W^X in
+the portable permission constructor, and unmaps on drop. Page-table access is
+restricted to single-core early boot, where the bootloader's complete physical
+direct map and unique ownership are explicit unsafe preconditions.
+
+The local APIC runs a one-shot timer with an atomic monotonic interrupt count.
+The wait path disables interrupts, rechecks the count, then uses atomic
+enable-and-halt so an arrival cannot be lost between the check and sleep. The
+handler performs only atomic publication and EOI; the driver publishes the
+correlated result through its unique, bounded completion-ring producer after
+the interrupt wakes it. Thus interrupt context neither allocates nor takes the
+completion slab's short spin locks.
 
 ### Redox
 
@@ -85,19 +132,32 @@ Every entry is bounded and non-blocking. Backpressure is explicit through
 `Result<(), Entry>`. `RequestId` correlates completions, which may arrive out of
 submission order.
 
-Planned rules:
+Implemented Stage 1 rules:
 
 - use one SPSC lane per producer/consumer pair; fan-in happens explicitly rather
   than silently turning the primitive into an MPMC queue;
-- register buffers and pass typed buffer capabilities, not arbitrary raw
-  pointers from general cells;
-- allocate request IDs with a generation so stale completions cannot satisfy a
-  reused slot;
-- store wakers in a bounded slab, not a tree protected by a global mutex;
-- in `Future::poll`, check completion, register/replace the waker, and check
-  completion again to close the arrival-vs-registration race;
+- registered buffers are supervisor-owned and public operations contain only a
+  typed capability plus checked offset/length, never an address;
+- capability handles use the low 32 bits for an O(1) table index and the high
+  32 bits for a nonzero generation; revocation clears the slot before advancing
+  its generation;
+- request IDs are monotonic wrapping `u64` values, independent of slab slots;
+  wrap requires 2^64 allocations (about 58.5 years even at ten billion per
+  second), and the contract forbids one request from surviving a full cycle;
+- wakers are owned by a bounded completion slab, cleared on completion,
+  cancellation, future drop, and bulk restart cancellation;
+- `Future::poll` holds the slot's short lock while checking the result and
+  registering/replacing the waker, so completion cannot arrive in the gap;
+- the executor's bounded atomic per-task state machine coalesces repeat wakes;
+  a wake during polling sets the ready bit that `complete_poll` preserves for
+  the next scheduler pass;
 - specify cancellation, timeout, driver reset, and ring overflow behavior before
   adding real DMA.
+
+The 32-bit capability generation is intentionally compact. A handle retained
+across 2^32 revocations of the same slot could alias again, so supervisors must
+not retain or import handles across that many reuse cycles. Moving the ABI to a
+wider generation remains possible before dynamic cells are introduced.
 
 “Everything async uses rings” does not mean every normal function call must be
 queued. Pure calculations and lifecycle control remain direct typed calls.
@@ -106,11 +166,10 @@ is asynchronous.
 
 ## Cells, state, and recovery
 
-The MVP `Cell` trait and `Supervisor` establish three properties: the supervisor
-owns the cell, restart replaces owned state, and a generation changes on every
-restart. Calls are statically typed and allocation-free.
-
-The next stage adds arenas and capability revocation. A restart must:
+The `Cell` trait and `Supervisor` establish that the supervisor owns the cell,
+restart replaces owned state, and a generation changes on every restart. Calls
+are statically typed and allocation-free. Each managed supervisor also owns an
+arena value and invokes integrations in this deterministic order:
 
 1. stop new submissions to the old generation;
 2. cancel or drain outstanding operations;
