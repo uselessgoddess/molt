@@ -1,7 +1,20 @@
 [workspace]
 resolver = "3"
-members = ["crates/molt-core", "kernel", "xtask"]
-default-members = ["crates/molt-core", "xtask"]
+members = [
+    "crates/molt-arch",
+    "crates/molt-core",
+    "crates/molt-riscv",
+    "crates/molt-x86_64",
+    "kernel",
+    "xtask",
+]
+default-members = [
+    "crates/molt-arch",
+    "crates/molt-core",
+    "crates/molt-riscv",
+    "crates/molt-x86_64",
+    "xtask",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,7 +23,10 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 bootloader_api = "0.11.15"
+molt-arch = { path = "crates/molt-arch" }
 molt-core = { path = "crates/molt-core" }
+molt-riscv = { path = "crates/molt-riscv" }
+molt-x86_64 = { path = "crates/molt-x86_64" }
 
 [profile.dev]
 panic = "abort"

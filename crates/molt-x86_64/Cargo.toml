@@ -1,0 +1,10 @@
+[package]
+name = "molt-x86_64"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+bootloader_api.workspace = true
+molt-arch.workspace = true

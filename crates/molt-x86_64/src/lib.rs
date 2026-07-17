@@ -1,0 +1,225 @@
+#![no_std]
+
+//! x86_64 boot adaptation and hardware implementations.
+
+use core::arch::asm;
+use core::fmt::Write;
+use core::panic::PanicInfo;
+
+use bootloader_api::info::{MemoryRegionKind as BootMemoryRegionKind, MemoryRegions};
+#[doc(hidden)]
+pub use bootloader_api::{BootInfo as BootloaderInfo, entry_point as __bootloader_entry_point};
+use molt_arch::{
+    BootInfo, ExitStatus, MemoryMap, MemoryRegion, MemoryRegionKind, Platform, SerialPort,
+    SerialWriter,
+};
+
+/// Defines the bootloader-specific entry wrapper outside `molt-kernel`.
+#[macro_export]
+macro_rules! entry_point {
+    ($path:path) => {
+        fn __molt_x86_64_entry(boot_info: &'static mut $crate::BootloaderInfo) -> ! {
+            $crate::start(boot_info, $path)
+        }
+
+        $crate::__bootloader_entry_point!(__molt_x86_64_entry);
+    };
+}
+
+/// Converts bootloader state and starts the architecture-independent kernel.
+#[doc(hidden)]
+pub fn start(raw: &'static mut BootloaderInfo, kernel: fn(BootInfo<'_>, &mut X86_64) -> !) -> ! {
+    let memory_map = BootloaderMemoryMap::new(&raw.memory_regions);
+    let physical_memory_offset = raw.physical_memory_offset.as_ref().copied();
+    let boot_info = BootInfo::new(&memory_map, physical_memory_offset);
+    let mut platform = X86_64::new();
+    kernel(boot_info, &mut platform)
+}
+
+/// Reports a panic through COM1 before terminating the QEMU machine.
+pub fn panic(info: &PanicInfo<'_>) -> ! {
+    let mut platform = X86_64::new();
+    platform.serial().init();
+    let _ = writeln!(SerialWriter::new(platform.serial()), "MOLT_PANIC: {info}");
+    platform.terminate(ExitStatus::Failure)
+}
+
+struct BootloaderMemoryMap<'map> {
+    regions: &'map MemoryRegions,
+}
+
+impl<'map> BootloaderMemoryMap<'map> {
+    const fn new(regions: &'map MemoryRegions) -> Self {
+        Self { regions }
+    }
+}
+
+impl MemoryMap for BootloaderMemoryMap<'_> {
+    fn len(&self) -> usize {
+        self.regions.len()
+    }
+
+    fn region(&self, index: usize) -> Option<MemoryRegion> {
+        self.regions.get(index).map(|region| {
+            let kind = match region.kind {
+                BootMemoryRegionKind::Usable => MemoryRegionKind::Usable,
+                BootMemoryRegionKind::Bootloader => MemoryRegionKind::Bootloader,
+                BootMemoryRegionKind::UnknownUefi(tag) | BootMemoryRegionKind::UnknownBios(tag) => {
+                    MemoryRegionKind::Firmware(tag)
+                }
+                _ => MemoryRegionKind::Reserved,
+            };
+            MemoryRegion::new(region.start, region.end, kind)
+        })
+    }
+}
+
+/// Concrete services for the current x86_64 boot target.
+pub struct X86_64 {
+    serial: Com1,
+}
+
+impl X86_64 {
+    pub const fn new() -> Self {
+        Self { serial: Com1 }
+    }
+}
+
+impl Default for X86_64 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Platform for X86_64 {
+    type Serial = Com1;
+
+    fn serial(&mut self) -> &mut Self::Serial {
+        &mut self.serial
+    }
+
+    fn terminate(&mut self, status: ExitStatus) -> ! {
+        let code = match status {
+            ExitStatus::Success => 0x10,
+            ExitStatus::Failure => 0x11,
+        };
+        // SAFETY: 0xf4 is reserved for the isa-debug-exit device by the image runner.
+        unsafe {
+            out_u32(0xf4, code);
+        }
+        halt_forever()
+    }
+}
+
+/// The legacy 16550 UART at the standard COM1 I/O base.
+pub struct Com1;
+
+impl SerialPort for Com1 {
+    fn init(&mut self) {
+        // SAFETY: the boot target reserves these standard COM1 registers for this driver.
+        unsafe {
+            out_u8(0x3f9, 0x00);
+            out_u8(0x3fb, 0x80);
+            out_u8(0x3f8, 0x03);
+            out_u8(0x3f9, 0x00);
+            out_u8(0x3fb, 0x03);
+            out_u8(0x3fa, 0xc7);
+            out_u8(0x3fc, 0x0b);
+        }
+    }
+
+    fn write_byte(&mut self, byte: u8) {
+        // SAFETY: COM1 was initialized above and this driver exclusively owns its registers.
+        unsafe {
+            while in_u8(0x3fd) & 0x20 == 0 {
+                core::hint::spin_loop();
+            }
+            out_u8(0x3f8, byte);
+        }
+    }
+}
+
+fn halt_forever() -> ! {
+    loop {
+        // SAFETY: the kernel has no work after reporting its terminal state.
+        unsafe {
+            asm!("hlt", options(nomem, nostack));
+        }
+    }
+}
+
+unsafe fn out_u8(port: u16, value: u8) {
+    // SAFETY: callers own the I/O port they pass to this architecture-private function.
+    unsafe {
+        asm!(
+            "out dx, al",
+            in("dx") port,
+            in("al") value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
+unsafe fn out_u32(port: u16, value: u32) {
+    // SAFETY: callers own the I/O port they pass to this architecture-private function.
+    unsafe {
+        asm!(
+            "out dx, eax",
+            in("dx") port,
+            in("eax") value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
+unsafe fn in_u8(port: u16) -> u8 {
+    let value: u8;
+    // SAFETY: callers own the I/O port they pass to this architecture-private function.
+    unsafe {
+        asm!(
+            "in al, dx",
+            in("dx") port,
+            out("al") value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use std::boxed::Box;
+
+    use bootloader_api::info::{
+        MemoryRegion as BootMemoryRegion, MemoryRegionKind as BootMemoryRegionKind, MemoryRegions,
+    };
+    use molt_arch::{MemoryMap, MemoryRegion, MemoryRegionKind};
+
+    use super::BootloaderMemoryMap;
+
+    #[test]
+    fn translates_bootloader_memory_without_leaking_its_types() {
+        let raw = Box::leak(Box::new([
+            BootMemoryRegion { start: 0, end: 4096, kind: BootMemoryRegionKind::Bootloader },
+            BootMemoryRegion { start: 4096, end: 8192, kind: BootMemoryRegionKind::Usable },
+            BootMemoryRegion {
+                start: 8192,
+                end: 12288,
+                kind: BootMemoryRegionKind::UnknownUefi(7),
+            },
+        ]));
+        let regions = MemoryRegions::from(&mut raw[..]);
+        let map = BootloaderMemoryMap::new(&regions);
+
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.region(0), Some(MemoryRegion::new(0, 4096, MemoryRegionKind::Bootloader)));
+        assert_eq!(map.region(1), Some(MemoryRegion::new(4096, 8192, MemoryRegionKind::Usable)));
+        assert_eq!(
+            map.region(2),
+            Some(MemoryRegion::new(8192, 12288, MemoryRegionKind::Firmware(7)))
+        );
+        assert_eq!(map.region(3), None);
+    }
+}
