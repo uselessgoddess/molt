@@ -5,8 +5,10 @@
 #[cfg(target_arch = "riscv64")]
 mod riscv64 {
     use core::arch::asm;
+    use core::fmt::Write;
+    use core::panic::PanicInfo;
 
-    use molt_arch::{ExitStatus, Platform, SerialPort};
+    use molt_arch::{ExitStatus, Platform, SerialPort, SerialWriter};
 
     const SBI_CONSOLE_PUTCHAR: usize = 0x01;
     const SBI_SYSTEM_RESET: usize = 0x5352_5354;
@@ -65,6 +67,13 @@ mod riscv64 {
         }
     }
 
+    /// Reports a panic through the SBI console before requesting shutdown.
+    pub fn panic(info: &PanicInfo<'_>) -> ! {
+        let mut platform = RiscV::new();
+        let _ = writeln!(SerialWriter::new(platform.serial()), "MOLT_PANIC: {info}");
+        platform.terminate(ExitStatus::Failure)
+    }
+
     unsafe fn sbi_call(extension: usize, function: usize, arg0: usize, arg1: usize) -> isize {
         let error: isize;
         // SAFETY: register placement follows the SBI calling convention and ecall preserves memory.
@@ -83,4 +92,4 @@ mod riscv64 {
 }
 
 #[cfg(target_arch = "riscv64")]
-pub use riscv64::{RiscV, SbiSerial};
+pub use riscv64::{RiscV, SbiSerial, panic};

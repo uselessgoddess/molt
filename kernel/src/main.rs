@@ -10,11 +10,14 @@ use molt_core::ring::{Completion, IoRing, RequestId, Submission};
 #[cfg(target_arch = "x86_64")]
 molt_x86_64::entry_point!(kernel_main);
 
+// The RISC-V platform is compile-checked before its boot adapter is implemented.
+#[cfg_attr(target_arch = "riscv64", allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KernelOp {
     TimerWait { deadline_ticks: u64 },
 }
 
+#[cfg_attr(target_arch = "riscv64", allow(dead_code))]
 fn kernel_main<P: Platform>(boot_info: BootInfo<'_>, platform: &mut P) -> ! {
     platform.serial().init();
     {
@@ -48,5 +51,12 @@ fn kernel_main<P: Platform>(boot_info: BootInfo<'_>, platform: &mut P) -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
     #[cfg(target_arch = "x86_64")]
-    molt_x86_64::panic(info)
+    {
+        molt_x86_64::panic(info)
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        molt_riscv::panic(info)
+    }
 }

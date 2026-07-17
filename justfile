@@ -16,7 +16,7 @@ test:
     cargo test --workspace --doc
 
 riscv-check:
-    cargo clippy --package molt-riscv --target riscv64gc-unknown-none-elf -- -D warnings
+    cargo clippy --package molt-kernel --target riscv64gc-unknown-none-elf -- -D warnings
 
 bench-check:
     cargo bench --package molt-core --no-run
