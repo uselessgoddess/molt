@@ -1,0 +1,5 @@
+[alias]
+xtask = "run --package xtask --"
+image = "run --package xtask -- image"
+boot = "run --package xtask -- boot"
+smoke = "run --package xtask -- smoke"

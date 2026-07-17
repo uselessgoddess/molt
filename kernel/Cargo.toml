@@ -1,0 +1,16 @@
+[package]
+name = "molt-kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "molt-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+bootloader_api.workspace = true
+molt-core.workspace = true
