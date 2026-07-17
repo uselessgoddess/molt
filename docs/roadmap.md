@@ -15,6 +15,14 @@ documented.
 - [x] Criterion ring benchmark harness
 - [x] architecture decisions and explicit security limits
 
+## Cross-platform foundation
+
+- [x] bootloader-independent memory-map and boot-information contract
+- [x] hardware traits isolated from architecture implementations
+- [x] x86_64 UART, halt, and test-exit implementation outside the kernel
+- [x] RISC-V SBI console and shutdown implementation with a target compile check
+- [x] shared `just` command suite with nextest and bounded slow-test timeouts
+
 ## Stage 1 — Kernel foundations (`P0-stage-1`)
 
 - [ ] GDT/IDT and exception diagnostics with double-fault protection

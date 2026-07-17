@@ -8,7 +8,9 @@ Molt is a learning operating system exploring two constraints:
 The current MVP boots on x86_64 through BIOS or UEFI, performs a typed ring
 round trip, prints `MOLT_BOOT_OK` on COM1, and exits cleanly under QEMU. The
 architecture-independent ring and cell lifecycle code is a `no_std` library so
-it can be tested and benchmarked on the host.
+it can be tested and benchmarked on the host. Hardware interfaces are defined
+separately from x86_64 and RISC-V implementations, so kernel orchestration
+contains no port I/O or bootloader-specific types.
 
 > Molt is research software, not a security boundary. Safe Rust reduces memory
 > safety risk, but a single address space does not contain unsafe code, DMA,
@@ -17,15 +19,20 @@ it can be tested and benchmarked on the host.
 ## Repository layout
 
 ```text
-crates/molt-core/  no_std ring and supervised-cell primitives
-kernel/            bootable x86_64 MVP
-xtask/             reproducible image builder and QEMU smoke runner
-docs/              architecture analysis and staged roadmap
+crates/molt-arch/    boot and hardware contracts; no platform implementation
+crates/molt-core/    no_std ring and supervised-cell primitives
+crates/molt-x86_64/  x86_64 boot adapter, UART, halt, and QEMU exit
+crates/molt-riscv/   RISC-V SBI console and shutdown implementation
+kernel/              architecture-independent kernel orchestration
+xtask/               reproducible image builder and QEMU smoke runner
+docs/                architecture analysis and staged roadmap
 ```
 
 ## Prerequisites
 
 - [rustup](https://rustup.rs/) (the pinned toolchain is installed automatically)
+- [just](https://just.systems/) and
+  [cargo-nextest](https://nexte.st/) for the development command suite
 - `qemu-system-x86_64` for `boot` and `smoke`
 
 The dated nightly in `rust-toolchain.toml` is intentional: `bootloader` builds
@@ -35,9 +42,8 @@ kernel source do not otherwise rely on unstable language features.
 ## Build and test
 
 ```console
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo image
+just check
+just image
 ```
 
 Images are written to `target/molt/molt-bios.img` and
@@ -46,7 +52,7 @@ Images are written to `target/molt/molt-bios.img` and
 Run the automated BIOS boot assertion:
 
 ```console
-cargo smoke
+just smoke
 ```
 
 Or show the serial/QEMU monitor interactively:
@@ -58,7 +64,7 @@ cargo boot
 Run the ring microbenchmarks with:
 
 ```console
-cargo bench -p molt-core
+just bench
 ```
 
 To try real hardware, write the UEFI image to a disposable USB drive using a
