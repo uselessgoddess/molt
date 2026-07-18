@@ -11,3 +11,4 @@ pub mod cell;
 pub mod completion;
 pub mod executor;
 pub mod ring;
+pub mod waker;
