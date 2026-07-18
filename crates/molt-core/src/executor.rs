@@ -1,4 +1,15 @@
 //! Allocation-free bounded ready scheduling.
+//!
+//! Each task owns one [`AtomicU8`] slot state. Packing several slots into a
+//! single `AtomicU64` was considered to shrink the scan and enable SIMD-style
+//! word loads, but rejected: at the `1..=256` capacity here the whole array is
+//! at most 256 bytes (four cache lines), so the linear scan is already cheap,
+//! while a shared word would make [`wake`](Executor::wake) — a lock-free path
+//! reachable from interrupt context — contend across otherwise independent
+//! tasks and turn every slot's compare-exchange into a retry against its
+//! neighbours. Per-slot atomics keep each task's state machine independent and
+//! free of that false sharing, which is worth more than a marginally tighter
+//! scan.
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
