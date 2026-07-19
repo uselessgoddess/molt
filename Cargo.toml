@@ -40,6 +40,13 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 
+# loom explores a very large number of executions, so its tests want
+# optimization; they also rely on debug assertions to catch model violations,
+# which `release` would strip.
+[profile.loom]
+inherits = "test"
+opt-level = 2
+
 [profile.micro]
 inherits = "release"
 codegen-units = 1

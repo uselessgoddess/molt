@@ -24,8 +24,10 @@
 //! [`AtomicU8`] it was handed, so no pointer arithmetic escapes the slot it
 //! borrows, and the vtable needs no capacity parameter.
 
-use core::sync::atomic::{AtomicU8, Ordering};
 use core::task::{RawWaker, RawWakerVTable, Waker};
+
+use crate::sync::atomic::{AtomicU8, Ordering};
+use crate::sync::{array, const_fn};
 
 const OCCUPIED: u8 = 1 << 0;
 const READY: u8 = 1 << 1;
@@ -45,9 +47,11 @@ pub struct Executor<const N: usize> {
 }
 
 impl<const N: usize> Executor<N> {
-    pub const fn new() -> Self {
-        const { assert!(N > 0 && N <= 256, "executor capacity must be in 1..=256") };
-        Self { states: [const { AtomicU8::new(0) }; N] }
+    const_fn! {
+        pub fn new() -> Self {
+            const { assert!(N > 0 && N <= 256, "executor capacity must be in 1..=256") };
+            Self { states: array![AtomicU8::new(0); N] }
+        }
     }
 
     pub fn register(&self) -> Result<TaskId, SpawnError> {
@@ -158,7 +162,39 @@ impl<const N: usize> Default for Executor<N> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use loom::sync::Arc;
+    use loom::thread;
+
+    use super::Executor;
+
+    /// A wake landing while the scheduler scans must still be observed: either
+    /// this scan sees it, or the next one does.
+    #[test]
+    fn a_wake_racing_the_scan_is_not_lost() {
+        loom::model(|| {
+            let executor = Arc::new(Executor::<2>::new());
+            let task = executor.register().expect("free slot");
+
+            let notifier = {
+                let executor = executor.clone();
+                thread::spawn(move || executor.wake(task))
+            };
+            let scanned = executor.next_ready();
+            notifier.join().unwrap();
+
+            assert!(
+                scanned == Some(task) || executor.next_ready() == Some(task),
+                "the wake was lost between the scan and the wake"
+            );
+        });
+    }
+}
+
+// These place executors in `static`s, which loom's non-const atomics forbid.
+// Model checking lives in `tests/loom.rs`.
+#[cfg(all(test, not(loom)))]
 mod tests {
     extern crate std;
 

@@ -8,6 +8,15 @@ publish = false
 [dev-dependencies]
 criterion = "0.7"
 
+# `sync` reaches into loom for its atomics, so this is a dependency of the
+# library itself — but only ever of a `--cfg loom` build. No shipped target
+# links it.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [[bench]]
 name = "ring"
 harness = false

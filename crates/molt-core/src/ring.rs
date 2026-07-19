@@ -4,9 +4,10 @@
 //! contract a property of the safe API instead of a convention callers must
 //! remember.
 
-use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::sync::atomic::{AtomicUsize, Ordering};
+use crate::sync::{UnsafeCell, array, const_fn};
 
 /// A fixed-capacity single-producer/single-consumer queue.
 pub struct SpscRing<T, const N: usize> {
@@ -20,16 +21,18 @@ pub struct SpscRing<T, const N: usize> {
 unsafe impl<T: Send, const N: usize> Sync for SpscRing<T, N> {}
 
 impl<T, const N: usize> SpscRing<T, N> {
-    /// Creates an empty queue.
-    pub const fn new() -> Self {
-        const {
-            assert!(N > 0, "a ring must contain at least one slot");
-        }
+    const_fn! {
+        /// Creates an empty queue.
+        pub fn new() -> Self {
+            const {
+                assert!(N > 0, "a ring must contain at least one slot");
+            }
 
-        Self {
-            slots: [const { UnsafeCell::new(MaybeUninit::uninit()) }; N],
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
+            Self {
+                slots: array![UnsafeCell::new(MaybeUninit::uninit()); N],
+                head: AtomicUsize::new(0),
+                tail: AtomicUsize::new(0),
+            }
         }
     }
 
@@ -52,9 +55,9 @@ impl<T, const N: usize> SpscRing<T, N> {
 
         // SAFETY: only the unique producer writes this slot. The acquire load
         // above observes the consumer's release before a wrapped slot is reused.
-        unsafe {
-            (*self.slots[tail % N].get()).write(value);
-        }
+        self.slots[tail % N].with_mut(|slot| unsafe {
+            (*slot).write(value);
+        });
         self.tail.store(tail.wrapping_add(1), Ordering::Release);
         Ok(())
     }
@@ -68,7 +71,7 @@ impl<T, const N: usize> SpscRing<T, N> {
 
         // SAFETY: the producer's release published a fully initialized value,
         // and only the unique consumer reads and advances this slot.
-        let value = unsafe { (*self.slots[head % N].get()).assume_init_read() };
+        let value = self.slots[head % N].with(|slot| unsafe { (*slot).assume_init_read() });
         self.head.store(head.wrapping_add(1), Ordering::Release);
         Some(value)
     }
@@ -82,16 +85,57 @@ impl<T, const N: usize> Default for SpscRing<T, N> {
 
 impl<T, const N: usize> Drop for SpscRing<T, N> {
     fn drop(&mut self) {
-        let mut head = *self.head.get_mut();
-        let tail = *self.tail.get_mut();
+        // `&mut self` already excludes both endpoints, so relaxed loads read the
+        // final values; going through the atomics keeps this identical under
+        // loom, whose atomics have no `&mut` accessor.
+        let mut head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Relaxed);
         while head != tail {
             // SAFETY: exclusive access prevents concurrent endpoints, and each
             // position between head and tail contains one initialized value.
-            unsafe {
-                self.slots[head % N].get_mut().assume_init_drop();
-            }
+            self.slots[head % N].with_mut(|slot| unsafe {
+                (*slot).assume_init_drop();
+            });
             head = head.wrapping_add(1);
         }
+    }
+}
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use loom::sync::Arc;
+    use loom::thread;
+
+    use super::SpscRing;
+
+    /// A one-slot ring forces the producer to reuse the slot behind the
+    /// consumer, which is exactly where the acquire/release pairing has to hold.
+    #[test]
+    fn every_value_arrives_once_and_in_order() {
+        loom::model(|| {
+            let ring = Arc::new(SpscRing::<u32, 1>::new());
+            let producer = {
+                let ring = ring.clone();
+                thread::spawn(move || {
+                    for value in 1..=2 {
+                        while ring.try_push(value).is_err() {
+                            thread::yield_now();
+                        }
+                    }
+                })
+            };
+
+            let mut seen = Vec::new();
+            while seen.len() < 2 {
+                match ring.try_pop() {
+                    Some(value) => seen.push(value),
+                    None => thread::yield_now(),
+                }
+            }
+
+            producer.join().unwrap();
+            assert_eq!(seen, [1, 2]);
+        });
     }
 }
 
@@ -191,8 +235,10 @@ pub struct IoRing<Op, C, const N: usize> {
 }
 
 impl<Op, C, const N: usize> IoRing<Op, C, N> {
-    pub const fn new() -> Self {
-        Self { submissions: SpscRing::new(), completions: SpscRing::new() }
+    const_fn! {
+        pub fn new() -> Self {
+            Self { submissions: SpscRing::new(), completions: SpscRing::new() }
+        }
     }
 
     /// Creates the unique client and driver views of both queues.
