@@ -8,7 +8,9 @@ mod interrupts;
 mod memory;
 
 use core::arch::asm;
+#[cfg(target_os = "none")]
 use core::fmt::Write;
+#[cfg(target_os = "none")]
 use core::panic::PanicInfo;
 
 #[doc(hidden)]
@@ -18,9 +20,11 @@ use bootloader_api::info::{MemoryRegionKind as BootMemoryRegionKind, MemoryRegio
 pub use bootloader_api::{
     BootInfo as BootloaderInfo, BootloaderConfig, entry_point as __bootloader_entry_point,
 };
+#[cfg(target_os = "none")]
+use molt_arch::SerialWriter;
 use molt_arch::{
     BootInfo, ExitStatus, MemoryMap, MemoryRegion, MemoryRegionKind, Platform, PlatformError,
-    SerialPort, SerialWriter,
+    SerialPort,
 };
 
 /// Defines the bootloader-specific entry wrapper outside `molt-kernel`.
@@ -52,7 +56,13 @@ pub fn start(raw: &'static mut BootloaderInfo, kernel: fn(BootInfo<'_>, &mut X86
 }
 
 /// Reports a panic through COM1 before terminating the QEMU machine.
-pub fn panic(info: &PanicInfo<'_>) -> ! {
+///
+/// Linking any Molt kernel against this crate installs the handler
+/// automatically, so no kernel binary can forget to provide one. It is gated on
+/// the bare-metal target so host unit tests keep the standard library's handler.
+#[cfg(target_os = "none")]
+#[panic_handler]
+fn panic(info: &PanicInfo<'_>) -> ! {
     let mut platform = X86_64::new();
     platform.serial().init();
     let _ = writeln!(SerialWriter::new(platform.serial()), "MOLT_PANIC: {info}");
@@ -115,8 +125,7 @@ impl Platform for X86_64 {
 
     fn initialize(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
         interrupts::init();
-        let offset =
-            boot_info.physical_offset().ok_or(PlatformError::MissingPhysicalMemoryMap)?;
+        let offset = boot_info.physical_offset().ok_or(PlatformError::MissingPhysicalMemoryMap)?;
         apic::init(offset)
     }
 
@@ -258,7 +267,7 @@ mod tests {
     use super::BootloaderMemoryMap;
 
     #[test]
-    fn translates_bootloader_memory_without_leaking_its_types() {
+    fn bootloader_memory() {
         let raw = Box::leak(Box::new([
             BootMemoryRegion { start: 0, end: 4096, kind: BootMemoryRegionKind::Bootloader },
             BootMemoryRegion { start: 4096, end: 8192, kind: BootMemoryRegionKind::Usable },

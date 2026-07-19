@@ -29,8 +29,13 @@ pre: fmt-check lint test x86_64-check riscv64gc-check bench-check
 image:
     cargo image
 
-smoke:
-    cargo smoke
+smoke-x86_64:
+    cargo smoke x86_64
+
+smoke-riscv64:
+    cargo smoke riscv64
+
+smoke: smoke-x86_64 smoke-riscv64
 
 bench:
     cargo bench --package molt-core

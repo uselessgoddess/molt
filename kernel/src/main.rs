@@ -2,28 +2,22 @@
 #![no_main]
 
 use core::fmt::Write;
-#[cfg(target_arch = "x86_64")]
 use core::future::Future;
-use core::panic::PanicInfo;
-#[cfg(target_arch = "x86_64")]
 use core::pin::pin;
-#[cfg(target_arch = "x86_64")]
 use core::task::{Context, Poll, Waker};
 
 use molt_arch::{BootInfo, ExitStatus, Platform, SerialPort, SerialWriter};
-#[cfg(target_arch = "x86_64")]
 use molt_core::capability::{CapabilityError, CapabilityTable, ReadWrite};
-#[cfg(target_arch = "x86_64")]
 use molt_core::cell::{Cell, CellId, Supervisor};
-#[cfg(target_arch = "x86_64")]
 use molt_core::completion::{CompletionError, CompletionSlab};
-#[cfg(target_arch = "x86_64")]
 use molt_core::ring::{Completion, IoRing, Submission};
 
 #[cfg(target_arch = "x86_64")]
 molt_x86_64::entry_point!(kernel_main);
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(target_arch = "riscv64")]
+molt_riscv::entry_point!(kernel_main);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KernelOp {
     TimerWait { initial_count: u32 },
@@ -39,22 +33,19 @@ macro_rules! println {
     };
 }
 
-#[cfg_attr(target_arch = "riscv64", allow(dead_code))]
 fn kernel_main<P: Platform>(boot_info: BootInfo<'_>, platform: &mut P) -> ! {
     platform.serial().init();
     println!(platform, "MOLT: booting");
     println!(platform, "MOLT: memory regions={}", boot_info.memory_map().len());
 
-    #[cfg(target_arch = "x86_64")]
     run_stage_1_checks(&boot_info, platform);
 
     println!(platform, "MOLT_BOOT_OK");
     platform.terminate(ExitStatus::Success)
 }
 
-#[cfg(target_arch = "x86_64")]
 fn run_stage_1_checks<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
-    platform.initialize(boot_info).expect("initialize exception tables and local APIC");
+    platform.initialize(boot_info).expect("initialize traps and timer source");
     assert!(platform.verify_exception_path(), "breakpoint handler did not return");
     println!(platform, "MOLT_EXCEPTION_OK");
 
@@ -79,12 +70,11 @@ fn run_stage_1_checks<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     println!(platform, "MOLT_RESTART_OK");
 }
 
-#[cfg(target_arch = "x86_64")]
 fn run_timer_future<P: Platform>(platform: &mut P) {
     let slab = CompletionSlab::<u64, 2>::new();
     let token = slab.reserve().expect("free timer completion slot");
     let mut future = pin!(slab.wait(token));
-    let mut context = Context::from_waker(&Waker::noop());
+    let mut context = Context::from_waker(Waker::noop());
     assert_eq!(future.as_mut().poll(&mut context), Poll::Pending);
 
     let mut ring = IoRing::<KernelOp, u64, 2>::new();
@@ -99,7 +89,7 @@ fn run_timer_future<P: Platform>(platform: &mut P) {
     let request = timer_driver.try_next().expect("submitted timer request");
     let KernelOp::TimerWait { initial_count } = *request.operation();
     let previous = platform.monotonic_ticks();
-    platform.arm_timer(initial_count).expect("arm local APIC one-shot timer");
+    platform.arm_timer(initial_count).expect("arm one-shot timer");
     while platform.monotonic_ticks() == previous {
         platform.wait_for_timer_change(previous);
     }
@@ -113,14 +103,11 @@ fn run_timer_future<P: Platform>(platform: &mut P) {
     assert_eq!(future.as_mut().poll(&mut context), Poll::Ready(Ok(elapsed)));
 }
 
-#[cfg(target_arch = "x86_64")]
 #[derive(Default)]
 struct ProbeState(u32);
 
-#[cfg(target_arch = "x86_64")]
 struct ProbeCell(ProbeState);
 
-#[cfg(target_arch = "x86_64")]
 impl Cell for ProbeCell {
     type Message = u32;
     type Reply = u32;
@@ -136,7 +123,6 @@ impl Cell for ProbeCell {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 fn verify_cell_restart() {
     let owner = CellId::new(1);
     let mut capabilities = CapabilityTable::<u32, 2>::new();
@@ -149,17 +135,4 @@ fn verify_cell_restart() {
     assert_eq!(supervisor.generation(), 1);
     assert_eq!(capabilities.get(old), Err(CapabilityError::Stale));
     assert_eq!(supervisor.call(2), 2);
-}
-
-#[panic_handler]
-fn panic(info: &PanicInfo<'_>) -> ! {
-    #[cfg(target_arch = "x86_64")]
-    {
-        molt_x86_64::panic(info)
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    {
-        molt_riscv::panic(info)
-    }
 }

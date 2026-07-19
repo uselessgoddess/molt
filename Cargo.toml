@@ -2,18 +2,16 @@
 resolver = "3"
 members = [
     "crates/molt-arch",
-    "crates/molt-core",
-    "crates/molt-riscv",
-    "crates/molt-x86_64",
-    "kernel",
     "xtask",
+    "crates/molt-core",
+    "crates/platforms/*",
+    "kernel",
 ]
 default-members = [
+    "xtask",
     "crates/molt-arch",
     "crates/molt-core",
-    "crates/molt-riscv",
-    "crates/molt-x86_64",
-    "xtask",
+    "crates/platforms/*",
 ]
 
 [workspace.package]
@@ -22,13 +20,19 @@ edition = "2024"
 rust-version = "1.85"
 
 [workspace.dependencies]
-bootloader_api = "0.11.15"
 molt-arch = { path = "crates/molt-arch" }
 molt-core = { path = "crates/molt-core" }
-molt-riscv = { path = "crates/molt-riscv" }
-molt-x86_64 = { path = "crates/molt-x86_64" }
+molt-riscv = { path = "crates/platforms/riscv" }
+molt-x86_64 = { path = "crates/platforms/x86_64" }
 spin = { version = "0.12.2", default-features = false, features = ["once"] }
-x86_64 = { version = "0.15.5", default-features = false, features = ["abi_x86_interrupt", "instructions"] }
+
+# platform 
+
+bootloader_api = "0.11.15"
+x86_64 = { version = "0.15.5", default-features = false, features = [
+    "abi_x86_interrupt",
+    "instructions",
+] }
 
 [profile.dev]
 panic = "abort"

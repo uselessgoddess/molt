@@ -6,7 +6,9 @@ use std::{env, fs, thread};
 
 use bootloader::{BiosBoot, UefiBoot};
 
-const TARGET: &str = "x86_64-unknown-none";
+const X86_64_TARGET: &str = "x86_64-unknown-none";
+const RISCV64_TARGET: &str = "riscv64gc-unknown-none-elf";
+
 const BOOT_MARKERS: &[&str] = &[
     "MOLT_EXCEPTION_OK",
     "MOLT_MAPPING_OK",
@@ -16,7 +18,8 @@ const BOOT_MARKERS: &[&str] = &[
     "MOLT_RESTART_OK",
     "MOLT_BOOT_OK",
 ];
-const QEMU_SUCCESS: i32 = (0x10 << 1) | 1;
+
+const QEMU_X86_64_SUCCESS: i32 = (0x10 << 1) | 1;
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn main() -> ExitCode {
@@ -42,9 +45,86 @@ fn run() -> Result<(), String> {
             let images = build_images()?;
             run_qemu_interactive(&images.bios)
         }
-        Some("smoke") if args.next().is_none() => smoke_test(),
-        _ => Err("usage: cargo xtask <image|boot|smoke>".into()),
+        Some("smoke") => {
+            let selection = args.next();
+            if args.next().is_some() {
+                return Err(usage());
+            }
+            smoke(selection.as_deref())
+        }
+        _ => Err(usage()),
     }
+}
+
+fn usage() -> String {
+    "usage: cargo xtask <image|boot|smoke [x86_64|riscv64|all]>".into()
+}
+
+#[derive(Clone, Copy)]
+enum Arch {
+    X86_64,
+    Riscv64,
+}
+
+fn smoke(selection: Option<&str>) -> Result<(), String> {
+    match selection {
+        None | Some("all") => {
+            smoke_arch(Arch::X86_64)?;
+            smoke_arch(Arch::Riscv64)
+        }
+        Some("x86_64") => smoke_arch(Arch::X86_64),
+        Some("riscv64") => smoke_arch(Arch::Riscv64),
+        Some(other) => Err(format!("unknown smoke target {other:?}; {}", usage())),
+    }
+}
+
+fn smoke_arch(arch: Arch) -> Result<(), String> {
+    let name = match arch {
+        Arch::X86_64 => "x86_64",
+        Arch::Riscv64 => "riscv64",
+    };
+    println!("== smoke: {name} ==");
+
+    let mut child = match arch {
+        Arch::X86_64 => {
+            let images = build_images()?;
+            qemu_x86_64_command(&images.bios)
+                .arg("-serial")
+                .arg("stdio")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|error| format!("failed to start qemu-system-x86_64: {error}"))?
+        }
+        Arch::Riscv64 => {
+            let kernel = build_kernel(RISCV64_TARGET)?;
+            qemu_riscv64_command(&kernel)
+                .arg("-serial")
+                .arg("stdio")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|error| format!("failed to start qemu-system-riscv64: {error}"))?
+        }
+    };
+
+    let status = wait_with_timeout(&mut child, SMOKE_TIMEOUT)?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to collect QEMU output: {error}"))?;
+    let serial = String::from_utf8_lossy(&output.stdout);
+    print!("{serial}");
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    check_exit_status(arch, status)?;
+    for marker in BOOT_MARKERS {
+        if !serial.contains(marker) {
+            return Err(format!("{name} QEMU exited without the {marker} serial marker"));
+        }
+    }
+    Ok(())
 }
 
 struct Images {
@@ -53,20 +133,9 @@ struct Images {
 }
 
 fn build_images() -> Result<Images, String> {
-    let root = workspace_root();
-    let status = Command::new(cargo())
-        .current_dir(&root)
-        .args(["build", "--package", "molt-kernel", "--target", TARGET, "--release"])
-        .status()
-        .map_err(|error| format!("failed to start cargo: {error}"))?;
-    require_success(status, "kernel build")?;
+    let kernel = build_kernel(X86_64_TARGET)?;
 
-    let target_dir = target_dir(&root);
-    let kernel = target_dir.join(TARGET).join("release/molt-kernel");
-    if !kernel.is_file() {
-        return Err(format!("kernel binary was not created at {}", kernel.display()));
-    }
-
+    let target_dir = target_dir(&workspace_root());
     let image_dir = target_dir.join("molt");
     fs::create_dir_all(&image_dir)
         .map_err(|error| format!("failed to create {}: {error}", image_dir.display()))?;
@@ -82,45 +151,32 @@ fn build_images() -> Result<Images, String> {
     Ok(images)
 }
 
+fn build_kernel(target: &str) -> Result<PathBuf, String> {
+    let root = workspace_root();
+    let status = Command::new(cargo())
+        .current_dir(&root)
+        .args(["build", "--package", "molt-kernel", "--target", target, "--release"])
+        .status()
+        .map_err(|error| format!("failed to start cargo: {error}"))?;
+    require_success(status, "kernel build")?;
+
+    let kernel = target_dir(&root).join(target).join("release/molt-kernel");
+    if !kernel.is_file() {
+        return Err(format!("kernel binary was not created at {}", kernel.display()));
+    }
+    Ok(kernel)
+}
+
 fn run_qemu_interactive(image: &Path) -> Result<(), String> {
-    let status = qemu_command(image)
+    let status = qemu_x86_64_command(image)
         .arg("-serial")
         .arg("mon:stdio")
         .status()
         .map_err(|error| format!("failed to start qemu-system-x86_64: {error}"))?;
-    require_qemu_success(status)
+    check_exit_status(Arch::X86_64, status)
 }
 
-fn smoke_test() -> Result<(), String> {
-    let images = build_images()?;
-    let mut child = qemu_command(&images.bios)
-        .arg("-serial")
-        .arg("stdio")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("failed to start qemu-system-x86_64: {error}"))?;
-
-    let status = wait_with_timeout(&mut child, SMOKE_TIMEOUT)?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("failed to collect QEMU output: {error}"))?;
-    let serial = String::from_utf8_lossy(&output.stdout);
-    print!("{serial}");
-    if !output.stderr.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    }
-
-    require_qemu_success(status)?;
-    for marker in BOOT_MARKERS {
-        if !serial.contains(marker) {
-            return Err(format!("QEMU exited without the {marker} serial marker"));
-        }
-    }
-    Ok(())
-}
-
-fn qemu_command(image: &Path) -> Command {
+fn qemu_x86_64_command(image: &Path) -> Command {
     let qemu = env::var_os("MOLT_QEMU").unwrap_or_else(|| OsString::from("qemu-system-x86_64"));
     let mut command = Command::new(qemu);
     if let Some(firmware) = env::var_os("MOLT_QEMU_FIRMWARE") {
@@ -136,6 +192,17 @@ fn qemu_command(image: &Path) -> Command {
         "-drive",
     ]);
     command.arg(format!("format=raw,file={}", image.display()));
+    command
+}
+
+fn qemu_riscv64_command(kernel: &Path) -> Command {
+    let qemu =
+        env::var_os("MOLT_QEMU_RISCV64").unwrap_or_else(|| OsString::from("qemu-system-riscv64"));
+    let mut command = Command::new(qemu);
+    // OpenSBI (`-bios default`) loads the ELF at its S-mode payload address and
+    // an orderly SBI shutdown exits QEMU through the `virt` board's test device.
+    command.args(["-machine", "virt", "-display", "none", "-no-reboot", "-bios", "default"]);
+    command.arg("-kernel").arg(kernel);
     command
 }
 
@@ -159,11 +226,17 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<ExitStatus,
     }
 }
 
-fn require_qemu_success(status: ExitStatus) -> Result<(), String> {
-    if status.code() == Some(QEMU_SUCCESS) {
-        Ok(())
-    } else {
-        Err(format!("QEMU reported {:?}; expected debug-exit status {QEMU_SUCCESS}", status.code()))
+fn check_exit_status(arch: Arch, status: ExitStatus) -> Result<(), String> {
+    match arch {
+        Arch::X86_64 if status.code() == Some(QEMU_X86_64_SUCCESS) => Ok(()),
+        Arch::X86_64 => Err(format!(
+            "QEMU reported {:?}; expected debug-exit status {QEMU_X86_64_SUCCESS}",
+            status.code()
+        )),
+        // An SBI shutdown exits QEMU cleanly; the marker check proves it reached
+        // the terminal state rather than shutting down early on a panic.
+        Arch::Riscv64 if status.code() == Some(0) => Ok(()),
+        Arch::Riscv64 => Err(format!("QEMU reported {:?}; expected clean exit 0", status.code())),
     }
 }
 

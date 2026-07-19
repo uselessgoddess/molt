@@ -68,3 +68,80 @@ fn concurrent_registration_and_completion_never_loses_a_wakeup() {
         }
     }
 }
+
+#[test]
+fn concurrent_cancel_and_complete_leave_the_slot_consistent() {
+    // A cancel racing a completion is serialized by the slot's claim flag: the
+    // waiter observes exactly one terminal outcome (the delivered value or a
+    // cancellation) and the slot is always returned to a reusable empty state
+    // without corruption, regardless of which side wins.
+    for _ in 0..1024 {
+        let slab = Arc::new(CompletionSlab::<usize, 1>::new());
+        let token = slab.reserve().unwrap();
+
+        let completer = slab.clone();
+        let complete = thread::spawn(move || {
+            thread::yield_now();
+            completer.complete(token.request_id(), 7)
+        });
+        let canceller = slab.clone();
+        let cancel = thread::spawn(move || {
+            thread::yield_now();
+            canceller.cancel(token)
+        });
+
+        let _ = complete.join().unwrap();
+        let _ = cancel.join().unwrap();
+
+        // The waiter never observes a torn value: it is either the completion
+        // (if it won and was not yet consumed) or a cancellation.
+        let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+        let waker = Waker::from(wake);
+        let mut cx = Context::from_waker(&waker);
+        let outcome = pin!(slab.wait(token)).as_mut().poll(&mut cx);
+        match outcome {
+            Poll::Ready(Ok(value)) => assert_eq!(value, 7),
+            Poll::Ready(Err(CompletionError::Cancelled)) => {}
+            other => panic!("unexpected terminal outcome: {other:?}"),
+        }
+
+        // Whatever raced, the slot is free again: a fresh reservation succeeds
+        // with a new id and a stale completion against the old id is rejected.
+        let reused = slab.reserve().unwrap();
+        assert_ne!(reused.request_id(), token.request_id());
+        assert_eq!(slab.complete(token.request_id(), 9), Err(CompletionError::Stale));
+    }
+}
+
+#[test]
+fn many_producers_complete_distinct_requests() {
+    // Independent producers completing distinct slots must each land in their
+    // own slot without clobbering a neighbour.
+    let slab = Arc::new(CompletionSlab::<usize, 8>::new());
+    let tokens: Vec<_> = (0..8).map(|_| slab.reserve().unwrap()).collect();
+    assert_eq!(slab.reserve(), Err(CompletionError::Full));
+
+    let handles: Vec<_> = tokens
+        .iter()
+        .enumerate()
+        .map(|(value, token)| {
+            let producer = slab.clone();
+            let id = token.request_id();
+            thread::spawn(move || {
+                thread::yield_now();
+                producer.complete(id, value).unwrap();
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    for (value, token) in tokens.into_iter().enumerate() {
+        let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+        let waker = Waker::from(wake);
+        let mut cx = Context::from_waker(&waker);
+        let mut future = pin!(slab.wait(token));
+        assert_eq!(future.as_mut().poll(&mut cx), Poll::Ready(Ok(value)));
+    }
+}
