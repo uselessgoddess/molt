@@ -6,8 +6,8 @@
 
 use core::mem::MaybeUninit;
 
+use crate::sync::UnsafeCell;
 use crate::sync::atomic::{AtomicUsize, Ordering};
-use crate::sync::{UnsafeCell, array, const_fn};
 
 /// A fixed-capacity single-producer/single-consumer queue.
 pub struct SpscRing<T, const N: usize> {
@@ -21,18 +21,28 @@ pub struct SpscRing<T, const N: usize> {
 unsafe impl<T: Send, const N: usize> Sync for SpscRing<T, N> {}
 
 impl<T, const N: usize> SpscRing<T, N> {
-    const_fn! {
-        /// Creates an empty queue.
-        pub fn new() -> Self {
-            const {
-                assert!(N > 0, "a ring must contain at least one slot");
-            }
+    /// Creates an empty queue.
+    #[cfg(not(loom))]
+    pub const fn new() -> Self {
+        const {
+            assert!(N > 0, "a ring must contain at least one slot");
+        }
 
-            Self {
-                slots: array![UnsafeCell::new(MaybeUninit::uninit()); N],
-                head: AtomicUsize::new(0),
-                tail: AtomicUsize::new(0),
-            }
+        Self {
+            slots: [const { UnsafeCell::new(MaybeUninit::uninit()) }; N],
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+        }
+    }
+
+    /// Creates an empty queue.
+    #[cfg(loom)]
+    pub fn new() -> Self {
+        assert!(N > 0, "a ring must contain at least one slot");
+        Self {
+            slots: core::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit())),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
         }
     }
 
@@ -111,7 +121,7 @@ mod loom_tests {
     /// A one-slot ring forces the producer to reuse the slot behind the
     /// consumer, which is exactly where the acquire/release pairing has to hold.
     #[test]
-    fn every_value_arrives_once_and_in_order() {
+    fn values_arrive_in_order() {
         loom::model(|| {
             let ring = Arc::new(SpscRing::<u32, 1>::new());
             let producer = {
@@ -235,10 +245,14 @@ pub struct IoRing<Op, C, const N: usize> {
 }
 
 impl<Op, C, const N: usize> IoRing<Op, C, N> {
-    const_fn! {
-        pub fn new() -> Self {
-            Self { submissions: SpscRing::new(), completions: SpscRing::new() }
-        }
+    #[cfg(not(loom))]
+    pub const fn new() -> Self {
+        Self { submissions: SpscRing::new(), completions: SpscRing::new() }
+    }
+
+    #[cfg(loom)]
+    pub fn new() -> Self {
+        Self { submissions: SpscRing::new(), completions: SpscRing::new() }
     }
 
     /// Creates the unique client and driver views of both queues.

@@ -14,9 +14,8 @@
 //!   because loom must know when a cell is accessed to detect a data race.
 //! - [`spin_loop`] yields under loom; loom's scheduler is deliberately unfair,
 //!   so a spin loop that never yields never makes progress and the test hangs.
-//! - [`const_fn`] drops `const` under loom, whose atomics are not
-//!   const-constructible, and [`array`] falls back to `from_fn` for the same
-//!   reason.
+//! - Constructors use an ordinary `cfg(loom)` branch because loom's atomics
+//!   are not const-constructible.
 //!
 //! Two limits are worth knowing before trusting a green loom run: it models
 //! `SeqCst` as `AcqRel`, so a `SeqCst`-dependent bug can slip through, and it
@@ -87,43 +86,3 @@ mod cell {
 }
 
 pub(crate) use cell::UnsafeCell;
-
-/// Declares a `const fn` that silently loses `const` under loom.
-///
-/// loom's atomics allocate model state on construction, so nothing containing
-/// one can be built in a `const` context. Outside loom the `const` is real and
-/// the kernel keeps placing these primitives in `static`s.
-#[cfg(not(loom))]
-macro_rules! const_fn {
-    ($(#[$meta:meta])* $vis:vis fn $($rest:tt)*) => {
-        $(#[$meta])* $vis const fn $($rest)*
-    };
-}
-
-#[cfg(loom)]
-macro_rules! const_fn {
-    ($(#[$meta:meta])* $vis:vis fn $($rest:tt)*) => {
-        $(#[$meta])* $vis fn $($rest)*
-    };
-}
-
-/// Builds a `[T; N]` by repeating an initializer.
-///
-/// Mirrors `[const { init }; N]`, falling back to `from_fn` under loom for the
-/// same reason [`const_fn`] drops `const`.
-#[cfg(not(loom))]
-macro_rules! array {
-    ($init:expr; $n:expr) => {
-        [const { $init }; $n]
-    };
-}
-
-#[cfg(loom)]
-macro_rules! array {
-    ($init:expr; $n:expr) => {
-        core::array::from_fn(|_| $init)
-    };
-}
-
-pub(crate) use array;
-pub(crate) use const_fn;

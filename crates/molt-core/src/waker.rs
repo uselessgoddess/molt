@@ -13,8 +13,8 @@
 
 use core::task::Waker;
 
+use crate::sync::UnsafeCell;
 use crate::sync::atomic::{AtomicU8, Ordering};
-use crate::sync::{UnsafeCell, const_fn};
 
 /// No task is registering and no wake is in flight.
 const WAITING: u8 = 0;
@@ -42,10 +42,14 @@ unsafe impl Send for AtomicWaker {}
 unsafe impl Sync for AtomicWaker {}
 
 impl AtomicWaker {
-    const_fn! {
-        pub fn new() -> Self {
-            Self { state: AtomicU8::new(WAITING), waker: UnsafeCell::new(None) }
-        }
+    #[cfg(not(loom))]
+    pub const fn new() -> Self {
+        Self { state: AtomicU8::new(WAITING), waker: UnsafeCell::new(None) }
+    }
+
+    #[cfg(loom)]
+    pub fn new() -> Self {
+        Self { state: AtomicU8::new(WAITING), waker: UnsafeCell::new(None) }
     }
 
     /// Registers `waker` to be notified by the next [`wake`](Self::wake).
@@ -161,7 +165,7 @@ mod loom_tests {
     /// A wake racing a registration must never vanish: it either fires the
     /// waker, or leaves it parked for the next wake to deliver.
     #[test]
-    fn a_racing_wake_is_never_dropped() {
+    fn race_keeps_wake() {
         loom::model(|| {
             let cell = Arc::new(AtomicWaker::new());
             let flag = Flag::new();

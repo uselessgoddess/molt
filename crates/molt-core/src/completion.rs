@@ -10,14 +10,15 @@
 //! separately by the lock-free [`AtomicWaker`]. Acquire/Release pairing on the
 //! state word publishes the [`UnsafeCell`] payload between producer and consumer.
 
+use core::borrow::Borrow;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use crate::cache::CachePadded;
+use crate::cache::{CacheLayout, Compact, Padded};
 use crate::ring::RequestId;
 use crate::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use crate::sync::{UnsafeCell, array, const_fn, spin_loop};
+use crate::sync::{UnsafeCell, spin_loop};
 use crate::waker::AtomicWaker;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,38 +63,75 @@ struct Slot<C> {
 unsafe impl<C: Send> Sync for Slot<C> {}
 
 impl<C> Slot<C> {
-    const_fn! {
-        fn new() -> Self {
-            Self {
-                state: AtomicU8::new(0),
-                request_id: AtomicU64::new(0),
-                result: UnsafeCell::new(None),
-                waker: AtomicWaker::new(),
-            }
+    #[cfg(not(loom))]
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(0),
+            request_id: AtomicU64::new(0),
+            result: UnsafeCell::new(None),
+            waker: AtomicWaker::new(),
+        }
+    }
+
+    #[cfg(loom)]
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(0),
+            request_id: AtomicU64::new(0),
+            result: UnsafeCell::new(None),
+            waker: AtomicWaker::new(),
         }
     }
 }
 
 /// Fixed-capacity executor-owned waker and completion slab.
-pub struct CompletionSlab<C, const N: usize> {
+pub struct CompletionSlab<C, const N: usize, L: CacheLayout = Compact> {
     next_request: AtomicU64,
-    /// Padded only under the `cache-padded` feature; see [`CachePadded`].
-    slots: [CachePadded<Slot<C>>; N],
+    slots: [L::Slot<Slot<C>>; N],
 }
 
-impl<C, const N: usize> CompletionSlab<C, N> {
-    const_fn! {
-        pub fn new() -> Self {
-            const { assert!(N > 0, "a completion slab needs at least one slot") };
-            Self {
-                next_request: AtomicU64::new(1),
-                slots: array![CachePadded::new(Slot::new()); N],
-            }
+#[cfg(not(loom))]
+impl<C, const N: usize> CompletionSlab<C, N, Compact> {
+    pub const fn new() -> Self {
+        const { assert!(N > 0, "a completion slab needs at least one slot") };
+        Self { next_request: AtomicU64::new(1), slots: [const { Slot::new() }; N] }
+    }
+}
+
+#[cfg(loom)]
+impl<C, const N: usize> CompletionSlab<C, N, Compact> {
+    pub fn new() -> Self {
+        assert!(N > 0, "a completion slab needs at least one slot");
+        Self { next_request: AtomicU64::new(1), slots: core::array::from_fn(|_| Slot::new()) }
+    }
+}
+
+#[cfg(not(loom))]
+impl<C, const N: usize> CompletionSlab<C, N, Padded> {
+    pub const fn new() -> Self {
+        const { assert!(N > 0, "a completion slab needs at least one slot") };
+        Self {
+            next_request: AtomicU64::new(1),
+            slots: [const { crate::cache::CachePadded::new(Slot::new()) }; N],
         }
     }
+}
 
+#[cfg(loom)]
+impl<C, const N: usize> CompletionSlab<C, N, Padded> {
+    pub fn new() -> Self {
+        assert!(N > 0, "a completion slab needs at least one slot");
+        Self {
+            next_request: AtomicU64::new(1),
+            slots: core::array::from_fn(|_| crate::cache::CachePadded::new(Slot::new())),
+        }
+    }
+}
+
+impl<C, const N: usize, L: CacheLayout> CompletionSlab<C, N, L> {
     pub fn reserve(&self) -> Result<CompletionToken, CompletionError> {
         for (index, slot) in self.slots.iter().enumerate() {
+            let slot = slot.borrow();
             if slot
                 .state
                 .compare_exchange(0, RESERVING, Ordering::Acquire, Ordering::Relaxed)
@@ -109,13 +147,14 @@ impl<C, const N: usize> CompletionSlab<C, N> {
         Err(CompletionError::Full)
     }
 
-    pub fn wait(&self, token: CompletionToken) -> CompletionFuture<'_, C, N> {
+    pub fn wait(&self, token: CompletionToken) -> CompletionFuture<'_, C, N, L> {
         CompletionFuture { slab: self, token, done: false }
     }
 
     pub fn complete(&self, request_id: RequestId, result: C) -> Result<(), CompletionError> {
         let target = request_id.get();
         for slot in &self.slots {
+            let slot = slot.borrow();
             if slot.state.load(Ordering::Acquire) != OCCUPIED {
                 continue;
             }
@@ -153,7 +192,7 @@ impl<C, const N: usize> CompletionSlab<C, N> {
         let Some(slot) = self.slots.get(token.slot) else {
             return Err(CompletionError::Stale);
         };
-        if Self::claim_and_clear(slot, token.request_id.get()) {
+        if Self::claim_and_clear(slot.borrow(), token.request_id.get()) {
             Ok(())
         } else {
             Err(CompletionError::Stale)
@@ -163,6 +202,7 @@ impl<C, const N: usize> CompletionSlab<C, N> {
     pub fn cancel_all(&self) -> usize {
         let mut cancelled = 0;
         for slot in &self.slots {
+            let slot = slot.borrow();
             let id = slot.request_id.load(Ordering::Relaxed);
             if id != 0 && Self::claim_and_clear(slot, id) {
                 cancelled += 1;
@@ -219,6 +259,7 @@ impl<C, const N: usize> CompletionSlab<C, N> {
         let Some(slot) = self.slots.get(token.slot) else {
             return Poll::Ready(Err(CompletionError::Cancelled));
         };
+        let slot = slot.borrow();
         let target = token.request_id.get();
         loop {
             let state = slot.state.load(Ordering::Acquire);
@@ -267,7 +308,13 @@ impl<C, const N: usize> CompletionSlab<C, N> {
     }
 }
 
-impl<C, const N: usize> Default for CompletionSlab<C, N> {
+impl<C, const N: usize> Default for CompletionSlab<C, N, Compact> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C, const N: usize> Default for CompletionSlab<C, N, Padded> {
     fn default() -> Self {
         Self::new()
     }
@@ -287,7 +334,7 @@ mod loom_tests {
     /// still wake it. If `poll` reports `Pending`, the completion that ran
     /// concurrently is obliged to have fired the waker.
     #[test]
-    fn a_completion_racing_a_poll_never_parks_the_task_forever() {
+    fn race_wakes_waiter() {
         loom::model(|| {
             let slab = Arc::new(CompletionSlab::<u32, 1>::new());
             let token = slab.reserve().expect("free slot");
@@ -311,7 +358,7 @@ mod loom_tests {
     /// A cancel racing a completion must leave the slot empty and reusable,
     /// with exactly one of the two winning the claim.
     #[test]
-    fn a_cancel_racing_a_completion_leaves_the_slot_free() {
+    fn race_releases_slot() {
         loom::model(|| {
             let slab = Arc::new(CompletionSlab::<u32, 1>::new());
             let token = slab.reserve().expect("free slot");
@@ -332,13 +379,13 @@ mod loom_tests {
     }
 }
 
-pub struct CompletionFuture<'s, C, const N: usize> {
-    slab: &'s CompletionSlab<C, N>,
+pub struct CompletionFuture<'s, C, const N: usize, L: CacheLayout = Compact> {
+    slab: &'s CompletionSlab<C, N, L>,
     token: CompletionToken,
     done: bool,
 }
 
-impl<C, const N: usize> Future for CompletionFuture<'_, C, N> {
+impl<C, const N: usize, L: CacheLayout> Future for CompletionFuture<'_, C, N, L> {
     type Output = Result<C, CompletionError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -351,7 +398,7 @@ impl<C, const N: usize> Future for CompletionFuture<'_, C, N> {
     }
 }
 
-impl<C, const N: usize> Drop for CompletionFuture<'_, C, N> {
+impl<C, const N: usize, L: CacheLayout> Drop for CompletionFuture<'_, C, N, L> {
     fn drop(&mut self) {
         if !self.done {
             let _ = self.slab.cancel(self.token);

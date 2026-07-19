@@ -54,8 +54,8 @@ item here is cheaper to fix now than after something depends on it.
 Testing and measurement:
 
 - [x] loom model checks for the ring, completion slab, waker, and executor
-- [x] cache padding as a measured, opt-in feature rather than an assumption
-- [x] benchmark numbers appended to a timeline instead of a discarded artifact
+- [x] cache padding as a measured, per-instance layout rather than an assumption
+- [x] machine-readable benchmark snapshots retained per main commit
 - [x] `molt-core` tested on aarch64, where atomics actually reorder
 - [x] Miri on every push; loom on main and behind a label
 - [x] the panic handler covered by a boot test, since a passing boot never
@@ -106,6 +106,7 @@ item stays unchecked rather than quietly reinterpreted.
 ## Stage 4 — SMP, hardware breadth, and performance
 
 - [ ] per-CPU executors and rings; explicit cross-core fan-in
+- [ ] allocator-backed executor stores and runtime capacity tuning
 - [ ] IOMMU and device isolation where available
 - [ ] NVMe and selected real NIC/storage targets
 - [ ] reproducible bare-metal benchmark runner

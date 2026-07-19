@@ -9,8 +9,8 @@
 //! tasks and turn every slot's compare-exchange into a retry against its
 //! neighbours. Per-slot atomics keep each task's state machine independent and
 //! free of that false sharing, which is worth more than a marginally tighter
-//! scan. Separate words still share a cache line, though; [`CachePadded`] and
-//! the `cache-padded` feature decide whether to spend memory on that.
+//! scan. Separate words still share a cache line, though; the [`Padded`] layout
+//! lets individual executors spend memory to avoid that.
 //!
 //! [`Executor::waker`] bridges this ready queue to [`core::task::Waker`]. The
 //! returned waker points straight at the task's own state word rather than at
@@ -24,12 +24,21 @@
 //! within the provenance it was built from: it only ever touches the one
 //! [`AtomicU8`] it was handed, so no pointer arithmetic escapes the slot it
 //! borrows, and the vtable needs no capacity parameter.
+//!
+//! The executor owns readiness, not task-local state. A [`crate::cell::Supervisor`]
+//! may drop and respawn a Cell while keeping its stable [`TaskId`]; the new
+//! generation resumes through the same slot. The fixed array is therefore a
+//! scheduler resource, not Cell state. An allocator-backed scheduler can add a
+//! dynamic store when runtime capacity or migration exists, without moving
+//! Cell ownership into this primitive. Such a store must pin slot addresses:
+//! resizing in place would invalidate every [`Waker`] already handed out, so a
+//! capacity change needs a new store generation and a drain of the old one.
 
+use core::borrow::Borrow;
 use core::task::{RawWaker, RawWakerVTable, Waker};
 
-use crate::cache::CachePadded;
+use crate::cache::{CacheLayout, Compact, Padded};
 use crate::sync::atomic::{AtomicU8, Ordering};
-use crate::sync::{array, const_fn};
 
 const OCCUPIED: u8 = 1 << 0;
 const READY: u8 = 1 << 1;
@@ -44,21 +53,46 @@ pub enum SpawnError {
 }
 
 /// A bounded task registry and ready queue represented by atomic slot states.
-pub struct Executor<const N: usize> {
-    /// Padded only under the `cache-padded` feature; see [`CachePadded`].
-    states: [CachePadded<AtomicU8>; N],
+pub struct Executor<const N: usize, L: CacheLayout = Compact> {
+    states: [L::Slot<AtomicU8>; N],
 }
 
-impl<const N: usize> Executor<N> {
-    const_fn! {
-        pub fn new() -> Self {
-            const { assert!(N > 0 && N <= 256, "executor capacity must be in 1..=256") };
-            Self { states: array![CachePadded::new(AtomicU8::new(0)); N] }
-        }
+#[cfg(not(loom))]
+impl<const N: usize> Executor<N, Compact> {
+    pub const fn new() -> Self {
+        const { assert!(N > 0 && N <= 256, "executor capacity must be in 1..=256") };
+        Self { states: [const { AtomicU8::new(0) }; N] }
     }
+}
 
+#[cfg(loom)]
+impl<const N: usize> Executor<N, Compact> {
+    pub fn new() -> Self {
+        assert!(N > 0 && N <= 256, "executor capacity must be in 1..=256");
+        Self { states: core::array::from_fn(|_| AtomicU8::new(0)) }
+    }
+}
+
+#[cfg(not(loom))]
+impl<const N: usize> Executor<N, Padded> {
+    pub const fn new() -> Self {
+        const { assert!(N > 0 && N <= 256, "executor capacity must be in 1..=256") };
+        Self { states: [const { crate::cache::CachePadded::new(AtomicU8::new(0)) }; N] }
+    }
+}
+
+#[cfg(loom)]
+impl<const N: usize> Executor<N, Padded> {
+    pub fn new() -> Self {
+        assert!(N > 0 && N <= 256, "executor capacity must be in 1..=256");
+        Self { states: core::array::from_fn(|_| crate::cache::CachePadded::new(AtomicU8::new(0))) }
+    }
+}
+
+impl<const N: usize, L: CacheLayout> Executor<N, L> {
     pub fn register(&self) -> Result<TaskId, SpawnError> {
         for (index, state) in self.states.iter().enumerate() {
+            let state = state.borrow();
             if state.compare_exchange(0, OCCUPIED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
                 return Ok(TaskId(index as u8));
             }
@@ -68,18 +102,20 @@ impl<const N: usize> Executor<N> {
 
     pub fn unregister(&self, task: TaskId) {
         if let Some(state) = self.states.get(task.0 as usize) {
+            let state = state.borrow();
             state.store(0, Ordering::Release);
         }
     }
 
     pub fn wake(&self, task: TaskId) {
         if let Some(state) = self.states.get(task.0 as usize) {
-            set_ready(state);
+            set_ready(state.borrow());
         }
     }
 
     pub fn next_ready(&self) -> Option<TaskId> {
         for (index, state) in self.states.iter().enumerate() {
+            let state = state.borrow();
             let mut current = state.load(Ordering::Acquire);
             while current & (OCCUPIED | READY | POLLING) == (OCCUPIED | READY) {
                 let polling = (current & !READY) | POLLING;
@@ -100,6 +136,7 @@ impl<const N: usize> Executor<N> {
     /// Marks the task's poll complete, preserving any wake that arrived during it.
     pub fn complete_poll(&self, task: TaskId) {
         if let Some(state) = self.states.get(task.0 as usize) {
+            let state = state.borrow();
             state.fetch_and(!POLLING, Ordering::Release);
         }
     }
@@ -116,7 +153,7 @@ impl<const N: usize> Executor<N> {
     /// slot states live for the whole program and the erased pointer stays
     /// valid.
     pub fn waker(&'static self, task: TaskId) -> Waker {
-        let state: &'static AtomicU8 = &self.states[task.0 as usize];
+        let state: &'static AtomicU8 = self.states[task.0 as usize].borrow();
         // SAFETY: `state` borrows one slot of a `'static` executor, so it stays
         // live and shared-borrowable forever, which is what `VTABLE` requires.
         unsafe { Waker::from_raw(RawWaker::new((state as *const AtomicU8).cast(), &VTABLE)) }
@@ -159,7 +196,13 @@ unsafe fn wake_raw(data: *const ()) {
 
 fn drop_raw(_data: *const ()) {}
 
-impl<const N: usize> Default for Executor<N> {
+impl<const N: usize> Default for Executor<N, Compact> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> Default for Executor<N, Padded> {
     fn default() -> Self {
         Self::new()
     }
@@ -175,7 +218,7 @@ mod loom_tests {
     /// A wake landing while the scheduler scans must still be observed: either
     /// this scan sees it, or the next one does.
     #[test]
-    fn a_wake_racing_the_scan_is_not_lost() {
+    fn race_keeps_wake() {
         loom::model(|| {
             let executor = Arc::new(Executor::<2>::new());
             let task = executor.register().expect("free slot");
@@ -201,11 +244,13 @@ mod loom_tests {
 mod tests {
     extern crate std;
 
+    use core::mem::size_of;
     use core::pin::pin;
     use core::task::{Context, Poll};
     use std::future::Future;
 
     use super::Executor;
+    use crate::cache::Padded;
     use crate::completion::CompletionSlab;
 
     // `waker` takes `&'static self`, matching the singleton executor a kernel
@@ -213,8 +258,8 @@ mod tests {
     // box, so nothing outlives the test binary unaccounted for.
 
     #[test]
-    fn waker_marks_only_its_own_task_ready() {
-        static EXECUTOR: Executor<4> = Executor::new();
+    fn waker_is_task_local() {
+        static EXECUTOR: Executor<4> = Executor::<4>::new();
         let executor = &EXECUTOR;
         let first = executor.register().expect("free slot");
         let second = executor.register().expect("free slot");
@@ -227,8 +272,8 @@ mod tests {
     }
 
     #[test]
-    fn cloned_waker_wakes_the_same_task() {
-        static EXECUTOR: Executor<2> = Executor::new();
+    fn clone_keeps_task() {
+        static EXECUTOR: Executor<2> = Executor::<2>::new();
         let executor = &EXECUTOR;
         let task = executor.register().expect("free slot");
 
@@ -239,8 +284,8 @@ mod tests {
     }
 
     #[test]
-    fn completion_wakes_the_registered_executor_task() {
-        static EXECUTOR: Executor<2> = Executor::new();
+    fn completion_wakes_task() {
+        static EXECUTOR: Executor<2> = Executor::<2>::new();
         let executor = &EXECUTOR;
         let task = executor.register().expect("free slot");
 
@@ -258,5 +303,20 @@ mod tests {
 
         executor.complete_poll(task);
         assert_eq!(future.as_mut().poll(&mut context), Poll::Ready(Ok(42)));
+    }
+
+    #[test]
+    fn padded_layout_schedules() {
+        let executor = Executor::<2, Padded>::new();
+        let task = executor.register().expect("free slot");
+
+        executor.wake(task);
+
+        assert_eq!(executor.next_ready(), Some(task));
+    }
+
+    #[test]
+    fn layout_is_typed() {
+        assert!(size_of::<Executor<4, Padded>>() > size_of::<Executor<4>>());
     }
 }

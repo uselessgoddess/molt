@@ -1,42 +1,93 @@
-//! Optional cache-line padding for contended words.
+//! Cache layout for contended words.
 //!
-//! Two threads writing neighbouring atomics in the same cache line bounce that
-//! line between their caches even though the writes are independent. Padding
-//! each word onto its own line removes the bounce — and costs memory the kernel
-//! cannot get back, because Molt has no allocator and these arrays are `static`.
+//! False-sharing is workload-specific, so layout is selected in code for each
+//! primitive: `Executor<N>` is compact, while `Executor<N, Padded>` puts every
+//! state word on its own cache line. The same choice applies to
+//! `CompletionSlab<C, N, Padded>`.
 //!
-//! Which side wins depends on the deployment, not on the code, so it is a
-//! feature rather than a decision baked into the type. Off by default:
-//!
-//! - `Executor<256>` is 256 bytes unpadded and 32 KiB padded.
-//! - `CompletionSlab<u64, 256>` grows by roughly the same factor.
-//!
-//! On a single-core or lightly contended kernel that is 32 KiB spent to avoid
-//! contention that never happens. Turn `cache-padded` on when several harts
-//! wake tasks or complete requests concurrently, and measure:
-//!
-//! ```text
-//! cargo bench -p molt-core --bench scheduler -- --save-baseline unpadded
-//! cargo bench -p molt-core --bench scheduler --features cache-padded -- --baseline unpadded
-//! ```
-//!
-//! On a 4-core x86_64 Linux VM that reports roughly −50% on
-//! `executor_contended_wake` and roughly +8% on `completion_round_trip`, which
-//! is the trade in one line: padding buys cross-hart wakes and charges the
-//! single-threaded scan, whose slots no longer share a line. Both numbers move
-//! with the machine, so treat them as a shape rather than a target.
-//!
-//! The alignment is 128 bytes, not 64. x86_64 prefetches cache lines in pairs
-//! and Apple's aarch64 cores use 128-byte lines, so 64 leaves false sharing on
-//! the table on exactly the machines this is meant to help.
+//! On a 4-core x86_64 Linux VM, padding took roughly 50% off contended wakes
+//! and added roughly 8% to completion round trips. It also grew
+//! `Executor<256>` from 256 bytes to 32 KiB. Both variants therefore remain
+//! explicit and can be benchmarked in the same binary.
 
+use core::borrow::Borrow;
 use core::ops::{Deref, DerefMut};
 
-/// Wraps a value so it does not share a cache line with its neighbours.
-///
-/// Without the `cache-padded` feature this is a transparent newtype and adds
-/// nothing to the layout.
-#[cfg_attr(feature = "cache-padded", repr(align(128)))]
+mod private {
+    pub trait Sealed {}
+}
+
+/// Chooses how neighbouring slots are laid out.
+#[doc(hidden)]
+pub trait CacheLayout: private::Sealed {
+    type Slot<T>: Borrow<T>;
+}
+
+/// Packs neighbouring slots without extra alignment.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Compact;
+
+impl private::Sealed for Compact {}
+
+impl CacheLayout for Compact {
+    type Slot<T> = T;
+}
+
+/// Places every slot on a target-appropriate cache-line boundary.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Padded;
+
+impl private::Sealed for Padded {}
+
+impl CacheLayout for Padded {
+    type Slot<T> = CachePadded<T>;
+}
+
+/// Pads and aligns a value to a target-appropriate cache line.
+// x86_64 prefetches adjacent lines; aarch64 and powerpc64 can use 128-byte
+// lines. These values follow crossbeam-utils rather than assuming one host.
+#[cfg_attr(
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "arm64ec",
+        target_arch = "powerpc64"
+    ),
+    repr(align(128))
+)]
+#[cfg_attr(
+    any(
+        target_arch = "arm",
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "hexagon"
+    ),
+    repr(align(32))
+)]
+#[cfg_attr(target_arch = "m68k", repr(align(16)))]
+#[cfg_attr(target_arch = "s390x", repr(align(256)))]
+#[cfg_attr(
+    not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "arm64ec",
+        target_arch = "powerpc64",
+        target_arch = "arm",
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "hexagon",
+        target_arch = "m68k",
+        target_arch = "s390x"
+    )),
+    repr(align(64))
+)]
+#[repr(C)]
 #[derive(Debug, Default)]
 pub struct CachePadded<T>(T);
 
@@ -47,6 +98,12 @@ impl<T> CachePadded<T> {
 
     pub fn into_inner(self) -> T {
         self.0
+    }
+}
+
+impl<T> Borrow<T> for CachePadded<T> {
+    fn borrow(&self) -> &T {
+        &self.0
     }
 }
 
@@ -73,8 +130,7 @@ mod tests {
     use super::CachePadded;
 
     #[test]
-    fn padding_follows_the_feature() {
-        let padded = align_of::<CachePadded<u8>>() > align_of::<u8>();
-        assert_eq!(padded, cfg!(feature = "cache-padded"));
+    fn padding_is_typed() {
+        assert!(align_of::<CachePadded<u8>>() > align_of::<u8>());
     }
 }
