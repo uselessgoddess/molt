@@ -13,7 +13,9 @@ concurrency:
 jobs:
   quality:
     name: Format, lint, test, benchmark build
-    runs-on: ubuntu-latest
+    # Pinned rather than `latest`: a runner image bump should be a commit that
+    # changes CI, not a surprise on an unrelated pull request.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
@@ -25,9 +27,77 @@ jobs:
           tool: just,cargo-nextest
       - run: just pre
 
+  # x86_64 is strongly ordered, so it hides exactly the bugs the lock-free
+  # primitives can have: a missing Acquire or Release stays invisible until the
+  # same code runs somewhere that reorders. aarch64 reorders, so a wrong
+  # ordering shows up here as a failing test rather than as a field report.
+  #
+  # Only `quality` gates a merge. A secondary runner breaking is worth knowing
+  # about, but it should not block work while it is being fixed — the tiering
+  # Redox applies to its non-primary targets.
+  atomics:
+    name: Test on ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: aarch64-linux
+            runner: ubuntu-24.04-arm
+          - name: aarch64-macos
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --package molt-core
+      # Padding changes the layout, so it is a different program to test.
+      - run: cargo nextest run --package molt-core --features cache-padded
+
+  # Undefined behaviour the type system cannot see: provenance, aliasing and
+  # data races in the hand-written wakers and vtables.
+  miri:
+    name: Miri
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: miri
+          rustflags: ""
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - run: just miri
+
+  # Exhaustive interleaving takes minutes, not seconds, so it does not belong on
+  # every pull request. It runs on main, and on demand when a pull request
+  # touches the primitives — add the `loom` label to ask for it.
+  loom:
+    name: Loom
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'loom')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - run: just loom
+
   boot:
     name: Build images and boot in QEMU
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
