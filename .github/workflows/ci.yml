@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # `labeled` is not in the default set, so without it adding the `loom` label
+    # starts no run and the loom job below is unreachable on a pull request.
+    types: [opened, synchronize, reopened, labeled]
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
