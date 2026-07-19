@@ -11,14 +11,12 @@ on:
       - "justfile"
       - "rust-toolchain.toml"
 
-# Appending a point to the series is a write to gh-pages.
 permissions:
-  contents: write
-  deployments: write
+  contents: read
 
 jobs:
   track:
-    name: Measure and append to the trend
+    name: Measure and preserve a baseline
     # Pinned, not `latest`: a runner image bump changes glibc and the compiler
     # environment, which shows up as a step in the series that no commit caused.
     runs-on: ubuntu-24.04
@@ -33,25 +31,12 @@ jobs:
           tool: just
       - run: just bench-track
 
-      # Keeps one point per commit on gh-pages, so every change to the
-      # primitives has a place on a timeline rather than an artifact nobody
-      # opens. Published at
-      # https://uselessgoddess.github.io/molt/dev/bench/
-      - uses: benchmark-action/github-action-benchmark@v1
+      # Private repositories cannot publish GitHub Pages on the current plan.
+      # Preserve one machine-readable snapshot per commit until a durable trend
+      # store exists; never gate a merge on shared-runner wall-clock numbers.
+      - uses: actions/upload-artifact@v7
         with:
-          name: molt-core
-          # Criterion cannot emit github-action-benchmark's own format; `cargo`
-          # reads the libtest output `--output-format bencher` produces.
-          tool: cargo
-          output-file-path: bench-output.txt
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: true
-          # A shared GitHub runner is a virtualized, noisy neighbour: Criterion's
-          # own FAQ says not to gate CI on wall-clock numbers measured there, and
-          # a 10-20% swing between identical commits is normal. So this comments
-          # on a regression and never fails the build. The signal worth acting on
-          # is a step that persists across several commits, not one spike.
-          alert-threshold: "150%"
-          comment-on-alert: true
-          fail-on-alert: false
-          alert-comment-cc-users: "@uselessgoddess"
+          name: molt-core-bench-${{ github.sha }}
+          path: bench-output.txt
+          if-no-files-found: error
+          retention-days: 90

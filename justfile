@@ -51,7 +51,7 @@ smoke: smoke-x86_64 smoke-riscv64
 bench:
     cargo bench --package molt-core
 
-# The same benchmarks in libtest's format, which github-action-benchmark reads.
-# Criterion has no exporter of its own, so this is the supported bridge.
+# Emit the same benchmarks in a machine-readable snapshot retained by CI.
+# Criterion has no exporter of its own, so use its libtest-compatible format.
 bench-track:
     cargo bench --package molt-core -- --output-format bencher | tee bench-output.txt

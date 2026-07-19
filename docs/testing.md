@@ -18,7 +18,7 @@ The short answers: yes, yes but not as a gate, and yes but tiered.
 | Concurrency model | `just loom` | main, or the `loom` label |
 | Boot | `just smoke` | every push |
 | Benchmarks | `just bench` | locally, on demand |
-| Benchmark trend | `just bench-track` | main only |
+| Benchmark snapshot | `just bench-track` | main only |
 
 Each layer catches a class the layer above cannot see. Unit tests catch logic.
 Miri catches undefined behaviour on the paths a test happens to execute. loom
@@ -62,10 +62,9 @@ hardware that actually reorders.
 **Shape of the integration.** `crates/molt-core/src/sync.rs` is a shim in the
 style cordyceps and tokio use: the crate imports its atomics, `UnsafeCell` and
 `spin_loop` from `sync`, which re-exports either `core::sync::atomic` or
-`loom::sync::atomic` depending on `cfg(loom)`. Two macros, `const_fn!` and
-`array!`, absorb the one real friction — loom's atomics allocate model state on
-construction, so nothing containing one can be built in a `const` context.
-Outside a loom build the `const` is real and the shim compiles to nothing.
+`loom::sync::atomic` depending on `cfg(loom)`. Constructors use a direct
+`cfg(loom)` branch: ordinary builds keep their `const fn`, while loom uses
+`from_fn` because its atomics allocate model state.
 
 ## Why benchmarks, and why they are not a gate
 
@@ -75,34 +74,28 @@ an array of contended atomics that is not cache-padded. Should it be?
 Without numbers that is an argument. With them it is a trade: on a 4-core
 x86_64 Linux VM, padding takes roughly 50% off `executor_contended_wake` and
 adds roughly 8% to `completion_round_trip`, and costs 32 KiB of `static` memory
-on `Executor<256>`. So it shipped as the `cache-padded` feature, off by
-default, documented with the numbers in `crates/molt-core/src/cache.rs`. The
-benchmark is what turned an opinion into an option.
+on `Executor<256>`. So layout is a per-instance type choice: `Executor<256>` is
+compact and `Executor<256, Padded>` is cache-aligned. `CompletionSlab` exposes
+the same choice. Both variants run in one benchmark binary, making the cost
+visible without rebuilding the whole kernel with a different feature set.
 
 That generalises. Benchmarks are worth having now, before Stage 2 adds drivers
 and a filesystem, because the primitives they measure are the ones everything
 later sits on, and because a baseline is only useful if it predates the change
 you want to compare against.
 
-**On a timeline, not against a remembered baseline.** Criterion compares a run
-to one saved baseline. The question worth answering is what the primitives have
-been doing over many commits, which needs a series. `just bench-track` emits
-libtest-format numbers and the `Benchmarks` workflow appends one point per
-commit to `gh-pages`, so every change has a place on a graph.
+**Keep a machine-readable history.** Criterion compares a run to one saved
+baseline. `just bench-track` emits libtest-format numbers and the `Benchmarks`
+workflow preserves one 90-day artifact per main commit. The repository is
+private and cannot publish GitHub Pages on its current plan, so a durable graph
+is deferred until there is a store that can actually retain the series.
 
-Criterion has no exporter for that format and github-action-benchmark has no
-Criterion reader, so `--output-format bencher` with `tool: cargo` is the
-supported bridge between them.
-
-**It never fails the build.** Criterion's own FAQ advises against gating CI on
-wall-clock numbers, and a shared GitHub runner is a virtualized noisy
-neighbour: 10-20% between identical commits is normal. The workflow comments on
-a regression and moves on. The signal worth acting on is a step that persists
-across several commits, not a spike. sel4bench takes the same position — it
-keeps a JSON history and does not auto-fail on it.
-
-Prerequisite: the trend needs a `gh-pages` branch with GitHub Pages enabled.
-Until then the workflow measures and the push step is what fails.
+**Performance never gates the build.** Criterion's own FAQ advises against
+gating CI on wall-clock numbers, and a shared GitHub runner is a virtualized
+noisy neighbour: 10-20% between identical commits is normal. The snapshots are
+there for manual comparison; the signal worth acting on is a change that
+persists across several runs, not one spike. sel4bench takes the same position
+— it keeps a JSON history and does not auto-fail on it.
 
 ## Why multi-platform CI
 
