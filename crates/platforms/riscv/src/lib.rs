@@ -99,10 +99,11 @@ _start:
         kernel(boot_info, &mut platform)
     }
 
-    // Reports a panic through the SBI console before requesting shutdown.
-    // Linking any Molt kernel against this crate installs the handler, so no
-    // kernel binary can forget to provide one.
-    molt_arch::panic_handler!(RiscV);
+    #[cfg(target_os = "none")]
+    #[panic_handler]
+    fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+        molt_arch::panic_handler::<RiscV>(info)
+    }
 
     /// The single usable RAM span left after the loaded kernel image.
     struct RiscVMemoryMap {

@@ -35,16 +35,19 @@ macro_rules! println {
 
 fn kernel_main<P: Platform>(boot_info: BootInfo<'_>, platform: &mut P) -> ! {
     platform.serial().init();
+    #[cfg(feature = "panic-smoke")]
+    panic!("panic-smoke");
+
     println!(platform, "MOLT: booting");
     println!(platform, "MOLT: memory regions={}", boot_info.memory_map().len());
 
-    run_stage_1_checks(&boot_info, platform);
+    smoke(&boot_info, platform);
 
     println!(platform, "MOLT_BOOT_OK");
     platform.terminate(ExitStatus::Success)
 }
 
-fn run_stage_1_checks<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
+fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     platform.initialize(boot_info).expect("initialize traps and timer source");
     assert!(platform.verify_exception_path(), "breakpoint handler did not return");
     println!(platform, "MOLT_EXCEPTION_OK");
@@ -66,20 +69,8 @@ fn run_stage_1_checks<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     println!(platform, "MOLT_CANCELLATION_OK");
     println!(platform, "MOLT_STALE_COMPLETION_OK");
 
-    verify_cell_restart();
+    cell_restart();
     println!(platform, "MOLT_RESTART_OK");
-
-    verify_panic_handler();
-}
-
-/// Panics on purpose in a `panic-smoke` build.
-///
-/// The panic handler is the one path a passing boot never takes, so without
-/// this it could rot unnoticed. `cargo smoke` boots this build too and requires
-/// the `MOLT_PANIC:` marker and a failure exit status.
-fn verify_panic_handler() {
-    #[cfg(feature = "panic-smoke")]
-    panic!("panic-smoke");
 }
 
 fn run_timer_future<P: Platform>(platform: &mut P) {
@@ -135,7 +126,7 @@ impl Cell for ProbeCell {
     }
 }
 
-fn verify_cell_restart() {
+fn cell_restart() {
     let owner = CellId::new(1);
     let mut capabilities = CapabilityTable::<u32, 2>::new();
     let old = capabilities.insert::<ReadWrite>(owner, 9).expect("free capability slot");

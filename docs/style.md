@@ -61,9 +61,9 @@ guarantee holds here. No exceptions — this is the one place verbosity wins.
 A test is documentation that fails. Make the name the claim:
 
 ```rust
-fn a_wake_racing_the_scan_is_not_lost()
-fn waker_marks_only_its_own_task_ready()
-fn padding_follows_the_feature()
+fn race_keeps_wake()
+fn waker_is_task_local()
+fn padding_is_typed()
 ```
 
 Not `test_wake`, not `executor_test_2`. If the name does not read as a
@@ -96,12 +96,16 @@ paragraph of scaffolding is telling you the API needs the work, not the test.
 
 ## Platform differences
 
-Do not spread `#[cfg]` across call sites. Push the difference behind a trait in
-`molt-arch`, or behind one exported macro, and let the platform crate spend a
-single unconditional line:
+Do not spread `#[cfg]` across call sites. Push shared behavior behind a trait or
+generic function in `molt-arch`; the platform crate should only select its
+concrete type:
 
 ```rust
-molt_arch::panic_handler!(RiscV);
+#[cfg(target_os = "none")]
+#[panic_handler]
+fn panic(info: &PanicInfo<'_>) -> ! {
+    molt_arch::panic_handler::<RiscV>(info)
+}
 ```
 
 A `cfg` that appears more than twice for the same reason is a missing

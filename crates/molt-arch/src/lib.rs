@@ -250,35 +250,16 @@ pub trait Platform {
     fn terminate(&mut self, status: ExitStatus) -> !;
 }
 
-/// Defines this platform's `#[panic_handler]`.
-///
-/// Every Molt platform panics identically: bring the serial port up, print
-/// `MOLT_PANIC: {info}` for the smoke tests to match on, and hand the failure
-/// status to the platform. Only the platform type differs.
-///
-/// The handler exists solely on bare metal, so this macro carries the
-/// `target_os = "none"` gate and every import behind it. Platform crates get
-/// one unconditional line instead of a gate per import plus a gate per item.
-///
-/// ```ignore
-/// molt_arch::panic_handler!(X86_64);
-/// ```
-#[macro_export]
-macro_rules! panic_handler {
-    ($platform:ty) => {
-        #[cfg(target_os = "none")]
-        #[panic_handler]
-        fn __molt_panic(info: &::core::panic::PanicInfo<'_>) -> ! {
-            let mut platform = <$platform>::new();
-            {
-                use ::core::fmt::Write as _;
+/// Reports a bare-metal panic through the selected platform.
+pub fn panic_handler<P>(info: &core::panic::PanicInfo<'_>) -> !
+where
+    P: Platform + Default,
+{
+    use core::fmt::Write as _;
 
-                let serial = $crate::Platform::serial(&mut platform);
-                $crate::SerialPort::init(serial);
-                let mut writer = $crate::SerialWriter::new(serial);
-                let _ = ::core::writeln!(writer, "MOLT_PANIC: {info}");
-            }
-            $crate::Platform::terminate(&mut platform, $crate::ExitStatus::Failure)
-        }
-    };
+    let mut platform = P::default();
+    let serial = platform.serial();
+    serial.init();
+    let _ = writeln!(SerialWriter::new(serial), "MOLT_PANIC: {info}");
+    platform.terminate(ExitStatus::Failure)
 }

@@ -49,10 +49,11 @@ pub fn start(raw: &'static mut BootloaderInfo, kernel: fn(BootInfo<'_>, &mut X86
     kernel(boot_info, &mut platform)
 }
 
-// Reports a panic through COM1 before terminating the QEMU machine. Linking any
-// Molt kernel against this crate installs the handler, so no kernel binary can
-// forget to provide one.
-molt_arch::panic_handler!(X86_64);
+#[cfg(target_os = "none")]
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    molt_arch::panic_handler::<X86_64>(info)
+}
 
 struct BootloaderMemoryMap<'map> {
     regions: &'map MemoryRegions,
