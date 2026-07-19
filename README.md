@@ -21,13 +21,13 @@ kernel orchestration contains no port I/O or bootloader-specific types.
 ## Repository layout
 
 ```text
-crates/molt-arch/    boot and hardware contracts; no platform implementation
-crates/molt-core/    no_std rings, executor, capabilities, and supervised cells
-crates/molt-x86_64/  x86_64 boot, exceptions, paging, local APIC, UART, and exit
-crates/molt-riscv/   RISC-V SBI console and shutdown implementation
-kernel/              architecture-independent kernel orchestration
-xtask/               reproducible image builder and QEMU smoke runner
-docs/                architecture analysis and staged roadmap
+crates/molt-arch/          boot and hardware contracts; no platform implementation
+crates/molt-core/          no_std rings, executor, capabilities, and supervised cells
+crates/platforms/x86_64/   x86_64 boot, exceptions, paging, local APIC, UART, and exit
+crates/platforms/riscv/    RISC-V SBI console and shutdown implementation
+kernel/                    architecture-independent kernel orchestration
+xtask/                     reproducible image builder and QEMU smoke runner
+docs/                      architecture, roadmap, testing strategy, and style
 ```
 
 ## Prerequisites
@@ -44,7 +44,7 @@ kernel source do not otherwise rely on unstable language features.
 ## Build and test
 
 ```console
-just check
+just pre
 just image
 ```
 
@@ -84,4 +84,6 @@ capability handles, as described in
 [the ABI section](docs/architecture.md#component-boundaries-and-abi).
 
 See [the roadmap](docs/roadmap.md) for first-stage acceptance criteria and later
-milestones.
+milestones, [the testing strategy](docs/testing.md) for what each layer of the
+suite is for, and [the style guide](docs/style.md) for the conventions rustfmt
+and clippy cannot check.
