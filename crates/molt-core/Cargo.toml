@@ -5,6 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# Gives each contended atomic its own cache line. Off by default: it trades a
+# large amount of `static` memory for contention that only multi-hart workloads
+# actually pay. See `cache` for the numbers.
+cache-padded = []
+
 [dev-dependencies]
 criterion = "0.7"
 
@@ -19,4 +25,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [[bench]]
 name = "ring"
+harness = false
+
+[[bench]]
+name = "scheduler"
 harness = false

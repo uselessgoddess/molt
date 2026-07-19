@@ -9,7 +9,8 @@
 //! tasks and turn every slot's compare-exchange into a retry against its
 //! neighbours. Per-slot atomics keep each task's state machine independent and
 //! free of that false sharing, which is worth more than a marginally tighter
-//! scan.
+//! scan. Separate words still share a cache line, though; [`CachePadded`] and
+//! the `cache-padded` feature decide whether to spend memory on that.
 //!
 //! [`Executor::waker`] bridges this ready queue to [`core::task::Waker`]. The
 //! returned waker points straight at the task's own state word rather than at
@@ -26,6 +27,7 @@
 
 use core::task::{RawWaker, RawWakerVTable, Waker};
 
+use crate::cache::CachePadded;
 use crate::sync::atomic::{AtomicU8, Ordering};
 use crate::sync::{array, const_fn};
 
@@ -43,14 +45,15 @@ pub enum SpawnError {
 
 /// A bounded task registry and ready queue represented by atomic slot states.
 pub struct Executor<const N: usize> {
-    states: [AtomicU8; N],
+    /// Padded only under the `cache-padded` feature; see [`CachePadded`].
+    states: [CachePadded<AtomicU8>; N],
 }
 
 impl<const N: usize> Executor<N> {
     const_fn! {
         pub fn new() -> Self {
             const { assert!(N > 0 && N <= 256, "executor capacity must be in 1..=256") };
-            Self { states: array![AtomicU8::new(0); N] }
+            Self { states: array![CachePadded::new(AtomicU8::new(0)); N] }
         }
     }
 

@@ -14,6 +14,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
+use crate::cache::CachePadded;
 use crate::ring::RequestId;
 use crate::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use crate::sync::{UnsafeCell, array, const_fn, spin_loop};
@@ -76,14 +77,18 @@ impl<C> Slot<C> {
 /// Fixed-capacity executor-owned waker and completion slab.
 pub struct CompletionSlab<C, const N: usize> {
     next_request: AtomicU64,
-    slots: [Slot<C>; N],
+    /// Padded only under the `cache-padded` feature; see [`CachePadded`].
+    slots: [CachePadded<Slot<C>>; N],
 }
 
 impl<C, const N: usize> CompletionSlab<C, N> {
     const_fn! {
         pub fn new() -> Self {
             const { assert!(N > 0, "a completion slab needs at least one slot") };
-            Self { next_request: AtomicU64::new(1), slots: array![Slot::new(); N] }
+            Self {
+                next_request: AtomicU64::new(1),
+                slots: array![CachePadded::new(Slot::new()); N],
+            }
         }
     }
 

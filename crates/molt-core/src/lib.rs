@@ -12,6 +12,7 @@
 //! for what that buys and where it stops short.
 
 pub mod buffer;
+pub mod cache;
 pub mod capability;
 pub mod cell;
 pub mod completion;
