@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+# The library has no `#[bench]` functions, and its harness rejects the Criterion
+# flags `just bench-track` passes to every bench target.
+[lib]
+bench = false
+
 [features]
 # Gives each contended atomic its own cache line. Off by default: it trades a
 # large amount of `static` memory for contention that only multi-hart workloads
