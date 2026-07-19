@@ -68,6 +68,18 @@ fn run_stage_1_checks<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
 
     verify_cell_restart();
     println!(platform, "MOLT_RESTART_OK");
+
+    verify_panic_handler();
+}
+
+/// Panics on purpose in a `panic-smoke` build.
+///
+/// The panic handler is the one path a passing boot never takes, so without
+/// this it could rot unnoticed. `cargo smoke` boots this build too and requires
+/// the `MOLT_PANIC:` marker and a failure exit status.
+fn verify_panic_handler() {
+    #[cfg(feature = "panic-smoke")]
+    panic!("panic-smoke");
 }
 
 fn run_timer_future<P: Platform>(platform: &mut P) {

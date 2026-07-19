@@ -19,7 +19,11 @@ const BOOT_MARKERS: &[&str] = &[
     "MOLT_BOOT_OK",
 ];
 
+/// Marker the platform panic handlers print before terminating.
+const PANIC_MARKER: &str = "MOLT_PANIC:";
+
 const QEMU_X86_64_SUCCESS: i32 = (0x10 << 1) | 1;
+const QEMU_X86_64_FAILURE: i32 = (0x11 << 1) | 1;
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn main() -> ExitCode {
@@ -36,13 +40,13 @@ fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
         Some("image") if args.next().is_none() => {
-            let images = build_images()?;
+            let images = build_images(Case::Boot)?;
             println!("BIOS image: {}", images.bios.display());
             println!("UEFI image: {}", images.uefi.display());
             Ok(())
         }
         Some("boot") if args.next().is_none() => {
-            let images = build_images()?;
+            let images = build_images(Case::Boot)?;
             run_qemu_interactive(&images.bios)
         }
         Some("smoke") => {
@@ -66,6 +70,31 @@ enum Arch {
     Riscv64,
 }
 
+/// What a smoke run boots and what it expects to see.
+#[derive(Clone, Copy)]
+enum Case {
+    /// The shipped kernel: every Stage 1 marker, then a success exit.
+    Boot,
+    /// The `panic-smoke` build: a panic report, then a failure exit.
+    Panic,
+}
+
+impl Case {
+    fn features(self) -> &'static [&'static str] {
+        match self {
+            Case::Boot => &[],
+            Case::Panic => &["panic-smoke"],
+        }
+    }
+
+    fn markers(self) -> &'static [&'static str] {
+        match self {
+            Case::Boot => BOOT_MARKERS,
+            Case::Panic => &[PANIC_MARKER],
+        }
+    }
+}
+
 fn smoke(selection: Option<&str>) -> Result<(), String> {
     match selection {
         None | Some("all") => {
@@ -79,15 +108,24 @@ fn smoke(selection: Option<&str>) -> Result<(), String> {
 }
 
 fn smoke_arch(arch: Arch) -> Result<(), String> {
+    smoke_case(arch, Case::Boot)?;
+    smoke_case(arch, Case::Panic)
+}
+
+fn smoke_case(arch: Arch, case: Case) -> Result<(), String> {
     let name = match arch {
         Arch::X86_64 => "x86_64",
         Arch::Riscv64 => "riscv64",
     };
-    println!("== smoke: {name} ==");
+    let label = match case {
+        Case::Boot => "boot",
+        Case::Panic => "panic",
+    };
+    println!("== smoke: {name} {label} ==");
 
     let mut child = match arch {
         Arch::X86_64 => {
-            let images = build_images()?;
+            let images = build_images(case)?;
             qemu_x86_64_command(&images.bios)
                 .arg("-serial")
                 .arg("stdio")
@@ -97,7 +135,7 @@ fn smoke_arch(arch: Arch) -> Result<(), String> {
                 .map_err(|error| format!("failed to start qemu-system-x86_64: {error}"))?
         }
         Arch::Riscv64 => {
-            let kernel = build_kernel(RISCV64_TARGET)?;
+            let kernel = build_kernel(RISCV64_TARGET, case)?;
             qemu_riscv64_command(&kernel)
                 .arg("-serial")
                 .arg("stdio")
@@ -118,10 +156,10 @@ fn smoke_arch(arch: Arch) -> Result<(), String> {
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
     }
 
-    check_exit_status(arch, status)?;
-    for marker in BOOT_MARKERS {
+    check_exit_status(arch, case, status)?;
+    for marker in case.markers() {
         if !serial.contains(marker) {
-            return Err(format!("{name} QEMU exited without the {marker} serial marker"));
+            return Err(format!("{name} {label} QEMU exited without the {marker} serial marker"));
         }
     }
     Ok(())
@@ -132,8 +170,8 @@ struct Images {
     uefi: PathBuf,
 }
 
-fn build_images() -> Result<Images, String> {
-    let kernel = build_kernel(X86_64_TARGET)?;
+fn build_images(case: Case) -> Result<Images, String> {
+    let kernel = build_kernel(X86_64_TARGET, case)?;
 
     let target_dir = target_dir(&workspace_root());
     let image_dir = target_dir.join("molt");
@@ -151,13 +189,21 @@ fn build_images() -> Result<Images, String> {
     Ok(images)
 }
 
-fn build_kernel(target: &str) -> Result<PathBuf, String> {
+fn build_kernel(target: &str, case: Case) -> Result<PathBuf, String> {
     let root = workspace_root();
-    let status = Command::new(cargo())
-        .current_dir(&root)
-        .args(["build", "--package", "molt-kernel", "--target", target, "--release"])
-        .status()
-        .map_err(|error| format!("failed to start cargo: {error}"))?;
+    let mut command = Command::new(cargo());
+    command.current_dir(&root).args([
+        "build",
+        "--package",
+        "molt-kernel",
+        "--target",
+        target,
+        "--release",
+    ]);
+    for feature in case.features() {
+        command.args(["--features", feature]);
+    }
+    let status = command.status().map_err(|error| format!("failed to start cargo: {error}"))?;
     require_success(status, "kernel build")?;
 
     let kernel = target_dir(&root).join(target).join("release/molt-kernel");
@@ -173,7 +219,7 @@ fn run_qemu_interactive(image: &Path) -> Result<(), String> {
         .arg("mon:stdio")
         .status()
         .map_err(|error| format!("failed to start qemu-system-x86_64: {error}"))?;
-    check_exit_status(Arch::X86_64, status)
+    check_exit_status(Arch::X86_64, Case::Boot, status)
 }
 
 fn qemu_x86_64_command(image: &Path) -> Command {
@@ -226,17 +272,18 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<ExitStatus,
     }
 }
 
-fn check_exit_status(arch: Arch, status: ExitStatus) -> Result<(), String> {
-    match arch {
-        Arch::X86_64 if status.code() == Some(QEMU_X86_64_SUCCESS) => Ok(()),
-        Arch::X86_64 => Err(format!(
-            "QEMU reported {:?}; expected debug-exit status {QEMU_X86_64_SUCCESS}",
-            status.code()
-        )),
-        // An SBI shutdown exits QEMU cleanly; the marker check proves it reached
-        // the terminal state rather than shutting down early on a panic.
-        Arch::Riscv64 if status.code() == Some(0) => Ok(()),
-        Arch::Riscv64 => Err(format!("QEMU reported {:?}; expected clean exit 0", status.code())),
+fn check_exit_status(arch: Arch, case: Case, status: ExitStatus) -> Result<(), String> {
+    let expected = match (arch, case) {
+        (Arch::X86_64, Case::Boot) => QEMU_X86_64_SUCCESS,
+        (Arch::X86_64, Case::Panic) => QEMU_X86_64_FAILURE,
+        // An SBI shutdown exits QEMU cleanly whatever the reason, so the marker
+        // check is what distinguishes a terminal state from an early panic.
+        (Arch::Riscv64, _) => 0,
+    };
+    if status.code() == Some(expected) {
+        Ok(())
+    } else {
+        Err(format!("QEMU reported {:?}; expected exit status {expected}", status.code()))
     }
 }
 

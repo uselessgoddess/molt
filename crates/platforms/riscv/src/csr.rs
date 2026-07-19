@@ -49,7 +49,8 @@ pub fn time() -> u64 {
 ///
 /// `value` must be a valid resumption address for the interrupted context.
 pub unsafe fn set_sepc(value: usize) {
-    write_csr!(sepc, value);
+    // SAFETY: the caller guarantees `value` resumes the interrupted context.
+    unsafe { write_csr!(sepc, value) }
 }
 
 /// Installs the direct-mode trap vector.
@@ -60,7 +61,8 @@ pub unsafe fn set_sepc(value: usize) {
 /// the interrupted context.
 pub unsafe fn set_stvec(base: usize) {
     // Mode bits [1:0] = 0 selects direct mode: every trap enters `base`.
-    write_csr!(stvec, base & !0b11);
+    // SAFETY: the caller guarantees `base` is a conforming trap entry.
+    unsafe { write_csr!(stvec, base & !0b11) }
 }
 
 /// # Safety

@@ -51,13 +51,10 @@ pub use imp::{RiscV, SbiSerial, start};
 #[cfg(target_arch = "riscv64")]
 mod imp {
     use core::arch::{asm, global_asm};
-    use core::fmt::Write;
-    #[cfg(target_os = "none")]
-    use core::panic::PanicInfo;
 
     use molt_arch::{
         BootInfo, ExitStatus, FRAME_SIZE, MemoryMap, MemoryRegion, MemoryRegionKind, Platform,
-        PlatformError, SerialPort, SerialWriter,
+        PlatformError, SerialPort,
     };
 
     use crate::{csr, paging, sbi, trap};
@@ -102,18 +99,10 @@ _start:
         kernel(boot_info, &mut platform)
     }
 
-    /// Reports a panic through the SBI console before requesting shutdown.
-    ///
-    /// Linking any Molt kernel against this crate installs the handler
-    /// automatically, so no kernel binary can forget to provide one. It is gated
-    /// on the bare-metal target so host unit tests keep the standard handler.
-    #[cfg(target_os = "none")]
-    #[panic_handler]
-    fn panic(info: &PanicInfo<'_>) -> ! {
-        let mut platform = RiscV::new();
-        let _ = writeln!(SerialWriter::new(platform.serial()), "MOLT_PANIC: {info}");
-        platform.terminate(ExitStatus::Failure)
-    }
+    // Reports a panic through the SBI console before requesting shutdown.
+    // Linking any Molt kernel against this crate installs the handler, so no
+    // kernel binary can forget to provide one.
+    molt_arch::panic_handler!(RiscV);
 
     /// The single usable RAM span left after the loaded kernel image.
     struct RiscVMemoryMap {

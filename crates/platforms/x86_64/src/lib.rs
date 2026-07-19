@@ -8,10 +8,6 @@ mod interrupts;
 mod memory;
 
 use core::arch::asm;
-#[cfg(target_os = "none")]
-use core::fmt::Write;
-#[cfg(target_os = "none")]
-use core::panic::PanicInfo;
 
 #[doc(hidden)]
 pub use bootloader_api::config::Mapping as BootMapping;
@@ -20,8 +16,6 @@ use bootloader_api::info::{MemoryRegionKind as BootMemoryRegionKind, MemoryRegio
 pub use bootloader_api::{
     BootInfo as BootloaderInfo, BootloaderConfig, entry_point as __bootloader_entry_point,
 };
-#[cfg(target_os = "none")]
-use molt_arch::SerialWriter;
 use molt_arch::{
     BootInfo, ExitStatus, MemoryMap, MemoryRegion, MemoryRegionKind, Platform, PlatformError,
     SerialPort,
@@ -55,19 +49,10 @@ pub fn start(raw: &'static mut BootloaderInfo, kernel: fn(BootInfo<'_>, &mut X86
     kernel(boot_info, &mut platform)
 }
 
-/// Reports a panic through COM1 before terminating the QEMU machine.
-///
-/// Linking any Molt kernel against this crate installs the handler
-/// automatically, so no kernel binary can forget to provide one. It is gated on
-/// the bare-metal target so host unit tests keep the standard library's handler.
-#[cfg(target_os = "none")]
-#[panic_handler]
-fn panic(info: &PanicInfo<'_>) -> ! {
-    let mut platform = X86_64::new();
-    platform.serial().init();
-    let _ = writeln!(SerialWriter::new(platform.serial()), "MOLT_PANIC: {info}");
-    platform.terminate(ExitStatus::Failure)
-}
+// Reports a panic through COM1 before terminating the QEMU machine. Linking any
+// Molt kernel against this crate installs the handler, so no kernel binary can
+// forget to provide one.
+molt_arch::panic_handler!(X86_64);
 
 struct BootloaderMemoryMap<'map> {
     regions: &'map MemoryRegions,
