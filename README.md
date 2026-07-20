@@ -5,10 +5,11 @@ Molt is a learning operating system exploring two constraints:
 - one compiler-checked address space with no process abstraction;
 - paired submission/completion rings as the asynchronous I/O primitive.
 
-The current kernel boots on x86_64 through BIOS or UEFI, installs protected
-exception tables, verifies an owned W^X mapping, and completes a local-APIC
-timer future through a typed ring. It then exercises cancellation, stale-result
-rejection, and cell restart before printing `MOLT_BOOT_OK` on COM1. The
+The current kernel boots on x86_64 through BIOS or UEFI and on RISC-V through
+OpenSBI, installs protected exception tables, verifies W^X mappings (including
+per-section Sv39 kernel mappings), and completes a timer future through a typed
+ring. It then exercises cancellation, stale-result rejection, and cell restart
+before printing `MOLT_BOOT_OK`. The
 architecture-independent ring, executor, capability, and cell lifecycle code
 is a `no_std` library so it can be tested and benchmarked on the host. Hardware
 interfaces are defined separately from x86_64 and RISC-V implementations, so
