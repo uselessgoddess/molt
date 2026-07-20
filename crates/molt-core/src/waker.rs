@@ -11,9 +11,10 @@
 //! reproduced here so the kernel keeps a single audited `no_std` primitive with
 //! no external dependency.
 
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU8, Ordering};
 use core::task::Waker;
+
+use crate::sync::UnsafeCell;
+use crate::sync::atomic::{AtomicU8, Ordering};
 
 /// No task is registering and no wake is in flight.
 const WAITING: u8 = 0;
@@ -41,7 +42,13 @@ unsafe impl Send for AtomicWaker {}
 unsafe impl Sync for AtomicWaker {}
 
 impl AtomicWaker {
+    #[cfg(not(loom))]
     pub const fn new() -> Self {
+        Self { state: AtomicU8::new(WAITING), waker: UnsafeCell::new(None) }
+    }
+
+    #[cfg(loom)]
+    pub fn new() -> Self {
         Self { state: AtomicU8::new(WAITING), waker: UnsafeCell::new(None) }
     }
 
@@ -58,14 +65,15 @@ impl AtomicWaker {
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                // SAFETY: the `REGISTERING` claim grants this consumer exclusive
-                // access to the waker cell until the release compare-exchange.
-                unsafe {
-                    let stored = &mut *self.waker.get();
+                self.waker.with_mut(|stored| {
+                    // SAFETY: the `REGISTERING` claim grants this consumer
+                    // exclusive access to the cell until the release
+                    // compare-exchange below.
+                    let stored = unsafe { &mut *stored };
                     if !stored.as_ref().is_some_and(|current| current.will_wake(waker)) {
                         *stored = Some(waker.clone());
                     }
-                }
+                });
                 match self.state.compare_exchange(
                     REGISTERING,
                     WAITING,
@@ -78,7 +86,7 @@ impl AtomicWaker {
                         // could not touch the cell, so we deliver the wakeup.
                         // SAFETY: the observed `REGISTERING | WAKING` state still
                         // excludes every other writer from the waker cell.
-                        let waker = unsafe { (*self.waker.get()).take() };
+                        let waker = self.waker.with_mut(|stored| unsafe { (*stored).take() });
                         self.state.swap(WAITING, Ordering::AcqRel);
                         if let Some(waker) = waker {
                             waker.wake();
@@ -106,7 +114,7 @@ impl AtomicWaker {
             WAITING => {
                 // SAFETY: transitioning `WAITING -> WAKING` claims the cell; no
                 // consumer can be registering and no other waker can be taking.
-                let waker = unsafe { (*self.waker.get()).take() };
+                let waker = self.waker.with_mut(|stored| unsafe { (*stored).take() });
                 self.state.fetch_and(!WAKING, Ordering::Release);
                 waker
             }
@@ -120,5 +128,60 @@ impl AtomicWaker {
 impl Default for AtomicWaker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A [`Waker`] that records whether it fired, for tests.
+#[cfg(all(test, loom))]
+pub(crate) struct Flag(pub(crate) loom::sync::atomic::AtomicBool);
+
+#[cfg(all(test, loom))]
+impl std::task::Wake for Flag {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.store(true, crate::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(all(test, loom))]
+impl Flag {
+    pub(crate) fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self(loom::sync::atomic::AtomicBool::new(false)))
+    }
+
+    pub(crate) fn fired(&self) -> bool {
+        self.0.load(crate::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use core::task::Waker;
+
+    use loom::sync::Arc;
+    use loom::thread;
+
+    use super::{AtomicWaker, Flag};
+
+    /// A wake racing a registration must never vanish: it either fires the
+    /// waker, or leaves it parked for the next wake to deliver.
+    #[test]
+    fn race_keeps_wake() {
+        loom::model(|| {
+            let cell = Arc::new(AtomicWaker::new());
+            let flag = Flag::new();
+            let waker = Waker::from(flag.clone());
+
+            let notifier = {
+                let cell = cell.clone();
+                thread::spawn(move || cell.wake())
+            };
+            cell.register(&waker);
+            notifier.join().unwrap();
+
+            assert!(
+                flag.fired() || cell.take().is_some(),
+                "the wake neither fired the waker nor left it registered"
+            );
+        });
     }
 }

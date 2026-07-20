@@ -40,6 +40,10 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 
+[profile.loom]
+inherits = "test"
+opt-level = 2
+
 [profile.micro]
 inherits = "release"
 codegen-units = 1

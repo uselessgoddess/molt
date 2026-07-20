@@ -11,10 +11,14 @@ on:
       - "justfile"
       - "rust-toolchain.toml"
 
+permissions:
+  contents: read
+
 jobs:
-  ring:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  track:
+    name: Measure and preserve a baseline
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -23,9 +27,10 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just
-      - run: just bench
+      - run: just bench-track
       - uses: actions/upload-artifact@v7
         with:
-          name: criterion-ring-results
-          path: target/criterion
+          name: molt-core-bench-${{ github.sha }}
+          path: bench-output.txt
           if-no-files-found: error
+          retention-days: 90

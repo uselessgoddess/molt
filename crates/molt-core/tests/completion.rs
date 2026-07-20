@@ -1,10 +1,10 @@
-use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 
+use molt_core::cache::Padded;
 use molt_core::completion::{CompletionError, CompletionSlab};
 
 struct CountWake(AtomicUsize);
@@ -16,7 +16,7 @@ impl Wake for CountWake {
 }
 
 #[test]
-fn completion_registration_wakes_and_delivers_once() {
+fn completion_wakes_once() {
     let slab = CompletionSlab::<u32, 2>::new();
     let token = slab.reserve().unwrap();
     let wake = Arc::new(CountWake(AtomicUsize::new(0)));
@@ -31,7 +31,7 @@ fn completion_registration_wakes_and_delivers_once() {
 }
 
 #[test]
-fn cancellation_and_restart_reject_stale_results() {
+fn restart_rejects_stale() {
     let slab = CompletionSlab::<u32, 2>::new();
     let cancelled = slab.reserve().unwrap();
     assert_eq!(slab.cancel(cancelled), Ok(()));
@@ -43,7 +43,7 @@ fn cancellation_and_restart_reject_stale_results() {
 }
 
 #[test]
-fn concurrent_registration_and_completion_never_loses_a_wakeup() {
+fn poll_race_keeps_wake() {
     for expected in 0..256 {
         let slab = Arc::new(CompletionSlab::<usize, 1>::new());
         let token = slab.reserve().unwrap();
@@ -70,7 +70,7 @@ fn concurrent_registration_and_completion_never_loses_a_wakeup() {
 }
 
 #[test]
-fn concurrent_cancel_and_complete_leave_the_slot_consistent() {
+fn cancel_race_reuses_slot() {
     // A cancel racing a completion is serialized by the slot's claim flag: the
     // waiter observes exactly one terminal outcome (the delivered value or a
     // cancellation) and the slot is always returned to a reusable empty state
@@ -114,7 +114,7 @@ fn concurrent_cancel_and_complete_leave_the_slot_consistent() {
 }
 
 #[test]
-fn many_producers_complete_distinct_requests() {
+fn producers_keep_slots() {
     // Independent producers completing distinct slots must each land in their
     // own slot without clobbering a neighbour.
     let slab = Arc::new(CompletionSlab::<usize, 8>::new());
@@ -144,4 +144,14 @@ fn many_producers_complete_distinct_requests() {
         let mut future = pin!(slab.wait(token));
         assert_eq!(future.as_mut().poll(&mut cx), Poll::Ready(Ok(value)));
     }
+}
+
+#[test]
+fn padded_layout_completes() {
+    let slab = CompletionSlab::<u32, 1, Padded>::new();
+    let token = slab.reserve().unwrap();
+
+    slab.complete(token.request_id(), 7).unwrap();
+
+    assert_eq!(slab.reserve(), Err(CompletionError::Full));
 }

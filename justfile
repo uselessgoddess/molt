@@ -15,6 +15,13 @@ test:
     cargo nextest run --workspace
     cargo test --workspace --doc
 
+miri:
+    MIRIFLAGS="-Zmiri-strict-provenance" cargo miri test --package molt-core
+
+loom:
+    LOOM_MAX_PREEMPTIONS=2 RUSTFLAGS="--cfg loom" \
+        cargo test --package molt-core --profile loom --lib
+
 x86_64-check:
     cargo clippy --package molt-kernel --target x86_64-unknown-none -- -D warnings
 
@@ -39,3 +46,6 @@ smoke: smoke-x86_64 smoke-riscv64
 
 bench:
     cargo bench --package molt-core
+
+bench-track:
+    cargo bench --package molt-core -- --output-format bencher | tee bench-output.txt

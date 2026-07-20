@@ -4,9 +4,10 @@
 //! contract a property of the safe API instead of a convention callers must
 //! remember.
 
-use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::sync::UnsafeCell;
+use crate::sync::atomic::{AtomicUsize, Ordering};
 
 /// A fixed-capacity single-producer/single-consumer queue.
 pub struct SpscRing<T, const N: usize> {
@@ -21,6 +22,7 @@ unsafe impl<T: Send, const N: usize> Sync for SpscRing<T, N> {}
 
 impl<T, const N: usize> SpscRing<T, N> {
     /// Creates an empty queue.
+    #[cfg(not(loom))]
     pub const fn new() -> Self {
         const {
             assert!(N > 0, "a ring must contain at least one slot");
@@ -28,6 +30,17 @@ impl<T, const N: usize> SpscRing<T, N> {
 
         Self {
             slots: [const { UnsafeCell::new(MaybeUninit::uninit()) }; N],
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+        }
+    }
+
+    /// Creates an empty queue.
+    #[cfg(loom)]
+    pub fn new() -> Self {
+        assert!(N > 0, "a ring must contain at least one slot");
+        Self {
+            slots: core::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit())),
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
         }
@@ -52,9 +65,9 @@ impl<T, const N: usize> SpscRing<T, N> {
 
         // SAFETY: only the unique producer writes this slot. The acquire load
         // above observes the consumer's release before a wrapped slot is reused.
-        unsafe {
-            (*self.slots[tail % N].get()).write(value);
-        }
+        self.slots[tail % N].with_mut(|slot| unsafe {
+            (*slot).write(value);
+        });
         self.tail.store(tail.wrapping_add(1), Ordering::Release);
         Ok(())
     }
@@ -68,7 +81,7 @@ impl<T, const N: usize> SpscRing<T, N> {
 
         // SAFETY: the producer's release published a fully initialized value,
         // and only the unique consumer reads and advances this slot.
-        let value = unsafe { (*self.slots[head % N].get()).assume_init_read() };
+        let value = self.slots[head % N].with(|slot| unsafe { (*slot).assume_init_read() });
         self.head.store(head.wrapping_add(1), Ordering::Release);
         Some(value)
     }
@@ -82,16 +95,52 @@ impl<T, const N: usize> Default for SpscRing<T, N> {
 
 impl<T, const N: usize> Drop for SpscRing<T, N> {
     fn drop(&mut self) {
-        let mut head = *self.head.get_mut();
-        let tail = *self.tail.get_mut();
+        let mut head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Relaxed);
         while head != tail {
             // SAFETY: exclusive access prevents concurrent endpoints, and each
             // position between head and tail contains one initialized value.
-            unsafe {
-                self.slots[head % N].get_mut().assume_init_drop();
-            }
+            self.slots[head % N].with_mut(|slot| unsafe {
+                (*slot).assume_init_drop();
+            });
             head = head.wrapping_add(1);
         }
+    }
+}
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use loom::sync::Arc;
+    use loom::thread;
+
+    use super::SpscRing;
+
+    #[test]
+    fn values_arrive_in_order() {
+        loom::model(|| {
+            let ring = Arc::new(SpscRing::<u32, 1>::new());
+            let producer = {
+                let ring = ring.clone();
+                thread::spawn(move || {
+                    for value in 1..=2 {
+                        while ring.try_push(value).is_err() {
+                            thread::yield_now();
+                        }
+                    }
+                })
+            };
+
+            let mut seen = Vec::new();
+            while seen.len() < 2 {
+                match ring.try_pop() {
+                    Some(value) => seen.push(value),
+                    None => thread::yield_now(),
+                }
+            }
+
+            producer.join().unwrap();
+            assert_eq!(seen, [1, 2]);
+        });
     }
 }
 
@@ -191,7 +240,13 @@ pub struct IoRing<Op, C, const N: usize> {
 }
 
 impl<Op, C, const N: usize> IoRing<Op, C, N> {
+    #[cfg(not(loom))]
     pub const fn new() -> Self {
+        Self { submissions: SpscRing::new(), completions: SpscRing::new() }
+    }
+
+    #[cfg(loom)]
+    pub fn new() -> Self {
         Self { submissions: SpscRing::new(), completions: SpscRing::new() }
     }
 

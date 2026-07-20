@@ -35,16 +35,19 @@ macro_rules! println {
 
 fn kernel_main<P: Platform>(boot_info: BootInfo<'_>, platform: &mut P) -> ! {
     platform.serial().init();
+    #[cfg(feature = "panic-smoke")]
+    panic!("panic-smoke");
+
     println!(platform, "MOLT: booting");
     println!(platform, "MOLT: memory regions={}", boot_info.memory_map().len());
 
-    run_stage_1_checks(&boot_info, platform);
+    smoke(&boot_info, platform);
 
     println!(platform, "MOLT_BOOT_OK");
     platform.terminate(ExitStatus::Success)
 }
 
-fn run_stage_1_checks<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
+fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     platform.initialize(boot_info).expect("initialize traps and timer source");
     assert!(platform.verify_exception_path(), "breakpoint handler did not return");
     println!(platform, "MOLT_EXCEPTION_OK");

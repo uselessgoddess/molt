@@ -11,6 +11,9 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[features]
+panic-smoke = []
+
 [dependencies]
 molt-arch.workspace = true
 molt-core.workspace = true
