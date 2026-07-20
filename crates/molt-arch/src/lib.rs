@@ -3,8 +3,11 @@
 //! Hardware-independent contracts shared by the kernel and architecture crates.
 
 pub mod audit;
+pub mod memory;
 
 use core::fmt;
+
+pub use crate::memory::Cache;
 
 /// Architecture-neutral information passed from a platform boot adapter.
 #[derive(Clone, Copy)]
@@ -301,6 +304,9 @@ pub enum MappingError {
     Granularity,
     /// A translation exists where the kernel declared no mapping at all.
     Unexpected,
+    /// The cacheability does not match the memory behind the mapping: a
+    /// write-back MMIO window, or device ordering imposed on plain RAM.
+    Cacheability,
 }
 
 /// The rights a live translation table actually grants a virtual address.
@@ -313,11 +319,27 @@ pub struct PageProtection {
     read: bool,
     write: bool,
     execute: bool,
+    cache: Cache,
 }
 
 impl PageProtection {
+    /// The rights of a leaf, assuming the ordinary cacheable memory type.
+    ///
+    /// A platform that reports device leaves must say so with [`Self::cached`]:
+    /// the default is write-back, and a device range audited as write-back
+    /// fails. Defaulting the other way would let a platform that ignores its
+    /// memory-type bits pass an MMIO audit it never actually performed.
     pub const fn new(read: bool, write: bool, execute: bool) -> Self {
-        Self { read, write, execute }
+        Self { read, write, execute, cache: Cache::WriteBack }
+    }
+
+    pub const fn cached(mut self, cache: Cache) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    pub const fn cache(self) -> Cache {
+        self.cache
     }
 
     pub const fn is_read(self) -> bool {

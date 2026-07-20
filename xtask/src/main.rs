@@ -18,6 +18,8 @@ const BOOT_MARKERS: &[&str] = &[
     "MOLT_CANCELLATION_OK",
     "MOLT_STALE_COMPLETION_OK",
     "MOLT_RESTART_OK",
+    "MOLT_PHYSMAP_OK",
+    "MOLT_FRAME_OWNER_OK",
     "MOLT_BOOT_OK",
 ];
 

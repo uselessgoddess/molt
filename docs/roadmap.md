@@ -93,11 +93,63 @@ item stays unchecked rather than quietly reinterpreted.
 
 ## Stage 2 — First useful asynchronous I/O (`P1-stage-2`)
 
-- [ ] PCI enumeration and MSI/MSI-X
-- [ ] VirtIO block driver with registered DMA buffers
+Stage 2 used to begin with PCI. It now begins with memory, because every item
+below it asks a question Stage 1 could not answer: which frames does this queue
+own, may this window be cached, and is the device still writing to the memory
+being reused. Stage 1 represents physical memory as a `u64` handed out once to
+the boot page table and never recorded again — enough for one consumer that
+runs before interrupts, and not enough for a driver. `docs/memory.md` is the
+decision record, including what was deliberately *not* taken from seL4,
+Theseus, and Redox.
+
+The sub-stages are ordered so that each one is the smallest thing the next one
+cannot proceed without.
+
+### Stage 2.0 — Typed physical memory
+
+- [x] `Span`, `Kind`, and `Inventory`: physical memory typed from the firmware
+      map, with device windows only where firmware left a hole
+- [x] `Owner`, `Frames`, and `FrameTable`: one owner per frame, in
+      caller-supplied storage, with no allocation in `molt-arch`
+- [x] `Rights` and `Cache` split apart, W^X still rejected at construction
+- [x] the live-table audit extended to device memory, failing closed on a leaf
+      whose platform does not report its memory type
+- [x] `MOLT_PHYSMAP_OK` and `MOLT_FRAME_OWNER_OK` on both platforms
+- [x] `docs/memory.md`
+
+### Stage 2.1 — A kernel-owned address space and the first MMIO window
+
+- [ ] x86_64 page tables owned by the kernel rather than the bootloader, so
+      `Audit::accepts` runs on both platforms and not just RISC-V
+- [ ] cache attributes actually programmed into hardware: PAT on x86_64, and
+      the `Svpbmt`/PMA question answered on RISC-V
+- [ ] a device window mapped through `Inventory::device`, with the UART as the
+      first consumer that stops being an identity-mapped assumption
+
+Nothing before this point maps a device. Nothing after it should map one
+without the audit being able to see it.
+
+### Stage 2.2 — PCI enumeration and interrupts
+
+- [ ] PCI configuration space enumerated through typed device windows
+- [ ] MSI/MSI-X vectors routed to the existing interrupt path
+
+### Stage 2.3 — VirtIO block
+
+- [ ] a VirtIO block driver whose queues are `Owner::Device` frames
+- [ ] registered DMA buffers; no raw physical address in a public operation
 - [ ] cancellation, timeout, queue reset, and backpressure semantics
+- [ ] queue reset that reclaims frames only after the device is told to stop
+
+### Stage 2.4 — Something to run
+
 - [ ] read-only filesystem and an async shell cell
 - [ ] deterministic integration tests using QEMU virtual devices
+
+Acceptance: the kernel maps every device window through a typed, audited path,
+completes block I/O through a ring using frames it owns, and reclaims those
+frames deterministically on reset — with the live-table audit passing on both
+platforms.
 
 ## Stage 3 — Services and networking
 

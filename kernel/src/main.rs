@@ -6,7 +6,10 @@ use core::future::Future;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 
-use molt_arch::{BootInfo, ExitStatus, Platform, SerialPort, SerialWriter};
+use molt_arch::memory::{Error, FrameTable, Inventory, Kind, Owner, Span};
+use molt_arch::{
+    BootInfo, ExitStatus, FRAME_SIZE, Platform, SerialPort, SerialWriter, UsableRegions,
+};
 use molt_core::capability::{CapabilityError, CapabilityTable, ReadWrite};
 use molt_core::cell::{Cell, CellId, Supervisor};
 use molt_core::completion::{CompletionError, CompletionSlab};
@@ -74,6 +77,65 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
 
     verify_cell_restart();
     println!(platform, "MOLT_RESTART_OK");
+
+    let usable = verify_inventory(boot_info);
+    println!(platform, "MOLT_PHYSMAP_OK");
+
+    verify_frame_ownership(usable);
+    println!(platform, "MOLT_FRAME_OWNER_OK");
+}
+
+/// Checks that firmware's map reads back as typed memory, and returns a span
+/// of usable RAM to claim frames from.
+fn verify_inventory(boot_info: &BootInfo<'_>) -> Span {
+    let map = boot_info.memory_map();
+    let inventory = Inventory::new(map);
+
+    // A prefix of one region rather than all of RAM: this classifies frame by
+    // frame, and the point is that the kind is read from the map, not how fast.
+    let usable = UsableRegions::above(map, FRAME_SIZE)
+        .find(|range| range.end() - range.start() >= OWNED_FRAMES * FRAME_SIZE)
+        .expect("one usable region of at least four frames");
+    let span = Span::frames(usable.start(), OWNED_FRAMES).expect("aligned usable range");
+    assert_eq!(inventory.classify(span), Ok(Kind::Ram), "usable RAM did not classify as RAM");
+
+    // Above every region firmware reported there is nothing but holes, and a
+    // hole is the only place a device window may live.
+    let mut top = 0;
+    let mut index = 0;
+    while index < map.len() {
+        if let Some(region) = map.region(index) {
+            // Saturating, so a region ending at the top of the address space
+            // fails the assertion below rather than wrapping to frame zero.
+            top = top.max(region.end().saturating_add(FRAME_SIZE - 1) / FRAME_SIZE * FRAME_SIZE);
+        }
+        index += 1;
+    }
+    let hole = Span::frames(top, 1).expect("aligned hole above the map");
+    assert_eq!(inventory.classify(hole), Ok(Kind::Device), "a hole is not device memory");
+    let window = inventory.device(hole).expect("device window above the map");
+    assert_eq!(inventory.device(span), Err(Error::Kind), "RAM was handed out as a device window");
+    assert_eq!(window.span(), hole);
+
+    span
+}
+
+/// The number of frames the boot-time ownership probe tracks.
+const OWNED_FRAMES: u64 = 4;
+
+/// Checks that claimed frames cannot be claimed twice and come back on release.
+fn verify_frame_ownership(span: Span) {
+    let mut slots = [None; OWNED_FRAMES as usize];
+    let mut frames = FrameTable::over(span, &mut slots).expect("one slot per tracked frame");
+    let first = Span::frames(span.start(), 2).expect("two frames of the tracked span");
+
+    let claimed = frames.claim(first, Owner::Tables).expect("free frames");
+    assert_eq!(frames.claim(first, Owner::Kernel), Err(Error::Owned), "frames handed out twice");
+    assert_eq!(frames.owner(first.start()), Ok(Some(Owner::Tables)));
+    assert_eq!(frames.claimed(), 2);
+
+    frames.release(claimed).expect("frames this table issued");
+    assert_eq!(frames.claimed(), 0, "released frames stayed claimed");
 }
 
 fn run_timer_future<P: Platform>(platform: &mut P) {
