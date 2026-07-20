@@ -6,7 +6,7 @@ use molt_core::capability::{
 struct Buffer(u32);
 
 #[test]
-fn capabilities_are_typed_and_revoked_by_cell_generation() {
+fn typed_caps_revoked_by_cell() {
     let owner = CellId::new(7);
     let mut table = CapabilityTable::<Buffer, 2>::new();
     let read_write = table.insert::<ReadWrite>(owner, Buffer(41)).unwrap();

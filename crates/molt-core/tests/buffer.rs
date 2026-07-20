@@ -3,7 +3,7 @@ use molt_core::capability::CapabilityError;
 use molt_core::cell::CellId;
 
 #[test]
-fn registered_operations_use_typed_handles_and_checked_ranges() {
+fn typed_and_checked_ranges() {
     let owner = CellId::new(7);
     let mut bytes = [0_u8; 8];
     let mut registry = BufferRegistry::<2>::new();
