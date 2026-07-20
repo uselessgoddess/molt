@@ -127,19 +127,17 @@ extern "C" fn molt_trap_handler() {
 
 /// Reports an unrecoverable trap over the SBI console and shuts the machine down.
 fn fatal(kind: &str, cause: usize) -> ! {
-    for byte in b"MOLT_EXCEPTION: " {
-        sbi::console_putchar(*byte);
-    }
-    for byte in kind.bytes() {
-        sbi::console_putchar(byte);
-    }
-    for byte in b" scause=0x" {
-        sbi::console_putchar(*byte);
-    }
-    for shift in (0..16).rev() {
+    let mut console = sbi::Console::new();
+    console.init();
+    console.write(b"MOLT_EXCEPTION: ");
+    console.write(kind.as_bytes());
+    console.write(b" scause=0x");
+    let mut hex = [0; 16];
+    for (index, shift) in (0..16).rev().enumerate() {
         let nibble = ((cause >> (shift * 4)) & 0xf) as u8;
-        sbi::console_putchar(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
+        hex[index] = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
     }
-    sbi::console_putchar(b'\n');
+    console.write(&hex);
+    console.write(b"\n");
     sbi::shutdown(false)
 }
