@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitCode, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
@@ -123,7 +123,7 @@ fn smoke_case(arch: Arch, case: Case) -> Result<(), String> {
     };
     println!("== smoke: {name} {label} ==");
 
-    let mut child = match arch {
+    let child = match arch {
         Arch::X86_64 => {
             let images = build_images(case)?;
             qemu_x86_64_command(&images.bios)
@@ -146,16 +146,14 @@ fn smoke_case(arch: Arch, case: Case) -> Result<(), String> {
         }
     };
 
-    let status = wait_with_timeout(&mut child, SMOKE_TIMEOUT)?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("failed to collect QEMU output: {error}"))?;
+    let (status, output) = collect_with_timeout(child, SMOKE_TIMEOUT)?;
     let serial = String::from_utf8_lossy(&output.stdout);
     print!("{serial}");
     if !output.stderr.is_empty() {
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
     }
 
+    let status = status?;
     check_exit_status(arch, case, status)?;
     for marker in case.markers() {
         if !serial.contains(marker) {
@@ -232,13 +230,23 @@ fn qemu_x86_64_command(image: &Path) -> Command {
         "-display",
         "none",
         "-no-reboot",
-        "-no-shutdown",
         "-device",
         "isa-debug-exit,iobase=0xf4,iosize=0x04",
         "-drive",
     ]);
     command.arg(format!("format=raw,file={}", image.display()));
     command
+}
+
+fn collect_with_timeout(
+    mut child: Child,
+    timeout: Duration,
+) -> Result<(Result<ExitStatus, String>, Output), String> {
+    let status = wait_with_timeout(&mut child, timeout);
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to collect QEMU output: {error}"))?;
+    Ok((status, output))
 }
 
 fn qemu_riscv64_command(kernel: &Path) -> Command {
@@ -262,7 +270,6 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<ExitStatus,
                 child
                     .kill()
                     .map_err(|error| format!("QEMU timed out and could not be killed: {error}"))?;
-                let _ = child.wait();
                 return Err(format!("QEMU did not exit within {}s", timeout.as_secs()));
             }
             Err(error) => {
@@ -307,4 +314,38 @@ fn target_dir(root: &Path) -> PathBuf {
 
 fn cargo() -> OsString {
     env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    use super::{collect_with_timeout, qemu_x86_64_command};
+
+    #[test]
+    fn x86_smoke_allows_debug_exit_shutdown() {
+        let command = qemu_x86_64_command(Path::new("molt.img"));
+        let arguments: Vec<_> = command.get_args().collect();
+
+        assert!(arguments.iter().all(|argument| *argument != "-no-shutdown"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_preserves_output() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "printf MOLT_STUCK; exec sleep 10"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().expect("spawn output probe");
+
+        let (status, output) =
+            collect_with_timeout(child, Duration::from_millis(100)).expect("collect killed probe");
+
+        assert!(status.is_err(), "the probe exceeded its deadline");
+        assert_eq!(output.stdout, b"MOLT_STUCK");
+    }
 }
