@@ -125,10 +125,14 @@ result as pending rather than claiming it.
 
 The smoke runner boots a real image under QEMU and asserts serial markers
 through `MOLT_BOOT_OK`, with a hard 20-second timeout so a hang fails instead
-of occupying a runner. Theseus and Redox both do a version of this — Theseus
-boots under QEMU and checks an `isa-debug-exit` code, Redox hooks `redoxer`
-into Cargo's target-runner so a kernel boot test is an ordinary `cargo` command.
-The property all three share is worth keeping: the boot test is the same
+of occupying a runner. The x86_64 command intentionally omits `-no-shutdown`:
+newer QEMU versions implement `isa-debug-exit` as a guest shutdown request, so
+that option would pause the VM instead of returning the requested status.
+Timeout failures still print all serial and QEMU diagnostics collected before
+the kill. Theseus and Redox both do a version of this — Theseus boots under
+QEMU and checks an `isa-debug-exit` code, Redox hooks `redoxer` into Cargo's
+target-runner so a kernel boot test is an ordinary `cargo` command. The
+property all three share is worth keeping: the boot test is the same
 artifact users get, not a special build.
 
 One gap was worth closing. The panic handler is the single path a passing boot

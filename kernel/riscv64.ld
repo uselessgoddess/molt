@@ -18,32 +18,44 @@ SECTIONS {
     . = ORIGIN(RAM);
 
     .text : ALIGN(4K) {
+        __text_start = .;
         KEEP(*(.text._start))
         *(.text .text.*)
+        . = ALIGN(4K);
+        __text_end = .;
     } > RAM
 
     .rodata : ALIGN(4K) {
+        __rodata_start = .;
         *(.rodata .rodata.*)
         *(.srodata .srodata.*)
+        . = ALIGN(4K);
+        __rodata_end = .;
     } > RAM
 
     .data : ALIGN(4K) {
+        __data_start = .;
         *(.data .data.*)
         *(.sdata .sdata.*)
+        . = ALIGN(4K);
+        __data_end = .;
     } > RAM
 
-    .bss (NOLOAD) : ALIGN(8) {
+    .bss (NOLOAD) : ALIGN(4K) {
         __bss_start = .;
         *(.bss .bss.*)
         *(.sbss .sbss.*)
         *(COMMON)
-        . = ALIGN(8);
+        . = ALIGN(4K);
         __bss_end = .;
     } > RAM
 
-    . = ALIGN(16);
-    . += 128K;
-    __molt_stack_top = .;
+    .stack (NOLOAD) : ALIGN(4K) {
+        __stack_start = .;
+        . += 128K;
+        __stack_end = .;
+        __molt_stack_top = .;
+    } > RAM
 
     __kernel_end = .;
 

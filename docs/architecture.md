@@ -40,10 +40,10 @@ Molt keeps three layers distinct:
   port I/O or consume a bootloader-owned type.
 
 The x86_64 crate translates `bootloader_api::BootInfo` into Molt's borrowed,
-read-only boot contract at the entry boundary. Consequently a future RISC-V
-boot path can supply the same contract without emulating a third-party x86
-bootloader API. Platform selection is compile-time, and serial calls are
-statically dispatched.
+read-only boot contract at the entry boundary. RISC-V constructs the same
+contract from its linker bounds without emulating a third-party x86 bootloader
+API. Platform selection is compile-time, and serial calls are statically
+dispatched.
 
 Unsafe assembly belongs to the architecture crate that owns the corresponding
 register or firmware contract. Its safe surface is exercised with host-side
@@ -66,6 +66,13 @@ The boot memory map feeds a monotonic 4 KiB physical-frame allocator. An
 the portable permission constructor, and unmaps on drop. Page-table access is
 restricted to single-core early boot, where the bootloader's complete physical
 direct map and unique ownership are explicit unsafe preconditions.
+
+RISC-V builds a fresh Sv39 root during the same early-boot phase. Linker bounds
+split its identity-mapped image into RX text, read-only data, and RW mutable
+data, BSS, and stack pages. A pre-enable page-table walk requires every image
+mapping to be a 4 KiB leaf with the exact section permissions. SBI diagnostic
+output probes DBCN and uses its multi-byte write, retaining the legacy byte
+extension as a compatibility and I/O-error fallback.
 
 The local APIC runs a one-shot timer with an atomic monotonic interrupt count.
 The wait path disables interrupts, rechecks the count, then uses atomic

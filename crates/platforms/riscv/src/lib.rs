@@ -11,15 +11,11 @@
 //! Every module that touches supervisor hardware is gated on the RISC-V target
 //! so the crate still compiles to an empty shell for host unit tests.
 
-/// Physical base of the QEMU `virt` board's RAM, below the S-mode payload.
-#[cfg(target_arch = "riscv64")]
-pub(crate) const RAM_BASE: usize = 0x8000_0000;
-
 #[cfg(target_arch = "riscv64")]
 mod csr;
 #[cfg(target_arch = "riscv64")]
 mod paging;
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", test))]
 mod sbi;
 #[cfg(target_arch = "riscv64")]
 mod trap;
@@ -143,7 +139,7 @@ _start:
 
     impl RiscV {
         pub const fn new() -> Self {
-            Self { serial: SbiSerial }
+            Self { serial: SbiSerial { console: sbi::Console::new() } }
         }
     }
 
@@ -203,12 +199,22 @@ _start:
         }
     }
 
-    /// Diagnostic output through the SBI legacy console extension.
-    pub struct SbiSerial;
+    /// Diagnostic output through SBI DBCN with a legacy-console fallback.
+    pub struct SbiSerial {
+        console: sbi::Console,
+    }
 
     impl SerialPort for SbiSerial {
+        fn init(&mut self) {
+            self.console.init();
+        }
+
         fn write_byte(&mut self, byte: u8) {
-            sbi::console_putchar(byte);
+            self.console.write(core::slice::from_ref(&byte));
+        }
+
+        fn write_bytes(&mut self, bytes: &[u8]) {
+            self.console.write(bytes);
         }
     }
 }

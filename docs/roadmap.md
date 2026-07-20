@@ -64,25 +64,22 @@ Testing and measurement:
 
 Correctness debt:
 
-- [ ] RISC-V: map the kernel image per section instead of one RWX gigapage
-- [ ] RISC-V: use the SBI debug console (DBCN) with a legacy fallback
+- [x] RISC-V: map the kernel image per section instead of one RWX gigapage
+- [x] RISC-V: use the SBI debug console (DBCN) with a legacy fallback
 
 Both are Stage 1 shortcuts, and both are Stage 1.5 rather than Stage 2 work.
 
-The gigapage is the one that matters. `MapPermissions` rejects a
-writable-and-executable mapping at construction, and the x86_64 platform
-honours that for the kernel image — but on RISC-V the running kernel executes
-out of an identity-mapped RWX gigapage, so only the probe page is actually
-W^X. A contract enforced on one platform and not the other is not a contract,
-and Stage 2's DMA and drivers are exactly the code that turns a writable `.text`
-into arbitrary execution. Retrofitting per-section permissions is also strictly
-harder once drivers hold mappings.
+The RISC-V linker exports page-aligned text, rodata, and mutable-image bounds.
+Sv39 maps those ranges as RX, R, and RW 4 KiB leaves respectively, then walks
+the resulting page tables before enabling translation. That boot assertion
+rejects a large leaf or any permission mismatch, so the former RWX gigapage
+cannot silently return.
 
-The console is smaller. The legacy `console_putchar` extension is deprecated in
-SBI 0.2 and later, reports no errors, and costs one `ecall` per byte. It works,
-and it is isolated in `sbi.rs`, so it is not urgent — but Stage 2 debugging
-leans on the console, and a console that cannot report its own failure is a bad
-thing to be holding while chasing a driver bug.
+The SBI console probes DBCN once during initialization and writes each format
+fragment with its multi-byte call. Partial writes retry the remainder; an
+unavailable extension, error, or zero-progress result falls back to legacy
+`console_putchar`. Host tests cover each selection path, while the older
+OpenSBI used by QEMU smoke exercises the fallback end to end.
 
 Not in this stage: real-hardware boot. It needs serial-capture equipment that
 does not exist yet, so QEMU stays the honest limit and the Stage 1 hardware
