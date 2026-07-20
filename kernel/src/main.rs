@@ -91,9 +91,11 @@ fn verify_inventory(boot_info: &BootInfo<'_>) -> Span {
     let map = boot_info.memory_map();
     let inventory = Inventory::new(map);
 
-    let usable = UsableRegions::above(map, FRAME_SIZE).next().expect("one usable region");
-    // A prefix rather than the whole region: this classifies frame by frame,
-    // and the point is that the kind is read from the map, not how fast.
+    // A prefix of one region rather than all of RAM: this classifies frame by
+    // frame, and the point is that the kind is read from the map, not how fast.
+    let usable = UsableRegions::above(map, FRAME_SIZE)
+        .find(|range| range.end() - range.start() >= OWNED_FRAMES * FRAME_SIZE)
+        .expect("one usable region of at least four frames");
     let span = Span::frames(usable.start(), OWNED_FRAMES).expect("aligned usable range");
     assert_eq!(inventory.classify(span), Ok(Kind::Ram), "usable RAM did not classify as RAM");
 
@@ -103,7 +105,9 @@ fn verify_inventory(boot_info: &BootInfo<'_>) -> Span {
     let mut index = 0;
     while index < map.len() {
         if let Some(region) = map.region(index) {
-            top = top.max(region.end().next_multiple_of(FRAME_SIZE));
+            // Saturating, so a region ending at the top of the address space
+            // fails the assertion below rather than wrapping to frame zero.
+            top = top.max(region.end().saturating_add(FRAME_SIZE - 1) / FRAME_SIZE * FRAME_SIZE);
         }
         index += 1;
     }
