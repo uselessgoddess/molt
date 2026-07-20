@@ -11,6 +11,12 @@ path = "src/main.rs"
 test = false
 bench = false
 
+# Panics on purpose once the Stage 1 checks pass, so `cargo smoke` can prove the
+# platform panic handler still reaches the console. Never enabled in a shipped
+# build.
+[features]
+panic-smoke = []
+
 [dependencies]
 molt-arch.workspace = true
 molt-core.workspace = true

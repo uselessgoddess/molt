@@ -15,6 +15,17 @@ test:
     cargo nextest run --workspace
     cargo test --workspace --doc
 
+# Undefined behaviour, aliasing and provenance in the unsafe primitives.
+miri:
+    MIRIFLAGS="-Zmiri-strict-provenance" cargo miri test --package molt-core
+
+# Model-checks the lock-free primitives against the C11 memory model. Slow, so
+# it runs on demand and on main rather than on every commit; the preemption
+# bound keeps a full sweep to a few minutes.
+loom:
+    LOOM_MAX_PREEMPTIONS=2 RUSTFLAGS="--cfg loom" \
+        cargo test --package molt-core --profile loom --lib
+
 x86_64-check:
     cargo clippy --package molt-kernel --target x86_64-unknown-none -- -D warnings
 
@@ -39,3 +50,8 @@ smoke: smoke-x86_64 smoke-riscv64
 
 bench:
     cargo bench --package molt-core
+
+# Emit the same benchmarks in a machine-readable snapshot retained by CI.
+# Criterion has no exporter of its own, so use its libtest-compatible format.
+bench-track:
+    cargo bench --package molt-core -- --output-format bencher | tee bench-output.txt

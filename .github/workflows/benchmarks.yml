@@ -11,10 +11,16 @@ on:
       - "justfile"
       - "rust-toolchain.toml"
 
+permissions:
+  contents: read
+
 jobs:
-  ring:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  track:
+    name: Measure and preserve a baseline
+    # Pinned, not `latest`: a runner image bump changes glibc and the compiler
+    # environment, which shows up as a step in the series that no commit caused.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -23,9 +29,14 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just
-      - run: just bench
+      - run: just bench-track
+
+      # Private repositories cannot publish GitHub Pages on the current plan.
+      # Preserve one machine-readable snapshot per commit until a durable trend
+      # store exists; never gate a merge on shared-runner wall-clock numbers.
       - uses: actions/upload-artifact@v7
         with:
-          name: criterion-ring-results
-          path: target/criterion
+          name: molt-core-bench-${{ github.sha }}
+          path: bench-output.txt
           if-no-files-found: error
+          retention-days: 90

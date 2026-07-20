@@ -249,3 +249,17 @@ pub trait Platform {
 
     fn terminate(&mut self, status: ExitStatus) -> !;
 }
+
+/// Reports a bare-metal panic through the selected platform.
+pub fn panic_handler<P>(info: &core::panic::PanicInfo<'_>) -> !
+where
+    P: Platform + Default,
+{
+    use core::fmt::Write as _;
+
+    let mut platform = P::default();
+    let serial = platform.serial();
+    serial.init();
+    let _ = writeln!(SerialWriter::new(serial), "MOLT_PANIC: {info}");
+    platform.terminate(ExitStatus::Failure)
+}
