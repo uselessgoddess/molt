@@ -13,6 +13,7 @@ const RISCV64_TARGET: &str = "riscv64gc-unknown-none-elf";
 const BOOT_MARKERS: &[&str] = &[
     "MOLT_EXCEPTION_OK",
     "MOLT_MAPPING_OK",
+    "MOLT_WX_OK",
     "MOLT_TIMER_OK",
     "MOLT_CANCELLATION_OK",
     "MOLT_STALE_COMPLETION_OK",
