@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -123,46 +124,90 @@ fn smoke_case(arch: Arch, case: Case) -> Result<(), String> {
     };
     println!("== smoke: {name} {label} ==");
 
-    let mut child = match arch {
+    let (command, binary) = match arch {
         Arch::X86_64 => {
             let images = build_images(case)?;
-            qemu_x86_64_command(&images.bios)
-                .arg("-serial")
-                .arg("stdio")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|error| format!("failed to start qemu-system-x86_64: {error}"))?
+            (qemu_x86_64_command(&images.bios), "qemu-system-x86_64")
         }
         Arch::Riscv64 => {
             let kernel = build_kernel(RISCV64_TARGET, case)?;
-            qemu_riscv64_command(&kernel)
-                .arg("-serial")
-                .arg("stdio")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|error| format!("failed to start qemu-system-riscv64: {error}"))?
+            (qemu_riscv64_command(&kernel), "qemu-system-riscv64")
         }
     };
 
-    let status = wait_with_timeout(&mut child, SMOKE_TIMEOUT)?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("failed to collect QEMU output: {error}"))?;
-    let serial = String::from_utf8_lossy(&output.stdout);
-    print!("{serial}");
-    if !output.stderr.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    let run = run_qemu_captured(command, binary, smoke_timeout())?;
+    // Print what the guest managed to say before anything is judged: a run that
+    // times out is the one whose serial log matters most.
+    print!("{}", run.serial);
+    if !run.diagnostics.is_empty() {
+        eprint!("{}", run.diagnostics);
     }
 
+    let status = run.status.ok_or_else(|| {
+        format!(
+            "{name} {label} QEMU did not exit within {}s; \
+             set MOLT_SMOKE_TIMEOUT to raise the limit",
+            smoke_timeout().as_secs()
+        )
+    })?;
     check_exit_status(arch, case, status)?;
     for marker in case.markers() {
-        if !serial.contains(marker) {
+        if !run.serial.contains(marker) {
             return Err(format!("{name} {label} QEMU exited without the {marker} serial marker"));
         }
     }
     Ok(())
+}
+
+/// Everything one bounded QEMU run produced. `status` is `None` on timeout.
+struct QemuRun {
+    status: Option<ExitStatus>,
+    serial: String,
+    diagnostics: String,
+}
+
+/// Runs QEMU with its serial log captured and a hard time bound.
+///
+/// Both pipes are drained by their own thread. A guest that outruns the 64 KiB
+/// pipe buffer would otherwise block on its own serial writes and be reported
+/// as a hang, and killing the child closes the pipes so the readers finish.
+fn run_qemu_captured(
+    mut command: Command,
+    binary: &str,
+    timeout: Duration,
+) -> Result<QemuRun, String> {
+    let mut child = command
+        .arg("-serial")
+        .arg("stdio")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to start {binary}: {error}"))?;
+    let serial = drain(child.stdout.take().expect("stdout was piped"));
+    let diagnostics = drain(child.stderr.take().expect("stderr was piped"));
+
+    let status = wait_with_timeout(&mut child, timeout)?;
+    let serial = serial.join().map_err(|_| "serial reader thread panicked".to_string())?;
+    let diagnostics =
+        diagnostics.join().map_err(|_| "diagnostic reader thread panicked".to_string())?;
+    Ok(QemuRun { status, serial, diagnostics })
+}
+
+/// Reads one child pipe to end-of-file on its own thread.
+fn drain(mut source: impl Read + Send + 'static) -> thread::JoinHandle<String> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = source.read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
+}
+
+/// The per-run QEMU time bound, overridable for slow emulated hosts.
+fn smoke_timeout() -> Duration {
+    env::var("MOLT_SMOKE_TIMEOUT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map_or(SMOKE_TIMEOUT, Duration::from_secs)
 }
 
 struct Images {
@@ -215,6 +260,9 @@ fn build_kernel(target: &str, case: Case) -> Result<PathBuf, String> {
 
 fn run_qemu_interactive(image: &Path) -> Result<(), String> {
     let status = qemu_x86_64_command(image)
+        // An interactive session keeps the machine alive after a guest reset so
+        // the monitor can still inspect it; a smoke run must exit instead.
+        .arg("-no-shutdown")
         .arg("-serial")
         .arg("mon:stdio")
         .status()
@@ -228,11 +276,14 @@ fn qemu_x86_64_command(image: &Path) -> Command {
     if let Some(firmware) = env::var_os("MOLT_QEMU_FIRMWARE") {
         command.arg("-L").arg(firmware);
     }
+    // `-no-shutdown` is deliberately absent: it makes QEMU *stop* rather than
+    // exit when the guest requests a reset, so a triple fault during boot turns
+    // into an unkillable hang with no serial log instead of a reported failure.
+    // The interactive `boot` path adds it back, where a monitor can use it.
     command.args([
         "-display",
         "none",
         "-no-reboot",
-        "-no-shutdown",
         "-device",
         "isa-debug-exit,iobase=0xf4,iosize=0x04",
         "-drive",
@@ -252,18 +303,19 @@ fn qemu_riscv64_command(kernel: &Path) -> Command {
     command
 }
 
-fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<ExitStatus, String> {
+/// Waits for `child`, killing it and reporting `None` once `timeout` elapses.
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<Option<ExitStatus>, String> {
     let started = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
+            Ok(Some(status)) => return Ok(Some(status)),
             Ok(None) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(25)),
             Ok(None) => {
                 child
                     .kill()
                     .map_err(|error| format!("QEMU timed out and could not be killed: {error}"))?;
                 let _ = child.wait();
-                return Err(format!("QEMU did not exit within {}s", timeout.as_secs()));
+                return Ok(None);
             }
             Err(error) => {
                 return Err(format!("failed while waiting for QEMU: {error}"));
