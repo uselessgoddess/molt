@@ -1,5 +1,5 @@
 use molt_arch::audit::{Audit, Contents, Leaf, MappedRange, PageWalk};
-use molt_arch::{FRAME_SIZE, ImageSection, MappingError, PageProtection};
+use molt_arch::{Cache, FRAME_SIZE, ImageSection, MappingError, PageProtection};
 
 const TEXT: u64 = 0x8020_0000;
 const RODATA: u64 = 0x8020_2000;
@@ -133,4 +133,27 @@ fn image_span_without_named_sections_still_enforces_wx() {
         Contents::Image.verify(Leaf::new(TEXT, 2 * 1024 * 1024, read_execute())),
         Err(MappingError::Granularity)
     );
+}
+
+#[test]
+fn cacheable_device_window_is_caught() {
+    let uart = 0x1000_0000;
+    let ranges = [MappedRange::device(uart, uart + FRAME_SIZE)];
+    let audit = Audit::new(&ranges);
+    let device = read_write().cached(Cache::Device);
+
+    assert_eq!(audit.cover(&Table(vec![Leaf::new(uart, FRAME_SIZE, device)])), Ok(()));
+    assert_eq!(
+        audit.cover(&Table(vec![Leaf::new(uart, FRAME_SIZE, read_write())])),
+        Err(MappingError::Cacheability),
+        "a platform that never reports its memory type does not pass an MMIO audit"
+    );
+}
+
+#[test]
+fn executable_device_window_is_caught() {
+    let uart = 0x1000_0000;
+    let leaf = Leaf::new(uart, FRAME_SIZE, read_execute().cached(Cache::Device));
+
+    assert_eq!(Contents::Device.verify(leaf), Err(MappingError::Permissions));
 }

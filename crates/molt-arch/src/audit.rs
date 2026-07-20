@@ -12,6 +12,7 @@
 //! inward one: nothing else is mapped at all, and no large leaf reaches past
 //! the range it belongs to. Firmware-owned tables can only afford the first.
 
+use crate::memory::{Kind, Rights};
 use crate::{FRAME_SIZE, ImageSection, MappingError, PageProtection};
 
 /// One leaf entry of a live translation table: what it covers and what it grants.
@@ -63,6 +64,10 @@ pub enum Contents {
     /// Free RAM: readable and writable, never executable. A megapage leaf is
     /// welcome here — the whole range carries one set of rights.
     Ram,
+    /// An MMIO window: never executable, and never cacheable. A leaf whose
+    /// platform does not report its memory type reads back as write-back and
+    /// fails here, which is the direction an unaudited attribute should fail.
+    Device,
 }
 
 impl Contents {
@@ -86,6 +91,17 @@ impl Contents {
                 if granted.is_read() { Ok(()) } else { Err(MappingError::Permissions) }
             }
             Self::Ram => ImageSection::Data.verify(granted),
+            Self::Device => {
+                let rights = match Rights::new(
+                    granted.is_read(),
+                    granted.is_write(),
+                    granted.is_execute(),
+                ) {
+                    Ok(rights) => rights,
+                    Err(error) => return Err(error),
+                };
+                Kind::Device.allows(rights, granted.cache())
+            }
         }
     }
 }
@@ -113,6 +129,10 @@ impl MappedRange {
 
     pub const fn ram(start: u64, end: u64) -> Self {
         Self::new(start, end, Contents::Ram)
+    }
+
+    pub const fn device(start: u64, end: u64) -> Self {
+        Self::new(start, end, Contents::Device)
     }
 
     pub const fn start(self) -> u64 {
