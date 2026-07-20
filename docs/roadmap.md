@@ -41,11 +41,6 @@ Acceptance: the kernel boots without polling for device work, completes timer
 futures through a ring, recovers a test cell without accepting stale results,
 and passes all host/QEMU tests with no unreviewed unsafe block.
 
-The remaining unchecked item requires a run on the named physical machine. Its
-reproducible procedure and result fields live in the
-[hardware validation record](hardware/amd-ryzen-9-9900x-gigabyte.md); no
-successful hardware run is claimed before those fields are completed.
-
 ## Stage 1.5 — Hardening before Stage 2 (`P0-stage-1.5`)
 
 Stage 2 adds drivers, DMA, and a filesystem on top of these primitives. Each

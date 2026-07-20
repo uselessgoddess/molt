@@ -18,24 +18,12 @@ kernel orchestration contains no port I/O or bootloader-specific types.
 > safety risk, but a single address space does not contain unsafe code, DMA,
 > logic errors, or malicious components. See [the architecture notes](docs/architecture.md).
 
-## Repository layout
-
-```text
-crates/molt-arch/          boot and hardware contracts; no platform implementation
-crates/molt-core/          no_std rings, executor, capabilities, and supervised cells
-crates/platforms/x86_64/   x86_64 boot, exceptions, paging, local APIC, UART, and exit
-crates/platforms/riscv/    RISC-V SBI console and shutdown implementation
-kernel/                    architecture-independent kernel orchestration
-xtask/                     reproducible image builder and QEMU smoke runner
-docs/                      architecture, roadmap, testing strategy, and style
-```
-
 ## Prerequisites
 
 - [rustup](https://rustup.rs/) (the pinned toolchain is installed automatically)
 - [just](https://just.systems/) and
   [cargo-nextest](https://nexte.st/) for the development command suite
-- `qemu-system-x86_64` for `boot` and `smoke`
+- `qemu-system-*` for `boot` and `smoke`
 
 The dated nightly in `rust-toolchain.toml` is intentional: `bootloader` builds
 custom BIOS stages and depends on nightly compiler details. Host tests and the
@@ -68,12 +56,6 @@ Run the ring microbenchmarks with:
 ```console
 just bench
 ```
-
-To try real hardware, follow the
-[Stage 1 hardware validation record](docs/hardware/amd-ryzen-9-9900x-gigabyte.md).
-Double-check the target device: imaging a disk overwrites its partition table.
-The automated path is continuously smoke-tested in QEMU; the named-machine
-result remains explicitly recorded as pending until it is run by its owner.
 
 ## Design status
 
