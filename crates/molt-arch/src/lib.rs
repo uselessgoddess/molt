@@ -214,20 +214,24 @@ impl ImageSection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MapPermissions {
     write: bool,
-    exec: bool,
+    execute: bool,
 }
 
 impl MapPermissions {
     pub const fn new(write: bool, exec: bool) -> Result<Self, MappingError> {
-        if write && exec { Err(MappingError::WritableExecutable) } else { Ok(Self { write, exec }) }
+        if write && exec {
+            Err(MappingError::WritableExecutable)
+        } else {
+            Ok(Self { write, execute: exec })
+        }
     }
 
     pub const fn is_write(self) -> bool {
         self.write
     }
 
-    pub const fn is_exec(self) -> bool {
-        self.exec
+    pub const fn is_execute(self) -> bool {
+        self.execute
     }
 }
 

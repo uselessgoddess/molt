@@ -89,7 +89,7 @@ impl<'m, 't> OwnedPage<'m, 't> {
         if permissions.is_write() {
             flags |= PageTableFlags::WRITABLE;
         }
-        if permissions.is_exec() {
+        if permissions.is_execute() {
             flags.remove(PageTableFlags::NO_EXECUTE);
         }
         // SAFETY: TEST_PAGE is a dedicated, otherwise-unused virtual page and `frame` is a fresh

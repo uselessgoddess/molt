@@ -69,5 +69,5 @@ fn executable_data_is_rejected() {
 fn write_exec_mappings_rejected() {
     assert_eq!(MapPermissions::new(true, true), Err(MappingError::WritableExecutable));
     assert!(MapPermissions::new(true, false).unwrap().is_write());
-    assert!(MapPermissions::new(false, true).unwrap().is_exec());
+    assert!(MapPermissions::new(false, true).unwrap().is_execute());
 }

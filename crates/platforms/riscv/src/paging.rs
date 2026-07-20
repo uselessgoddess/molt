@@ -143,7 +143,7 @@ pub fn verify_owned_mapping(boot_info: &BootInfo<'_>) -> Result<(), PlatformErro
     if permissions.is_write() {
         leaf |= PTE_R | PTE_W;
     }
-    if permissions.is_exec() {
+    if permissions.is_execute() {
         leaf |= PTE_X;
     }
 
