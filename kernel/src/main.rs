@@ -55,6 +55,9 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     platform.verify_owned_mapping(boot_info).expect("owned W^X mapping probe");
     println!(platform, "MOLT_MAPPING_OK");
 
+    platform.verify_image_protection(boot_info).expect("kernel image obeys W^X");
+    println!(platform, "MOLT_WX_OK");
+
     run_timer_future(platform);
     println!(platform, "MOLT_TIMER_OK");
 

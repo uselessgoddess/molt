@@ -1,10 +1,14 @@
+use core::sync::atomic::AtomicU8;
+
 use molt_arch::{
-    BootInfo, FrameAllocator as BootFrameAllocator, MapPermissions, MappingError, PlatformError,
+    BootInfo, FrameAllocator as BootFrameAllocator, ImageSection, MapPermissions, MappingError,
+    PageProtection, PlatformError,
 };
 use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::mapper::MapToError;
+use x86_64::structures::paging::mapper::{MapToError, TranslateResult};
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
+    Translate,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -23,6 +27,37 @@ pub fn verify_owned_mapping(boot_info: &BootInfo<'_>) -> Result<(), PlatformErro
     let mut mapping = OwnedPage::map(&mut mapper, &mut frames, page, permissions)?;
     mapping.write_and_verify(0x4d4f_4c54_5f57_585e)?;
     drop(mapping);
+    Ok(())
+}
+
+static RODATA_PROBE: u8 = 0x4d;
+static DATA_PROBE: AtomicU8 = AtomicU8::new(0);
+
+pub fn verify_image_protection(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+    let offset = boot_info.physical_offset().ok_or(PlatformError::MissingPhysicalMemoryMap)?;
+    // SAFETY: single-core boot, and the bootloader's direct map covers every
+    // physical page-table frame.
+    let level_4 = unsafe { active_level_4_table(VirtAddr::new(offset)) };
+    // SAFETY: `level_4` is the active table and `offset` is its complete direct map.
+    let mapper = unsafe { OffsetPageTable::new(level_4, VirtAddr::new(offset)) };
+
+    let probes = [
+        (ImageSection::Text, verify_image_protection as *const () as usize),
+        (ImageSection::Rodata, (&raw const RODATA_PROBE) as usize),
+        (ImageSection::Data, (&raw const DATA_PROBE) as usize),
+    ];
+    for (section, address) in probes {
+        let TranslateResult::Mapped { flags, .. } = mapper.translate(VirtAddr::new(address as u64))
+        else {
+            return Err(PlatformError::Mapping(MappingError::Unmapped));
+        };
+        let granted = PageProtection::new(
+            flags.contains(PageTableFlags::PRESENT),
+            flags.contains(PageTableFlags::WRITABLE),
+            !flags.contains(PageTableFlags::NO_EXECUTE),
+        );
+        section.verify(granted).map_err(PlatformError::Mapping)?;
+    }
     Ok(())
 }
 
@@ -51,10 +86,10 @@ impl<'m, 't> OwnedPage<'m, 't> {
         let frame =
             frames.allocate_frame().ok_or(PlatformError::Mapping(MappingError::OutOfFrames))?;
         let mut flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
-        if permissions.is_writable() {
+        if permissions.is_write() {
             flags |= PageTableFlags::WRITABLE;
         }
-        if permissions.is_executable() {
+        if permissions.is_exec() {
             flags.remove(PageTableFlags::NO_EXECUTE);
         }
         // SAFETY: TEST_PAGE is a dedicated, otherwise-unused virtual page and `frame` is a fresh
