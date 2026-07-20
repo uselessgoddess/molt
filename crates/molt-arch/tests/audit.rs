@@ -1,0 +1,139 @@
+//! The address-space audit judged against tables built to be wrong.
+
+use molt_arch::audit::{Audit, Contents, Leaf, MappedRange, PageWalk};
+use molt_arch::{FRAME_SIZE, ImageSection, MappingError, PageProtection};
+
+const TEXT: u64 = 0x8020_0000;
+const RODATA: u64 = 0x8020_2000;
+const RAM: u64 = 0x8040_0000;
+
+fn read_execute() -> PageProtection {
+    PageProtection::new(true, false, true)
+}
+
+fn read_only() -> PageProtection {
+    PageProtection::new(true, false, false)
+}
+
+fn read_write() -> PageProtection {
+    PageProtection::new(true, true, false)
+}
+
+/// A page table spelled out leaf by leaf, so a test can build a broken one.
+struct Table(Vec<Leaf>);
+
+impl PageWalk for Table {
+    fn leaf(&self, address: u64) -> Option<Leaf> {
+        self.0.iter().copied().find(|leaf| leaf.start() <= address && address < leaf.end())
+    }
+}
+
+/// `.text` and `.rodata`, one 4 KiB leaf each, mapped as they should be.
+fn image() -> Vec<Leaf> {
+    vec![
+        Leaf::new(TEXT, FRAME_SIZE, read_execute()),
+        Leaf::new(TEXT + FRAME_SIZE, FRAME_SIZE, read_execute()),
+        Leaf::new(RODATA, FRAME_SIZE, read_only()),
+    ]
+}
+
+fn image_ranges() -> [MappedRange; 2] {
+    [
+        MappedRange::section(ImageSection::Text, TEXT, RODATA),
+        MappedRange::section(ImageSection::Rodata, RODATA, RODATA + FRAME_SIZE),
+    ]
+}
+
+#[test]
+fn a_correct_image_passes_the_audit() {
+    let ranges = image_ranges();
+    let audit = Audit::new(&ranges);
+    let table = Table(image());
+
+    assert_eq!(audit.cover(&table), Ok(()));
+    for leaf in table.0.iter().copied() {
+        assert_eq!(audit.accepts(leaf), Ok(()));
+    }
+}
+
+#[test]
+fn a_writable_page_between_correct_probes_is_caught() {
+    let ranges = image_ranges();
+    let mut leaves = image();
+    // Exactly what probing `__text_start` and `__text_end - 1` would miss.
+    leaves[1] = Leaf::new(TEXT + FRAME_SIZE, FRAME_SIZE, PageProtection::new(true, true, true));
+    let table = Table(leaves);
+
+    assert_eq!(Audit::new(&ranges).cover(&table), Err(MappingError::WritableExecutable));
+}
+
+#[test]
+fn a_hole_in_a_declared_range_is_caught() {
+    let ranges = image_ranges();
+    let mut leaves = image();
+    leaves.remove(1);
+    let table = Table(leaves);
+
+    assert_eq!(Audit::new(&ranges).cover(&table), Err(MappingError::Unmapped));
+}
+
+#[test]
+fn a_megapage_over_image_sections_is_caught() {
+    let ranges = image_ranges();
+    // One 2 MiB leaf cannot hold `.text` and `.rodata` at once, so mapping the
+    // image with it hands `.rodata` execute rights.
+    let table = Table(vec![Leaf::new(TEXT, 2 * 1024 * 1024, read_execute())]);
+
+    assert_eq!(Audit::new(&ranges).cover(&table), Err(MappingError::Granularity));
+}
+
+#[test]
+fn free_ram_may_use_megapages_but_never_execute() {
+    let megapage = 2 * 1024 * 1024;
+    let ranges = [MappedRange::ram(RAM, RAM + megapage)];
+    let audit = Audit::new(&ranges);
+
+    assert_eq!(audit.cover(&Table(vec![Leaf::new(RAM, megapage, read_write())])), Ok(()));
+    assert_eq!(
+        audit.cover(&Table(vec![Leaf::new(RAM, megapage, PageProtection::new(true, true, true))])),
+        Err(MappingError::WritableExecutable)
+    );
+}
+
+#[test]
+fn a_megapage_reaching_past_its_range_is_caught() {
+    let ranges = [MappedRange::ram(RAM, RAM + FRAME_SIZE)];
+    let leaf = Leaf::new(RAM, 2 * 1024 * 1024, read_write());
+
+    assert_eq!(Audit::new(&ranges).accepts(leaf), Err(MappingError::Straddling));
+}
+
+#[test]
+fn a_mapping_nobody_declared_is_caught() {
+    let ranges = image_ranges();
+    // A reserved or firmware range mapped read/write is exactly this shape.
+    let stray = Leaf::new(0x1000_0000, FRAME_SIZE, read_write());
+
+    assert_eq!(Audit::new(&ranges).accepts(stray), Err(MappingError::Unexpected));
+}
+
+#[test]
+fn an_image_span_without_named_sections_still_enforces_wx() {
+    let ranges = [MappedRange::image(TEXT, TEXT + FRAME_SIZE)];
+    let audit = Audit::new(&ranges);
+
+    assert_eq!(audit.cover(&Table(vec![Leaf::new(TEXT, FRAME_SIZE, read_execute())])), Ok(()));
+    assert_eq!(audit.cover(&Table(vec![Leaf::new(TEXT, FRAME_SIZE, read_write())])), Ok(()));
+    assert_eq!(
+        audit.cover(&Table(vec![Leaf::new(
+            TEXT,
+            FRAME_SIZE,
+            PageProtection::new(true, true, true)
+        )])),
+        Err(MappingError::WritableExecutable)
+    );
+    assert_eq!(
+        Contents::Image.verify(Leaf::new(TEXT, 2 * 1024 * 1024, read_execute())),
+        Err(MappingError::Granularity)
+    );
+}
