@@ -17,8 +17,8 @@ pub use bootloader_api::{
     BootInfo as BootloaderInfo, BootloaderConfig, entry_point as __bootloader_entry_point,
 };
 use molt_arch::{
-    BootInfo, ExitStatus, MemoryMap, MemoryRegion, MemoryRegionKind, Platform, PlatformError,
-    SerialPort,
+    BootInfo, ExitStatus, ImageRange, MemoryMap, MemoryRegion, MemoryRegionKind, Platform,
+    PlatformError, SerialPort,
 };
 
 /// Defines the bootloader-specific entry wrapper outside `molt-kernel`.
@@ -43,7 +43,9 @@ macro_rules! entry_point {
 pub fn start(raw: &'static mut BootloaderInfo, kernel: fn(BootInfo<'_>, &mut X86_64) -> !) -> ! {
     let memory_map = BootloaderMemoryMap::new(&raw.memory_regions);
     let physical_memory_offset = raw.physical_memory_offset.as_ref().copied();
-    let boot_info = BootInfo::new(&memory_map, physical_memory_offset);
+    let kernel_image = ImageRange::new(raw.kernel_image_offset, raw.kernel_len);
+    let boot_info =
+        BootInfo::new(&memory_map, physical_memory_offset).with_kernel_image(kernel_image);
     let mut platform = X86_64::new();
     kernel(boot_info, &mut platform)
 }

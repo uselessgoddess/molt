@@ -2,6 +2,8 @@
 
 //! Hardware-independent contracts shared by the kernel and architecture crates.
 
+pub mod audit;
+
 use core::fmt;
 
 /// Architecture-neutral information passed from a platform boot adapter.
@@ -9,11 +11,18 @@ use core::fmt;
 pub struct BootInfo<'boot> {
     memory_map: &'boot dyn MemoryMap,
     physical_offset: Option<u64>,
+    kernel_image: Option<ImageRange>,
 }
 
 impl<'boot> BootInfo<'boot> {
     pub const fn new(memory_map: &'boot dyn MemoryMap, physical_offset: Option<u64>) -> Self {
-        Self { memory_map, physical_offset }
+        Self { memory_map, physical_offset, kernel_image: None }
+    }
+
+    /// Attaches the virtual range the loader placed the kernel image at.
+    pub const fn with_kernel_image(mut self, image: ImageRange) -> Self {
+        self.kernel_image = Some(image);
+        self
     }
 
     pub const fn memory_map(&self) -> &'boot dyn MemoryMap {
@@ -23,11 +32,46 @@ impl<'boot> BootInfo<'boot> {
     pub const fn physical_offset(&self) -> Option<u64> {
         self.physical_offset
     }
+
+    /// The kernel image's live virtual range, when the loader reports it.
+    pub const fn kernel_image(&self) -> Option<ImageRange> {
+        self.kernel_image
+    }
+}
+
+/// Where a loader placed the kernel image once translation was set up.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageRange {
+    start: u64,
+    len: u64,
+}
+
+impl ImageRange {
+    pub const fn new(start: u64, len: u64) -> Self {
+        Self { start, len }
+    }
+
+    pub const fn start(self) -> u64 {
+        self.start
+    }
+
+    pub const fn len(self) -> u64 {
+        self.len
+    }
+
+    pub const fn end(self) -> u64 {
+        self.start.saturating_add(self.len)
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
 }
 
 /// Read-only physical memory map supplied by a platform boot adapter.
 pub trait MemoryMap {
     fn len(&self) -> usize;
+
     fn region(&self, index: usize) -> Option<MemoryRegion>;
 
     fn is_empty(&self) -> bool {
@@ -90,9 +134,91 @@ impl PhysicalFrame {
     }
 }
 
-/// Allocation-free iterator over firmware regions marked usable.
-pub struct FrameAllocator<'map> {
-    map: &'map dyn MemoryMap,
+fn align_down(value: u64, alignment: u64) -> u64 {
+    value & !(alignment - 1)
+}
+
+fn align_up(value: u64, alignment: u64) -> Option<u64> {
+    value.checked_add(alignment - 1).map(|value| value & !(alignment - 1))
+}
+
+/// A page-aligned span of physical memory the firmware reported as usable.
+///
+/// Alignment goes inward — the start rounds up, the end rounds down — so a
+/// range never claims a byte the firmware did not hand out. A region that is
+/// too small or too badly aligned to hold a whole frame disappears instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UsableRange {
+    start: u64,
+    end: u64,
+}
+
+impl UsableRange {
+    /// The frames of `region` that lie at or above `floor`, or `None` when the
+    /// region is not usable RAM, or holds no whole frame above the floor.
+    pub fn of(region: MemoryRegion, floor: u64) -> Option<Self> {
+        if region.kind() != MemoryRegionKind::Usable {
+            return None;
+        }
+        let start = align_up(region.start().max(floor), FRAME_SIZE)?;
+        let end = align_down(region.end(), FRAME_SIZE);
+        if start + FRAME_SIZE <= end { Some(Self { start, end }) } else { None }
+    }
+
+    pub const fn start(self) -> u64 {
+        self.start
+    }
+
+    pub const fn end(self) -> u64 {
+        self.end
+    }
+
+    pub const fn len(self) -> u64 {
+        self.end - self.start
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.start >= self.end
+    }
+}
+
+/// The usable RAM of a memory map above a floor, one aligned range at a time.
+///
+/// The frame allocator hands out frames from this iterator and the boot page
+/// tables map exactly what it yields, so the memory the kernel writes to and
+/// the memory it maps cannot drift apart. The floor is what keeps the loaded
+/// image, and everything the firmware put below it, out of both.
+pub struct UsableRegions<'m> {
+    map: &'m dyn MemoryMap,
+    region: usize,
+    floor: u64,
+}
+
+impl<'m> UsableRegions<'m> {
+    pub const fn above(map: &'m dyn MemoryMap, floor: u64) -> Self {
+        Self { map, region: 0, floor }
+    }
+}
+
+impl Iterator for UsableRegions<'_> {
+    type Item = UsableRange;
+
+    fn next(&mut self) -> Option<UsableRange> {
+        while self.region < self.map.len() {
+            let region = self.map.region(self.region);
+            self.region += 1;
+            if let Some(range) = region.and_then(|region| UsableRange::of(region, self.floor)) {
+                return Some(range);
+            }
+        }
+        None
+    }
+}
+
+/// Allocation-free bump allocator over the usable ranges of a memory map.
+pub struct FrameAllocator<'m> {
+    map: &'m dyn MemoryMap,
+    floor: u64,
     region: usize,
     next: u64,
 }
@@ -104,48 +230,51 @@ pub struct FrameAllocator<'map> {
 /// Restarting it would hand out the frames the first pass already owns.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameCursor {
+    floor: u64,
     region: usize,
     next: u64,
 }
 
 impl<'map> FrameAllocator<'map> {
     pub const fn new(map: &'map dyn MemoryMap) -> Self {
-        Self { map, region: 0, next: 0 }
+        Self::above(map, 0)
+    }
+
+    /// Hands out frames from usable RAM at or above `floor`.
+    ///
+    /// A platform whose firmware reports the RAM its own image sits in as
+    /// usable passes the end of that image, so the allocator cannot hand back
+    /// a frame the kernel is running from.
+    pub const fn above(map: &'map dyn MemoryMap, floor: u64) -> Self {
+        Self { map, floor, region: 0, next: 0 }
     }
 
     /// Resumes allocation over `map` from a cursor an earlier allocator left.
     pub const fn resume(map: &'map dyn MemoryMap, cursor: FrameCursor) -> Self {
-        Self { map, region: cursor.region, next: cursor.next }
+        Self { map, floor: cursor.floor, region: cursor.region, next: cursor.next }
     }
 
     pub const fn cursor(&self) -> FrameCursor {
-        FrameCursor { region: self.region, next: self.next }
+        FrameCursor { floor: self.floor, region: self.region, next: self.next }
     }
 
     pub fn allocate(&mut self) -> Option<PhysicalFrame> {
-        fn align_up(value: u64, alignment: u64) -> Option<u64> {
-            value.checked_add(alignment - 1).map(|value| value & !(alignment - 1))
-        }
-
         while self.region < self.map.len() {
-            let Some(region) = self.map.region(self.region) else {
-                self.region += 1;
-                self.next = 0;
-                continue;
-            };
-            if region.kind() != MemoryRegionKind::Usable {
-                self.region += 1;
-                self.next = 0;
-                continue;
-            }
-            if self.next == 0 {
-                self.next = align_up(region.start(), FRAME_SIZE)?;
-            }
-            let end = self.next.checked_add(FRAME_SIZE)?;
-            if end <= region.end() {
-                let frame = PhysicalFrame(self.next);
-                self.next = end;
-                return Some(frame);
+            let range = self.map.region(self.region).and_then(|region| {
+                // The same aligned view of usable memory the boot page tables
+                // map, so a handed-out frame is always a mapped frame.
+                UsableRange::of(region, self.floor)
+            });
+            if let Some(range) = range {
+                // A cursor below the range means allocation in it has not
+                // started; every range starts at least one frame above zero.
+                self.next = self.next.max(range.start());
+                let end = self.next.checked_add(FRAME_SIZE)?;
+                if end <= range.end() {
+                    let frame = PhysicalFrame(self.next);
+                    self.next = end;
+                    return Some(frame);
+                }
             }
             self.region += 1;
             self.next = 0;
@@ -164,6 +293,14 @@ pub enum MappingError {
     Unmapped,
     /// The granted rights do not match what the section is allowed to hold.
     Permissions,
+    /// A leaf reaches past the range it maps, so it also covers memory that
+    /// was declared with different rights.
+    Straddling,
+    /// The leaf is coarser than the range allows: one 2 MiB leaf cannot give
+    /// `.text` and `.rodata` the different rights each of them needs.
+    Granularity,
+    /// A translation exists where the kernel declared no mapping at all.
+    Unexpected,
 }
 
 /// The rights a live translation table actually grants a virtual address.
@@ -175,12 +312,28 @@ pub enum MappingError {
 pub struct PageProtection {
     read: bool,
     write: bool,
-    exec: bool,
+    execute: bool,
 }
 
 impl PageProtection {
-    pub const fn new(read: bool, write: bool, exec: bool) -> Self {
-        Self { read, write, exec }
+    pub const fn new(read: bool, write: bool, execute: bool) -> Self {
+        Self { read, write, execute }
+    }
+
+    pub const fn is_read(self) -> bool {
+        self.read
+    }
+
+    pub const fn is_write(self) -> bool {
+        self.write
+    }
+
+    pub const fn is_execute(self) -> bool {
+        self.execute
+    }
+
+    pub const fn into_parts(self) -> (bool, bool, bool) {
+        (self.read, self.write, self.execute)
     }
 }
 
@@ -198,13 +351,16 @@ pub enum ImageSection {
 impl ImageSection {
     /// Checks one section's live rights against the W^X policy.
     pub const fn verify(self, granted: PageProtection) -> Result<(), MappingError> {
-        if granted.write && granted.exec {
+        let (read, write, execute) = granted.into_parts();
+
+        if write && execute {
             return Err(MappingError::WritableExecutable);
         }
+
         let expected = match self {
-            Self::Text => granted.read && granted.exec,
-            Self::Rodata => granted.read && !granted.write && !granted.exec,
-            Self::Data => granted.read && granted.write,
+            Self::Text => read && execute,
+            Self::Rodata => read && !write && !execute,
+            Self::Data => read && write,
         };
         if expected { Ok(()) } else { Err(MappingError::Permissions) }
     }

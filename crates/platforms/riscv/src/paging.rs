@@ -5,21 +5,24 @@
 //! `.data` was executable, so the W^X contract `MapPermissions` enforces on
 //! x86_64 held nowhere on RISC-V. [`init`] instead walks the linker-exported
 //! section bounds and gives each span exactly the rights it needs — `.text`
-//! read/execute, `.rodata` read-only, everything writable from `.data` to the
-//! end of RAM read/write — so a stray write to code or a jump into data faults.
+//! read/execute, `.rodata` read-only, `.data`/`.bss`/boot stack read/write up
+//! to `__kernel_end`, and only firmware-declared usable RAM above that as free
+//! RAM. Reserved regions, firmware, and MMIO holes get no mapping at all.
 //!
 //! Two checks are built on top of it. [`verify_owned_mapping`] maps one private
 //! page with [`MapPermissions`]-derived flags and round-trips a value through
 //! the MMU. [`verify_image_protection`] reads the live page tables back and
-//! confirms each section still holds the rights it was mapped with, which is
-//! the check that would have failed against the old gigapage.
+//! walks every declared range, confirming each page holds the rights it was
+//! mapped with — the check that would have failed against the old gigapage,
+//! and that a probe of a handful of addresses would have missed.
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
 
+use molt_arch::audit::{Audit, Leaf, MappedRange, PageWalk};
 use molt_arch::{
     BootInfo, FrameAllocator, FrameCursor, ImageSection, MapPermissions, MappingError,
-    PageProtection, PhysicalFrame, PlatformError,
+    PageProtection, PhysicalFrame, PlatformError, UsableRegions,
 };
 
 /// Sv39 page-table entry flags.
@@ -52,8 +55,40 @@ unsafe extern "C" {
     static __rodata_start: u8;
     static __rodata_end: u8;
     static __data_start: u8;
-    static __molt_stack_top: u8;
     static __kernel_end: u8;
+}
+
+/// The largest number of usable free-RAM ranges the audit stores inline.
+///
+/// The QEMU `virt` build exposes one contiguous span, and no plausible RISC-V
+/// board grows this to double digits; growing it here is a one-line change.
+const MAX_RAM_RANGES: usize = 8;
+
+/// Every mapped range the boot address space declares, in one array so
+/// [`verify_image_protection`] can hand them to a portable audit.
+struct MappingLog {
+    ranges: [MappedRange; 3 + MAX_RAM_RANGES],
+    len: usize,
+}
+
+impl MappingLog {
+    const fn new() -> Self {
+        const EMPTY: MappedRange = MappedRange::section(ImageSection::Text, 0, 0);
+        Self { ranges: [EMPTY; 3 + MAX_RAM_RANGES], len: 0 }
+    }
+
+    fn push(&mut self, range: MappedRange) -> Result<(), PlatformError> {
+        if self.len >= self.ranges.len() {
+            return Err(PlatformError::Mapping(MappingError::Backend));
+        }
+        self.ranges[self.len] = range;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn as_slice(&self) -> &[MappedRange] {
+        &self.ranges[..self.len]
+    }
 }
 
 /// Address of a linker-defined symbol.
@@ -68,6 +103,8 @@ struct BootPaging {
     root: *mut u64,
     /// Where frame allocation stopped, so a probe does not reissue a table frame.
     cursor: FrameCursor,
+    /// Every mapped range, in the order [`init`] built them.
+    log: MappingLog,
 }
 
 struct Active(UnsafeCell<Option<BootPaging>>);
@@ -86,23 +123,60 @@ fn active() -> Result<&'static mut BootPaging, PlatformError> {
 }
 
 /// Builds the per-section boot address space and enables Sv39 translation.
+///
+/// Free RAM is mapped only for firmware-reported usable regions above the
+/// image, so reserved ranges, firmware, and MMIO holes get no S-mode mapping
+/// at all. The paging tables and the frame allocator see the same set of
+/// pages because [`UsableRegions`] and [`FrameAllocator::above`] share a floor.
 pub fn init(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
-    let mut frames = FrameAllocator::new(boot_info.memory_map());
+    let kernel_end = bound!(__kernel_end) as u64;
+    let mut frames = FrameAllocator::above(boot_info.memory_map(), kernel_end);
     let root = alloc_table(&mut frames)?;
 
+    let mut log = MappingLog::new();
     // Identity mappings throughout: `satp` is enabled from code that is running
     // at its physical address, so any virtual-to-physical shift would fault on
     // the instruction right after the `csrw`.
     //
     // The OpenSBI region below the payload address is deliberately left out: it
     // is M-mode firmware, and nothing in S-mode has any business reaching it.
-    map_range(root, &mut frames, bound!(__text_start), bound!(__text_end), PTE_R | PTE_X)?;
-    map_range(root, &mut frames, bound!(__rodata_start), bound!(__rodata_end), PTE_R)?;
-    // `.data`, `.bss`, and the boot stack are one writable span, and the free
-    // RAM after the image carries the same rights: page-table frames come out
-    // of it, so it must stay reachable once translation is on.
-    let writable_end = usize::try_from(ram_end(boot_info)).unwrap_or(bound!(__kernel_end));
-    map_range(root, &mut frames, bound!(__data_start), writable_end, PTE_R | PTE_W)?;
+    map_section(
+        root,
+        &mut frames,
+        &mut log,
+        ImageSection::Text,
+        bound!(__text_start),
+        bound!(__text_end),
+    )?;
+    map_section(
+        root,
+        &mut frames,
+        &mut log,
+        ImageSection::Rodata,
+        bound!(__rodata_start),
+        bound!(__rodata_end),
+    )?;
+    // `.data`, `.bss`, and the boot stack are one writable span that stops at
+    // `__kernel_end`. Free RAM above it is mapped separately, once per usable
+    // region: mapping through firmware or MMIO holes is exactly what an audit
+    // would flag next.
+    map_section(
+        root,
+        &mut frames,
+        &mut log,
+        ImageSection::Data,
+        bound!(__data_start),
+        bound!(__kernel_end),
+    )?;
+
+    for range in UsableRegions::above(boot_info.memory_map(), kernel_end) {
+        let start = usize::try_from(range.start())
+            .map_err(|_| PlatformError::Mapping(MappingError::InvalidAddress))?;
+        let end = usize::try_from(range.end())
+            .map_err(|_| PlatformError::Mapping(MappingError::InvalidAddress))?;
+        map_range(root, &mut frames, start, end, PTE_R | PTE_W, Granularity::LargeOk)?;
+        log.push(MappedRange::ram(range.start(), range.end()))?;
+    }
 
     let cursor = frames.cursor();
     // SAFETY: every address the kernel executes from, reads, or writes — code,
@@ -113,21 +187,31 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
     }
     // SAFETY: same reasoning as `active`; this runs once on the boot hart.
     unsafe {
-        *ACTIVE.0.get() = Some(BootPaging { root, cursor });
+        *ACTIVE.0.get() = Some(BootPaging { root, cursor, log });
     }
     Ok(())
 }
 
-/// One past the last usable physical byte the firmware reported.
-fn ram_end(boot_info: &BootInfo<'_>) -> u64 {
-    let map = boot_info.memory_map();
-    let mut end = 0;
-    for index in 0..map.len() {
-        if let Some(region) = map.region(index) {
-            end = end.max(region.end());
-        }
-    }
-    end
+fn map_section(
+    root: *mut u64,
+    frames: &mut FrameAllocator<'_>,
+    log: &mut MappingLog,
+    section: ImageSection,
+    start: usize,
+    end: usize,
+) -> Result<(), PlatformError> {
+    let flags = match section {
+        ImageSection::Text => PTE_R | PTE_X,
+        ImageSection::Rodata => PTE_R,
+        ImageSection::Data => PTE_R | PTE_W,
+    };
+    map_range(root, frames, start, end, flags, Granularity::Small)?;
+    // The audit walks the range page by page and needs its aligned bounds, so
+    // it agrees with whatever [`map_range`] actually gave the MMU.
+    let aligned_start = align_down(start, PAGE_4K) as u64;
+    let aligned_end =
+        align_up(end, PAGE_4K).ok_or(PlatformError::Mapping(MappingError::InvalidAddress))? as u64;
+    log.push(MappedRange::section(section, aligned_start, aligned_end))
 }
 
 pub fn verify_owned_mapping(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
@@ -159,63 +243,136 @@ pub fn verify_owned_mapping(boot_info: &BootInfo<'_>) -> Result<(), PlatformErro
     let pointer = PROBE_VA as *mut u64;
     // SAFETY: `PROBE_VA` is now mapped present, readable, and writable to a
     // uniquely owned frame; the access is naturally aligned and volatile.
-    unsafe {
+    let outcome = unsafe {
         pointer.write_volatile(PROBE_VALUE);
         if pointer.read_volatile() != PROBE_VALUE {
-            return Err(PlatformError::Mapping(MappingError::Backend));
+            Err(PlatformError::Mapping(MappingError::Backend))
+        } else {
+            Ok(())
         }
+    };
+    // Clear the probe leaf whether the round-trip passed or not, so the audit
+    // that runs next sees exactly the ranges [`init`] declared, nothing more.
+    // SAFETY: nothing else references `PROBE_VA` after this scope, and the
+    // fence retires the stale translation before another access can hit it.
+    unsafe {
+        clear_leaf(state.root, PROBE_VA);
+        asm!("sfence.vma", options(nostack));
     }
-    Ok(())
+    outcome
 }
 
-/// A constant that must live in `.rodata` for the image audit to have a target.
-static RODATA_PROBE: u8 = 0x4d;
+/// Clears the level-0 PTE that translates `va`, if one exists.
+///
+/// # Safety
+///
+/// The caller must ensure no other thread holds a cached translation for `va`
+/// after this returns; the boot hart is single-threaded, so a following
+/// `sfence.vma` on it is enough.
+unsafe fn clear_leaf(root: *mut u64, va: usize) {
+    let mut table = root;
+    for level in (1..=2).rev() {
+        // SAFETY: `table` addresses a 512-entry table frame, identity mapped
+        // by `init`, and the index is masked to nine bits.
+        let entry = unsafe { *table.add(index(va, level)) };
+        if entry & PTE_V == 0 || entry & PTE_RWX != 0 {
+            return;
+        }
+        table = ((entry >> 10) << 12) as *mut u64;
+    }
+    // SAFETY: `table` addresses the level-0 table frame covering `va`.
+    unsafe {
+        table.add(index(va, 0)).write(0);
+    }
+}
 
-/// Reads the live tables back and checks each image section obeys W^X.
 pub fn verify_image_protection() -> Result<(), PlatformError> {
     let state = active()?;
-    let probes = [
-        // A function address rather than `__text_start`: it proves the check
-        // looks at a page the kernel is really executing from.
-        (ImageSection::Text, verify_image_protection as *const () as usize),
-        (ImageSection::Text, bound!(__text_start)),
-        (ImageSection::Text, bound!(__text_end) - 1),
-        (ImageSection::Rodata, (&raw const RODATA_PROBE) as usize),
-        (ImageSection::Rodata, bound!(__rodata_start)),
-        (ImageSection::Data, bound!(__data_start)),
-        // The boot stack shares the writable span; a non-writable stack would
-        // fault on the next call rather than at a place worth debugging.
-        (ImageSection::Data, bound!(__molt_stack_top) - 1),
-        (ImageSection::Data, bound!(__kernel_end)),
-    ];
-    for (section, address) in probes {
-        let granted = protection(state.root, address)
-            .ok_or(PlatformError::Mapping(MappingError::Unmapped))?;
-        section.verify(granted).map_err(PlatformError::Mapping)?;
+    let walk = TableWalk { root: state.root };
+    Audit::new(state.log.as_slice()).cover(&walk).map_err(PlatformError::Mapping)?;
+    // A full sweep of the live tables catches anything mapped that the kernel
+    // never declared — a stray writable range through firmware or MMIO would
+    // fail here rather than escape the outward-only check above.
+    walk_leaves(state.root, &Audit::new(state.log.as_slice()))
+}
+
+/// Walks the live translation tables and hands every present leaf to `audit`.
+fn walk_leaves(root: *const u64, audit: &Audit<'_>) -> Result<(), PlatformError> {
+    walk_table(root, 2, 0, audit)
+}
+
+fn walk_table(
+    table: *const u64,
+    level: usize,
+    base: u64,
+    audit: &Audit<'_>,
+) -> Result<(), PlatformError> {
+    let span_bits = 12 + 9 * level;
+    for i in 0..512u64 {
+        // SAFETY: `table` points at a 512-entry table frame, identity mapped
+        // read/write by `init`, and the offset is masked to nine bits.
+        let entry = unsafe { *table.add(i as usize) };
+        if entry & PTE_V == 0 {
+            continue;
+        }
+        let start = base | (i << span_bits);
+        if entry & PTE_RWX != 0 {
+            let size = 1u64 << span_bits;
+            let protection =
+                PageProtection::new(entry & PTE_R != 0, entry & PTE_W != 0, entry & PTE_X != 0);
+            audit.accepts(Leaf::new(start, size, protection)).map_err(PlatformError::Mapping)?;
+            continue;
+        }
+        // A pointer entry — walk into the child table it names.
+        if level == 0 {
+            return Err(PlatformError::Mapping(MappingError::Backend));
+        }
+        let next = ((entry >> 10) << 12) as *const u64;
+        walk_table(next, level - 1, start, audit)?;
     }
     Ok(())
 }
 
-/// Walks the live tables and reports the rights `va` actually holds.
-fn protection(root: *const u64, va: usize) -> Option<PageProtection> {
-    let mut table = root;
-    for level in (0..=2).rev() {
-        // SAFETY: `table` points at a 512-entry table frame, identity mapped
-        // read/write by `init`, and the index is masked to nine bits.
-        let entry = unsafe { *table.add(index(va, level)) };
-        if entry & PTE_V == 0 {
-            return None;
+/// [`PageWalk`] over the live Sv39 tables the kernel built.
+struct TableWalk {
+    root: *const u64,
+}
+
+impl PageWalk for TableWalk {
+    fn leaf(&self, address: u64) -> Option<Leaf> {
+        let va = usize::try_from(address).ok()?;
+        let mut table = self.root;
+        let mut level = 2;
+        loop {
+            // SAFETY: `table` points at a 512-entry Sv39 table frame — the
+            // root by construction, or a child table `init` mapped read-only
+            // through the identity map. The index is masked to nine bits.
+            let entry = unsafe { *table.add(index(va, level)) };
+            if entry & PTE_V == 0 {
+                return None;
+            }
+            if entry & PTE_RWX != 0 {
+                let span = 1u64 << (12 + 9 * level);
+                let start = address & !(span - 1);
+                return Some(Leaf::new(
+                    start,
+                    span,
+                    PageProtection::new(entry & PTE_R != 0, entry & PTE_W != 0, entry & PTE_X != 0),
+                ));
+            }
+            if level == 0 {
+                return None;
+            }
+            table = ((entry >> 10) << 12) as *const u64;
+            level -= 1;
         }
-        if entry & PTE_RWX != 0 {
-            return Some(PageProtection::new(
-                entry & PTE_R != 0,
-                entry & PTE_W != 0,
-                entry & PTE_X != 0,
-            ));
-        }
-        table = ((entry >> 10) << 12) as *const u64;
     }
-    None
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Granularity {
+    Small,
+    LargeOk,
 }
 
 fn map_range(
@@ -224,6 +381,7 @@ fn map_range(
     start: usize,
     end: usize,
     rights: u64,
+    granularity: Granularity,
 ) -> Result<(), PlatformError> {
     let mut flags = rights | PTE_A;
     if rights & PTE_W != 0 {
@@ -232,7 +390,9 @@ fn map_range(
     let mut va = align_down(start, PAGE_4K);
     let end = align_up(end, PAGE_4K).ok_or(PlatformError::Mapping(MappingError::InvalidAddress))?;
     while va < end {
-        let level = if va % PAGE_2M == 0 && end - va >= PAGE_2M { 1 } else { 0 };
+        let level = (granularity == Granularity::LargeOk
+            && va % PAGE_2M == 0
+            && end - va >= PAGE_2M) as usize;
         map_leaf(root, frames, va, va as u64, flags, level)?;
         va += if level == 1 { PAGE_2M } else { PAGE_4K };
     }
