@@ -11,10 +11,6 @@
 //! Every module that touches supervisor hardware is gated on the RISC-V target
 //! so the crate still compiles to an empty shell for host unit tests.
 
-/// Physical base of the QEMU `virt` board's RAM, below the S-mode payload.
-#[cfg(target_arch = "riscv64")]
-pub(crate) const RAM_BASE: usize = 0x8000_0000;
-
 #[cfg(target_arch = "riscv64")]
 mod csr;
 #[cfg(target_arch = "riscv64")]
