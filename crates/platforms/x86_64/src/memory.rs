@@ -1,8 +1,7 @@
-use core::sync::atomic::AtomicU8;
-
+use molt_arch::audit::{Audit, Leaf, MappedRange, PageWalk};
 use molt_arch::{
-    BootInfo, FrameAllocator as BootFrameAllocator, ImageSection, MapPermissions, MappingError,
-    PageProtection, PlatformError,
+    BootInfo, FrameAllocator as BootFrameAllocator, MapPermissions, MappingError, PageProtection,
+    PlatformError,
 };
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::{MapToError, TranslateResult};
@@ -30,35 +29,53 @@ pub fn verify_owned_mapping(boot_info: &BootInfo<'_>) -> Result<(), PlatformErro
     Ok(())
 }
 
-static RODATA_PROBE: u8 = 0x4d;
-static DATA_PROBE: AtomicU8 = AtomicU8::new(0);
-
+/// Checks every page of the loaded kernel image against the W^X contract.
+///
+/// The bootloader — not the kernel — built the x86_64 tables, so the section
+/// bounds the linker exports are not visible here; what is visible is the ELF
+/// image the loader placed and its length. That span is walked one 4 KiB page
+/// at a time via [`Audit::cover`], which asks the live tables for the leaf of
+/// every address: a stray writable-and-executable page hiding between two
+/// linker symbols cannot slip past a per-page walk the way it could past a
+/// three-point probe.
 pub fn verify_image_protection(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
     let offset = boot_info.physical_offset().ok_or(PlatformError::MissingPhysicalMemoryMap)?;
+    let image = boot_info.kernel_image().ok_or(PlatformError::Mapping(MappingError::Unmapped))?;
     // SAFETY: single-core boot, and the bootloader's direct map covers every
     // physical page-table frame.
     let level_4 = unsafe { active_level_4_table(VirtAddr::new(offset)) };
     // SAFETY: `level_4` is the active table and `offset` is its complete direct map.
     let mapper = unsafe { OffsetPageTable::new(level_4, VirtAddr::new(offset)) };
 
-    let probes = [
-        (ImageSection::Text, verify_image_protection as *const () as usize),
-        (ImageSection::Rodata, (&raw const RODATA_PROBE) as usize),
-        (ImageSection::Data, (&raw const DATA_PROBE) as usize),
-    ];
-    for (section, address) in probes {
-        let TranslateResult::Mapped { flags, .. } = mapper.translate(VirtAddr::new(address as u64))
+    let ranges = [MappedRange::image(image.start(), image.end())];
+    let walk = MapperWalk { mapper: &mapper };
+    Audit::new(&ranges).cover(&walk).map_err(PlatformError::Mapping)
+}
+
+/// [`PageWalk`] over the live x86_64 tables the bootloader built.
+struct MapperWalk<'m, 't> {
+    mapper: &'m OffsetPageTable<'t>,
+}
+
+impl PageWalk for MapperWalk<'_, '_> {
+    fn leaf(&self, address: u64) -> Option<Leaf> {
+        // Report the actual leaf size the loader used, not always 4 KiB, so a
+        // 2 MiB huge page across the image surfaces as a granularity error
+        // rather than silently passing 512 same-rights per-page checks.
+        let TranslateResult::Mapped { frame, flags, .. } =
+            self.mapper.translate(VirtAddr::new(address))
         else {
-            return Err(PlatformError::Mapping(MappingError::Unmapped));
+            return None;
         };
-        let granted = PageProtection::new(
+        let size = frame.size();
+        let start = address & !(size - 1);
+        let protection = PageProtection::new(
             flags.contains(PageTableFlags::PRESENT),
             flags.contains(PageTableFlags::WRITABLE),
             !flags.contains(PageTableFlags::NO_EXECUTE),
         );
-        section.verify(granted).map_err(PlatformError::Mapping)?;
+        Some(Leaf::new(start, size, protection))
     }
-    Ok(())
 }
 
 struct X86Frames<'map>(BootFrameAllocator<'map>);

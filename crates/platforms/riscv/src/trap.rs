@@ -7,9 +7,12 @@
 //! can await a completion). Anything else is fatal and reported before shutdown.
 
 use core::arch::{asm, global_asm};
+use core::fmt::Write as _;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::{csr, sbi};
+use molt_arch::{SerialPort, SerialWriter};
+
+use crate::{SbiSerial, csr, sbi};
 
 /// Set by the breakpoint handler so [`verify_breakpoint`] can observe a return.
 static BREAKPOINT_SEEN: AtomicBool = AtomicBool::new(false);
@@ -126,20 +129,16 @@ extern "C" fn molt_trap_handler() {
 }
 
 /// Reports an unrecoverable trap over the SBI console and shuts the machine down.
+///
+/// The report goes through [`SbiSerial`] rather than a raw `console_putchar`
+/// loop, so a firmware that advertises DBCN gets the reliable, error-checked
+/// path; the legacy call remains as `SbiSerial`'s automatic fallback.
 fn fatal(kind: &str, cause: usize) -> ! {
-    for byte in b"MOLT_EXCEPTION: " {
-        sbi::console_putchar(*byte);
-    }
-    for byte in kind.bytes() {
-        sbi::console_putchar(byte);
-    }
-    for byte in b" scause=0x" {
-        sbi::console_putchar(*byte);
-    }
-    for shift in (0..16).rev() {
-        let nibble = ((cause >> (shift * 4)) & 0xf) as u8;
-        sbi::console_putchar(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
-    }
-    sbi::console_putchar(b'\n');
+    let mut serial = SbiSerial::new();
+    serial.init();
+    // Formatting through `SerialWriter` cannot fail on `SbiSerial`, but a full
+    // trap report is worth having even if a single write returns short.
+    let _ =
+        writeln!(SerialWriter::new(&mut serial), "MOLT_EXCEPTION: {kind} scause=0x{cause:016x}");
     sbi::shutdown(false)
 }
