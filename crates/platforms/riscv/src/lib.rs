@@ -13,6 +13,8 @@
 
 #[cfg(target_arch = "riscv64")]
 mod csr;
+// Decoding an SBI error involves no registers, so it stays testable on the host.
+mod error;
 #[cfg(target_arch = "riscv64")]
 mod paging;
 #[cfg(target_arch = "riscv64")]
@@ -41,16 +43,18 @@ macro_rules! entry_point {
     };
 }
 
+pub use error::SbiError;
 #[cfg(target_arch = "riscv64")]
-pub use imp::{RiscV, SbiSerial, start};
+pub use imp::{Console, RiscV, SbiSerial, start};
 
 #[cfg(target_arch = "riscv64")]
 mod imp {
     use core::arch::{asm, global_asm};
+    use core::fmt::Write as _;
 
     use molt_arch::{
         BootInfo, ExitStatus, FRAME_SIZE, MemoryMap, MemoryRegion, MemoryRegionKind, Platform,
-        PlatformError, SerialPort,
+        PlatformError, SerialPort, SerialWriter,
     };
 
     use crate::{csr, paging, sbi, trap};
@@ -139,7 +143,7 @@ _start:
 
     impl RiscV {
         pub const fn new() -> Self {
-            Self { serial: SbiSerial }
+            Self { serial: SbiSerial::new() }
         }
     }
 
@@ -157,6 +161,12 @@ _start:
         }
 
         fn initialize(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+            // Which console won the probe decides whether a dropped byte is
+            // reported at all, so the boot log says which one it is.
+            self.serial.init();
+            let console = self.serial.console();
+            let _ = writeln!(SerialWriter::new(&mut self.serial), "MOLT_SBI_CONSOLE: {console:?}");
+
             trap::init();
             // Paging comes up here rather than inside a probe: every later
             // check runs against the address space the kernel actually uses.
@@ -208,12 +218,82 @@ _start:
         }
     }
 
-    /// Diagnostic output through the SBI legacy console extension.
-    pub struct SbiSerial;
+    /// Which console call this port settled on.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum Console {
+        /// Nothing has been probed yet; the next write decides.
+        Unprobed,
+        /// The debug console extension: one call per buffer, errors reported.
+        Debug,
+        /// The legacy `console_putchar`: one call per byte, errors invisible.
+        Legacy,
+    }
+
+    /// Diagnostic output through the SBI console.
+    ///
+    /// The backend is chosen once, on the first write, and demoted to the
+    /// legacy call if DBCN ever reports an error — a console that stops
+    /// speaking mid-boot is worse than a slow one, and the demotion is exactly
+    /// what a firmware that advertises DBCN without implementing it needs.
+    pub struct SbiSerial {
+        console: Console,
+    }
+
+    impl SbiSerial {
+        pub const fn new() -> Self {
+            Self { console: Console::Unprobed }
+        }
+
+        /// The backend in use, for diagnostics and tests.
+        pub fn console(&self) -> Console {
+            self.console
+        }
+    }
+
+    impl Default for SbiSerial {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
 
     impl SerialPort for SbiSerial {
+        fn init(&mut self) {
+            if self.console == Console::Unprobed {
+                self.console =
+                    if sbi::has_debug_console() { Console::Debug } else { Console::Legacy };
+            }
+        }
+
         fn write_byte(&mut self, byte: u8) {
-            sbi::console_putchar(byte);
+            self.write_bytes(&[byte]);
+        }
+
+        fn write_bytes(&mut self, bytes: &[u8]) {
+            self.init();
+            if self.console == Console::Debug {
+                let mut written = 0;
+                while written < bytes.len() {
+                    match sbi::debug_console_write(&bytes[written..]) {
+                        // A conforming implementation only returns zero for an
+                        // empty buffer; treating it as progress would spin.
+                        Ok(0) | Err(_) => {
+                            self.console = Console::Legacy;
+                            break;
+                        }
+                        Ok(count) => written += count,
+                    }
+                }
+                if self.console == Console::Debug {
+                    return;
+                }
+                for &byte in &bytes[written..] {
+                    sbi::console_putchar(byte);
+                }
+                return;
+            }
+            for &byte in bytes {
+                sbi::console_putchar(byte);
+            }
         }
     }
 }

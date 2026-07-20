@@ -251,6 +251,17 @@ impl MapPermissions {
 pub trait SerialPort {
     fn init(&mut self) {}
     fn write_byte(&mut self, byte: u8);
+
+    /// Writes a whole run of bytes.
+    ///
+    /// A port whose transport costs more per call than per byte — an SBI
+    /// `ecall`, say — should override this instead of paying that cost once
+    /// per character.
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_byte(byte);
+        }
+    }
 }
 
 /// Adapts a [`SerialPort`] to Rust's formatting machinery.
@@ -266,9 +277,7 @@ impl<'s, S: SerialPort + ?Sized> SerialWriter<'s, S> {
 
 impl<S: SerialPort + ?Sized> fmt::Write for SerialWriter<'_, S> {
     fn write_str(&mut self, text: &str) -> fmt::Result {
-        for byte in text.bytes() {
-            self.serial.write_byte(byte);
-        }
+        self.serial.write_bytes(text.as_bytes());
         Ok(())
     }
 }

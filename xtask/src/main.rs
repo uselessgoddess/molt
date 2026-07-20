@@ -97,6 +97,18 @@ impl Case {
     }
 }
 
+/// Markers only one architecture can produce.
+///
+/// The RISC-V console backend is chosen by an SBI probe at boot. Requiring the
+/// line, rather than a particular backend, proves the probe ran without
+/// demanding firmware new enough to offer the debug console extension.
+fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
+    match (arch, case) {
+        (Arch::Riscv64, Case::Boot) => &["MOLT_SBI_CONSOLE:"],
+        _ => &[],
+    }
+}
+
 fn smoke(selection: Option<&str>) -> Result<(), String> {
     match selection {
         None | Some("all") => {
@@ -152,7 +164,7 @@ fn smoke_case(arch: Arch, case: Case) -> Result<(), String> {
         )
     })?;
     check_exit_status(arch, case, status)?;
-    for marker in case.markers() {
+    for marker in case.markers().iter().chain(arch_markers(arch, case)) {
         if !run.serial.contains(marker) {
             return Err(format!("{name} {label} QEMU exited without the {marker} serial marker"));
         }
