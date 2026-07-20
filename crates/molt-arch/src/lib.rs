@@ -97,9 +97,29 @@ pub struct FrameAllocator<'map> {
     next: u64,
 }
 
+/// Where a [`FrameAllocator`] stopped, so a later one can carry on.
+///
+/// A platform that maps in two passes — a boot address space, then a page
+/// mapped into it — cannot keep the borrowing allocator alive between them.
+/// Restarting it would hand out the frames the first pass already owns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameCursor {
+    region: usize,
+    next: u64,
+}
+
 impl<'map> FrameAllocator<'map> {
     pub const fn new(map: &'map dyn MemoryMap) -> Self {
         Self { map, region: 0, next: 0 }
+    }
+
+    /// Resumes allocation over `map` from a cursor an earlier allocator left.
+    pub const fn resume(map: &'map dyn MemoryMap, cursor: FrameCursor) -> Self {
+        Self { map, region: cursor.region, next: cursor.next }
+    }
+
+    pub const fn cursor(&self) -> FrameCursor {
+        FrameCursor { region: self.region, next: self.next }
     }
 
     pub fn allocate(&mut self) -> Option<PhysicalFrame> {
@@ -140,6 +160,66 @@ pub enum MappingError {
     InvalidAddress,
     OutOfFrames,
     Backend,
+    /// The address has no translation in the table that was walked.
+    Unmapped,
+    /// The granted rights do not match what the section is allowed to hold.
+    Permissions,
+}
+
+/// The rights a live translation table actually grants a virtual address.
+///
+/// This is read back out of the hardware tables rather than remembered from
+/// the request, so a platform that maps a section correctly and then relaxes
+/// it still fails the check.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageProtection {
+    readable: bool,
+    writable: bool,
+    executable: bool,
+}
+
+impl PageProtection {
+    pub const fn new(readable: bool, writable: bool, executable: bool) -> Self {
+        Self { readable, writable, executable }
+    }
+
+    pub const fn is_readable(self) -> bool {
+        self.readable
+    }
+
+    pub const fn is_writable(self) -> bool {
+        self.writable
+    }
+
+    pub const fn is_executable(self) -> bool {
+        self.executable
+    }
+}
+
+/// A kernel-image section, named by the rights its pages may hold.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageSection {
+    /// Executable code: readable and executable, never writable.
+    Text,
+    /// Constants: readable only.
+    Rodata,
+    /// Mutable state, including `.bss` and the boot stack: readable, writable.
+    Data,
+}
+
+impl ImageSection {
+    /// Checks one section's live rights against the W^X policy.
+    pub const fn verify(self, granted: PageProtection) -> Result<(), MappingError> {
+        if granted.writable && granted.executable {
+            return Err(MappingError::WritableExecutable);
+        }
+        let expected = match self {
+            Self::Text => granted.readable && granted.executable,
+            Self::Rodata => granted.readable && !granted.writable && !granted.executable,
+            Self::Data => granted.readable && granted.writable,
+        };
+        if expected { Ok(()) } else { Err(MappingError::Permissions) }
+    }
 }
 
 /// Page permissions that enforce W^X at construction time.
@@ -171,6 +251,17 @@ impl MapPermissions {
 pub trait SerialPort {
     fn init(&mut self) {}
     fn write_byte(&mut self, byte: u8);
+
+    /// Writes a whole run of bytes.
+    ///
+    /// A port whose transport costs more per call than per byte — an SBI
+    /// `ecall`, say — should override this instead of paying that cost once
+    /// per character.
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_byte(byte);
+        }
+    }
 }
 
 /// Adapts a [`SerialPort`] to Rust's formatting machinery.
@@ -186,9 +277,7 @@ impl<'s, S: SerialPort + ?Sized> SerialWriter<'s, S> {
 
 impl<S: SerialPort + ?Sized> fmt::Write for SerialWriter<'_, S> {
     fn write_str(&mut self, text: &str) -> fmt::Result {
-        for byte in text.bytes() {
-            self.serial.write_byte(byte);
-        }
+        self.serial.write_bytes(text.as_bytes());
         Ok(())
     }
 }
@@ -230,6 +319,11 @@ pub trait Platform {
     }
 
     fn verify_owned_mapping(&mut self, _boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    /// Reads the live tables back and checks the running image obeys W^X.
+    fn verify_image_protection(&mut self, _boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
         Err(PlatformError::Unsupported)
     }
 

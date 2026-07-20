@@ -124,8 +124,14 @@ result as pending rather than claiming it.
 ## Boot tests
 
 The smoke runner boots a real image under QEMU and asserts serial markers
-through `MOLT_BOOT_OK`, with a hard 20-second timeout so a hang fails instead
-of occupying a runner. Theseus and Redox both do a version of this — Theseus
+through `MOLT_BOOT_OK`, with a hard 20-second timeout (`MOLT_SMOKE_TIMEOUT`
+raises it for a slow host) so a hang fails instead of occupying a runner.
+A timed-out run prints the serial log it captured, because the log is the only
+evidence of where the boot stopped; the pipe is drained by its own thread so a
+talkative guest cannot block on its own console and look like a hang. The smoke
+path also does not pass `-no-shutdown`, which would turn a guest reset into a
+silent hang rather than a reported exit status — see
+`experiments/qemu-no-shutdown`. Theseus and Redox both do a version of this — Theseus
 boots under QEMU and checks an `isa-debug-exit` code, Redox hooks `redoxer`
 into Cargo's target-runner so a kernel boot test is an ordinary `cargo` command.
 The property all three share is worth keeping: the boot test is the same

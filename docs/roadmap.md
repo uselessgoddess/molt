@@ -64,25 +64,33 @@ Testing and measurement:
 
 Correctness debt:
 
-- [ ] RISC-V: map the kernel image per section instead of one RWX gigapage
-- [ ] RISC-V: use the SBI debug console (DBCN) with a legacy fallback
+- [x] RISC-V: map the kernel image per section instead of one RWX gigapage
+- [x] RISC-V: use the SBI debug console (DBCN) with a legacy fallback
 
-Both are Stage 1 shortcuts, and both are Stage 1.5 rather than Stage 2 work.
+Both were Stage 1 shortcuts, and both were Stage 1.5 rather than Stage 2 work.
 
-The gigapage is the one that matters. `MapPermissions` rejects a
+The gigapage was the one that mattered. `MapPermissions` rejects a
 writable-and-executable mapping at construction, and the x86_64 platform
-honours that for the kernel image — but on RISC-V the running kernel executes
-out of an identity-mapped RWX gigapage, so only the probe page is actually
+honoured that for the kernel image — but on RISC-V the running kernel executed
+out of an identity-mapped RWX gigapage, so only the probe page was actually
 W^X. A contract enforced on one platform and not the other is not a contract,
 and Stage 2's DMA and drivers are exactly the code that turns a writable `.text`
 into arbitrary execution. Retrofitting per-section permissions is also strictly
-harder once drivers hold mappings.
+harder once drivers hold mappings. The boot mapping now walks the linker's
+section bounds, and both platforms read their live tables back through
+`Platform::verify_image_protection`, which prints `MOLT_WX_OK` — a marker the
+smoke runner requires. `experiments/riscv-wx-regression` reintroduces the
+defect to prove the audit can fail.
 
-The console is smaller. The legacy `console_putchar` extension is deprecated in
-SBI 0.2 and later, reports no errors, and costs one `ecall` per byte. It works,
-and it is isolated in `sbi.rs`, so it is not urgent — but Stage 2 debugging
+The console was smaller. The legacy `console_putchar` extension is deprecated in
+SBI 0.2 and later, reports no errors, and costs one `ecall` per byte. It worked,
+and it was isolated in `sbi.rs`, so it was not urgent — but Stage 2 debugging
 leans on the console, and a console that cannot report its own failure is a bad
-thing to be holding while chasing a driver bug.
+thing to be holding while chasing a driver bug. The port now probes the base
+extension for DBCN, writes whole buffers through it, and demotes itself to the
+legacy call if DBCN ever reports an error; `MOLT_SBI_CONSOLE:` names the winner
+in the boot log, and `experiments/riscv-sbi-legacy-console` exercises the
+fallback that QEMU's firmware never selects on its own.
 
 Not in this stage: real-hardware boot. It needs serial-capture equipment that
 does not exist yet, so QEMU stays the honest limit and the Stage 1 hardware

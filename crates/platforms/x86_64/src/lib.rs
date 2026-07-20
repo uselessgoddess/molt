@@ -122,6 +122,10 @@ impl Platform for X86_64 {
         memory::verify_owned_mapping(boot_info)
     }
 
+    fn verify_image_protection(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+        memory::verify_image_protection(boot_info)
+    }
+
     fn arm_timer(&mut self, initial_count: u32) -> Result<(), PlatformError> {
         apic::arm(initial_count)
     }

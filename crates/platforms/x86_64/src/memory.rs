@@ -1,10 +1,12 @@
 use molt_arch::{
-    BootInfo, FrameAllocator as BootFrameAllocator, MapPermissions, MappingError, PlatformError,
+    BootInfo, FrameAllocator as BootFrameAllocator, ImageSection, MapPermissions, MappingError,
+    PageProtection, PlatformError,
 };
 use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::mapper::MapToError;
+use x86_64::structures::paging::mapper::{MapToError, TranslateResult};
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
+    Translate,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -23,6 +25,47 @@ pub fn verify_owned_mapping(boot_info: &BootInfo<'_>) -> Result<(), PlatformErro
     let mut mapping = OwnedPage::map(&mut mapper, &mut frames, page, permissions)?;
     mapping.write_and_verify(0x4d4f_4c54_5f57_585e)?;
     drop(mapping);
+    Ok(())
+}
+
+/// A constant that must live in `.rodata` for the image audit to have a target.
+static RODATA_PROBE: u8 = 0x4d;
+/// Mutable state the audit reads back as a `.data`/`.bss` representative.
+static DATA_PROBE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Reads the live tables back and checks each image section obeys W^X.
+///
+/// The bootloader maps the kernel per ELF segment, so this is an audit of a
+/// promise someone else made. It is worth auditing anyway: the same check runs
+/// on RISC-V, where the mapping is Molt's own, and a silently relaxed segment
+/// would otherwise be invisible until something exploited it.
+pub fn verify_image_protection(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+    let offset = boot_info.physical_offset().ok_or(PlatformError::MissingPhysicalMemoryMap)?;
+    // SAFETY: single-core boot, and the bootloader's direct map covers every
+    // physical page-table frame.
+    let level_4 = unsafe { active_level_4_table(VirtAddr::new(offset)) };
+    // SAFETY: `level_4` is the active table and `offset` is its complete direct map.
+    let mapper = unsafe { OffsetPageTable::new(level_4, VirtAddr::new(offset)) };
+
+    let probes = [
+        (ImageSection::Text, verify_image_protection as *const () as usize),
+        (ImageSection::Rodata, (&raw const RODATA_PROBE) as usize),
+        (ImageSection::Data, (&raw const DATA_PROBE) as usize),
+    ];
+    for (section, address) in probes {
+        let TranslateResult::Mapped { flags, .. } = mapper.translate(VirtAddr::new(address as u64))
+        else {
+            return Err(PlatformError::Mapping(MappingError::Unmapped));
+        };
+        // A present page is always readable on x86_64; there is no read bit to
+        // consult, so the other two are what the check turns on.
+        let granted = PageProtection::new(
+            flags.contains(PageTableFlags::PRESENT),
+            flags.contains(PageTableFlags::WRITABLE),
+            !flags.contains(PageTableFlags::NO_EXECUTE),
+        );
+        section.verify(granted).map_err(PlatformError::Mapping)?;
+    }
     Ok(())
 }
 
