@@ -103,6 +103,7 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<u64, PlatformError> {
     // instruction. Their rights are read back out of the loader's tables
     // rather than assumed, so a section it mapped wrongly fails the audit
     // instead of being silently re-created correctly here.
+    //
     // `kernel_len` is the ELF file length, so it stops short of the `.bss`
     // pages the loader also mapped. Following the loader's mapping to its first
     // hole is what keeps kernel statics — the audit log, the APIC window base —
@@ -168,9 +169,7 @@ fn direct_map(
                 // SAFETY: the target table is not live yet, the frame is plain
                 // RAM the firmware reported usable, and the mapping is created
                 // once — the loop never revisits a physical address.
-                unsafe { space.map_to(page, frame, flags, frames) }
-                    .map_err(map_error)?
-                    .ignore();
+                unsafe { space.map_to(page, frame, flags, frames) }.map_err(map_error)?.ignore();
                 physical += Size2MiB::SIZE;
             } else {
                 map_4k(space, frames, virtual_address, physical, flags)?;
@@ -359,7 +358,10 @@ impl Space {
         // SAFETY: the boot CPU is the only writer, `root` is this address
         // space's level-4 table, and `offset` direct-maps every table frame.
         unsafe {
-            OffsetPageTable::new(&mut *table_pointer(self.offset, self.root), VirtAddr::new(self.offset))
+            OffsetPageTable::new(
+                &mut *table_pointer(self.offset, self.root),
+                VirtAddr::new(self.offset),
+            )
         }
     }
 }
@@ -517,11 +519,7 @@ unsafe fn active_level_4_table(physical_offset: VirtAddr) -> &'static mut PageTa
 /// A reported image length covers the file image only; the loader maps the
 /// zeroed sections beyond it, and those pages are as much the kernel as the
 /// ones that came from the file.
-fn mapped_end(
-    live: &OffsetPageTable<'_>,
-    start: u64,
-    end: u64,
-) -> Result<u64, PlatformError> {
+fn mapped_end(live: &OffsetPageTable<'_>, start: u64, end: u64) -> Result<u64, PlatformError> {
     use x86_64::structures::paging::Translate;
 
     let mut end = align_up(end)?;
