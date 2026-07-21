@@ -193,16 +193,23 @@ them twice, and gets them back on release. Both run on x86_64 and RISC-V.
 - **DMA is not isolated.** A device given a physical address can write
   anywhere, `Owner::Device` or not. Until Stage 4's IOMMU work, the honest
   statement is that DMA buffers are *tracked*, not *contained*.
-- **x86_64 does not own its page tables.** The bootloader's tables are still
-  live there, so the x86_64 audit can only run `cover` (everything declared is
-  mapped correctly) and not `accepts` (nothing else is mapped). RISC-V owns its
-  tables and runs both. Mapping an MMIO window is the first thing that needs
-  the kernel to own x86_64's tables too, which is why it is Stage 2.1 and not
-  a Stage 2.3 discovery.
-- **Cacheability is not yet applied.** `Cache` is enforced in the audit and in
-  `Kind::allows`, but no platform *sets* the corresponding hardware bits yet —
-  PAT/MTRR on x86_64, the PMA/`Svpbmt` question on RISC-V. Stage 2.1 does that,
-  and the fail-closed audit is what will notice if it does not.
+- **x86_64 pins the loader's boot windows.** The kernel builds its own tables
+  and switches `CR3` onto them, so both `cover` and `accepts` run on either
+  platform. The image, the stack, and the boot info keep the addresses the
+  loader chose, because `CR3` is written from code running at those addresses;
+  the stack and the boot info are pinned through `BootloaderConfig` so the
+  kernel can find them again, and the image window follows the loader's mapping
+  past the reported file length because `.bss` lives beyond it.
+- **Cacheability is applied, one memory type per platform.** x86_64 pins PAT to
+  its reset configuration and selects the uncacheable entry with `PCD|PWT` for
+  device windows, so a `Cache::Device` leaf really is uncacheable rather than
+  merely declared so. RISC-V's Sv39 PTE has no memory-type field at all:
+  `Svpbmt` is absent on QEMU `virt` and cannot be detected from S-mode without
+  the device tree, so the effective type is the PMA of the physical address and
+  the audit reports it from `Inventory::kind`. `Svpbmt` becomes an override on
+  top of that once the device tree is parsed, not a replacement for it.
+- **Write-combining still has no consumer.** `Cache` remains two values; a
+  framebuffer that wants a third can add it with a test that fails without it.
 
 ## References
 

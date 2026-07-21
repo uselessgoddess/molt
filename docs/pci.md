@@ -170,14 +170,21 @@ to ask for it in as many words — and Stage 2.3 will be the first place that
 asks. This is a real limit, not a deferred nicety: on this kernel a DMA-capable
 device is as privileged as the kernel.
 
-**Device windows on x86_64 still have a write-back alias.** `map_device` marks
-its own window uncached, via PAT entry 3 selected by `PCD | PWT`, and refuses to
-map a device window any other way. But the bootloader's direct map already
-covers every physical page with a write-back mapping, including MMIO, and two
-mappings of one page with different cacheability is exactly what the manuals
-tell you not to do. Removing the alias needs the kernel to own its own page
-tables, which is the outstanding Stage 2.1 item, so this stage records the
-alias rather than claiming to have fixed it.
+**Device windows are never unmapped.** On both platforms `map_device` bumps a
+cursor through a region of its own — `0xffff_9300_0000_0000` on x86_64,
+`0x20_0000_0000` on RISC-V — and that cursor only ever moves forward. Nothing
+in this stage releases a device, and an unmap that raced a driver still holding
+its `Mmio` is precisely the bug the borrow on the window exists to prevent, so
+the reclaim is left for the stage that first has a reason to reclaim. Each
+window costs its own page-table frames out of a pool drained at boot; running
+that pool dry is an `OutOfFrames`, not a fallback into fresh allocation, because
+the only allocator still reachable at that point would hand back the frames the
+live tables are built from.
+
+Note what is *not* a limit any more. Stage 2.1 gave the kernel its own page
+tables, whose direct map covers firmware-usable RAM only, so a device window no
+longer has a write-back alias underneath it on x86_64 — `Audit::accepts` proves
+it by refusing any mapping the kernel did not declare.
 
 **RISC-V has no MSI fabric.** `InterruptFabric::allocate` returns
 `FabricError::Unsupported` there, honestly, rather than inventing a message.

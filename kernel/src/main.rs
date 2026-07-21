@@ -63,6 +63,9 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     platform.verify_image_protection(boot_info).expect("kernel image obeys W^X");
     println!(platform, "MOLT_WX_OK");
 
+    platform.verify_device_window(boot_info).expect("device window mapped and reachable");
+    println!(platform, "MOLT_DEVICE_WINDOW_OK");
+
     run_timer_future(platform);
     println!(platform, "MOLT_TIMER_OK");
 

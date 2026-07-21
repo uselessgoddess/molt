@@ -7,6 +7,9 @@ use x86_64::instructions::interrupts;
 pub const TIMER_VECTOR: u8 = 0x40;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 
+/// The architectural local APIC MMIO base, which the kernel maps a window for.
+pub const APIC_MMIO: u64 = 0xfee0_0000;
+
 const IA32_APIC_BASE: u32 = 0x1b;
 const APIC_ENABLE: u64 = 1 << 11;
 const APIC_BASE_MASK: u64 = 0xffff_f000;
@@ -22,7 +25,12 @@ const TIMER_MASKED: u32 = 1 << 16;
 static APIC_VIRTUAL_BASE: AtomicU64 = AtomicU64::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
-pub fn init(physical_memory_offset: u64) -> Result<(), PlatformError> {
+/// Brings up the local APIC through the `window` the kernel mapped for it.
+///
+/// The window replaces the loader's direct map: it is the kernel's own leaf,
+/// uncacheable and non-executable, so an APIC register write is a write to the
+/// APIC rather than a store that reaches it whenever a cache line is evicted.
+pub fn init(window: u64) -> Result<(), PlatformError> {
     let features = core::arch::x86_64::__cpuid(1);
     if features.edx & (1 << 9) == 0 {
         return Err(PlatformError::InvalidHardware);
@@ -33,10 +41,12 @@ pub fn init(physical_memory_offset: u64) -> Result<(), PlatformError> {
     base |= APIC_ENABLE;
     // SAFETY: only the APIC enable bit is changed; the firmware-selected base is preserved.
     unsafe { write_msr(IA32_APIC_BASE, base) };
-    let physical = base & APIC_BASE_MASK;
-    let virtual_base =
-        physical_memory_offset.checked_add(physical).ok_or(PlatformError::InvalidHardware)?;
-    APIC_VIRTUAL_BASE.store(virtual_base, Ordering::Release);
+    // The window is mapped for the architectural base; firmware that relocated
+    // the APIC would leave it pointing at the wrong frame, so refuse instead.
+    if base & APIC_BASE_MASK != APIC_MMIO {
+        return Err(PlatformError::InvalidHardware);
+    }
+    APIC_VIRTUAL_BASE.store(window, Ordering::Release);
 
     write(REG_SPURIOUS, APIC_SOFTWARE_ENABLE | u32::from(SPURIOUS_VECTOR))?;
     write(REG_LVT_TIMER, TIMER_MASKED | u32::from(TIMER_VECTOR))?;
@@ -132,7 +142,10 @@ unsafe fn read_msr(msr: u32) -> u64 {
     u64::from(low) | (u64::from(high) << 32)
 }
 
-unsafe fn write_msr(msr: u32, value: u64) {
+/// # Safety
+///
+/// The caller must preserve reserved bits for the selected MSR.
+pub unsafe fn write_msr(msr: u32, value: u64) {
     // SAFETY: the caller preserves reserved bits for the selected architectural MSR.
     unsafe {
         asm!(

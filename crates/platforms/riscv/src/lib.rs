@@ -17,11 +17,6 @@ mod csr;
 mod error;
 // Reading a device tree is byte parsing, so it stays testable on the host too.
 pub mod fdt;
-// The declared-mapping log is arithmetic over an array, so it is host-testable
-// even though the page tables it describes are not. Its only consumer is
-// `paging`, so on the host it is compiled for its own tests and nothing else.
-#[cfg(any(target_arch = "riscv64", test))]
-mod mappings;
 #[cfg(target_arch = "riscv64")]
 mod paging;
 #[cfg(target_arch = "riscv64")]
@@ -236,9 +231,13 @@ _start:
 
         fn verify_image_protection(
             &mut self,
-            _boot_info: &BootInfo<'_>,
+            boot_info: &BootInfo<'_>,
         ) -> Result<(), PlatformError> {
-            paging::verify_image_protection()
+            paging::verify_image_protection(boot_info)
+        }
+
+        fn verify_device_window(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+            paging::verify_device_window(boot_info)
         }
 
         /// The ECAM window the device tree describes, if firmware described one.

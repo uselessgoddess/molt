@@ -1,4 +1,4 @@
-use molt_arch::audit::{Audit, Contents, Leaf, MappedRange, PageWalk};
+use molt_arch::audit::{Audit, Contents, Declared, Leaf, MappedRange, PageWalk};
 use molt_arch::{Cache, FRAME_SIZE, ImageSection, MappingError, PageProtection};
 
 const TEXT: u64 = 0x8020_0000;
@@ -155,4 +155,45 @@ fn executable_device_window_is_caught() {
     let leaf = Leaf::new(uart, FRAME_SIZE, read_execute().cached(Cache::Device));
 
     assert_eq!(Contents::Device.verify(leaf), Err(MappingError::Permissions));
+}
+
+#[test]
+fn declarations_merge_into_ono() {
+    let mut declared = Declared::<4>::new();
+
+    declared.push(MappedRange::ram(RAM, RAM + FRAME_SIZE)).unwrap();
+    declared.push(MappedRange::ram(RAM + FRAME_SIZE, RAM + 2 * FRAME_SIZE)).unwrap();
+
+    assert_eq!(declared.as_slice(), &[MappedRange::ram(RAM, RAM + 2 * FRAME_SIZE)]);
+}
+
+#[test]
+fn declarations_stay_apart() {
+    let mut declared = Declared::<4>::new();
+
+    declared.push(MappedRange::ram(RAM, RAM + FRAME_SIZE)).unwrap();
+    declared.push(MappedRange::device(RAM + FRAME_SIZE, RAM + 2 * FRAME_SIZE)).unwrap();
+
+    assert_eq!(declared.as_slice().len(), 2);
+}
+
+#[test]
+fn empty_declarations_dropped() {
+    let mut declared = Declared::<1>::new();
+
+    declared.push(MappedRange::ram(RAM, RAM)).unwrap();
+
+    assert!(declared.as_slice().is_empty());
+}
+
+#[test]
+fn overflowing_declaration_error() {
+    let mut declared = Declared::<1>::new();
+
+    declared.push(MappedRange::ram(RAM, RAM + FRAME_SIZE)).unwrap();
+
+    assert_eq!(
+        declared.push(MappedRange::ram(RAM + 2 * FRAME_SIZE, RAM + 3 * FRAME_SIZE)),
+        Err(MappingError::Backend)
+    );
 }

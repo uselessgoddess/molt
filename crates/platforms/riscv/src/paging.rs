@@ -15,22 +15,16 @@
 //! walks every declared range, confirming each page holds the rights it was
 //! mapped with — the check that would have failed against the old gigapage,
 //! and that a probe of a handful of addresses would have missed.
-//!
-//! [`map_device`] adds device windows to the same address space afterwards,
-//! out of a pool of frames [`init`] set aside, and declares them to the same
-//! log — so a window the kernel maps is a window the audit checks.
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
 
-use molt_arch::audit::{Audit, Leaf, MappedRange, PageWalk};
-use molt_arch::memory::{Device, Rights};
+use molt_arch::audit::{Audit, Declared, Leaf, MappedRange, PageWalk};
+use molt_arch::memory::{Cache, Device, Inventory, Kind, Rights, Span};
 use molt_arch::{
     BootInfo, FrameAllocator, FrameCursor, FramePool, ImageSection, MapPermissions, MappingError,
     Mmio, PageProtection, PhysicalFrame, PlatformError, UsableRegions,
 };
-
-use crate::mappings::MappingLog;
 
 /// Sv39 page-table entry flags.
 const PTE_V: u64 = 1 << 0; // valid
@@ -65,6 +59,25 @@ unsafe extern "C" {
     static __kernel_end: u8;
 }
 
+/// The largest number of usable free-RAM ranges the audit stores inline.
+///
+/// The QEMU `virt` build exposes one contiguous span, and no plausible RISC-V
+/// board grows this to double digits; growing it here is a one-line change.
+const MAX_RAM_RANGES: usize = 8;
+
+/// The largest number of device windows the kernel may map.
+///
+/// The UART window [`verify_device_window`] maps, one ECAM region, and a
+/// handful of BARs is what Stage 2.2 asks for. A board that wants more gets
+/// [`MappingError::Backend`] from the log rather than a mapping nobody
+/// declared.
+const MAX_DEVICE_RANGES: usize = 8;
+
+/// Every mapped range the boot address space declares: three image sections,
+/// the free-RAM regions, and the device windows [`verify_device_window`] and
+/// [`map_device`] add.
+type MappingLog = Declared<{ 3 + MAX_RAM_RANGES + MAX_DEVICE_RANGES }>;
+
 /// Frames set aside at boot for the page tables later mappings need.
 ///
 /// [`map_device`] runs long after the firmware memory map went out of scope, so
@@ -72,9 +85,9 @@ unsafe extern "C" {
 /// frames the live tables are already made of. The size is the arithmetic for
 /// the largest window Stage 2.2 maps: a 256 MiB ECAM region at 4 KiB
 /// granularity needs one level-0 table per 2 MiB — 128 of them — plus a level-1
-/// table for each gigabyte it touches. The rest is headroom for a few BARs.
-/// Running short is not a corruption, it is [`MappingError::OutOfFrames`] at
-/// the mapping that needed the frame.
+/// table per gigabyte it touches. The rest is headroom for a few BARs. Running
+/// short is not a corruption, it is [`MappingError::OutOfFrames`] at the
+/// mapping that needed the frame.
 const TABLE_FRAMES: usize = 160;
 
 /// Address of a linker-defined symbol.
@@ -94,6 +107,9 @@ struct BootPaging {
     pool: FramePool<TABLE_FRAMES>,
     /// Every mapped range, in the order [`init`] built them.
     log: MappingLog,
+    /// The next free device address; bumps forward and never back, so a window
+    /// handed out once is never handed out again.
+    devices: usize,
 }
 
 struct Active(UnsafeCell<Option<BootPaging>>);
@@ -105,10 +121,10 @@ unsafe impl Sync for Active {}
 static ACTIVE: Active = Active(UnsafeCell::new(None));
 
 /// Borrows the boot address space, or reports that [`init`] has not run.
-fn active() -> Result<&'static mut BootPaging, MappingError> {
+fn active() -> Result<&'static mut BootPaging, PlatformError> {
     // SAFETY: single boot hart, traps do not touch this cell, and the returned
     // borrow is confined to one call.
-    unsafe { &mut *ACTIVE.0.get() }.as_mut().ok_or(MappingError::Unmapped)
+    unsafe { &mut *ACTIVE.0.get() }.as_mut().ok_or(PlatformError::Mapping(MappingError::Unmapped))
 }
 
 /// Builds the per-section boot address space and enables Sv39 translation.
@@ -164,7 +180,7 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
         let end = usize::try_from(range.end())
             .map_err(|_| PlatformError::Mapping(MappingError::InvalidAddress))?;
         map_range(root, &mut frames, start, end, PTE_R | PTE_W, Granularity::LargeOk)?;
-        log.push(MappedRange::ram(range.start(), range.end()))?;
+        log.push(MappedRange::ram(range.start(), range.end())).map_err(PlatformError::Mapping)?;
     }
 
     // Drained before the cursor is taken, so the pool's frames and everything a
@@ -172,6 +188,7 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
     // is not an error here: it becomes one at the mapping that runs out.
     let mut pool = FramePool::empty();
     pool.fill(&mut frames);
+
     let cursor = frames.cursor();
     // SAFETY: every address the kernel executes from, reads, or writes — code,
     // constants, stack, and the page tables themselves — was just identity
@@ -181,31 +198,9 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
     }
     // SAFETY: same reasoning as `active`; this runs once on the boot hart.
     unsafe {
-        *ACTIVE.0.get() = Some(BootPaging { root, cursor, pool, log });
+        *ACTIVE.0.get() = Some(BootPaging { root, cursor, pool, log, devices: DEVICE_REGION });
     }
     Ok(())
-}
-
-/// Somewhere page-table frames come from.
-///
-/// The boot pass allocates straight out of the firmware memory map; everything
-/// after it allocates out of the [`FramePool`] that pass filled. The mapping
-/// code cares about neither, only that a frame arrives, so it takes this rather
-/// than growing a second copy of itself per source.
-trait Frames {
-    fn take(&mut self) -> Option<u64>;
-}
-
-impl Frames for FrameAllocator<'_> {
-    fn take(&mut self) -> Option<u64> {
-        self.allocate().map(PhysicalFrame::start)
-    }
-}
-
-impl<const N: usize> Frames for FramePool<N> {
-    fn take(&mut self) -> Option<u64> {
-        self.allocate().map(PhysicalFrame::start)
-    }
 }
 
 fn map_section(
@@ -227,8 +222,8 @@ fn map_section(
     let aligned_start = align_down(start, PAGE_4K) as u64;
     let aligned_end =
         align_up(end, PAGE_4K).ok_or(PlatformError::Mapping(MappingError::InvalidAddress))? as u64;
-    log.push(MappedRange::section(section, aligned_start, aligned_end))?;
-    Ok(())
+    log.push(MappedRange::section(section, aligned_start, aligned_end))
+        .map_err(PlatformError::Mapping)
 }
 
 pub fn verify_owned_mapping(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
@@ -303,73 +298,179 @@ unsafe fn clear_leaf(root: *mut u64, va: usize) {
     }
 }
 
+pub fn verify_image_protection(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+    let state = active()?;
+    let inventory = Inventory::new(boot_info.memory_map());
+    let walk = TableWalk { root: state.root, inventory: &inventory };
+    state.log.audit().cover(&walk).map_err(PlatformError::Mapping)?;
+    // A full sweep of the live tables catches anything mapped that the kernel
+    // never declared — a stray writable range through firmware or MMIO would
+    // fail here rather than escape the outward-only check above.
+    walk_leaves(state.root, &state.log.audit(), &inventory)
+}
+
+/// The QEMU `virt` board's NS16550A transmitter, the first mapped device.
+const UART_MMIO: u64 = 0x1000_0000;
+/// Where that window lives in the kernel's address space — deliberately not
+/// its physical address, so nothing can reach the UART by assuming identity.
+const UART_WINDOW: usize = 0x3000_0000;
+/// Transmitter holding register, and the line status whose bit 5 means "empty".
+const UART_THR: usize = 0;
+const UART_LSR: usize = 5;
+const UART_LSR_THRE: u8 = 1 << 5;
+
+/// Maps the UART through [`Inventory::device`] and writes a line through it.
+///
+/// Everything before this reached hardware either through an identity mapping
+/// or through firmware, so this is the first evidence that a device is
+/// reachable *because* the kernel mapped it, with the rights and the memory
+/// type its window says it may have, and that the audit sees it that way too.
+pub fn verify_device_window(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+    let state = active()?;
+    let inventory = Inventory::new(boot_info.memory_map());
+    let span = Span::frames(UART_MMIO, 1).map_err(|_| address_error())?;
+    // Refuses anything firmware claimed as RAM, so a mistyped constant cannot
+    // become a device mapping over the kernel's own memory.
+    let window = inventory.device(span).map_err(|_| address_error())?;
+    let (rights, cache) = window.mapping(Rights::READ_WRITE).map_err(PlatformError::Mapping)?;
+    debug_assert_eq!(cache, Cache::Device);
+
+    let mut frames = FrameAllocator::resume(boot_info.memory_map(), state.cursor);
+    map_leaf(state.root, &mut frames, UART_WINDOW, window.span().start(), leaf_flags(rights), 0)?;
+    state.cursor = frames.cursor();
+    state
+        .log
+        .push(MappedRange::device(UART_WINDOW as u64, UART_WINDOW as u64 + PAGE_4K as u64))
+        .map_err(PlatformError::Mapping)?;
+    // SAFETY: the new leaf is in memory; the fence retires any negative caching
+    // of `UART_WINDOW` from before it existed.
+    unsafe {
+        asm!("sfence.vma", options(nostack));
+    }
+
+    for byte in b"MOLT_UART_WINDOW: ns16550a\n" {
+        // SAFETY: the window is mapped read/write to the UART's own frame, and
+        // both registers are single bytes at fixed offsets within it.
+        unsafe {
+            while (UART_WINDOW as *const u8).add(UART_LSR).read_volatile() & UART_LSR_THRE == 0 {}
+            (UART_WINDOW as *mut u8).add(UART_THR).write_volatile(*byte);
+        }
+    }
+
+    // Re-audit with the window declared: `cover` proves the leaf is uncacheable
+    // and unexecutable, and the sweep proves nothing else appeared with it.
+    let walk = TableWalk { root: state.root, inventory: &inventory };
+    state.log.audit().cover(&walk).map_err(PlatformError::Mapping)?;
+    walk_leaves(state.root, &state.log.audit(), &inventory)
+}
+
+/// Where the windows [`map_device`] hands out live, and how far they reach.
+///
+/// Not the identity address the window has physically: the QEMU `virt` board
+/// puts its ECAM region at `0x3000_0000`, which is where [`UART_WINDOW`]
+/// already is, and more generally a driver that can reach a device by guessing
+/// its physical address has not been given a capability at all. 128 GiB is
+/// clear of RAM and well inside Sv39's 512 GiB, and a gigabyte is far more
+/// register space than any board needs — exceeding it means a caller asked for
+/// something that is not registers.
+const DEVICE_REGION: usize = 0x20_0000_0000;
+const DEVICE_REGION_END: usize = DEVICE_REGION + (1 << 30);
+
 /// Maps one device window into the boot address space.
 ///
-/// The boot address space is identity mapped, so the window's physical span is
-/// also its virtual one and no address arithmetic is needed to hand the caller
-/// a pointer.
-///
 /// Nothing here selects a cache policy, and that is not an omission: Sv39
-/// without the Svpbmt extension has **no** cacheability bits in a page-table
+/// without the `Svpbmt` extension has **no** cacheability bits in a page-table
 /// entry at all. What makes an access uncached and unspeculated on this
-/// platform is the physical address — the memory attributes (PMAs) the
-/// implementation assigns to the device holes of the address map. So the check
-/// that carries the weight is not this function, it is
-/// [`Inventory::device`](molt_arch::memory::Inventory::device) refusing a span
-/// that firmware called RAM: a window that reached into RAM would be mapped
-/// cacheable by the hardware no matter what this code asked for.
+/// platform is the physical address — the memory attributes the implementation
+/// assigns to the device holes of its address map. So the check that carries
+/// the weight is not this function, it is [`Inventory::device`] refusing a span
+/// firmware called RAM: a window that reached into RAM would be mapped
+/// cacheable by the hardware no matter what this code asked for. That is also
+/// why [`protection`] recovers the memory type from the physical address rather
+/// than from the entry.
 pub fn map_device(window: Device, rights: Rights) -> Result<Mmio<'static>, MappingError> {
     // First, because this is what refuses an executable window, and it decides
     // the cache policy rather than accepting one from the caller.
     let (rights, _cache) = window.mapping(rights)?;
     let span = window.span();
-    let start = usize::try_from(span.start()).map_err(|_| MappingError::InvalidAddress)?;
-    let end = usize::try_from(span.end()).map_err(|_| MappingError::InvalidAddress)?;
+    let bytes = usize::try_from(span.bytes()).map_err(|_| MappingError::InvalidAddress)?;
 
-    let state = active()?;
-    // A second window over registers someone already holds would break the
-    // uniqueness `Mmio` promises, and it would do it silently.
-    if state.log.overlaps(span.start(), span.end()) {
-        return Err(MappingError::Backend);
+    let state = active().map_err(mapping_error)?;
+    let base = state.devices;
+    let end = base.checked_add(bytes).ok_or(MappingError::InvalidAddress)?;
+    if end > DEVICE_REGION_END {
+        return Err(MappingError::OutOfFrames);
     }
-    // Declared before it is mapped, so a log that is full fails before the
-    // tables change rather than leaving a mapping the audit never heard of.
-    state.log.push(MappedRange::device(span.start(), span.end()))?;
 
-    let mut flags = PTE_A | PTE_D | PTE_R;
-    if rights.is_write() {
-        flags |= PTE_W;
+    // Declared before it is mapped, so a full log fails before the tables
+    // change rather than leaving a mapping the audit never heard of.
+    state.log.push(MappedRange::device(base as u64, end as u64))?;
+    let mut address = 0;
+    while address < bytes {
+        // `map_leaf` at level zero rather than `map_range`: a megapage would
+        // reach past the window and cover whatever the bus put beside it.
+        map_leaf(
+            state.root,
+            &mut state.pool,
+            base + address,
+            span.start() + address as u64,
+            leaf_flags(rights),
+            0,
+        )
+        .map_err(mapping_error)?;
+        address += PAGE_4K;
     }
-    // `Granularity::Small`: a megapage would reach past the window and cover
-    // whatever the bus put beside it. Never `PTE_X`; `window.mapping` already
-    // refused a window that asked for it.
-    map_range(state.root, &mut state.pool, start, end, flags, Granularity::Small)?;
     // SAFETY: the new leaves are in memory; the fence retires any negative
     // caching of the window from before it was mapped.
     unsafe {
         asm!("sfence.vma", options(nostack));
     }
 
+    // Round out to a megapage boundary so two windows never share a level-zero
+    // table's neighbourhood, and an off-by-one in a driver's offset arithmetic
+    // lands in a hole rather than in another device.
+    state.devices = end.next_multiple_of(PAGE_2M);
     // SAFETY: every frame of `span` was just mapped readable, never executable,
-    // at its identity address, and the mapping is never torn down, so the
-    // window stays valid for `'static`. The overlap check above is what makes
-    // this the only handle over the range.
-    Ok(unsafe { Mmio::new(start as *mut u8, span.bytes()) })
+    // at `base`, and the mapping is never torn down, so the window stays valid
+    // for `'static`. The cursor only moves forward, so no second window can be
+    // handed out over the same virtual range.
+    Ok(unsafe { Mmio::new(base as *mut u8, span.bytes()) })
 }
 
-pub fn verify_image_protection() -> Result<(), PlatformError> {
-    let state = active()?;
-    let walk = TableWalk { root: state.root, log: &state.log };
-    Audit::new(state.log.as_slice()).cover(&walk).map_err(PlatformError::Mapping)?;
-    // A full sweep of the live tables catches anything mapped that the kernel
-    // never declared — a stray writable range through firmware or MMIO would
-    // fail here rather than escape the outward-only check above.
-    walk_leaves(state.root, &Audit::new(state.log.as_slice()), &state.log)
+/// The mapping error inside a [`PlatformError`], for the paths that report one.
+fn mapping_error(error: PlatformError) -> MappingError {
+    match error {
+        PlatformError::Mapping(error) => error,
+        _ => MappingError::Backend,
+    }
+}
+
+/// Sv39 leaf flags for `rights`, with access and dirty pre-set.
+fn leaf_flags(rights: Rights) -> u64 {
+    let mut flags = PTE_A;
+    if rights.is_read() {
+        flags |= PTE_R;
+    }
+    if rights.is_write() {
+        flags |= PTE_R | PTE_W | PTE_D;
+    }
+    if rights.is_execute() {
+        flags |= PTE_X;
+    }
+    flags
+}
+
+fn address_error() -> PlatformError {
+    PlatformError::Mapping(MappingError::InvalidAddress)
 }
 
 /// Walks the live translation tables and hands every present leaf to `audit`.
-fn walk_leaves(root: *const u64, audit: &Audit<'_>, log: &MappingLog) -> Result<(), PlatformError> {
-    walk_table(root, 2, 0, audit, log)
+fn walk_leaves(
+    root: *const u64,
+    audit: &Audit<'_>,
+    inventory: &Inventory<'_>,
+) -> Result<(), PlatformError> {
+    walk_table(root, 2, 0, audit, inventory)
 }
 
 fn walk_table(
@@ -377,7 +478,7 @@ fn walk_table(
     level: usize,
     base: u64,
     audit: &Audit<'_>,
-    log: &MappingLog,
+    inventory: &Inventory<'_>,
 ) -> Result<(), PlatformError> {
     let span_bits = 12 + 9 * level;
     for i in 0..512u64 {
@@ -390,13 +491,9 @@ fn walk_table(
         let start = base | (i << span_bits);
         if entry & PTE_RWX != 0 {
             let size = 1u64 << span_bits;
-            // The memory type is not in the entry — Sv39 has no bits for one —
-            // so it comes from the physical address, which the identity map
-            // makes equal to `start`.
-            let protection =
-                PageProtection::new(entry & PTE_R != 0, entry & PTE_W != 0, entry & PTE_X != 0)
-                    .cached(log.cache(start));
-            audit.accepts(Leaf::new(start, size, protection)).map_err(PlatformError::Mapping)?;
+            audit
+                .accepts(Leaf::new(start, size, protection(entry, inventory)))
+                .map_err(PlatformError::Mapping)?;
             continue;
         }
         // A pointer entry — walk into the child table it names.
@@ -404,19 +501,37 @@ fn walk_table(
             return Err(PlatformError::Mapping(MappingError::Backend));
         }
         let next = ((entry >> 10) << 12) as *const u64;
-        walk_table(next, level - 1, start, audit, log)?;
+        walk_table(next, level - 1, start, audit, inventory)?;
     }
     Ok(())
 }
 
-/// [`PageWalk`] over the live Sv39 tables the kernel built.
+/// The rights and memory type a live Sv39 leaf grants.
 ///
-/// The log rides along because a page-table entry cannot answer the audit's
-/// other question: Sv39 stores no memory type, so cacheability is recovered
-/// from the physical address instead.
-struct TableWalk<'log> {
+/// Sv39 has no memory-type bits: `Svpbmt` adds them, it is an extension the
+/// QEMU `virt` board's `rv64` CPU does not implement, and S-mode cannot even
+/// ask without parsing the device tree. So the memory type of a leaf here is
+/// not a property of the entry at all — it is the PMA of the physical address
+/// the entry names, fixed by the platform. Classifying that address through
+/// [`Inventory`] therefore reports what the hardware actually does: RAM and
+/// image frames are write-back — as is firmware-reserved RAM — and anything in
+/// a hole of the firmware map is
+/// I/O-ordered. When `Svpbmt` is present it becomes an override on top of this
+/// answer — a PBMT field of zero still means "whatever the PMA says" — so the
+/// classification stays correct and gains a bit to read instead.
+fn protection(entry: u64, inventory: &Inventory<'_>) -> PageProtection {
+    let physical = (entry >> 10) << 12;
+    let cache = match inventory.kind(physical) {
+        Kind::Ram | Kind::Image | Kind::Reserved => Cache::WriteBack,
+        Kind::Device => Cache::Device,
+    };
+    PageProtection::new(entry & PTE_R != 0, entry & PTE_W != 0, entry & PTE_X != 0).cached(cache)
+}
+
+/// [`PageWalk`] over the live Sv39 tables the kernel built.
+struct TableWalk<'i> {
     root: *const u64,
-    log: &'log MappingLog,
+    inventory: &'i Inventory<'i>,
 }
 
 impl PageWalk for TableWalk<'_> {
@@ -435,10 +550,7 @@ impl PageWalk for TableWalk<'_> {
             if entry & PTE_RWX != 0 {
                 let span = 1u64 << (12 + 9 * level);
                 let start = address & !(span - 1);
-                let protection =
-                    PageProtection::new(entry & PTE_R != 0, entry & PTE_W != 0, entry & PTE_X != 0)
-                        .cached(self.log.cache(start));
-                return Some(Leaf::new(start, span, protection));
+                return Some(Leaf::new(start, span, protection(entry, self.inventory)));
             }
             if level == 0 {
                 return None;
@@ -446,6 +558,29 @@ impl PageWalk for TableWalk<'_> {
             table = ((entry >> 10) << 12) as *const u64;
             level -= 1;
         }
+    }
+}
+
+/// Somewhere page-table frames come from.
+///
+/// The boot pass allocates straight out of the firmware memory map; a window
+/// mapped after that map is gone allocates out of the [`FramePool`] the boot
+/// pass filled. The mapping code cares about neither, only that a frame
+/// arrives, so it takes this rather than growing a second copy of itself per
+/// source.
+trait Frames {
+    fn take(&mut self) -> Option<u64>;
+}
+
+impl Frames for FrameAllocator<'_> {
+    fn take(&mut self) -> Option<u64> {
+        self.allocate().map(PhysicalFrame::start)
+    }
+}
+
+impl<const N: usize> Frames for FramePool<N> {
+    fn take(&mut self) -> Option<u64> {
+        self.allocate().map(PhysicalFrame::start)
     }
 }
 
@@ -462,13 +597,13 @@ fn map_range(
     end: usize,
     rights: u64,
     granularity: Granularity,
-) -> Result<(), MappingError> {
+) -> Result<(), PlatformError> {
     let mut flags = rights | PTE_A;
     if rights & PTE_W != 0 {
         flags |= PTE_D;
     }
     let mut va = align_down(start, PAGE_4K);
-    let end = align_up(end, PAGE_4K).ok_or(MappingError::InvalidAddress)?;
+    let end = align_up(end, PAGE_4K).ok_or(PlatformError::Mapping(MappingError::InvalidAddress))?;
     while va < end {
         let level = (granularity == Granularity::LargeOk
             && va % PAGE_2M == 0
@@ -486,7 +621,7 @@ fn map_leaf(
     pa: u64,
     flags: u64,
     level: usize,
-) -> Result<(), MappingError> {
+) -> Result<(), PlatformError> {
     let mut table = root;
     for above in ((level + 1)..=2).rev() {
         // SAFETY: `table` always points at a valid 512-entry table frame.
@@ -496,7 +631,7 @@ fn map_leaf(
             *entry = pte(next as u64, 0); // a pointer entry clears R/W/X.
         } else if *entry & PTE_RWX != 0 {
             // Splitting a live leaf is not implemented; ranges are mapped once.
-            return Err(MappingError::Backend);
+            return Err(PlatformError::Mapping(MappingError::Backend));
         }
         table = ((*entry >> 10) << 12) as *mut u64;
     }
@@ -512,12 +647,14 @@ fn index(va: usize, level: usize) -> usize {
     (va >> (12 + 9 * level)) & 0x1ff
 }
 
+/// The shared [`molt_arch::align_down`] on this platform's address width.
 fn align_down(value: usize, alignment: usize) -> usize {
-    value & !(alignment - 1)
+    molt_arch::align_down(value as u64, alignment as u64) as usize
 }
 
+/// The shared [`molt_arch::align_up`] on this platform's address width.
 fn align_up(value: usize, alignment: usize) -> Option<usize> {
-    value.checked_add(alignment - 1).map(|value| value & !(alignment - 1))
+    molt_arch::align_up(value as u64, alignment as u64).map(|value| value as usize)
 }
 
 /// Assembles an Sv39 PTE from a physical address and permission flags.
@@ -526,12 +663,12 @@ fn pte(pa: u64, flags: u64) -> u64 {
 }
 
 /// Allocates one frame and returns its physical base address.
-fn alloc_frame(frames: &mut dyn Frames) -> Result<u64, MappingError> {
-    frames.take().ok_or(MappingError::OutOfFrames)
+fn alloc_frame(frames: &mut dyn Frames) -> Result<u64, PlatformError> {
+    frames.take().ok_or(PlatformError::Mapping(MappingError::OutOfFrames))
 }
 
 /// Allocates and zeroes one frame for use as a page table.
-fn alloc_table(frames: &mut dyn Frames) -> Result<*mut u64, MappingError> {
+fn alloc_table(frames: &mut dyn Frames) -> Result<*mut u64, PlatformError> {
     let frame = alloc_frame(frames)?;
     let table = frame as *mut u64;
     // SAFETY: every frame the allocator hands out is identity mapped — before

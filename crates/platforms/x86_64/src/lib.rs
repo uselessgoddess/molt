@@ -21,10 +21,25 @@ pub use bootloader_api::{
 };
 use molt_arch::memory::{Device, Rights};
 use molt_arch::{
-    BootInfo, ConfigSpace, DeviceMapper, ExitStatus, FabricError, FramePool, ImageRange,
-    InterruptFabric, MappingError, MemoryMap, MemoryRegion, MemoryRegionKind, Mmio, MsiMessage,
-    Platform, PlatformError, SerialPort, Sink,
+    BootInfo, ConfigSpace, DeviceMapper, ExitStatus, FabricError, ImageRange, InterruptFabric,
+    MappingError, MemoryMap, MemoryRegion, MemoryRegionKind, Mmio, MsiMessage, Platform,
+    PlatformError, SerialPort, Sink,
 };
+
+/// Where the loader must place the boot stack, and how large it is.
+///
+/// The kernel re-creates the stack mapping in its own tables before switching
+/// `CR3`, and it cannot ask the loader afterwards where the stack went — the
+/// boot info does not say. Pinning the address is what makes the window
+/// findable, so it is a fixed address rather than a dynamic one.
+pub const STACK_BASE: u64 = 0xffff_9000_0000_0000;
+pub const STACK_SIZE: u64 = 128 * 1024;
+
+/// Where the loader must place [`BootloaderInfo`], and the window the kernel
+/// clones around it. The structure's length depends on the firmware memory
+/// map, so the window is sized for the largest map and holes are skipped.
+pub const BOOT_INFO_BASE: u64 = 0xffff_9100_0000_0000;
+pub const BOOT_INFO_WINDOW: u64 = 2 * 1024 * 1024;
 
 /// Defines the bootloader-specific entry wrapper outside `molt-kernel`.
 #[macro_export]
@@ -33,6 +48,9 @@ macro_rules! entry_point {
         static __MOLT_BOOT_CONFIG: $crate::BootloaderConfig = {
             let mut config = $crate::BootloaderConfig::new_default();
             config.mappings.physical_memory = Some($crate::BootMapping::Dynamic);
+            config.mappings.kernel_stack = $crate::BootMapping::FixedAddress($crate::STACK_BASE);
+            config.kernel_stack_size = $crate::STACK_SIZE;
+            config.mappings.boot_info = $crate::BootMapping::FixedAddress($crate::BOOT_INFO_BASE);
             config
         };
 
@@ -94,49 +112,40 @@ impl MemoryMap for BootloaderMemoryMap<'_> {
     }
 }
 
-/// Where device register windows are mapped.
-///
-/// A region of its own, far from the kernel image and from the bootloader's
-/// direct map, so that a stray pointer into device space is a fault rather than
-/// a write into somebody's data.
-pub(crate) const DEVICE_REGION: u64 = 0x0000_4444_0000_0000;
-
-/// How many page-table frames are set aside for device mappings.
-///
-/// Enough for a few windows' worth of intermediate tables — every window needs
-/// at most one table per level below the top — with room to spare. Running out
-/// is a bounded, reported failure rather than a corrupted table.
-const TABLE_FRAMES: usize = 32;
-
-pub(crate) type TableFrames = FramePool<TABLE_FRAMES>;
-
 /// Concrete services for the current x86_64 boot target.
 pub struct X86_64 {
     serial: Com1,
-    /// The bootloader's direct-map offset, or zero before `initialize`.
-    offset: u64,
     /// The physical address firmware reported for the ACPI RSDP.
     rsdp: Option<u64>,
-    /// Frames reserved while the firmware memory map was still borrowable.
-    tables: TableFrames,
-    /// The next free device address; bumps forward and never back.
-    devices: u64,
+    /// What the MCFG table said, read before the kernel's tables went live.
+    space: Option<ConfigSpace>,
 }
 
 impl X86_64 {
     pub const fn new() -> Self {
-        Self {
-            serial: Com1,
-            offset: 0,
-            rsdp: None,
-            tables: TableFrames::empty(),
-            devices: DEVICE_REGION,
-        }
+        Self { serial: Com1, rsdp: None, space: None }
     }
 
     const fn with_rsdp(mut self, rsdp: Option<u64>) -> Self {
         self.rsdp = rsdp;
         self
+    }
+
+    /// Walks ACPI for the configuration space, through the loader's direct map.
+    ///
+    /// Firmware reports the RSDP address and molt walks from there rather than
+    /// scanning low memory for the signature: the scan is a guess that finds a
+    /// stale table on machines that kept one, and UEFI does not put the RSDP
+    /// where the scan looks in the first place. A machine with no MCFG is not a
+    /// failure to report — it is a machine with no configuration space — so
+    /// this answers `None` and the caller says so on the serial line.
+    fn acpi_config_space(&self, boot_info: &BootInfo<'_>) -> Option<ConfigSpace> {
+        let rsdp = self.rsdp?;
+        let offset = boot_info.physical_offset()?;
+        // SAFETY: `rsdp` is the address the bootloader took from firmware, and
+        // `offset` is the loader's direct map, still live at this point in
+        // `initialize` — the kernel has not written `CR3` yet.
+        unsafe { acpi::config_space(rsdp, offset) }.ok()
     }
 }
 
@@ -155,18 +164,19 @@ impl Platform for X86_64 {
 
     fn initialize(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
         interrupts::init();
-        let offset = boot_info.physical_offset().ok_or(PlatformError::MissingPhysicalMemoryMap)?;
-        self.offset = offset;
+        // ACPI is read here, before anything else, because this is the last
+        // moment it is readable at all: firmware tables sit in reserved memory,
+        // the kernel's own direct map covers only usable RAM, and the loader's
+        // map stops being live the moment `CR3` is written. What survives the
+        // switch is the ECAM base this walk found, not the tables it found it
+        // in — and the window over that base is mapped like any other device.
+        self.space = self.acpi_config_space(boot_info);
 
-        // The page-table frames are taken now, while the firmware map is still
-        // borrowable. A device mapped later cannot go back and ask for one:
-        // the map is gone by then, and building a fresh allocator over it would
-        // start handing out the frames the live tables are already made of.
-        let floor = boot_info.kernel_image().map_or(0, |image| image.end());
-        let mut frames = molt_arch::FrameAllocator::above(boot_info.memory_map(), floor);
-        self.tables.fill(&mut frames);
-
-        apic::init(offset)
+        // The kernel's own tables come up before the APIC, not after: the
+        // loader's direct map is the only way to reach MMIO until they exist,
+        // and it stops being live the moment `CR3` is written.
+        let apic_window = memory::init(boot_info)?;
+        apic::init(apic_window)
     }
 
     fn verify_exception_path(&mut self) -> bool {
@@ -174,35 +184,25 @@ impl Platform for X86_64 {
     }
 
     fn verify_owned_mapping(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
-        let offset = boot_info.physical_offset().ok_or(PlatformError::MissingPhysicalMemoryMap)?;
-        memory::verify_owned_mapping(offset, &mut self.tables)
+        memory::verify_owned_mapping(boot_info)
     }
 
     fn verify_image_protection(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
-        let offset = boot_info.physical_offset().ok_or(PlatformError::MissingPhysicalMemoryMap)?;
-        memory::verify_image_protection(offset, boot_info)
+        memory::verify_image_protection(boot_info)
     }
 
-    /// The configuration space ACPI's MCFG table describes.
-    ///
-    /// Firmware reports the RSDP address and molt walks from there rather than
-    /// scanning low memory for the signature: the scan is a guess that finds a
-    /// stale table on machines that kept one, and UEFI does not put the RSDP
-    /// where the scan looks in the first place.
+    /// The configuration space ACPI's MCFG table described, read at boot.
     fn config_space(&mut self, _boot_info: &BootInfo<'_>) -> Result<ConfigSpace, PlatformError> {
-        let rsdp = self.rsdp.ok_or(PlatformError::MissingConfigSpace)?;
-        if self.offset == 0 {
-            return Err(PlatformError::MissingPhysicalMemoryMap);
-        }
-        // SAFETY: `rsdp` is the address the bootloader took from firmware, and
-        // `self.offset` is the direct map it built, valid for the whole run.
-        unsafe { acpi::config_space(rsdp, self.offset) }
-            .map_err(|_| PlatformError::MissingConfigSpace)
+        self.space.ok_or(PlatformError::MissingConfigSpace)
     }
 
     fn route_interrupts(&mut self, sink: &'static dyn Sink) -> Result<(), PlatformError> {
         msi::route(sink);
         Ok(())
+    }
+
+    fn verify_device_window(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+        memory::verify_device_window(boot_info)
     }
 
     fn arm_timer(&mut self, initial_count: u32) -> Result<(), PlatformError> {
@@ -236,7 +236,7 @@ impl DeviceMapper for X86_64 {
         window: Device,
         rights: Rights,
     ) -> Result<Mmio<'static>, MappingError> {
-        memory::map_device(self.offset, &mut self.tables, &mut self.devices, window, rights)
+        memory::map_device(window, rights)
     }
 }
 

@@ -14,6 +14,7 @@ const BOOT_MARKERS: &[&str] = &[
     "MOLT_EXCEPTION_OK",
     "MOLT_MAPPING_OK",
     "MOLT_WX_OK",
+    "MOLT_DEVICE_WINDOW_OK",
     "MOLT_TIMER_OK",
     "MOLT_CANCELLATION_OK",
     "MOLT_STALE_COMPLETION_OK",
@@ -108,7 +109,7 @@ impl Case {
 /// than pretending it delivered something.
 fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
     match (arch, case) {
-        (Arch::Riscv64, Case::Boot) => &["MOLT_SBI_CONSOLE:"],
+        (Arch::Riscv64, Case::Boot) => &["MOLT_SBI_CONSOLE:", "MOLT_UART_WINDOW:"],
         (Arch::X86_64, Case::Boot) => &["MOLT_BAR_OK:", "MOLT_MSI_OK:", "MOLT_INTERRUPT_OK:"],
         _ => &[],
     }
