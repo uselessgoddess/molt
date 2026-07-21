@@ -144,6 +144,60 @@ impl MappedRange {
     }
 }
 
+/// The declared ranges of one address space, without an allocator.
+///
+/// A kernel that owns its tables has to remember what it mapped in order to
+/// audit it later, and it has to do so while building the very address space
+/// an allocation would need. `N` is the capacity; [`push`](Self::push) merges a
+/// range into the previous one when they touch and hold the same contents, so
+/// cloning a window page by page costs one entry rather than one per page.
+#[derive(Clone, Copy, Debug)]
+pub struct Declared<const N: usize> {
+    ranges: [MappedRange; N],
+    len: usize,
+}
+
+impl<const N: usize> Declared<N> {
+    pub const fn new() -> Self {
+        const EMPTY: MappedRange = MappedRange::new(0, 0, Contents::Ram);
+        Self { ranges: [EMPTY; N], len: 0 }
+    }
+
+    /// Records `range`, extending the previous entry when the two are adjacent.
+    pub fn push(&mut self, range: MappedRange) -> Result<(), MappingError> {
+        if range.start >= range.end {
+            return Ok(());
+        }
+        if let Some(last) = self.ranges[..self.len].last_mut()
+            && last.contents == range.contents
+            && last.end == range.start
+        {
+            last.end = range.end;
+            return Ok(());
+        }
+        if self.len == N {
+            return Err(MappingError::Backend);
+        }
+        self.ranges[self.len] = range;
+        self.len += 1;
+        Ok(())
+    }
+
+    pub fn as_slice(&self) -> &[MappedRange] {
+        &self.ranges[..self.len]
+    }
+
+    pub fn audit(&self) -> Audit<'_> {
+        Audit::new(self.as_slice())
+    }
+}
+
+impl<const N: usize> Default for Declared<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The ranges a kernel claims to have mapped, checked against the live tables.
 #[derive(Clone, Copy, Debug)]
 pub struct Audit<'ranges> {
