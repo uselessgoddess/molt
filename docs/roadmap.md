@@ -131,8 +131,23 @@ without the audit being able to see it.
 
 ### Stage 2.2 — PCI enumeration and interrupts
 
-- [ ] PCI configuration space enumerated through typed device windows
-- [ ] MSI/MSI-X vectors routed to the existing interrupt path
+- [x] `molt-pci`: configuration space as typed views over a mapped window, with
+      no way to produce a pointer the audit never saw
+- [x] the aperture found where each machine keeps it — ACPI's MCFG on x86_64, a
+      `compatible` node in the device tree on RISC-V — and opened through
+      `Inventory::device` like any other window
+- [x] every function swept rather than walked through bridges, with
+      `MOLT_PCI:` reporting what was found on both platforms
+- [x] an MSI vector bound, fired, and delivered into the same `InterruptSlab`
+      the timer path already uses, armed before the device is poked
+- [x] a real MSI-X table mapped through the BAR its capability names, and an
+      entry read back through the mapping
+- [x] `docs/pci.md`
+
+Not in this stage: message delivery on RISC-V. The `virt` board's interrupt
+file is AIA's IMSIC, and claiming a vector through the wired PLIC instead would
+prove nothing about MSI — so the platform reports `Unsupported` and the item
+stays honest rather than being reinterpreted into something the machine can do.
 
 ### Stage 2.3 — VirtIO block
 

@@ -1,0 +1,30 @@
+Prints what the device tree says about configuration space before anything maps
+it. The question it answers is the RISC-V half of the x86_64 firmware report:
+the board has no architectural address for a bus, so either the tree names one
+or the kernel is guessing, and a guess would map a window over whatever else
+lives at that address.
+
+Observed on QEMU 8.x `-machine virt -bios default`:
+
+    MOLT_FDT: Some(Region { base: 30000000, size: 10000000 })
+
+That is 256 MiB, so 256 buses of 1 MiB each, which is what `Ecam::span(0, 255)`
+then asks `open_window` to map — and 0x3000_0000 is outside every region the
+memory map reports, so `Inventory::device` classifies it as a hole and the
+window comes back `Cache::Device` rather than write-back.
+
+Worth noting for anyone reading `paging.rs` next to this: 0x3000_0000 is also
+the *virtual* address the UART window uses. The two never collide, because on
+RISC-V only RAM and the image are identity mapped and every device window is
+handed a virtual address from 0x4_0000_0000 upward.
+
+Apply with `git apply experiments/riscv-device-tree-report.patch`, run
+`cargo smoke riscv64`, then revert.
+
+--- a/crates/platforms/riscv/src/lib.rs
++++ b/crates/platforms/riscv/src/lib.rs
+@@ fn initialize
+             let _ = writeln!(SerialWriter::new(&mut self.serial), "MOLT_SBI_CONSOLE: {console:?}");
+
++            let _ = writeln!(SerialWriter::new(&mut self.serial), "MOLT_FDT: {:x?}", self.bus);
+             trap::init();

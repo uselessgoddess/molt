@@ -137,6 +137,14 @@ into Cargo's target-runner so a kernel boot test is an ordinary `cargo` command.
 The property all three share is worth keeping: the boot test is the same
 artifact users get, not a special build.
 
+What each marker establishes is listed in the record for the stage that added
+it; the bus and interrupt markers are in [`pci.md`](pci.md). Two of them need
+QEMU to be told to provide a device: the x86_64 machine gets `-device edu`,
+which is the only device on either machine that raises a vector with no driver
+behind it, and both machines get `-device virtio-rng-pci` for its MSI-X table.
+A marker that only passes because the default machine happens to have something
+is a marker that stops meaning anything when the default changes.
+
 One gap was worth closing. The panic handler is the single path a passing boot
 never takes, so it could rot silently. `cargo smoke` now also boots a
 `panic-smoke` build per architecture and requires both the `MOLT_PANIC:` marker

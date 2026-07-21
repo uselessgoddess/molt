@@ -163,6 +163,11 @@ type of its leaves fails an MMIO audit rather than silently passing one. That
 is the direction an unaudited attribute should fail, and it is a standing task
 for whichever platform reports first.
 
+Stage 2.2 put that direction to work: configuration space, a device's BAR, and
+an MSI-X table are all reached through the same `Inventory::device` window and
+the same audit, so a bus is not a special case of a device window — see
+[the bus decision record](pci.md).
+
 Two boot markers cover the rest. `MOLT_PHYSMAP_OK` reads firmware's map back
 as typed memory — usable RAM classifies as `Kind::Ram`, the space above every
 reported region is a hole and therefore `Kind::Device`, and asking for a device
@@ -194,10 +199,11 @@ them twice, and gets them back on release. Both run on x86_64 and RISC-V.
   its reset configuration and selects the uncacheable entry with `PCD|PWT` for
   device windows, so a `Cache::Device` leaf really is uncacheable rather than
   merely declared so. RISC-V's Sv39 PTE has no memory-type field at all:
-  `Svpbmt` is absent on QEMU `virt` and cannot be detected from S-mode without
-  the device tree, so the effective type is the PMA of the physical address and
-  the audit reports it from `Inventory::kind`. `Svpbmt` becomes an override on
-  top of that once the device tree is parsed, not a replacement for it.
+  `Svpbmt` is absent on QEMU `virt`, so the effective type is the PMA of the
+  physical address and the audit reports it from `Inventory::kind`. Stage 2.2
+  added a device-tree reader (`docs/pci.md`), so detecting `Svpbmt` is now a
+  question of reading one more node rather than of having no reader at all — it
+  becomes an override on top of the PMA, not a replacement for it.
 - **Write-combining still has no consumer.** `Cache` remains two values; a
   framebuffer that wants a third can add it with a test that fails without it.
 
