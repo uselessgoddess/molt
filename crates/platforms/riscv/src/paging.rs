@@ -82,12 +82,14 @@ type MappingLog = Declared<{ 3 + MAX_RAM_RANGES + MAX_DEVICE_RANGES }>;
 ///
 /// [`map_device`] runs long after the firmware memory map went out of scope, so
 /// it cannot resume a [`FrameAllocator`], and a fresh one would hand back the
-/// frames the live tables are already made of. The size is the arithmetic for
-/// the largest window Stage 2.2 maps: a 256 MiB ECAM region at 4 KiB
-/// granularity needs one level-0 table per 2 MiB — 128 of them — plus a level-1
-/// table per gigabyte it touches. The rest is headroom for a few BARs. Running
-/// short is not a corruption, it is [`MappingError::OutOfFrames`] at the
-/// mapping that needed the frame.
+/// frames the live tables are already made of. The size is arithmetic over what
+/// Stage 2.2 maps: a window costs one level-0 table per 2 MiB it spans, plus a
+/// level-1 table per gigabyte, and windows are rounded apart to megapage
+/// boundaries so they never share one. The largest is a single ECAM bus — 256
+/// functions of 4 KiB, one table — and the rest is headroom for BARs and for a
+/// board whose device holes are scattered across gigabytes. Running short is
+/// not a corruption, it is [`MappingError::OutOfFrames`] at the mapping that
+/// needed the frame.
 const TABLE_FRAMES: usize = 160;
 
 /// Address of a linker-defined symbol.
