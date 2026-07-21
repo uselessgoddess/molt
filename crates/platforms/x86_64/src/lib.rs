@@ -21,6 +21,21 @@ use molt_arch::{
     PlatformError, SerialPort,
 };
 
+/// Where the loader must place the boot stack, and how large it is.
+///
+/// The kernel re-creates the stack mapping in its own tables before switching
+/// `CR3`, and it cannot ask the loader afterwards where the stack went — the
+/// boot info does not say. Pinning the address is what makes the window
+/// findable, so it is a fixed address rather than a dynamic one.
+pub const STACK_BASE: u64 = 0xffff_9000_0000_0000;
+pub const STACK_SIZE: u64 = 128 * 1024;
+
+/// Where the loader must place [`BootloaderInfo`], and the window the kernel
+/// clones around it. The structure's length depends on the firmware memory
+/// map, so the window is sized for the largest map and holes are skipped.
+pub const BOOT_INFO_BASE: u64 = 0xffff_9100_0000_0000;
+pub const BOOT_INFO_WINDOW: u64 = 2 * 1024 * 1024;
+
 /// Defines the bootloader-specific entry wrapper outside `molt-kernel`.
 #[macro_export]
 macro_rules! entry_point {
@@ -28,6 +43,9 @@ macro_rules! entry_point {
         static __MOLT_BOOT_CONFIG: $crate::BootloaderConfig = {
             let mut config = $crate::BootloaderConfig::new_default();
             config.mappings.physical_memory = Some($crate::BootMapping::Dynamic);
+            config.mappings.kernel_stack = $crate::BootMapping::FixedAddress($crate::STACK_BASE);
+            config.kernel_stack_size = $crate::STACK_SIZE;
+            config.mappings.boot_info = $crate::BootMapping::FixedAddress($crate::BOOT_INFO_BASE);
             config
         };
 
@@ -112,8 +130,11 @@ impl Platform for X86_64 {
 
     fn initialize(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
         interrupts::init();
-        let offset = boot_info.physical_offset().ok_or(PlatformError::MissingPhysicalMemoryMap)?;
-        apic::init(offset)
+        // The kernel's own tables come up before the APIC, not after: the
+        // loader's direct map is the only way to reach MMIO until they exist,
+        // and it stops being live the moment `CR3` is written.
+        let apic_window = memory::init(boot_info)?;
+        apic::init(apic_window)
     }
 
     fn verify_exception_path(&mut self) -> bool {
@@ -126,6 +147,10 @@ impl Platform for X86_64 {
 
     fn verify_image_protection(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
         memory::verify_image_protection(boot_info)
+    }
+
+    fn verify_device_window(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+        memory::verify_device_window(boot_info)
     }
 
     fn arm_timer(&mut self, initial_count: u32) -> Result<(), PlatformError> {
