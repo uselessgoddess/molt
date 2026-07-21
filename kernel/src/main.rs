@@ -15,6 +15,8 @@ use molt_core::cell::{Cell, CellId, Supervisor};
 use molt_core::completion::{CompletionError, CompletionSlab};
 use molt_core::ring::{Completion, IoRing, Submission};
 
+mod pci;
+
 #[cfg(target_arch = "x86_64")]
 molt_x86_64::entry_point!(kernel_main);
 
@@ -83,6 +85,8 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
 
     verify_frame_ownership(usable);
     println!(platform, "MOLT_FRAME_OWNER_OK");
+
+    pci::smoke(boot_info, platform);
 }
 
 const OWNED_FRAMES: u64 = 4;
