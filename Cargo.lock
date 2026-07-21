@@ -522,6 +522,7 @@ name = "molt-riscv"
 version = "0.1.0"
 dependencies = [
  "molt-arch",
+ "molt-pci",
 ]
 
 [[package]]

@@ -380,7 +380,10 @@ pub fn open_window(
     }
     state.cursor = frames.0.cursor();
     state.window = base + WINDOW_STRIDE;
-    state.log.push(MappedRange::device(base, base + (end - start))).map_err(PlatformError::Mapping)?;
+    state
+        .log
+        .push(MappedRange::device(base, base + (end - start)))
+        .map_err(PlatformError::Mapping)?;
     Ok(base + (physical - start))
 }
 

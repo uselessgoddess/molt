@@ -106,7 +106,7 @@ impl Case {
 /// silently where they are absent and only this arch demands them.
 fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
     match (arch, case) {
-        (Arch::Riscv64, Case::Boot) => &["MOLT_SBI_CONSOLE:", "MOLT_UART_WINDOW:"],
+        (Arch::Riscv64, Case::Boot) => &["MOLT_SBI_CONSOLE:", "MOLT_UART_WINDOW:", "MOLT_PCI_OK"],
         (Arch::X86_64, Case::Boot) => &["MOLT_PCI_OK", "MOLT_MSI:", "MOLT_MSI_OK", "MOLT_MSIX_OK"],
         _ => &[],
     }
@@ -313,7 +313,20 @@ fn qemu_riscv64_command(kernel: &Path) -> Command {
     let mut command = Command::new(qemu);
     // OpenSBI (`-bios default`) loads the ELF at its S-mode payload address and
     // an orderly SBI shutdown exits QEMU through the `virt` board's test device.
-    command.args(["-machine", "virt", "-display", "none", "-no-reboot", "-bios", "default"]);
+    command.args([
+        "-machine",
+        "virt",
+        "-display",
+        "none",
+        "-no-reboot",
+        "-bios",
+        "default",
+        // The `virt` board's host bridge answers on its own, but a bridge alone
+        // reports no message vectors; this device carries an MSI-X capability,
+        // so the sweep has something to read a vector count out of.
+        "-device",
+        "virtio-rng-pci",
+    ]);
     command.arg("-kernel").arg(kernel);
     command
 }

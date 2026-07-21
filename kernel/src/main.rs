@@ -11,9 +11,9 @@ use molt_arch::{
     BootInfo, ExitStatus, FRAME_SIZE, InterruptSink, Platform, PlatformError, SerialPort,
     SerialWriter, UsableRegions,
 };
+use molt_core::cache::Compact;
 use molt_core::capability::{CapabilityError, CapabilityTable, ReadWrite};
 use molt_core::cell::{Cell, CellId, Supervisor};
-use molt_core::cache::Compact;
 use molt_core::completion::{CompletionError, CompletionSlab};
 use molt_core::interrupt::InterruptSlab;
 use molt_core::ring::{Completion, IoRing, Submission};

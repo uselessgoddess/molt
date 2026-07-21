@@ -15,8 +15,16 @@
 mod csr;
 // Decoding an SBI error involves no registers, so it stays testable on the host.
 mod error;
+// Reading the device tree is byte work over a slice, so it stays testable on
+// the host — which matters more here than anywhere else, since a misread tree
+// sends every later window at the wrong physical address. It is public for the
+// same reason [`SbiError`] is: it says something about this platform that is
+// true whether or not a kernel is running on it.
+pub mod fdt;
 #[cfg(target_arch = "riscv64")]
 mod paging;
+#[cfg(target_arch = "riscv64")]
+mod pci;
 #[cfg(target_arch = "riscv64")]
 mod sbi;
 #[cfg(target_arch = "riscv64")]
@@ -53,11 +61,12 @@ mod imp {
     use core::fmt::Write as _;
 
     use molt_arch::{
-        BootInfo, ExitStatus, FRAME_SIZE, MemoryMap, MemoryRegion, MemoryRegionKind, Platform,
-        PlatformError, SerialPort, SerialWriter,
+        BootInfo, DeviceFunction, ExitStatus, FRAME_SIZE, MemoryMap, MemoryRegion,
+        MemoryRegionKind, Platform, PlatformError, SerialPort, SerialWriter,
     };
 
-    use crate::{csr, paging, sbi, trap};
+    use crate::fdt::Region;
+    use crate::{csr, fdt, paging, pci, sbi, trap};
 
     /// One past the top of the QEMU `virt` board's default 128 MiB of RAM.
     const RAM_END: u64 = 0x8800_0000;
@@ -89,13 +98,22 @@ _start:
     #[doc(hidden)]
     pub fn start(
         _hartid: usize,
-        _device_tree: usize,
+        device_tree: usize,
         kernel: fn(BootInfo<'_>, &mut RiscV) -> !,
     ) -> ! {
         let memory_map = RiscVMemoryMap::new();
         // Sv39 identity-maps physical memory, so the physical offset is zero.
         let boot_info = BootInfo::new(&memory_map, Some(0));
-        let mut platform = RiscV::new();
+        // The tree is read here and not kept: it sits in RAM the kernel is
+        // about to hand out as page-table frames, and the few numbers worth
+        // having are cheaper to carry than the pointer is to keep honest.
+        // Keeping it out of `BootInfo` is the same call ACPI got on x86_64 —
+        // where the board puts its bus is this platform's business.
+        //
+        // SAFETY: `device_tree` is the pointer OpenSBI passed `_start` in `a1`,
+        // and nothing has allocated or mapped anything yet.
+        let bus = unsafe { fdt::configuration(device_tree) };
+        let mut platform = RiscV::new(bus);
         kernel(boot_info, &mut platform)
     }
 
@@ -139,17 +157,19 @@ _start:
     /// Concrete services for the current RISC-V supervisor boot target.
     pub struct RiscV {
         serial: SbiSerial,
+        /// Where the device tree said configuration space is, if it said.
+        bus: Option<Region>,
     }
 
     impl RiscV {
-        pub const fn new() -> Self {
-            Self { serial: SbiSerial::new() }
+        pub const fn new(bus: Option<Region>) -> Self {
+            Self { serial: SbiSerial::new(), bus }
         }
     }
 
     impl Default for RiscV {
         fn default() -> Self {
-            Self::new()
+            Self::new(None)
         }
     }
 
@@ -170,7 +190,11 @@ _start:
             trap::init();
             // Paging comes up here rather than inside a probe: every later
             // check runs against the address space the kernel actually uses.
-            paging::init(boot_info)
+            paging::init(boot_info)?;
+            // Configuration space is a window like any other, so it is opened
+            // through the same audited path — after the tables exist, because
+            // there is nothing to open a window in before them.
+            pci::init(boot_info, self.bus)
         }
 
         fn verify_exception_path(&mut self) -> bool {
@@ -190,6 +214,13 @@ _start:
 
         fn verify_device_window(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
             paging::verify_device_window(boot_info)
+        }
+
+        fn enumerate(
+            &mut self,
+            found: &mut dyn FnMut(DeviceFunction),
+        ) -> Result<(), PlatformError> {
+            pci::enumerate(found)
         }
 
         fn arm_timer(&mut self, initial_count: u32) -> Result<(), PlatformError> {
