@@ -17,8 +17,8 @@
 //! an owned, cloned [`Waker`]: waking is one bit-set on that word, cloning
 //! copies one pointer, and dropping is a no-op. That keeps the completion hot
 //! path free of allocation, waker copies, and any user vtable indirection
-//! beyond the single unavoidable [`RawWaker`] call, which is the [`TaskId`]-
-//! direct integration Stage 1 calls for.
+//! beyond the single unavoidable [`RawWaker`] call — a [`TaskId`]-direct
+//! integration.
 //!
 //! Pointing at the state word rather than at the executor also keeps the waker
 //! within the provenance it was built from: it only ever touches the one
@@ -145,7 +145,7 @@ impl<const N: usize, L: CacheLayout> Executor<N, L> {
     ///
     /// Waking it is a direct [`Executor::wake`] atomic bit-set with no
     /// allocation, no waker clone, and no user vtable indirection beyond the one
-    /// [`RawWaker`] call — the [`TaskId`]-direct hot path Stage 1 asks for. A
+    /// [`RawWaker`] call — a [`TaskId`]-direct hot path. A
     /// completion slab can register this waker and notify the task by index.
     ///
     /// Requires `&'static self` because a [`Waker`] erases lifetimes and may be

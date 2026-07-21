@@ -7,8 +7,7 @@
 /// What an SBI implementation reported in `a0`.
 ///
 /// An unrecognised code keeps its raw value rather than collapsing into a
-/// generic failure: the reason for moving off the legacy console call was that
-/// it discards exactly this information.
+/// generic failure, so a caller can report exactly what the implementation said.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SbiError {
     Failed,

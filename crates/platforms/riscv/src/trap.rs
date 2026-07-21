@@ -1,10 +1,10 @@
 //! Supervisor trap handling: exception path probe and one-shot timer ticks.
 //!
 //! A single direct-mode vector (`__molt_trap_entry`) saves the caller-saved
-//! registers, calls [`molt_trap_handler`], and returns with `sret`. Only the
-//! traps Stage 1 exercises are handled: `ebreak` (used to prove the exception
-//! path returns) and the supervisor timer interrupt (counted so the executor
-//! can await a completion). Anything else is fatal and reported before shutdown.
+//! registers, calls [`molt_trap_handler`], and returns with `sret`. Two traps
+//! are handled: `ebreak` (used to prove the exception path returns) and the
+//! supervisor timer interrupt (counted so the executor can await a completion).
+//! Anything else is fatal and reported before shutdown.
 
 use core::arch::{asm, global_asm};
 use core::fmt::Write as _;

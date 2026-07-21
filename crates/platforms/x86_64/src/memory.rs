@@ -1,22 +1,20 @@
 //! The x86_64 address space the kernel builds for itself.
 //!
-//! Until now the bootloader's tables stayed live for the whole of boot. That
-//! made [`Audit::accepts`] impossible on this platform: the loader maps its own
-//! framebuffer, page tables, and identity regions, so a sweep of the live
-//! tables would have reported dozens of leaves the kernel never declared, and
-//! the check had to be dropped to the outward-only [`Audit::cover`]. It also
-//! left nowhere to put an MMIO window with its own memory type, because
-//! everything reachable went through the loader's write-back direct map — the
-//! local APIC included.
+//! [`init`] builds a fresh four-level table from frames the kernel allocates,
+//! containing exactly four things: a direct map of firmware-usable RAM, the
+//! kernel image cloned page by page with the rights the loader gave each page,
+//! the pinned boot stack and boot-info windows, and the APIC device window.
+//! Then it loads `CR3`. Everything the CPU touches after that instruction — the
+//! code it is executing, its stack, the tables themselves — is in that list,
+//! and everything in that list is declared, so both directions of the audit run
+//! here.
 //!
-//! [`init`] therefore builds a fresh four-level table from frames the kernel
-//! allocates, containing exactly four things: a direct map of firmware-usable
-//! RAM, the kernel image cloned page by page with the rights the loader gave
-//! each page, the pinned boot stack and boot-info windows, and the APIC device
-//! window. Then it loads `CR3`. Everything the CPU touches after that
-//! instruction — the code it is executing, its stack, the tables themselves —
-//! is in that list, and everything in that list is declared, so both directions
-//! of the audit run here.
+//! Owning the tables is what lets the inward audit run at all. The loader maps
+//! its own framebuffer, page tables, and identity regions, so a sweep of its
+//! live tables reports dozens of leaves the kernel never declared; only tables
+//! the kernel controls can pass [`Audit::accepts`]. The loader's write-back
+//! direct map also leaves nowhere for an MMIO window with its own memory type,
+//! which the local APIC needs.
 
 use core::cell::UnsafeCell;
 
@@ -137,8 +135,8 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<u64, PlatformError> {
     let cursor = frames.0.cursor();
     // SAFETY: the executing code, its stack, the boot info, the tables reached
     // through `offset`, and the APIC window are all present in `root`, so
-    // translation can be switched over in place. `Cr3Flags::empty()` keeps
-    // write-through and cache-disable off for the table walk itself.
+    // translation can switch in place, and `Cr3Flags::empty()` leaves the table
+    // walk write-back cacheable.
     unsafe { Cr3::write(root, Cr3Flags::empty()) };
     // SAFETY: same reasoning as `active`; this runs once on the boot CPU.
     unsafe { *ACTIVE.0.get() = Some(Space { root, offset, cursor, log }) };
@@ -482,8 +480,8 @@ impl<'m, 't> OwnedPage<'m, 't> {
         let frame = frames.allocate_frame().ok_or(out_of_frames())?;
         let rights = Rights::new(true, permissions.is_write(), permissions.is_execute())
             .map_err(PlatformError::Mapping)?;
-        // SAFETY: TEST_PAGE is a dedicated, otherwise-unused virtual page and `frame` is a fresh
-        // unique frame. W^X was validated by `Rights` before flags were constructed.
+        // SAFETY: TEST_PAGE is a dedicated, otherwise-unused virtual page mapped to a fresh unique
+        // frame, with W^X validated by `Rights` before the flags were constructed.
         unsafe { mapper.map_to(page, frame, leaf_flags(rights, Cache::WriteBack), frames) }
             .map_err(map_error)?
             .flush();

@@ -51,8 +51,8 @@ pub fn init(window: u64) -> Result<(), PlatformError> {
     write(REG_LVT_TIMER, TIMER_MASKED | u32::from(TIMER_VECTOR))?;
     write(REG_DIVIDE, 0b0011)?; // divide the bus clock by 16
     TICKS.store(0, Ordering::Release);
-    // SAFETY: Stage 1 uses the local APIC exclusively; masking both legacy PICs prevents their
-    // firmware vector assignments (notably IRQ 8) from colliding with CPU exception vectors.
+    // SAFETY: masking both legacy PICs keeps their firmware vector assignments (notably IRQ 8)
+    // from colliding with CPU exception vectors while the kernel routes interrupts through the APIC.
     unsafe {
         super::out_u8(0x21, 0xff);
         super::out_u8(0xa1, 0xff);

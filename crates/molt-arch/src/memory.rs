@@ -1,10 +1,10 @@
 //! Typed physical memory: what a span holds, who owns it, and what a mapping
 //! of it may grant.
 //!
-//! Stage 1 treated physical memory as addresses. [`FrameAllocator`] handed out
-//! a `u64` and nothing recorded what happened to it afterwards, which is
-//! survivable while the only consumer is the boot page table and fatal once a
-//! driver, a DMA engine, and a ring all want frames from the same pool.
+//! A bare [`FrameAllocator`](crate::FrameAllocator) hands out a `u64` and
+//! records nothing about what happens to it, which is survivable while the only
+//! consumer is the boot page table and fatal once a driver, a DMA engine, and a
+//! ring all want frames from the same pool.
 //!
 //! Three things are separated here, because collapsing them is what makes a
 //! memory model hard to reason about later:
@@ -148,7 +148,7 @@ impl Kind {
 ///
 /// This is [`MapPermissions`](crate::MapPermissions) with the read bit made
 /// explicit, because device and DMA mappings need to say "readable, not
-/// writable" and Stage 1 only ever needed "writable, not executable".
+/// writable" where a page-table mapping only says "writable, not executable".
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Rights {
     read: bool,

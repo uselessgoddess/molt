@@ -78,7 +78,7 @@ enum Arch {
 /// What a smoke run boots and what it expects to see.
 #[derive(Clone, Copy)]
 enum Case {
-    /// The shipped kernel: every Stage 1 marker, then a success exit.
+    /// The shipped kernel: every boot marker, then a success exit.
     Boot,
     /// The `panic-smoke` build: a panic report, then a failure exit.
     Panic,

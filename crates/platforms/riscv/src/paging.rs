@@ -1,20 +1,19 @@
 //! Sv39 boot address space that maps the kernel image one section at a time.
 //!
-//! The earlier version identity-mapped all of RAM with a single RWX gigapage.
-//! That kept the kernel running, but it also meant `.text` was writable and
-//! `.data` was executable, so the W^X contract `MapPermissions` enforces on
-//! x86_64 held nowhere on RISC-V. [`init`] instead walks the linker-exported
-//! section bounds and gives each span exactly the rights it needs — `.text`
-//! read/execute, `.rodata` read-only, `.data`/`.bss`/boot stack read/write up
-//! to `__kernel_end`, and only firmware-declared usable RAM above that as free
-//! RAM. Reserved regions, firmware, and MMIO holes get no mapping at all.
+//! Mapping per section is what upholds W^X on RISC-V: a single RWX mapping of
+//! all RAM would leave `.text` writable and `.data` executable. [`init`] walks
+//! the linker-exported section bounds and gives each span exactly the rights it
+//! needs — `.text` read/execute, `.rodata` read-only, `.data`/`.bss`/boot stack
+//! read/write up to `__kernel_end`, and only firmware-declared usable RAM above
+//! that as free RAM. Reserved regions, firmware, and MMIO holes get no mapping
+//! at all.
 //!
 //! Two checks are built on top of it. [`verify_owned_mapping`] maps one private
 //! page with [`MapPermissions`]-derived flags and round-trips a value through
 //! the MMU. [`verify_image_protection`] reads the live page tables back and
 //! walks every declared range, confirming each page holds the rights it was
-//! mapped with — the check that would have failed against the old gigapage,
-//! and that a probe of a handful of addresses would have missed.
+//! mapped with — the whole-image guarantee that a probe of a handful of
+//! addresses would miss.
 
 use core::arch::asm;
 use core::cell::UnsafeCell;

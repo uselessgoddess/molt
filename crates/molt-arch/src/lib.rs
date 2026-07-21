@@ -464,7 +464,7 @@ pub enum ExitStatus {
     Failure,
 }
 
-/// Failure while enabling a platform's Stage 1 hardware services.
+/// Failure while enabling a platform's hardware services.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlatformError {
     Unsupported,
