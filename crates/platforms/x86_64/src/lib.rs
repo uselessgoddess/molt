@@ -7,6 +7,7 @@ mod acpi;
 mod apic;
 mod interrupts;
 mod memory;
+mod pci;
 
 use core::arch::asm;
 
@@ -18,8 +19,8 @@ pub use bootloader_api::{
     BootInfo as BootloaderInfo, BootloaderConfig, entry_point as __bootloader_entry_point,
 };
 use molt_arch::{
-    BootInfo, ExitStatus, ImageRange, MemoryMap, MemoryRegion, MemoryRegionKind, Platform,
-    PlatformError, SerialPort,
+    BootInfo, DeviceFunction, ExitStatus, ImageRange, InterruptSink, MemoryMap, MemoryRegion,
+    MemoryRegionKind, Platform, PlatformError, SerialPort,
 };
 
 /// Where the loader must place the boot stack, and how large it is.
@@ -159,6 +160,22 @@ impl Platform for X86_64 {
 
     fn verify_device_window(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
         memory::verify_device_window(boot_info)
+    }
+
+    fn attach(&mut self, sink: &'static dyn InterruptSink) {
+        interrupts::attach(sink);
+    }
+
+    fn enumerate(&mut self, found: &mut dyn FnMut(DeviceFunction)) -> Result<(), PlatformError> {
+        pci::enumerate(found)
+    }
+
+    fn raise_message_interrupt(&mut self, boot_info: &BootInfo<'_>) -> Result<u8, PlatformError> {
+        pci::raise_message_interrupt(boot_info)
+    }
+
+    fn verify_message_table(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+        pci::verify_message_table(boot_info)
     }
 
     fn arm_timer(&mut self, initial_count: u32) -> Result<(), PlatformError> {

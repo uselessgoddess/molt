@@ -556,13 +556,22 @@ pub trait Platform {
         Err(PlatformError::Unsupported)
     }
 
-    /// Binds a device's first message vector to the interrupt path and makes
-    /// the device raise it, returning the vector it was bound to.
+    /// Binds a device's message vector to the interrupt path and makes the
+    /// device raise it, returning the vector it was bound to.
     ///
     /// The vector is the platform's to choose: on x86_64 it is an entry in the
     /// interrupt descriptor table, and elsewhere it is whatever the interrupt
     /// file understands. The kernel waits for it on that number.
-    fn raise_message_interrupt(&mut self) -> Result<u8, PlatformError> {
+    fn raise_message_interrupt(&mut self, _boot_info: &BootInfo<'_>) -> Result<u8, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    /// Programs one entry of a real MSI-X table and reads it back.
+    ///
+    /// Delivery through a table needs a device with work outstanding, which
+    /// needs a driver; this proves everything up to that point — the capability,
+    /// the window its table lives in, and the entry itself.
+    fn verify_message_table(&mut self, _boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
         Err(PlatformError::Unsupported)
     }
 

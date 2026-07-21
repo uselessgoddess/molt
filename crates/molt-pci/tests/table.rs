@@ -36,6 +36,17 @@ fn a_vector_past_the_table_is_refused() {
 
     assert_eq!(table.program(1, Message::new(0, 0)), Err(Error::Vector));
     assert_eq!(table.mask(1, true), Err(Error::Vector));
+    assert_eq!(table.message(1), Err(Error::Vector));
+}
+
+#[test]
+fn an_entry_answers_with_what_was_written_into_it() {
+    let (_entries, table) = table(2);
+    let message = Message::new(0xfee0_1000, 0x42);
+
+    table.program(1, message).unwrap();
+    assert_eq!(table.message(1), Ok(message));
+    assert_eq!(table.message(0), Ok(Message::new(0, 0)), "a neighbour was written");
 }
 
 #[test]

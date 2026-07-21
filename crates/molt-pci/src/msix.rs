@@ -173,6 +173,25 @@ impl Table {
         Ok(())
     }
 
+    /// Reads back the message one vector currently carries.
+    ///
+    /// A table is device memory, and the only thing that distinguishes it from
+    /// any other frame the kernel might have mapped by mistake is that it
+    /// answers with what was written into it. That makes this a check as much as
+    /// an accessor.
+    pub fn message(&self, index: u16) -> Result<Message, Error> {
+        let entry = self.entry(index)?;
+        // SAFETY: `entry` is inside the table `new`'s caller vouched for.
+        let (low, high, data) = unsafe {
+            (
+                entry.add(ADDRESS_LOW).read_volatile(),
+                entry.add(ADDRESS_HIGH).read_volatile(),
+                entry.add(DATA).read_volatile(),
+            )
+        };
+        Ok(Message::new(u64::from(low) | u64::from(high) << 32, data))
+    }
+
     pub fn mask(&self, index: u16, masked: bool) -> Result<(), Error> {
         let entry = self.entry(index)?;
         // SAFETY: as in `program`; this writes only the entry's own control.

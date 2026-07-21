@@ -155,7 +155,7 @@ fn find<'p, P: Physical>(memory: &'p P, rsdp: u64, signature: &[u8; 4]) -> Optio
 }
 
 /// One whole table, read at its own declared length and checksummed.
-fn table<'p, P: Physical>(memory: &'p P, at: u64) -> Option<&'p [u8]> {
+fn table<P: Physical>(memory: &P, at: u64) -> Option<&[u8]> {
     let header = memory.bytes(at, HEADER)?;
     let length = read32(header, 4);
     if length < HEADER as u32 || length > LIMIT {

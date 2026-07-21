@@ -21,7 +21,7 @@
 use core::cell::UnsafeCell;
 
 use molt_arch::audit::{Audit, Contents, Declared, Leaf, MappedRange, PageWalk};
-use molt_arch::memory::{Cache, Inventory, Rights, Span};
+use molt_arch::memory::{Cache, Device, Inventory, Rights, Span};
 use molt_arch::{
     BootInfo, FrameAllocator as BootFrameAllocator, FrameCursor, MapPermissions, MappingError,
     PageProtection, PlatformError, UsableRegions,
@@ -56,9 +56,17 @@ const APIC_WINDOW: u64 = 0xffff_9200_0000_0000;
 /// one 1 MiB window per bus — so it gets a slot of its own rather than a page.
 const ECAM_WINDOW: u64 = 0xffff_9300_0000_0000;
 
+/// Where the kernel maps device windows it opens after boot — a BAR a driver
+/// asked for. Windows are handed out from here upwards, each 2 MiB apart so a
+/// register block never shares a leaf with the next one.
+const DRIVER_WINDOW: u64 = 0xffff_9400_0000_0000;
+
+/// The stride between successive driver windows.
+const WINDOW_STRIDE: u64 = 2 * 1024 * 1024;
+
 /// Declared ranges: the image, two boot windows, the APIC, configuration
-/// space, and one entry per usable RAM region — firmware maps are chatty, so
-/// this is generous.
+/// space, the driver windows, and one entry per usable RAM region — firmware
+/// maps are chatty, so this is generous.
 type Log = Declared<64>;
 
 /// The device windows [`init`] mapped, in the addresses the kernel now uses.
@@ -85,6 +93,8 @@ struct Space {
     offset: u64,
     /// Where frame allocation stopped, so a probe does not reissue a table frame.
     cursor: FrameCursor,
+    /// Where the next driver window goes.
+    window: u64,
     log: Log,
 }
 
@@ -185,7 +195,7 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<Windows, PlatformError> {
     // write-through and cache-disable off for the table walk itself.
     unsafe { Cr3::write(root, Cr3Flags::empty()) };
     // SAFETY: same reasoning as `active`; this runs once on the boot CPU.
-    unsafe { *ACTIVE.0.get() = Some(Space { root, offset, cursor, log }) };
+    unsafe { *ACTIVE.0.get() = Some(Space { root, offset, cursor, window: DRIVER_WINDOW, log }) };
     Ok(Windows { apic: APIC_WINDOW, configuration })
 }
 
@@ -322,6 +332,56 @@ fn map_device(
     }
     log.push(MappedRange::device(virtual_address, virtual_address + span.bytes()))
         .map_err(PlatformError::Mapping)
+}
+
+/// Maps `bytes` of MMIO at `physical` where a driver can reach it, and returns
+/// the address `physical` itself now has.
+///
+/// Everything [`init`] maps goes into a table nothing is walking yet. This does
+/// not: the leaves appear underneath the running CPU, so each is flushed as it
+/// is created rather than at the end, and the window is declared before the
+/// next audit runs — a leaf the log has not heard of is exactly what
+/// [`Audit::accepts`] exists to catch.
+///
+/// The span still goes through [`Inventory`], so a BAR firmware programmed over
+/// RAM is refused here rather than mapped uncacheable over the kernel's own
+/// memory. `physical` need not be page aligned: an MSI-X table is at an offset
+/// inside a BAR, and the offset comes back in the returned address.
+pub fn open_window(
+    boot_info: &BootInfo<'_>,
+    physical: u64,
+    bytes: u64,
+) -> Result<u64, PlatformError> {
+    let state = active()?;
+    let start = align_down(physical);
+    let end = align_up(physical.checked_add(bytes).ok_or(address_error())?)?;
+    // One stride is the whole of a window's room; a larger one would overlap
+    // its successor, and no register block this kernel opens is that big.
+    if end - start > WINDOW_STRIDE {
+        return Err(address_error());
+    }
+    let span = Span::new(start, end).map_err(|_| address_error())?;
+    let window =
+        Inventory::new(boot_info.memory_map()).device(span).map_err(|_| address_error())?;
+    let (rights, cache) = window.mapping(Rights::READ_WRITE).map_err(PlatformError::Mapping)?;
+    let flags = leaf_flags(rights, cache);
+
+    let base = state.window;
+    let mut frames = X86Frames(BootFrameAllocator::resume(boot_info.memory_map(), state.cursor));
+    let mut space = state.mapper();
+    let mut at = start;
+    while at < end {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(base + (at - start)));
+        let frame = PhysFrame::containing_address(PhysAddr::new(at));
+        // SAFETY: the frame is inside a span `Inventory` proved firmware did not
+        // claim as RAM, and `base` is a fresh window no other mapping uses.
+        unsafe { space.map_to(page, frame, flags, &mut frames) }.map_err(map_error)?.flush();
+        at += Size4KiB::SIZE;
+    }
+    state.cursor = frames.0.cursor();
+    state.window = base + WINDOW_STRIDE;
+    state.log.push(MappedRange::device(base, base + (end - start))).map_err(PlatformError::Mapping)?;
+    Ok(base + (physical - start))
 }
 
 /// Page-table flags for `rights` and `cache`.

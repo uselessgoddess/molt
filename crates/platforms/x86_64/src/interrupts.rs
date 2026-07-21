@@ -1,6 +1,7 @@
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+use molt_arch::InterruptSink;
 use spin::Once;
 use x86_64::VirtAddr;
 use x86_64::instructions::segmentation::{CS, DS, ES, SS, Segment};
@@ -14,6 +15,17 @@ use crate::{apic, emergency_write};
 
 const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
+/// The first vector handed out to a message interrupt.
+///
+/// It sits above the timer so the two banks cannot be confused by eye in a
+/// trace, and far above the 32 vectors the architecture reserves for faults.
+pub const FIRST_MESSAGE_VECTOR: u8 = 0x41;
+
+/// How many message vectors exist. One per device the kernel binds, and it
+/// binds them one at a time, so this is a bank rather than a table: a device
+/// that asks for a vector gets the next one and keeps it.
+pub const MESSAGE_VECTORS: u8 = 8;
+
 #[repr(align(16))]
 struct ExceptionStack(UnsafeCell<[u8; 4096 * 5]>);
 
@@ -26,6 +38,66 @@ static TSS: Once<TaskStateSegment> = Once::new();
 static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
 static IDT: Once<InterruptDescriptorTable> = Once::new();
 static BREAKPOINT_SEEN: AtomicBool = AtomicBool::new(false);
+static SINK: Once<&'static dyn InterruptSink> = Once::new();
+static NEXT_VECTOR: AtomicU8 = AtomicU8::new(FIRST_MESSAGE_VECTOR);
+
+/// Points the message vectors at the kernel's interrupt table.
+///
+/// Attaching is separate from installing the descriptors: the descriptors exist
+/// from `init` onwards because a vector that arrives with no entry behind it is
+/// a general protection fault, whereas one that arrives before the kernel has
+/// somewhere to record it is merely unobserved.
+pub fn attach(sink: &'static dyn InterruptSink) {
+    SINK.call_once(|| sink);
+}
+
+/// Takes the next unused message vector, or `None` once the bank is spent.
+pub fn allocate() -> Option<u8> {
+    let vector = NEXT_VECTOR.fetch_add(1, Ordering::Relaxed);
+    (vector < FIRST_MESSAGE_VECTOR + MESSAGE_VECTORS).then_some(vector)
+}
+
+/// Reports one arrival and acknowledges it at the interrupt controller.
+///
+/// The order is deliberate: the kernel records the vector first, so a waiter
+/// woken by the record cannot observe the arrival before the record exists, and
+/// the end-of-interrupt goes last because it is what allows the next one.
+fn deliver(vector: u8) {
+    if let Some(sink) = SINK.get() {
+        sink.signal(vector);
+    }
+    apic::eoi();
+}
+
+/// One `extern "x86-interrupt"` entry per vector.
+///
+/// A trap gate is a code address and nothing else — there is no argument to
+/// carry the vector number in — so the number has to be baked into the function.
+/// Eight near-identical functions is what that costs; writing them by hand is
+/// what it would cost without the macro.
+macro_rules! message_handlers {
+    ($($name:ident = $offset:expr),* $(,)?) => {
+        $(
+            extern "x86-interrupt" fn $name(_frame: InterruptStackFrame) {
+                deliver(FIRST_MESSAGE_VECTOR + $offset);
+            }
+        )*
+
+        const MESSAGE_HANDLERS: [extern "x86-interrupt" fn(InterruptStackFrame);
+            MESSAGE_VECTORS as usize] = [$($name),*];
+    };
+}
+
+message_handlers! {
+    message_0 = 0,
+    message_1 = 1,
+    message_2 = 2,
+    message_3 = 3,
+    message_4 = 4,
+    message_5 = 5,
+    message_6 = 6,
+    message_7 = 7,
+}
 
 struct Selectors {
     code: SegmentSelector,
@@ -70,6 +142,9 @@ pub fn init() {
         }
         idt[apic::TIMER_VECTOR].set_handler_fn(apic::timer_interrupt);
         idt[apic::SPURIOUS_VECTOR].set_handler_fn(apic::spurious_interrupt);
+        for (offset, handler) in MESSAGE_HANDLERS.into_iter().enumerate() {
+            idt[FIRST_MESSAGE_VECTOR + offset as u8].set_handler_fn(handler);
+        }
         idt
     });
     idt.load();
