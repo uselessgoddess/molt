@@ -131,8 +131,26 @@ without the audit being able to see it.
 
 ### Stage 2.2 — PCI enumeration and interrupts
 
-- [ ] PCI configuration space enumerated through typed device windows
-- [ ] MSI/MSI-X vectors routed to the existing interrupt path
+- [x] PCI configuration space enumerated through typed device windows
+- [x] BARs sized non-destructively from the caller's point of view, and
+      classified through `Inventory::device` before anything maps them
+- [x] MSI/MSI-X vectors routed to the existing interrupt path, with the message
+      minted by the platform fabric and unforgeable by a driver
+- [x] `InterruptSlab`: arrivals counted in interrupt context, awaited as
+      futures, with generations that refuse a stale token
+- [x] `MOLT_PCI_OK` on both platforms; `MOLT_BAR_OK`, `MOLT_MSI_OK`, and
+      `MOLT_INTERRUPT_OK` on x86_64, where an `edu` device proves an interrupt
+      raised by a device actually reaches the slab
+- [x] `docs/pci.md`
+
+Two limits are recorded rather than checked off. Bus mastering is granted in
+exactly one place — the kernel, for the one function whose MSI it routes —
+because an MSI *is* a DMA write and a function that may not initiate
+transactions cannot post one. Nothing in `molt-pci` sets the bit, but the
+consequence is real: without an IOMMU that device is as privileged as the
+kernel, and Stage 2.3 is where that trade has to be made explicitly. And RISC-V
+mints no MSI vectors: its fabric reports `Unsupported` until there is an AIA
+driver, so the RISC-V smoke enumerates and stops.
 
 ### Stage 2.3 — VirtIO block
 

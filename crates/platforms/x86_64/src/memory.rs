@@ -21,10 +21,10 @@
 use core::cell::UnsafeCell;
 
 use molt_arch::audit::{Audit, Contents, Declared, Leaf, MappedRange, PageWalk};
-use molt_arch::memory::{Cache, Inventory, Rights, Span};
+use molt_arch::memory::{Cache, Device, Inventory, Rights, Span};
 use molt_arch::{
     BootInfo, FrameAllocator as BootFrameAllocator, FrameCursor, MapPermissions, MappingError,
-    PageProtection, PlatformError, UsableRegions,
+    Mmio, PageProtection, PlatformError, UsableRegions,
 };
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::mapper::{MapToError, TranslateResult};
@@ -52,6 +52,26 @@ const TEST_PAGE: u64 = 0x0000_5555_5555_0000;
 /// Where the kernel maps the local APIC.
 const APIC_WINDOW: u64 = 0xffff_9200_0000_0000;
 
+/// Where [`map_device`] puts the windows a driver asks for, and how far it may
+/// go. A region of its own, far from the image and from the direct map, so a
+/// stray pointer into device space faults instead of landing in somebody's
+/// data. The bound is not a policy: a gigabyte is far more register space than
+/// any plausible machine needs, and exceeding it means a caller asked for
+/// something that is not registers.
+const DEVICE_REGION: u64 = 0xffff_9300_0000_0000;
+const DEVICE_REGION_END: u64 = DEVICE_REGION + (1 << 30);
+
+/// How many page-table frames are set aside for device mappings.
+///
+/// [`map_device`] runs long after the firmware memory map went out of scope, so
+/// it cannot resume the boot allocator; the frames it will need are drained
+/// into a pool while the map is still borrowable. Every window needs at most
+/// one table per level below the top, so this is a few dozen windows' worth,
+/// and running out is a bounded, reported failure rather than a corrupt table.
+const DEVICE_TABLE_FRAMES: usize = 32;
+
+type TableFrames = molt_arch::FramePool<DEVICE_TABLE_FRAMES>;
+
 /// Declared ranges: the image, two boot windows, the APIC, and one entry per
 /// usable RAM region — firmware maps are chatty, so this is generous.
 type Log = Declared<64>;
@@ -63,6 +83,11 @@ struct Space {
     /// Where frame allocation stopped, so a probe does not reissue a table frame.
     cursor: FrameCursor,
     log: Log,
+    /// Table frames reserved for windows mapped after the memory map is gone.
+    pool: TableFrames,
+    /// The next free device address; bumps forward and never back, so a window
+    /// is never re-issued at an address a previous one used to hold.
+    devices: u64,
 }
 
 struct Active(UnsafeCell<Option<Space>>);
@@ -134,6 +159,12 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<u64, PlatformError> {
     // something else.
     unsafe { write_pat() };
 
+    // Drained here, while the map is still borrowable, and out of the same
+    // allocator every table frame came from, so a device window mapped later
+    // cannot be handed a frame this address space is already built out of.
+    let mut pool = TableFrames::empty();
+    pool.fill(&mut frames.0);
+
     let cursor = frames.0.cursor();
     // SAFETY: the executing code, its stack, the boot info, the tables reached
     // through `offset`, and the APIC window are all present in `root`, so
@@ -141,7 +172,9 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<u64, PlatformError> {
     // write-through and cache-disable off for the table walk itself.
     unsafe { Cr3::write(root, Cr3Flags::empty()) };
     // SAFETY: same reasoning as `active`; this runs once on the boot CPU.
-    unsafe { *ACTIVE.0.get() = Some(Space { root, offset, cursor, log }) };
+    unsafe {
+        *ACTIVE.0.get() = Some(Space { root, offset, cursor, log, pool, devices: DEVICE_REGION })
+    };
     Ok(APIC_WINDOW)
 }
 
@@ -242,6 +275,72 @@ fn device_window(
     map_4k(space, frames, virtual_address, window.span().start(), leaf_flags(rights, cache))?;
     log.push(MappedRange::device(virtual_address, virtual_address + Size4KiB::SIZE))
         .map_err(PlatformError::Mapping)
+}
+
+/// Maps `window` into the live address space and hands back its registers.
+///
+/// This is [`device_window`] after the switch: the APIC's window is built while
+/// the tables are still private, but a driver's window is asked for long after
+/// `CR3` was loaded, so this one edits tables the CPU is walking and flushes.
+/// The frames come from the pool [`init`] drained rather than from a fresh
+/// allocator, which would hand back the frames those tables are made of.
+///
+/// Unmapping is deliberately absent: nothing in Stage 2.2 releases a device,
+/// and an unmap that races a driver still holding an [`Mmio`] is exactly the
+/// bug the borrow on the window exists to prevent. The cursor therefore only
+/// ever moves forward.
+pub fn map_device(window: Device, rights: Rights) -> Result<Mmio<'static>, MappingError> {
+    let state = active().map_err(|_| MappingError::Unmapped)?;
+    // The window decides its own cacheability; the caller only says whether it
+    // needs to write. An executable or write-back device mapping is refused
+    // here, before a single page table is touched.
+    let (rights, cache) = window.mapping(rights)?;
+    let flags = leaf_flags(rights, cache);
+
+    let span = window.span();
+    let bytes = span.bytes();
+    let base = state.devices;
+    let end = base.checked_add(bytes).ok_or(MappingError::InvalidAddress)?;
+    if end > DEVICE_REGION_END {
+        return Err(MappingError::OutOfFrames);
+    }
+
+    let mut space = state.mapper();
+    {
+        let mut frames = PoolFrames(&mut state.pool);
+        let mut address = 0;
+        while address < bytes {
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(base + address));
+            // A translation that already exists means the bump pointer and the
+            // live tables disagree about what is free. Overwriting it would
+            // unmap something silently, so this fails closed instead.
+            if !matches!(space.translate(page.start_address()), TranslateResult::NotMapped) {
+                return Err(MappingError::Unexpected);
+            }
+            let frame =
+                PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(span.start() + address));
+            // SAFETY: `Inventory::device` established that this physical range
+            // is not RAM and not the kernel image, the virtual page was just
+            // proven unmapped, and the flags carry no execute permission.
+            unsafe { space.map_to(page, frame, flags, &mut frames) }
+                .map_err(|_| MappingError::Backend)?
+                .flush();
+            address += molt_arch::FRAME_SIZE;
+        }
+    }
+
+    // Declared as it is mapped, so the sweep that runs afterwards sees a leaf
+    // the kernel admits to instead of one nobody claimed.
+    state.log.push(MappedRange::device(base, end))?;
+    // Round out to a 2 MiB boundary so two windows never share a leaf's
+    // neighbourhood, and an off-by-one in a driver's offset arithmetic lands
+    // in a hole rather than in another device.
+    state.devices = end.next_multiple_of(2 * 1024 * 1024);
+    // SAFETY: every frame of `span` was just mapped at `base`, uncached and
+    // non-executable, and the mapping is never removed, so the window stays
+    // valid for `'static`. The bump cursor guarantees no second window over the
+    // same virtual range.
+    Ok(unsafe { Mmio::new(base as *mut u8, bytes) })
 }
 
 /// Page-table flags for `rights` and `cache`.
@@ -458,6 +557,17 @@ impl PageWalk for MapperWalk<'_, '_> {
 }
 
 struct X86Frames<'map>(BootFrameAllocator<'map>);
+
+/// The table frames [`init`] set aside, adapted for the mapper.
+struct PoolFrames<'pool>(&'pool mut TableFrames);
+
+// SAFETY: the pool was drained from a `BootFrameAllocator` that hands out each
+// frame at most once, and hands each one on at most once in turn.
+unsafe impl FrameAllocator<Size4KiB> for PoolFrames<'_> {
+    fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        self.0.allocate().map(|frame| PhysFrame::containing_address(PhysAddr::new(frame.start())))
+    }
+}
 
 // SAFETY: `BootFrameAllocator` advances monotonically through firmware regions marked usable,
 // so this adapter returns each aligned physical frame at most once.

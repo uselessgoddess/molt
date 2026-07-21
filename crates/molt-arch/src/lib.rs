@@ -3,11 +3,17 @@
 //! Hardware-independent contracts shared by the kernel and architecture crates.
 
 pub mod audit;
+pub mod irq;
 pub mod memory;
+pub mod mmio;
+pub mod pci;
 
 use core::fmt;
 
+pub use crate::irq::{FabricError, InterruptFabric, MsiMessage, Sink};
 pub use crate::memory::Cache;
+pub use crate::mmio::{DeviceMapper, Mmio, MmioError};
+pub use crate::pci::ConfigSpace;
 
 /// Architecture-neutral information passed from a platform boot adapter.
 #[derive(Clone, Copy)]
@@ -293,6 +299,61 @@ impl<'map> FrameAllocator<'map> {
     }
 }
 
+/// Frames set aside at boot for page-table work that happens later.
+///
+/// [`DeviceMapper::map_device`] runs long after the firmware memory map has
+/// gone out of scope, so it cannot resume a [`FrameAllocator`] — and building a
+/// fresh one would hand back the frames the live tables are already made of.
+/// Draining a fixed number of frames into an array while the map is still
+/// borrowable keeps the "every frame at most once" property without keeping the
+/// map alive, and turns "the kernel ran out of page tables" into a bounded,
+/// visible number rather than a surprise.
+pub struct FramePool<const N: usize> {
+    frames: [u64; N],
+    len: usize,
+    next: usize,
+}
+
+impl<const N: usize> FramePool<N> {
+    pub const fn empty() -> Self {
+        Self { frames: [0; N], len: 0, next: 0 }
+    }
+
+    /// Drains up to `N` frames out of `frames`, returning how many were taken.
+    ///
+    /// Fewer than `N` is not an error here: a short pool fails later, at the
+    /// mapping that actually needed the frame, where the error says so.
+    pub fn fill(&mut self, frames: &mut FrameAllocator<'_>) -> usize {
+        while self.len < N {
+            let Some(frame) = frames.allocate() else { break };
+            self.frames[self.len] = frame.start();
+            self.len += 1;
+        }
+        self.len
+    }
+
+    pub fn allocate(&mut self) -> Option<PhysicalFrame> {
+        // Bounded by `len`, not by the array: a pool that filled short is
+        // padded with zeroes, and frame zero is a mapping, not a refusal.
+        if self.next >= self.len {
+            return None;
+        }
+        let frame = self.frames[self.next];
+        self.next += 1;
+        Some(PhysicalFrame(frame))
+    }
+
+    pub const fn remaining(&self) -> usize {
+        self.len - self.next
+    }
+}
+
+impl<const N: usize> Default for FramePool<N> {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MappingError {
     WritableExecutable,
@@ -471,10 +532,29 @@ pub enum PlatformError {
     MissingPhysicalMemoryMap,
     InvalidHardware,
     Mapping(MappingError),
+    Fabric(FabricError),
+    /// Firmware did not describe a PCI configuration space.
+    MissingConfigSpace,
+}
+
+impl From<MappingError> for PlatformError {
+    fn from(error: MappingError) -> Self {
+        Self::Mapping(error)
+    }
+}
+
+impl From<FabricError> for PlatformError {
+    fn from(error: FabricError) -> Self {
+        Self::Fabric(error)
+    }
 }
 
 /// Hardware services used directly by architecture-independent kernel code.
-pub trait Platform {
+///
+/// Mapping a device window and handing out an interrupt identity are
+/// supertraits rather than methods so a driver can take the narrow capability
+/// it needs — `&mut impl DeviceMapper` — instead of the whole platform.
+pub trait Platform: DeviceMapper + InterruptFabric {
     type Serial: SerialPort;
 
     fn serial(&mut self) -> &mut Self::Serial;
@@ -500,6 +580,19 @@ pub trait Platform {
     ///
     /// [`Inventory::device`]: memory::Inventory::device
     fn verify_device_window(&mut self, _boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    /// The PCI configuration space firmware described, if there is one.
+    fn config_space(&mut self, _boot_info: &BootInfo<'_>) -> Result<ConfigSpace, PlatformError> {
+        Err(PlatformError::MissingConfigSpace)
+    }
+
+    /// Sends every interrupt line this platform raises to `sink`.
+    ///
+    /// The sink is `'static` because the interrupt entry path outlives every
+    /// stack frame that could have installed it.
+    fn route_interrupts(&mut self, _sink: &'static dyn Sink) -> Result<(), PlatformError> {
         Err(PlatformError::Unsupported)
     }
 

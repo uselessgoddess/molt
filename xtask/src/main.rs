@@ -21,6 +21,7 @@ const BOOT_MARKERS: &[&str] = &[
     "MOLT_RESTART_OK",
     "MOLT_PHYSMAP_OK",
     "MOLT_FRAME_OWNER_OK",
+    "MOLT_PCI_OK",
     "MOLT_BOOT_OK",
 ];
 
@@ -100,9 +101,16 @@ impl Case {
     }
 }
 
+/// Markers only one machine can produce.
+///
+/// The MSI ones are x86_64-only because they are the only place a vector is
+/// minted: the `virt` board's RISC-V fabric reports itself unsupported until
+/// there is an AIA driver, and the kernel says so on the serial line rather
+/// than pretending it delivered something.
 fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
     match (arch, case) {
         (Arch::Riscv64, Case::Boot) => &["MOLT_SBI_CONSOLE:", "MOLT_UART_WINDOW:"],
+        (Arch::X86_64, Case::Boot) => &["MOLT_BAR_OK:", "MOLT_MSI_OK:", "MOLT_INTERRUPT_OK:"],
         _ => &[],
     }
 }
@@ -276,6 +284,14 @@ fn qemu_x86_64_command(image: &Path) -> Command {
         command.arg("-L").arg(firmware);
     }
     command.args([
+        // `q35` rather than the default `pc`: only the former's chipset has an
+        // MCFG table, and without one there is no configuration space to
+        // enumerate. `edu` is QEMU's teaching device, and the only function on
+        // the machine whose MSI can be raised on demand from software.
+        "-machine",
+        "q35",
+        "-device",
+        "edu",
         "-display",
         "none",
         "-no-reboot",
