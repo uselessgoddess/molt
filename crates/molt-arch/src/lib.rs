@@ -556,13 +556,24 @@ pub trait Platform {
         Err(PlatformError::Unsupported)
     }
 
-    /// Binds a device's message vector to the interrupt path and makes the
-    /// device raise it, returning the vector it was bound to.
+    /// Binds a device's message vector to the interrupt path, returning the
+    /// vector it was bound to without letting anything arrive on it yet.
     ///
     /// The vector is the platform's to choose: on x86_64 it is an entry in the
     /// interrupt descriptor table, and elsewhere it is whatever the interrupt
-    /// file understands. The kernel waits for it on that number.
-    fn raise_message_interrupt(&mut self, _boot_info: &BootInfo<'_>) -> Result<u8, PlatformError> {
+    /// file understands. The kernel waits for it on that number, which is why
+    /// binding and firing are two calls: an arrival between them would be an
+    /// arrival before anything was watching, and unloseable edges are the whole
+    /// point of the slab the kernel records them in.
+    fn bind_message_interrupt(&mut self, _boot_info: &BootInfo<'_>) -> Result<u8, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    /// Makes the bound device raise the vector [`bind_message_interrupt`] gave
+    /// out. Calling this without a prior bind interrupts nothing.
+    ///
+    /// [`bind_message_interrupt`]: Self::bind_message_interrupt
+    fn raise_message_interrupt(&mut self) -> Result<(), PlatformError> {
         Err(PlatformError::Unsupported)
     }
 

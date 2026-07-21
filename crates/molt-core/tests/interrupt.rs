@@ -93,6 +93,28 @@ fn exhausted_slab_refuses_reservations() {
 }
 
 #[test]
+fn a_vector_can_be_claimed_by_number() {
+    let slab = InterruptSlab::<4>::new();
+    let token = slab.claim(2).unwrap();
+
+    assert_eq!(token.index(), 2);
+    assert!(slab.signal(2));
+    assert_eq!(slab.arrivals(token), Ok(1));
+    assert_eq!(slab.reserve().unwrap().index(), 0, "a claim moved the free vector");
+}
+
+#[test]
+fn a_vector_someone_else_holds_is_refused() {
+    let slab = InterruptSlab::<2>::new();
+    let token = slab.claim(1).unwrap();
+
+    assert_eq!(slab.claim(1), Err(InterruptError::Taken));
+    assert_eq!(slab.claim(2), Err(InterruptError::Taken), "a vector past the slab was handed out");
+    slab.release(token).unwrap();
+    assert_eq!(slab.claim(1).map(|token| token.index()), Ok(1));
+}
+
+#[test]
 fn padded_vectors_deliver_the_same_way() {
     let slab = InterruptSlab::<2, Padded>::new();
     let token = slab.reserve().unwrap();

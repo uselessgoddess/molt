@@ -31,6 +31,8 @@ use crate::waker::AtomicWaker;
 pub enum InterruptError {
     /// Every vector in the slab is already reserved.
     Full,
+    /// That vector is owned by somebody else, or the slab has no such number.
+    Taken,
     /// The vector was released, so nothing will ever signal this token again.
     Released,
 }
@@ -128,22 +130,34 @@ impl<const N: usize> InterruptSlab<N, Padded> {
 impl<const N: usize, L: CacheLayout> InterruptSlab<N, L> {
     /// Reserves the lowest free vector.
     pub fn reserve(&self) -> Result<InterruptToken, InterruptError> {
-        for (index, slot) in self.slots.iter().enumerate() {
-            let slot = slot.borrow();
-            if slot
-                .state
-                .compare_exchange(FREE, RESERVING, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                continue;
-            }
-            let generation = slot.generation.fetch_add(1, Ordering::Relaxed) + 1;
-            // Release publishes the generation before any signal can observe
-            // `LIVE` and count into it.
-            slot.state.store(LIVE, Ordering::Release);
-            return Ok(InterruptToken { index, generation });
+        (0..N).find_map(|index| self.claim(index).ok()).ok_or(InterruptError::Full)
+    }
+
+    /// Reserves the vector at `index`, or [`InterruptError::Taken`] where it is
+    /// already owned.
+    ///
+    /// Which number a device interrupts on is not the slab's to decide: on
+    /// x86_64 it is an entry in the descriptor table the platform handed out,
+    /// and the trap handler has nothing but that number to report. So a driver
+    /// that has been given a vector claims *that* slot, and [`reserve`] is the
+    /// special case of not caring which.
+    ///
+    /// [`reserve`]: Self::reserve
+    pub fn claim(&self, index: usize) -> Result<InterruptToken, InterruptError> {
+        let slot = self.slots.get(index).ok_or(InterruptError::Taken)?;
+        let slot = slot.borrow();
+        if slot
+            .state
+            .compare_exchange(FREE, RESERVING, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(InterruptError::Taken);
         }
-        Err(InterruptError::Full)
+        let generation = slot.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        // Release publishes the generation before any signal can observe
+        // `LIVE` and count into it.
+        slot.state.store(LIVE, Ordering::Release);
+        Ok(InterruptToken { index, generation })
     }
 
     /// Frees the vector and wakes anything still waiting on it.

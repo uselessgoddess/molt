@@ -170,8 +170,12 @@ impl Platform for X86_64 {
         pci::enumerate(found)
     }
 
-    fn raise_message_interrupt(&mut self, boot_info: &BootInfo<'_>) -> Result<u8, PlatformError> {
-        pci::raise_message_interrupt(boot_info)
+    fn bind_message_interrupt(&mut self, boot_info: &BootInfo<'_>) -> Result<u8, PlatformError> {
+        pci::bind_message_interrupt(boot_info)
+    }
+
+    fn raise_message_interrupt(&mut self) -> Result<(), PlatformError> {
+        pci::raise_message_interrupt()
     }
 
     fn verify_message_table(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {

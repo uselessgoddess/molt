@@ -9,6 +9,7 @@
 //! [`memory::init`]: crate::memory::init
 
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use molt_arch::{BootInfo, DeviceFunction, PlatformError};
 use molt_pci::{Command, Ecam, Error, Function, Message, Table, msix, scan};
@@ -103,14 +104,17 @@ fn find(id: (u16, u16)) -> Option<Function<'static, Ecam>> {
     functions().find(|function| (function.id().vendor, function.id().device) == id)
 }
 
-/// Binds a device's MSI vector to the interrupt path and makes it fire.
+/// Where the bound device's registers ended up, once one has been bound.
+static BOUND: AtomicU64 = AtomicU64::new(0);
+
+/// Binds a device's MSI vector to the interrupt path, without firing it.
 ///
 /// This is the whole of "routed to the existing interrupt path", proved rather
-/// than asserted: the kernel picks a vector, the device is told to write the
-/// address the local APIC decodes into it, and then the device is poked through
-/// a window of its own BAR. What arrives is a real interrupt on a real vector,
-/// through the same descriptor table the timer uses.
-pub fn raise_message_interrupt(boot_info: &BootInfo<'_>) -> Result<u8, PlatformError> {
+/// than asserted: the kernel picks a vector, and the device is told to write the
+/// address the local APIC decodes into it. What [`raise_message_interrupt`]
+/// then produces is a real interrupt on a real vector, through the same
+/// descriptor table the timer uses.
+pub fn bind_message_interrupt(boot_info: &BootInfo<'_>) -> Result<u8, PlatformError> {
     let function = find(EDU).ok_or(PlatformError::Unsupported)?;
     let msi = function.msi().map_err(hardware)?;
     let bar = function.bar(0).map_err(hardware)?;
@@ -123,16 +127,26 @@ pub fn raise_message_interrupt(boot_info: &BootInfo<'_>) -> Result<u8, PlatformE
     // left able to raise it would deliver an edge nothing is waiting on.
     function.enable(Command::MEMORY | Command::BUS_MASTER | Command::INTX_DISABLE);
     let registers = memory::open_window(boot_info, bar.base(), bar.size())?;
-    msi.enable();
-
+    // Anything the device had outstanding from reset is cleared before delivery
+    // comes on, so the first vector the kernel sees is one it asked for.
     // SAFETY: `registers` maps this device's own BAR read/write and
-    // uncacheable, and both offsets are naturally aligned 32-bit registers
-    // inside it.
-    unsafe {
-        ((registers + EDU_ACKNOWLEDGE) as *mut u32).write_volatile(!0);
-        ((registers + EDU_RAISE) as *mut u32).write_volatile(1);
-    }
+    // uncacheable, and the offset is a naturally aligned 32-bit register in it.
+    unsafe { ((registers + EDU_ACKNOWLEDGE) as *mut u32).write_volatile(!0) };
+    msi.enable();
+    BOUND.store(registers, Ordering::Release);
     Ok(vector)
+}
+
+/// Pokes the bound device's raise register, which makes it send its message.
+pub fn raise_message_interrupt() -> Result<(), PlatformError> {
+    let registers = match BOUND.load(Ordering::Acquire) {
+        0 => return Err(PlatformError::Unsupported),
+        registers => registers,
+    };
+    // SAFETY: `bind_message_interrupt` mapped this window over the device's own
+    // BAR, and the offset is a naturally aligned 32-bit register inside it.
+    unsafe { ((registers + EDU_RAISE) as *mut u32).write_volatile(1) };
+    Ok(())
 }
 
 /// Programs a real MSI-X table through a window of the BAR it lives in.

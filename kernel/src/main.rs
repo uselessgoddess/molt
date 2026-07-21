@@ -8,11 +8,14 @@ use core::task::{Context, Poll, Waker};
 
 use molt_arch::memory::{Error, FrameTable, Inventory, Kind, Owner, Span};
 use molt_arch::{
-    BootInfo, ExitStatus, FRAME_SIZE, Platform, SerialPort, SerialWriter, UsableRegions,
+    BootInfo, ExitStatus, FRAME_SIZE, InterruptSink, Platform, PlatformError, SerialPort,
+    SerialWriter, UsableRegions,
 };
 use molt_core::capability::{CapabilityError, CapabilityTable, ReadWrite};
 use molt_core::cell::{Cell, CellId, Supervisor};
+use molt_core::cache::Compact;
 use molt_core::completion::{CompletionError, CompletionSlab};
+use molt_core::interrupt::InterruptSlab;
 use molt_core::ring::{Completion, IoRing, Submission};
 
 #[cfg(target_arch = "x86_64")]
@@ -86,6 +89,134 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
 
     verify_frame_ownership(usable);
     println!(platform, "MOLT_FRAME_OWNER_OK");
+
+    // From here on the platform has somewhere to report arrivals, which is what
+    // makes a device interrupt observable rather than merely handled.
+    platform.attach(&VECTORS);
+    if verify_bus(platform) {
+        println!(platform, "MOLT_PCI_OK");
+    }
+    if verify_message_interrupt(boot_info, platform) {
+        println!(platform, "MOLT_MSI_OK");
+    }
+    if verify_message_table(boot_info, platform) {
+        println!(platform, "MOLT_MSIX_OK");
+    }
+}
+
+/// One slot per vector an interrupt controller can name, so the number a trap
+/// handler carries indexes the slab directly and no table has to be searched in
+/// interrupt context. Vectors are sparse and slots are small; a map from vector
+/// to slot would be the only alternative, and it would need a lock.
+const VECTOR_SLOTS: usize = 256;
+
+/// Where every hardware vector the kernel owns is counted.
+static VECTORS: Vectors = Vectors(InterruptSlab::<VECTOR_SLOTS, Compact>::new());
+
+/// The kernel's side of the interrupt path: the one thing a trap handler is
+/// allowed to touch, and the reason [`Platform::attach`] takes a trait object
+/// rather than a function pointer — what a vector means is the kernel's, and
+/// where it comes from is the platform's.
+struct Vectors(InterruptSlab<VECTOR_SLOTS>);
+
+impl InterruptSink for Vectors {
+    fn signal(&self, vector: u8) {
+        self.0.signal(usize::from(vector));
+    }
+}
+
+/// How long the kernel is willing to spin for an interrupt it asked for.
+///
+/// Nothing else is running, so there is nothing to yield to and no waker to be
+/// woken by; the bound is here so a vector that never arrives fails the boot
+/// instead of hanging it.
+const SPINS: u32 = 100_000_000;
+
+/// Reports what the platform's configuration window holds, and whether it has
+/// one at all.
+///
+/// A machine whose firmware described no configuration space says
+/// [`PlatformError::Unsupported`], which is a fact about the machine rather
+/// than a failure: there is nothing to enumerate and nothing to report.
+fn verify_bus<P: Platform>(platform: &mut P) -> bool {
+    let mut functions = [None; 16];
+    let mut seen = 0;
+    let mut record = |function| {
+        if let Some(slot) = functions.get_mut(seen) {
+            *slot = Some(function);
+        }
+        seen += 1;
+    };
+    match platform.enumerate(&mut record) {
+        Err(PlatformError::Unsupported) => return false,
+        result => result.expect("sweep configuration space"),
+    }
+
+    for function in functions.iter().flatten() {
+        println!(
+            platform,
+            "MOLT_PCI: {:02x}:{:02x}.{} {:04x}:{:04x} class={:02x}{:02x} windows={} vectors={}",
+            function.bus,
+            function.device,
+            function.function,
+            function.vendor,
+            function.id,
+            function.class,
+            function.subclass,
+            function.windows,
+            function.vectors
+        );
+    }
+    // Every PCI machine has a host bridge at the first address; a window that
+    // answers with nothing is a window mapped over the wrong frame.
+    assert!(seen > 0, "configuration space held no functions at all");
+    assert!(
+        functions.iter().flatten().any(|function| function.vectors > 0),
+        "no function on the bus reported a message vector"
+    );
+    true
+}
+
+/// Binds a device to a vector, tells it to raise it, and waits for it to land.
+///
+/// The wait is armed before the device is poked, so an interrupt that beats the
+/// first poll is still observed: that ordering is the reason binding and firing
+/// are separate calls.
+fn verify_message_interrupt<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) -> bool {
+    let vector = match platform.bind_message_interrupt(boot_info) {
+        Err(PlatformError::Unsupported) => return false,
+        result => result.expect("bind a device to a message vector"),
+    };
+    let token = VECTORS.0.claim(usize::from(vector)).expect("an unclaimed hardware vector");
+    let mut future = pin!(VECTORS.0.watch(token));
+    let mut context = Context::from_waker(Waker::noop());
+    assert_eq!(
+        future.as_mut().poll(&mut context),
+        Poll::Pending,
+        "the vector arrived before anything was told to send it"
+    );
+
+    platform.raise_message_interrupt().expect("make the bound device interrupt");
+    for _ in 0..SPINS {
+        if let Poll::Ready(arrivals) = future.as_mut().poll(&mut context) {
+            assert_eq!(arrivals, Ok(1), "more arrived than was asked for");
+            println!(platform, "MOLT_MSI: vector={vector}");
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    panic!("the device never raised its message vector");
+}
+
+/// Programs one entry of a real MSI-X table, where the machine has one.
+fn verify_message_table<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) -> bool {
+    match platform.verify_message_table(boot_info) {
+        Err(PlatformError::Unsupported) => false,
+        result => {
+            result.expect("program a device's message table");
+            true
+        }
+    }
 }
 
 const OWNED_FRAMES: u64 = 4;
