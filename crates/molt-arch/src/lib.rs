@@ -473,6 +473,42 @@ pub enum PlatformError {
     Mapping(MappingError),
 }
 
+/// One function found in configuration space.
+///
+/// This is a report, not a handle: it says what is there, and reaching the
+/// device still goes through the platform. Repeating a few fields here rather
+/// than exposing the bus crate's types keeps this crate the contract it is —
+/// a platform that has no PCI at all needs none of them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceFunction {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub vendor: u16,
+    pub id: u16,
+    pub class: u8,
+    pub subclass: u8,
+    /// Memory windows the function decodes.
+    pub windows: u8,
+    /// Message vectors the function implements, zero where it has none.
+    pub vectors: u16,
+}
+
+/// The kernel's interrupt table, as a trap handler can see it.
+///
+/// Vectors arrive in the platform and are waited on in the kernel, and neither
+/// half should have to know the other's type to connect them: the platform
+/// calls [`signal`](Self::signal) from a trap handler, and what happens next —
+/// which future wakes, whether anyone was waiting at all — is the kernel's
+/// business. This is what "routed to the existing interrupt path" comes down
+/// to, and it is one method wide on purpose, because a trap handler holds
+/// nothing but a number.
+pub trait InterruptSink: Sync {
+    /// Records the arrival of `vector`. Called with interrupts disabled, from
+    /// a trap handler, so it must not block and must not allocate.
+    fn signal(&self, vector: u8);
+}
+
 /// Hardware services used directly by architecture-independent kernel code.
 pub trait Platform {
     type Serial: SerialPort;
@@ -500,6 +536,53 @@ pub trait Platform {
     ///
     /// [`Inventory::device`]: memory::Inventory::device
     fn verify_device_window(&mut self, _boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    /// Points the platform's trap handlers at the kernel's interrupt table.
+    ///
+    /// A platform that has not been attached still takes interrupts; it simply
+    /// has nowhere to report them, which is what a kernel that never asked for
+    /// one should get.
+    fn attach(&mut self, _sink: &'static dyn InterruptSink) {}
+
+    /// Reports every function the platform's configuration window holds.
+    ///
+    /// Enumeration is a sweep of a window the platform mapped, so it is the
+    /// platform that performs it; the kernel decides what to do with what comes
+    /// back. A platform whose firmware described no configuration space reports
+    /// nothing and returns `Ok`, because that is a fact about the machine.
+    fn enumerate(&mut self, _found: &mut dyn FnMut(DeviceFunction)) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    /// Binds a device's message vector to the interrupt path, returning the
+    /// vector it was bound to without letting anything arrive on it yet.
+    ///
+    /// The vector is the platform's to choose: on x86_64 it is an entry in the
+    /// interrupt descriptor table, and elsewhere it is whatever the interrupt
+    /// file understands. The kernel waits for it on that number, which is why
+    /// binding and firing are two calls: an arrival between them would be an
+    /// arrival before anything was watching, and unloseable edges are the whole
+    /// point of the slab the kernel records them in.
+    fn bind_message_interrupt(&mut self, _boot_info: &BootInfo<'_>) -> Result<u8, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    /// Makes the bound device raise the vector [`bind_message_interrupt`] gave
+    /// out. Calling this without a prior bind interrupts nothing.
+    ///
+    /// [`bind_message_interrupt`]: Self::bind_message_interrupt
+    fn raise_message_interrupt(&mut self) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    /// Programs one entry of a real MSI-X table and reads it back.
+    ///
+    /// Delivery through a table needs a device with work outstanding, which
+    /// needs a driver; this proves everything up to that point — the capability,
+    /// the window its table lives in, and the entry itself.
+    fn verify_message_table(&mut self, _boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
         Err(PlatformError::Unsupported)
     }
 

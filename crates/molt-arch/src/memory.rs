@@ -406,6 +406,30 @@ impl<'m> Inventory<'m> {
             _ => Err(Error::Kind),
         }
     }
+
+    /// A device window at a span some firmware *description table* named.
+    ///
+    /// [`device`](Self::device) takes silence as the evidence: a span no region
+    /// covers belongs to no one, so it can only be a device. That rule is right
+    /// for a register base the architecture fixes — the local APIC, a board's
+    /// UART — and wrong for the one window firmware actually documents. A PC
+    /// reports its ECAM aperture twice: MCFG says where configuration space is,
+    /// and the memory map covers the same bytes with a reserved region so that
+    /// no allocator touches them. Under `device` those two statements cancel
+    /// out, and the kernel could map only the windows firmware forgot to
+    /// mention.
+    ///
+    /// So a span firmware described is a window as well, on the condition that
+    /// firmware did not simultaneously describe it as something else: RAM, the
+    /// kernel image, and a span that straddles two kinds all stay refused. The
+    /// caller supplies the description; this supplies the proof that the
+    /// description does not contradict the map.
+    pub fn aperture(&self, span: Span) -> Result<Device, Error> {
+        match self.classify(span)? {
+            Kind::Device | Kind::Reserved => Ok(Device { span }),
+            _ => Err(Error::Kind),
+        }
+    }
 }
 
 /// An MMIO window: a span the firmware map does not claim as RAM.

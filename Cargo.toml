@@ -4,6 +4,7 @@ members = [
     "crates/molt-arch",
     "xtask",
     "crates/molt-core",
+    "crates/molt-pci",
     "crates/platforms/*",
     "kernel",
 ]
@@ -11,6 +12,7 @@ default-members = [
     "xtask",
     "crates/molt-arch",
     "crates/molt-core",
+    "crates/molt-pci",
     "crates/platforms/*",
 ]
 
@@ -22,6 +24,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 molt-arch = { path = "crates/molt-arch" }
 molt-core = { path = "crates/molt-core" }
+molt-pci = { path = "crates/molt-pci" }
 molt-riscv = { path = "crates/platforms/riscv" }
 molt-x86_64 = { path = "crates/platforms/x86_64" }
 spin = { version = "0.12.2", default-features = false, features = ["once"] }

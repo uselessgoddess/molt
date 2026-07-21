@@ -69,6 +69,24 @@ pub fn arm(initial_count: u32) -> Result<(), PlatformError> {
     write(REG_INITIAL_COUNT, initial_count)
 }
 
+/// Where a device writes to raise an interrupt on the boot CPU.
+///
+/// A message signalled interrupt is a posted write and nothing else: the APIC
+/// decodes the address into a destination and the data into a vector. The
+/// destination field is the APIC identifier, and the kernel runs on one core, so
+/// this is the boot CPU's own identifier — read from the window rather than
+/// assumed to be zero, because firmware chooses it.
+pub fn message_address() -> u64 {
+    let id = u64::from((core::arch::x86_64::__cpuid(1).ebx >> 24) as u8);
+    APIC_MMIO | id << 12
+}
+
+/// Acknowledges the interrupt being handled, which is what lets the next one
+/// through. Every handler owes the APIC exactly one of these.
+pub fn eoi() {
+    let _ = write(REG_EOI, 0);
+}
+
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Acquire)
 }
@@ -86,7 +104,7 @@ pub extern "x86-interrupt" fn timer_interrupt(
     _frame: x86_64::structures::idt::InterruptStackFrame,
 ) {
     TICKS.fetch_add(1, Ordering::Release);
-    let _ = write(REG_EOI, 0);
+    eoi();
 }
 
 pub extern "x86-interrupt" fn spurious_interrupt(

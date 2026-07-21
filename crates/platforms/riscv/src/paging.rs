@@ -65,9 +65,25 @@ unsafe extern "C" {
 /// board grows this to double digits; growing it here is a one-line change.
 const MAX_RAM_RANGES: usize = 8;
 
+/// How many windows the kernel may open onto devices after boot: the UART the
+/// mapping check writes through, configuration space, and room for the register
+/// blocks a driver asks for.
+const MAX_DEVICE_WINDOWS: usize = 8;
+
 /// Every mapped range the boot address space declares: three image sections,
-/// the free-RAM regions, and the device window [`verify_device_window`] adds.
-type MappingLog = Declared<{ 3 + MAX_RAM_RANGES + 1 }>;
+/// the free-RAM regions, and the device windows opened on top of them.
+type MappingLog = Declared<{ 3 + MAX_RAM_RANGES + MAX_DEVICE_WINDOWS }>;
+
+/// Where windows onto devices are laid out, and how far apart.
+///
+/// Sixteen gigabytes up is past anything this board puts in physical memory,
+/// which is the point: a window's address is the kernel's to choose, and one
+/// that cannot be confused with the address it maps is one no driver can reach
+/// by assuming identity. Windows are handed out upwards from here with a
+/// megapage of unmapped space between them, so a driver that walks off the end
+/// of its registers faults instead of landing in another device.
+const DEVICE_WINDOW: usize = 0x4_0000_0000;
+const WINDOW_GAP: usize = PAGE_2M;
 
 /// Address of a linker-defined symbol.
 macro_rules! bound {
@@ -81,6 +97,8 @@ struct BootPaging {
     root: *mut u64,
     /// Where frame allocation stopped, so a probe does not reissue a table frame.
     cursor: FrameCursor,
+    /// Where the next device window goes.
+    window: usize,
     /// Every mapped range, in the order [`init`] built them.
     log: MappingLog,
 }
@@ -165,7 +183,7 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
     }
     // SAFETY: same reasoning as `active`; this runs once on the boot hart.
     unsafe {
-        *ACTIVE.0.get() = Some(BootPaging { root, cursor, log });
+        *ACTIVE.0.get() = Some(BootPaging { root, cursor, window: DEVICE_WINDOW, log });
     }
     Ok(())
 }
@@ -329,6 +347,68 @@ pub fn verify_device_window(boot_info: &BootInfo<'_>) -> Result<(), PlatformErro
     let walk = TableWalk { root: state.root, inventory: &inventory };
     state.log.audit().cover(&walk).map_err(PlatformError::Mapping)?;
     walk_leaves(state.root, &state.log.audit(), &inventory)
+}
+
+/// Maps `[base, base + bytes)` of device memory and says where it landed.
+///
+/// This is [`verify_device_window`] with the address it writes through no
+/// longer a constant: the caller knows which registers it wants and nothing
+/// else, and the window it gets back is one the audit has already accepted.
+/// Every window goes through [`Inventory::device`] first, so a base that is
+/// really RAM — a misread device tree, a driver's arithmetic — is refused here
+/// rather than mapped uncacheable over the kernel's own memory.
+///
+/// The physical base's offset within a megapage is carried into the virtual
+/// address, which is what lets a large aperture be mapped with megapages
+/// instead of tens of thousands of small leaves.
+pub fn open_window(
+    boot_info: &BootInfo<'_>,
+    base: u64,
+    bytes: u64,
+) -> Result<usize, PlatformError> {
+    let state = active()?;
+    let inventory = Inventory::new(boot_info.memory_map());
+    let start = molt_arch::align_down(base, PAGE_4K as u64);
+    let end = molt_arch::align_up(base.checked_add(bytes).ok_or(address_error())?, PAGE_4K as u64)
+        .ok_or(address_error())?;
+    let span = Span::new(start, end).map_err(|_| address_error())?;
+    let window = inventory.device(span).map_err(|_| address_error())?;
+    let (rights, cache) = window.mapping(Rights::READ_WRITE).map_err(PlatformError::Mapping)?;
+    debug_assert_eq!(cache, Cache::Device);
+
+    let len = usize::try_from(end - start).map_err(|_| address_error())?;
+    let va = state.window + (start as usize % PAGE_2M);
+    // The next window starts a megapage past the end of this one, rounded up so
+    // its own offset arithmetic starts from a megapage boundary again.
+    state.window = align_up(va + len, PAGE_2M).ok_or(address_error())? + WINDOW_GAP;
+
+    let mut frames = FrameAllocator::resume(boot_info.memory_map(), state.cursor);
+    let flags = leaf_flags(rights);
+    let mut mapped = 0;
+    while mapped < len {
+        let (va, pa) = (va + mapped, start + mapped as u64);
+        let large = va % PAGE_2M == 0 && pa % PAGE_2M as u64 == 0 && len - mapped >= PAGE_2M;
+        map_leaf(state.root, &mut frames, va, pa, flags, large as usize)?;
+        mapped += if large { PAGE_2M } else { PAGE_4K };
+    }
+    state.cursor = frames.cursor();
+    state
+        .log
+        .push(MappedRange::device(va as u64, (va + len) as u64))
+        .map_err(PlatformError::Mapping)?;
+    // SAFETY: the new leaves are in memory; the fence retires any negative
+    // caching of the window from before it existed.
+    unsafe {
+        asm!("sfence.vma", options(nostack));
+    }
+
+    // The window is not handed out until the audit has seen it: `cover` proves
+    // the leaves are uncacheable and unexecutable, and the sweep proves nothing
+    // else appeared alongside them.
+    let walk = TableWalk { root: state.root, inventory: &inventory };
+    state.log.audit().cover(&walk).map_err(PlatformError::Mapping)?;
+    walk_leaves(state.root, &state.log.audit(), &inventory)?;
+    Ok(va)
 }
 
 /// Sv39 leaf flags for `rights`, with access and dirty pre-set.

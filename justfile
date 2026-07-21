@@ -17,6 +17,7 @@ test:
 
 miri:
     MIRIFLAGS="-Zmiri-strict-provenance" cargo miri test --package molt-core
+    MIRIFLAGS="-Zmiri-strict-provenance" cargo miri test --package molt-pci
 
 loom:
     LOOM_MAX_PREEMPTIONS=2 RUSTFLAGS="--cfg loom" \

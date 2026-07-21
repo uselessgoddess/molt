@@ -63,6 +63,30 @@ fn a_device_window_inside_ram_is_refused() {
 }
 
 #[test]
+fn a_described_aperture_may_sit_in_a_reserved_region() {
+    let map = map();
+    let inventory = Inventory::new(&map);
+    let aperture = Span::new(0x4000, 0x5000).unwrap();
+
+    assert_eq!(inventory.device(aperture), Err(Error::Kind), "a hole is not the only evidence");
+    assert_eq!(inventory.aperture(aperture).map(|window| window.span()), Ok(aperture));
+    assert!(inventory.aperture(Span::new(0x8000, 0x9000).unwrap()).is_ok(), "a hole is one too");
+}
+
+#[test]
+fn a_described_aperture_over_ram_is_still_refused() {
+    let map = map();
+    let inventory = Inventory::new(&map);
+
+    assert_eq!(inventory.aperture(Span::new(0x1000, 0x2000).unwrap()), Err(Error::Kind));
+    assert_eq!(
+        inventory.aperture(Span::new(0x3000, 0x5000).unwrap()),
+        Err(Error::Mixed),
+        "an aperture that reaches out of its region is not one region's",
+    );
+}
+
+#[test]
 fn a_device_window_is_uncached_and_never_executable() {
     let map = map();
     let inventory = Inventory::new(&map);

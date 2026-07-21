@@ -100,9 +100,14 @@ impl Case {
     }
 }
 
+/// Markers that depend on what the machine has rather than on what the kernel
+/// does. Configuration space, a device that can be made to interrupt, and a
+/// table to program are facts about the board, so the kernel skips them
+/// silently where they are absent and only this arch demands them.
 fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
     match (arch, case) {
-        (Arch::Riscv64, Case::Boot) => &["MOLT_SBI_CONSOLE:", "MOLT_UART_WINDOW:"],
+        (Arch::Riscv64, Case::Boot) => &["MOLT_SBI_CONSOLE:", "MOLT_UART_WINDOW:", "MOLT_PCI_OK"],
+        (Arch::X86_64, Case::Boot) => &["MOLT_PCI_OK", "MOLT_MSI:", "MOLT_MSI_OK", "MOLT_MSIX_OK"],
         _ => &[],
     }
 }
@@ -276,11 +281,26 @@ fn qemu_x86_64_command(image: &Path) -> Command {
         command.arg("-L").arg(firmware);
     }
     command.args([
+        // ECAM only exists on a PCI Express host bridge, and the default i440fx
+        // machine has none: on it the kernel would find no MCFG table and skip
+        // the whole enumeration path, so the smoke run would prove nothing.
+        "-machine",
+        "q35",
         "-display",
         "none",
         "-no-reboot",
         "-device",
         "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        // The education device: a BAR, an MSI capability, and a register that
+        // makes it interrupt on demand. It is the only device here that raises
+        // a vector without a driver behind it, which is what makes delivery
+        // observable rather than merely programmed.
+        "-device",
+        "edu",
+        // A device with an MSI-X table to program, chosen because its table
+        // lives at an offset inside a BAR the kernel then has to map.
+        "-device",
+        "virtio-rng-pci",
         "-drive",
     ]);
     command.arg(format!("format=raw,file={}", image.display()));
@@ -293,7 +313,20 @@ fn qemu_riscv64_command(kernel: &Path) -> Command {
     let mut command = Command::new(qemu);
     // OpenSBI (`-bios default`) loads the ELF at its S-mode payload address and
     // an orderly SBI shutdown exits QEMU through the `virt` board's test device.
-    command.args(["-machine", "virt", "-display", "none", "-no-reboot", "-bios", "default"]);
+    command.args([
+        "-machine",
+        "virt",
+        "-display",
+        "none",
+        "-no-reboot",
+        "-bios",
+        "default",
+        // The `virt` board's host bridge answers on its own, but a bridge alone
+        // reports no message vectors; this device carries an MSI-X capability,
+        // so the sweep has something to read a vector count out of.
+        "-device",
+        "virtio-rng-pci",
+    ]);
     command.arg("-kernel").arg(kernel);
     command
 }
