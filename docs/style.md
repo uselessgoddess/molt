@@ -37,6 +37,13 @@ When a comment is long, it is because the reasoning is long — see the module
 doc on `executor.rs` for why the slot states are separate atomics. That is
 allowed. Filler is not.
 
+Write the present tense of the code, not its past. "The earlier version mapped
+all of RAM RWX", "until now the tables stayed live", "Stage 1 only needed" —
+these are commit messages, not comments. Git holds the diff and the reasoning
+that motivated it; a comment that narrates a problem the code already solves
+becomes a lie the first time someone solves it again a different way. Say what
+the code does and why it must, as if it had always been this way.
+
 Delete commented-out code. Git has it.
 
 ## Documentation
@@ -54,7 +61,10 @@ design rationale; that is where a paragraph belongs.
 
 Every `unsafe fn` has a `# Safety` section stating what the caller must
 guarantee. Every `unsafe` block has a `// SAFETY:` comment saying why that
-guarantee holds here. No exceptions — this is the one place verbosity wins.
+guarantee holds. One sentence: the condition that makes the block sound, not a
+tour of everything that could go wrong. Several conditions join with a
+semicolon; they do not become several sentences. The comment is never optional
+— that is the exception verbosity does not get to make.
 
 ## Tests
 
