@@ -119,11 +119,11 @@ cannot proceed without.
 
 ### Stage 2.1 — A kernel-owned address space and the first MMIO window
 
-- [ ] x86_64 page tables owned by the kernel rather than the bootloader, so
+- [x] x86_64 page tables owned by the kernel rather than the bootloader, so
       `Audit::accepts` runs on both platforms and not just RISC-V
-- [ ] cache attributes actually programmed into hardware: PAT on x86_64, and
+- [x] cache attributes actually programmed into hardware: PAT on x86_64, and
       the `Svpbmt`/PMA question answered on RISC-V
-- [ ] a device window mapped through `Inventory::device`, with the UART as the
+- [x] a device window mapped through `Inventory::device`, with the UART as the
       first consumer that stops being an identity-mapped assumption
 
 Nothing before this point maps a device. Nothing after it should map one

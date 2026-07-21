@@ -183,9 +183,13 @@ _start:
 
         fn verify_image_protection(
             &mut self,
-            _boot_info: &BootInfo<'_>,
+            boot_info: &BootInfo<'_>,
         ) -> Result<(), PlatformError> {
-            paging::verify_image_protection()
+            paging::verify_image_protection(boot_info)
+        }
+
+        fn verify_device_window(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+            paging::verify_device_window(boot_info)
         }
 
         fn arm_timer(&mut self, initial_count: u32) -> Result<(), PlatformError> {
