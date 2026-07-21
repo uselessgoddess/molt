@@ -143,9 +143,12 @@ without the audit being able to see it.
       raised by a device actually reaches the slab
 - [x] `docs/pci.md`
 
-Two limits are recorded rather than checked off. Bus mastering is enabled
-nowhere, because without an IOMMU a DMA-capable device is as privileged as the
-kernel and Stage 2.3 is where that trade has to be made explicitly. And RISC-V
+Two limits are recorded rather than checked off. Bus mastering is granted in
+exactly one place — the kernel, for the one function whose MSI it routes —
+because an MSI *is* a DMA write and a function that may not initiate
+transactions cannot post one. Nothing in `molt-pci` sets the bit, but the
+consequence is real: without an IOMMU that device is as privileged as the
+kernel, and Stage 2.3 is where that trade has to be made explicitly. And RISC-V
 mints no MSI vectors: its fabric reports `Unsupported` until there is an AIA
 driver, so the RISC-V smoke enumerates and stops.
 
