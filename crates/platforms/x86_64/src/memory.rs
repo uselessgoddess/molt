@@ -37,6 +37,14 @@ use x86_64::{PhysAddr, VirtAddr};
 use crate::{BOOT_INFO_BASE, BOOT_INFO_WINDOW, STACK_BASE, STACK_SIZE};
 
 /// How far past the reported image length `mapped_end` will follow the loader.
+///
+/// This is a runaway guard, not a size the kernel is expected to reach: the
+/// walk stops at the loader's first unmapped page, and the kernel image plus
+/// its `.bss` is a couple of megabytes. Without a bound, a loader that mapped
+/// the image right up against another window would make the walk cross into
+/// it, one 4 KiB page walk at a time. 64 MiB caps that at 16K probes — a few
+/// milliseconds even under QEMU — while leaving two orders of magnitude of
+/// headroom over the real image.
 const IMAGE_LIMIT: u64 = 64 * 1024 * 1024;
 
 const TEST_PAGE: u64 = 0x0000_5555_5555_0000;
@@ -347,6 +355,25 @@ pub fn verify_device_window(_boot_info: &BootInfo<'_>) -> Result<(), PlatformErr
         return Err(PlatformError::InvalidHardware);
     }
 
+    // The read alone proves only half the window. RISC-V drives its UART
+    // through the mapping; do the same here on the one APIC register that is
+    // writable without disturbing interrupt delivery — the task priority
+    // register, which the kernel leaves at zero. Write a priority class, read
+    // it back through the same window, then restore it.
+    // SAFETY: `APIC_WINDOW + 0x80` is the naturally aligned 32-bit TPR of the
+    // APIC frame this window maps read/write and uncacheable.
+    let observed = unsafe {
+        let tpr = (APIC_WINDOW + 0x80) as *mut u32;
+        let previous = tpr.read_volatile();
+        tpr.write_volatile(0x20);
+        let observed = tpr.read_volatile();
+        tpr.write_volatile(previous);
+        observed
+    };
+    if observed & 0xff != 0x20 {
+        return Err(PlatformError::InvalidHardware);
+    }
+
     let space = state.mapper();
     let audit = state.log.audit();
     audit.cover(&MapperWalk { mapper: &space }).map_err(PlatformError::Mapping)?;
@@ -485,12 +512,14 @@ impl Drop for OwnedPage<'_, '_> {
     }
 }
 
+/// The shared [`molt_arch::align_down`] at this platform's page size.
 fn align_down(address: u64) -> u64 {
-    address & !(Size4KiB::SIZE - 1)
+    molt_arch::align_down(address, Size4KiB::SIZE)
 }
 
+/// The shared [`molt_arch::align_up`] at this platform's page size.
 fn align_up(address: u64) -> Result<u64, PlatformError> {
-    address.checked_add(Size4KiB::SIZE - 1).map(align_down).ok_or(address_error())
+    molt_arch::align_up(address, Size4KiB::SIZE).ok_or(address_error())
 }
 
 fn map_error(_error: MapToError<impl PageSize>) -> PlatformError {

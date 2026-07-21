@@ -400,15 +400,22 @@ fn walk_table(
 /// not a property of the entry at all — it is the PMA of the physical address
 /// the entry names, fixed by the platform. Classifying that address through
 /// [`Inventory`] therefore reports what the hardware actually does: RAM and
-/// image frames are write-back, and anything in a hole of the firmware map is
+/// image frames are write-back — as is firmware-reserved RAM — and anything in
+/// a hole of the firmware map is
 /// I/O-ordered. When `Svpbmt` is present it becomes an override on top of this
 /// answer — a PBMT field of zero still means "whatever the PMA says" — so the
 /// classification stays correct and gains a bit to read instead.
 fn protection(entry: u64, inventory: &Inventory<'_>) -> PageProtection {
     let physical = (entry >> 10) << 12;
     let cache = match inventory.kind(physical) {
-        Kind::Ram | Kind::Image => Cache::WriteBack,
-        Kind::Device | Kind::Reserved => Cache::Device,
+        // Reserved is RAM the firmware kept for itself — OpenSBI, the device
+        // tree, loader structures — so its PMA is write-back like any other
+        // RAM address. Only a hole in the firmware map is I/O-ordered. Nothing
+        // maps Reserved today, and `Audit::accepts` rejects a leaf over it as
+        // unexpected, but reporting Device here would be a false claim the
+        // moment Stage 2.2 maps the device tree read-only.
+        Kind::Ram | Kind::Image | Kind::Reserved => Cache::WriteBack,
+        Kind::Device => Cache::Device,
     };
     PageProtection::new(entry & PTE_R != 0, entry & PTE_W != 0, entry & PTE_X != 0).cached(cache)
 }
@@ -509,12 +516,14 @@ fn index(va: usize, level: usize) -> usize {
     (va >> (12 + 9 * level)) & 0x1ff
 }
 
+/// The shared [`molt_arch::align_down`] on this platform's address width.
 fn align_down(value: usize, alignment: usize) -> usize {
-    value & !(alignment - 1)
+    molt_arch::align_down(value as u64, alignment as u64) as usize
 }
 
+/// The shared [`molt_arch::align_up`] on this platform's address width.
 fn align_up(value: usize, alignment: usize) -> Option<usize> {
-    value.checked_add(alignment - 1).map(|value| value & !(alignment - 1))
+    molt_arch::align_up(value as u64, alignment as u64).map(|value| value as usize)
 }
 
 /// Assembles an Sv39 PTE from a physical address and permission flags.
