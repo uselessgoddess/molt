@@ -1,5 +1,5 @@
 use molt_arch::{
-    FrameAllocator, ImageSection, MapPermissions, MappingError, MemoryMap, MemoryRegion,
+    FrameAllocator, FramePool, ImageSection, MapPermissions, MappingError, MemoryMap, MemoryRegion,
     MemoryRegionKind, PageProtection, UsableRange, UsableRegions,
 };
 
@@ -131,4 +131,41 @@ fn write_exec_mappings_rejected() {
     assert_eq!(MapPermissions::new(true, true), Err(MappingError::WritableExecutable));
     assert!(MapPermissions::new(true, false).unwrap().is_write());
     assert!(MapPermissions::new(false, true).unwrap().is_execute());
+}
+
+#[test]
+fn a_pool_hands_out_reserved_frames_once() {
+    let map = TestMap([
+        MemoryRegion::new(0, 0x1000, MemoryRegionKind::Reserved),
+        MemoryRegion::new(0x4000, 0x8000, MemoryRegionKind::Usable),
+        MemoryRegion::new(0x9000, 0xa000, MemoryRegionKind::Usable),
+    ]);
+    let mut allocator = FrameAllocator::new(&map);
+    let mut pool = FramePool::<3>::empty();
+
+    assert_eq!(pool.fill(&mut allocator), 3);
+    assert_eq!(pool.remaining(), 3);
+    let taken = [pool.allocate(), pool.allocate(), pool.allocate()]
+        .map(|frame| frame.map(|frame| frame.start()));
+
+    assert_eq!(taken, [Some(0x4000), Some(0x5000), Some(0x6000)]);
+    assert_eq!(pool.allocate(), None, "a drained pool invented a frame");
+    assert_eq!(pool.remaining(), 0);
+    // The allocator carried on from where the pool stopped, so no frame is
+    // handed out twice.
+    assert_eq!(allocator.allocate().map(|frame| frame.start()), Some(0x7000));
+}
+
+#[test]
+fn a_pool_over_a_short_map_reports_what_it_got() {
+    let map = TestMap([
+        MemoryRegion::new(0, 0x1000, MemoryRegionKind::Reserved),
+        MemoryRegion::new(0x4000, 0x5000, MemoryRegionKind::Usable),
+        MemoryRegion::new(0x8000, 0x9000, MemoryRegionKind::Reserved),
+    ]);
+    let mut pool = FramePool::<4>::empty();
+
+    assert_eq!(pool.fill(&mut FrameAllocator::new(&map)), 1);
+    assert!(pool.allocate().is_some());
+    assert_eq!(pool.allocate(), None);
 }

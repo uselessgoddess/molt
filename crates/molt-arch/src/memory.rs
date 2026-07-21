@@ -399,11 +399,23 @@ impl<'m> Inventory<'m> {
         Ok(kind)
     }
 
-    /// A device window at `span`, if firmware left that span to devices.
+    /// A device window at `span`, if firmware did not claim it as memory.
+    ///
+    /// Both [`Kind::Device`] and [`Kind::Reserved`] qualify, because the two
+    /// are the same fact reported by two firmwares. A device tree describes
+    /// ECAM by listing RAM and leaving the window out, so it arrives here as a
+    /// hole — [`Kind::Device`]. An e820 map describes the identical window with
+    /// an explicit non-usable entry, so it arrives as [`Kind::Reserved`].
+    /// Accepting only the hole would make the x86_64 PCI path fail on every
+    /// machine whose firmware is more, not less, informative.
+    ///
+    /// [`Kind::Ram`] and [`Kind::Image`] stay refused, which is the check that
+    /// matters: those are the spans a driver must never reach through an
+    /// uncached window.
     pub fn device(&self, span: Span) -> Result<Device, Error> {
         match self.classify(span)? {
-            Kind::Device => Ok(Device { span }),
-            _ => Err(Error::Kind),
+            Kind::Device | Kind::Reserved => Ok(Device { span }),
+            Kind::Ram | Kind::Image => Err(Error::Kind),
         }
     }
 }
