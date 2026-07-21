@@ -12,6 +12,7 @@ mod msi;
 
 use core::arch::asm;
 
+use acpi::AcpiError;
 #[doc(hidden)]
 pub use bootloader_api::config::Mapping as BootMapping;
 use bootloader_api::info::{MemoryRegionKind as BootMemoryRegionKind, MemoryRegions};
@@ -140,12 +141,28 @@ impl X86_64 {
     /// failure to report — it is a machine with no configuration space — so
     /// this answers `None` and the caller says so on the serial line.
     fn acpi_config_space(&self, boot_info: &BootInfo<'_>) -> Option<ConfigSpace> {
-        let rsdp = self.rsdp?;
-        let offset = boot_info.physical_offset()?;
-        // SAFETY: `rsdp` is the address the bootloader took from firmware, and
-        // `offset` is the loader's direct map, still live at this point in
-        // `initialize` — the kernel has not written `CR3` yet.
-        unsafe { acpi::config_space(rsdp, offset) }.ok()
+        let space = match (self.rsdp, boot_info.physical_offset()) {
+            (Some(rsdp), Some(offset)) => {
+                // SAFETY: `rsdp` is the address the bootloader took from
+                // firmware, and `offset` is the loader's direct map, still live
+                // at this point in `initialize` — `CR3` has not been written.
+                unsafe { acpi::config_space(rsdp, offset) }
+            }
+            _ => Err(AcpiError::Absent),
+        };
+
+        match space {
+            Ok(space) => Some(space),
+            // Named, not swallowed: "no configuration space" and "the tables
+            // were there and molt did not believe them" are different bugs, and
+            // the serial line is the only place a boot can say which it hit.
+            Err(reason) => {
+                emergency_write("MOLT_ACPI_SKIPPED: ");
+                emergency_write(acpi::reason(reason));
+                emergency_write("\n");
+                None
+            }
+        }
     }
 }
 

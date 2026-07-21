@@ -372,7 +372,8 @@ pub fn verify_device_window(boot_info: &BootInfo<'_>) -> Result<(), PlatformErro
 /// puts its ECAM region at `0x3000_0000`, which is where [`UART_WINDOW`]
 /// already is, and more generally a driver that can reach a device by guessing
 /// its physical address has not been given a capability at all. 128 GiB is
-/// clear of RAM and well inside Sv39's 512 GiB, and a gigabyte is far more
+/// clear of RAM and inside Sv39's lower canonical half, which ends at 256 GiB,
+/// so no sign extension is involved and a gigabyte is far more
 /// register space than any board needs — exceeding it means a caller asked for
 /// something that is not registers.
 const DEVICE_REGION: usize = 0x20_0000_0000;

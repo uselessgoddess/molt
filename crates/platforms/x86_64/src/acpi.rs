@@ -17,8 +17,10 @@ pub enum AcpiError {
     Rsdp,
     /// A table's bytes do not sum to zero.
     Checksum,
-    /// The RSDP predates ACPI 2.0, so there is no XSDT to walk.
+    /// The RSDP names no root table at all, in either width.
     Revision,
+    /// Firmware reported no RSDP address for us to start from.
+    Absent,
     /// A table carries a different signature than the one asked for.
     Signature,
     /// A table's `length` is implausible or reaches past the bytes we have.
@@ -29,14 +31,43 @@ pub enum AcpiError {
     Range,
 }
 
+/// A word for `error`, for the boot line that reports why ACPI told us nothing.
+pub const fn reason(error: AcpiError) -> &'static str {
+    match error {
+        AcpiError::Rsdp => "no RSD PTR signature at the reported address",
+        AcpiError::Checksum => "a table's bytes do not sum to zero",
+        AcpiError::Revision => "the RSDP names neither an RSDT nor an XSDT",
+        AcpiError::Absent => "firmware reported no RSDP, or no direct map to read it through",
+        AcpiError::Signature => "a table carries the wrong signature",
+        AcpiError::Truncated => "a table's length is implausible",
+        AcpiError::Missing => "no MCFG table, so no memory-mapped configuration space",
+        AcpiError::Range => "the MCFG allocation names a bus range molt refuses",
+    }
+}
+
 /// Bytes of the header every ACPI table starts with.
 const HEADER: usize = 36;
 
 /// Nothing we parse is anywhere near this large; a bigger `length` is garbage.
 const MAX_TABLE: usize = 64 * 1024;
 
-/// The XSDT's physical address, from the RSDP image firmware pointed at.
-pub fn rsdp(bytes: &[u8]) -> Result<u64, AcpiError> {
+/// The root table an RSDP names, and how wide its entries are.
+///
+/// Both forms are real. QEMU hands a legacy BIOS boot a revision-0 RSDP with
+/// nothing but a 32-bit RSDT pointer, and hands UEFI a revision-2 one with an
+/// XSDT; refusing the first would mean no configuration space on half the
+/// images this kernel builds. The XSDT is preferred wherever both exist,
+/// because it is the one that can name a table above 4 GiB.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Root {
+    /// ACPI 1.0's root table: a header followed by 32-bit addresses.
+    Rsdt(u64),
+    /// ACPI 2.0's: the same, in 64-bit addresses.
+    Xsdt(u64),
+}
+
+/// The root table's physical address, from the RSDP image firmware pointed at.
+pub fn rsdp(bytes: &[u8]) -> Result<Root, AcpiError> {
     let first = bytes.get(..20).ok_or(AcpiError::Truncated)?;
     if &first[..8] != b"RSD PTR " {
         return Err(AcpiError::Rsdp);
@@ -44,9 +75,12 @@ pub fn rsdp(bytes: &[u8]) -> Result<u64, AcpiError> {
     if sum(first) != 0 {
         return Err(AcpiError::Checksum);
     }
-    // Revision 0 is ACPI 1.0: the RSDP stops at 20 bytes and has no XSDT.
+    let rsdt = le(&first[16..20]);
+
+    // Revision 0 is ACPI 1.0: the RSDP stops at 20 bytes, and reading the
+    // extended fields would be reading whatever firmware left after them.
     if first[15] < 2 {
-        return Err(AcpiError::Revision);
+        return if rsdt == 0 { Err(AcpiError::Revision) } else { Ok(Root::Rsdt(rsdt)) };
     }
 
     // The revision 2 RSDP is 36 bytes; anything shorter cannot hold an XSDT
@@ -60,13 +94,21 @@ pub fn rsdp(bytes: &[u8]) -> Result<u64, AcpiError> {
         return Err(AcpiError::Checksum);
     }
 
-    Ok(le(&bytes[24..32]))
+    match (le(&bytes[24..32]), rsdt) {
+        (0, 0) => Err(AcpiError::Revision),
+        (0, rsdt) => Ok(Root::Rsdt(rsdt)),
+        (xsdt, _) => Ok(Root::Xsdt(xsdt)),
+    }
 }
 
-/// The physical addresses of the tables an XSDT image lists.
-pub fn xsdt_entries(bytes: &[u8]) -> Result<impl Iterator<Item = u64> + '_, AcpiError> {
-    let body = table(bytes, b"XSDT")?;
-    Ok(body[HEADER..].chunks_exact(8).map(le))
+/// The physical addresses of the tables a root table image lists.
+pub fn entries(root: Root, bytes: &[u8]) -> Result<impl Iterator<Item = u64> + '_, AcpiError> {
+    let (signature, width) = match root {
+        Root::Rsdt(_) => (b"RSDT", 4),
+        Root::Xsdt(_) => (b"XSDT", 8),
+    };
+    let body = table(bytes, signature)?;
+    Ok(body[HEADER..].chunks_exact(width).map(le))
 }
 
 /// The configuration space of the first allocation in an MCFG image.
@@ -88,16 +130,19 @@ pub fn mcfg(bytes: &[u8]) -> Result<ConfigSpace, AcpiError> {
 pub unsafe fn config_space(rsdp_physical: u64, offset: u64) -> Result<ConfigSpace, AcpiError> {
     // SAFETY: the caller promises the direct map covers the RSDP, whose
     // extended form is 36 bytes.
-    let root = unsafe { image(offset, rsdp_physical, HEADER) };
-    let xsdt_physical = rsdp(root)?;
+    let pointer = unsafe { image(offset, rsdp_physical, HEADER) };
+    let root = rsdp(pointer)?;
+    let root_physical = match root {
+        Root::Rsdt(physical) | Root::Xsdt(physical) => physical,
+    };
 
     // SAFETY: as above; the header is what tells us how much more to read.
-    let header = unsafe { image(offset, xsdt_physical, HEADER) };
-    let xsdt_length = length(header)?;
+    let header = unsafe { image(offset, root_physical, HEADER) };
+    let root_length = length(header)?;
     // SAFETY: as above, now for the length the header just vouched for.
-    let xsdt = unsafe { image(offset, xsdt_physical, xsdt_length) };
+    let listing = unsafe { image(offset, root_physical, root_length) };
 
-    for entry in xsdt_entries(xsdt)? {
+    for entry in entries(root, listing)? {
         // SAFETY: as above; a listed table starts with its 4-byte signature.
         if unsafe { image(offset, entry, 4) } != b"MCFG" {
             continue;
@@ -164,7 +209,7 @@ mod tests {
 
     use std::vec::Vec;
 
-    use super::{AcpiError, mcfg, rsdp, xsdt_entries};
+    use super::{AcpiError, Root, entries, mcfg, rsdp};
 
     /// Writes the byte that makes `covered` bytes sum to zero.
     fn checksum(bytes: &mut [u8], index: usize, covered: usize) {
@@ -173,10 +218,11 @@ mod tests {
         bytes[index] = sum.wrapping_neg();
     }
 
-    fn rsdp_image(xsdt: u64, revision: u8) -> [u8; 36] {
+    fn rsdp_image(xsdt: u64, rsdt: u32, revision: u8) -> [u8; 36] {
         let mut bytes = [0u8; 36];
         bytes[..8].copy_from_slice(b"RSD PTR ");
         bytes[15] = revision;
+        bytes[16..20].copy_from_slice(&rsdt.to_le_bytes());
         bytes[20..24].copy_from_slice(&36u32.to_le_bytes());
         bytes[24..32].copy_from_slice(&xsdt.to_le_bytes());
         checksum(&mut bytes, 8, 20);
@@ -194,6 +240,16 @@ mod tests {
         bytes
     }
 
+    fn rsdt_image(entries: [u32; 2]) -> [u8; 44] {
+        let mut bytes = [0u8; 44];
+        bytes[..4].copy_from_slice(b"RSDT");
+        bytes[4..8].copy_from_slice(&44u32.to_le_bytes());
+        bytes[36..40].copy_from_slice(&entries[0].to_le_bytes());
+        bytes[40..44].copy_from_slice(&entries[1].to_le_bytes());
+        checksum(&mut bytes, 9, 44);
+        bytes
+    }
+
     fn mcfg_image(base: u64, segment: u16, first_bus: u8, last_bus: u8) -> [u8; 60] {
         let mut bytes = [0u8; 60];
         bytes[..4].copy_from_slice(b"MCFG");
@@ -208,16 +264,16 @@ mod tests {
 
     #[test]
     fn rsdp_reports_the_xsdt_address() {
-        let bytes = rsdp_image(0x7fff_0000, 2);
+        let bytes = rsdp_image(0x7fff_0000, 0x7ffe_0000, 2);
 
-        let xsdt = rsdp(&bytes);
+        let root = rsdp(&bytes);
 
-        assert_eq!(xsdt, Ok(0x7fff_0000), "the extended pointer firmware wrote");
+        assert_eq!(root, Ok(Root::Xsdt(0x7fff_0000)), "the wider pointer wins where both exist");
     }
 
     #[test]
     fn bad_checksum_is_refused() {
-        let mut bytes = rsdp_image(0x7fff_0000, 2);
+        let mut bytes = rsdp_image(0x7fff_0000, 0, 2);
 
         bytes[24] ^= 0xff;
 
@@ -225,12 +281,38 @@ mod tests {
     }
 
     #[test]
-    fn acpi_one_rsdp_is_refused() {
-        let bytes = rsdp_image(0, 0);
+    fn acpi_one_rsdp_reports_its_rsdt() {
+        let bytes = rsdp_image(0, 0x7fff_0000, 0);
 
-        let xsdt = rsdp(&bytes);
+        let root = rsdp(&bytes);
 
-        assert_eq!(xsdt, Err(AcpiError::Revision), "revision 0 has no XSDT to point at");
+        assert_eq!(root, Ok(Root::Rsdt(0x7fff_0000)), "a legacy BIOS names only the 32-bit table");
+    }
+
+    #[test]
+    fn an_rsdp_naming_no_root_table_is_refused() {
+        let bytes = rsdp_image(0, 0, 2);
+
+        assert_eq!(rsdp(&bytes), Err(AcpiError::Revision), "neither width points anywhere");
+    }
+
+    #[test]
+    fn rsdt_entries_are_read_as_32_bit_addresses() {
+        let bytes = rsdt_image([0x7fff_1000, 0x7fff_2000]);
+
+        let listed: Vec<u64> =
+            entries(Root::Rsdt(0), &bytes).expect("a well-formed RSDT").collect();
+
+        assert_eq!(listed, [0x7fff_1000, 0x7fff_2000]);
+    }
+
+    #[test]
+    fn a_root_table_of_the_other_width_is_refused() {
+        let bytes = rsdt_image([0x7fff_1000, 0x7fff_2000]);
+
+        let listed = entries(Root::Xsdt(0), &bytes).map(Iterator::count);
+
+        assert_eq!(listed.err(), Some(AcpiError::Signature), "an RSDT is not an XSDT");
     }
 
     #[test]
@@ -258,8 +340,9 @@ mod tests {
         let mut buffer = [0u8; 55];
         buffer[3..].copy_from_slice(&image);
 
-        let entries: Vec<u64> = xsdt_entries(&buffer[3..]).expect("a well-formed XSDT").collect();
+        let listed: Vec<u64> =
+            entries(Root::Xsdt(0), &buffer[3..]).expect("a well-formed XSDT").collect();
 
-        assert_eq!(entries, [0x7fff_1000, 0x7fff_2000], "entries at odd addresses");
+        assert_eq!(listed, [0x7fff_1000, 0x7fff_2000], "entries at odd addresses");
     }
 }
