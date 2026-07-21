@@ -3,9 +3,12 @@
 
 //! x86_64 boot adaptation and hardware implementations.
 
+pub mod acpi;
+
 mod apic;
 mod interrupts;
 mod memory;
+mod msi;
 
 use core::arch::asm;
 
@@ -16,9 +19,11 @@ use bootloader_api::info::{MemoryRegionKind as BootMemoryRegionKind, MemoryRegio
 pub use bootloader_api::{
     BootInfo as BootloaderInfo, BootloaderConfig, entry_point as __bootloader_entry_point,
 };
+use molt_arch::memory::{Device, Rights};
 use molt_arch::{
-    BootInfo, ExitStatus, ImageRange, MemoryMap, MemoryRegion, MemoryRegionKind, Platform,
-    PlatformError, SerialPort,
+    BootInfo, ConfigSpace, DeviceMapper, ExitStatus, FabricError, FramePool, ImageRange,
+    InterruptFabric, MappingError, MemoryMap, MemoryRegion, MemoryRegionKind, Mmio, MsiMessage,
+    Platform, PlatformError, SerialPort, Sink,
 };
 
 /// Defines the bootloader-specific entry wrapper outside `molt-kernel`.
@@ -46,7 +51,10 @@ pub fn start(raw: &'static mut BootloaderInfo, kernel: fn(BootInfo<'_>, &mut X86
     let kernel_image = ImageRange::new(raw.kernel_image_offset, raw.kernel_len);
     let boot_info =
         BootInfo::new(&memory_map, physical_memory_offset).with_kernel_image(kernel_image);
-    let mut platform = X86_64::new();
+    // The RSDP is captured here because this is the only place it exists: it is
+    // a field of the bootloader's structure, not of the memory map, and there
+    // is no way to find it again later that is not a guess.
+    let mut platform = X86_64::new().with_rsdp(raw.rsdp_addr.as_ref().copied());
     kernel(boot_info, &mut platform)
 }
 
@@ -86,14 +94,49 @@ impl MemoryMap for BootloaderMemoryMap<'_> {
     }
 }
 
+/// Where device register windows are mapped.
+///
+/// A region of its own, far from the kernel image and from the bootloader's
+/// direct map, so that a stray pointer into device space is a fault rather than
+/// a write into somebody's data.
+pub(crate) const DEVICE_REGION: u64 = 0x0000_4444_0000_0000;
+
+/// How many page-table frames are set aside for device mappings.
+///
+/// Enough for a few windows' worth of intermediate tables — every window needs
+/// at most one table per level below the top — with room to spare. Running out
+/// is a bounded, reported failure rather than a corrupted table.
+const TABLE_FRAMES: usize = 32;
+
+pub(crate) type TableFrames = FramePool<TABLE_FRAMES>;
+
 /// Concrete services for the current x86_64 boot target.
 pub struct X86_64 {
     serial: Com1,
+    /// The bootloader's direct-map offset, or zero before `initialize`.
+    offset: u64,
+    /// The physical address firmware reported for the ACPI RSDP.
+    rsdp: Option<u64>,
+    /// Frames reserved while the firmware memory map was still borrowable.
+    tables: TableFrames,
+    /// The next free device address; bumps forward and never back.
+    devices: u64,
 }
 
 impl X86_64 {
     pub const fn new() -> Self {
-        Self { serial: Com1 }
+        Self {
+            serial: Com1,
+            offset: 0,
+            rsdp: None,
+            tables: TableFrames::empty(),
+            devices: DEVICE_REGION,
+        }
+    }
+
+    const fn with_rsdp(mut self, rsdp: Option<u64>) -> Self {
+        self.rsdp = rsdp;
+        self
     }
 }
 
@@ -113,6 +156,16 @@ impl Platform for X86_64 {
     fn initialize(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
         interrupts::init();
         let offset = boot_info.physical_offset().ok_or(PlatformError::MissingPhysicalMemoryMap)?;
+        self.offset = offset;
+
+        // The page-table frames are taken now, while the firmware map is still
+        // borrowable. A device mapped later cannot go back and ask for one:
+        // the map is gone by then, and building a fresh allocator over it would
+        // start handing out the frames the live tables are already made of.
+        let floor = boot_info.kernel_image().map_or(0, |image| image.end());
+        let mut frames = molt_arch::FrameAllocator::above(boot_info.memory_map(), floor);
+        self.tables.fill(&mut frames);
+
         apic::init(offset)
     }
 
@@ -121,11 +174,35 @@ impl Platform for X86_64 {
     }
 
     fn verify_owned_mapping(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
-        memory::verify_owned_mapping(boot_info)
+        let offset = boot_info.physical_offset().ok_or(PlatformError::MissingPhysicalMemoryMap)?;
+        memory::verify_owned_mapping(offset, &mut self.tables)
     }
 
     fn verify_image_protection(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
-        memory::verify_image_protection(boot_info)
+        let offset = boot_info.physical_offset().ok_or(PlatformError::MissingPhysicalMemoryMap)?;
+        memory::verify_image_protection(offset, boot_info)
+    }
+
+    /// The configuration space ACPI's MCFG table describes.
+    ///
+    /// Firmware reports the RSDP address and molt walks from there rather than
+    /// scanning low memory for the signature: the scan is a guess that finds a
+    /// stale table on machines that kept one, and UEFI does not put the RSDP
+    /// where the scan looks in the first place.
+    fn config_space(&mut self, _boot_info: &BootInfo<'_>) -> Result<ConfigSpace, PlatformError> {
+        let rsdp = self.rsdp.ok_or(PlatformError::MissingConfigSpace)?;
+        if self.offset == 0 {
+            return Err(PlatformError::MissingPhysicalMemoryMap);
+        }
+        // SAFETY: `rsdp` is the address the bootloader took from firmware, and
+        // `self.offset` is the direct map it built, valid for the whole run.
+        unsafe { acpi::config_space(rsdp, self.offset) }
+            .map_err(|_| PlatformError::MissingConfigSpace)
+    }
+
+    fn route_interrupts(&mut self, sink: &'static dyn Sink) -> Result<(), PlatformError> {
+        msi::route(sink);
+        Ok(())
     }
 
     fn arm_timer(&mut self, initial_count: u32) -> Result<(), PlatformError> {
@@ -150,6 +227,26 @@ impl Platform for X86_64 {
             out_u32(0xf4, code);
         }
         halt_forever()
+    }
+}
+
+impl DeviceMapper for X86_64 {
+    fn map_device(
+        &mut self,
+        window: Device,
+        rights: Rights,
+    ) -> Result<Mmio<'static>, MappingError> {
+        memory::map_device(self.offset, &mut self.tables, &mut self.devices, window, rights)
+    }
+}
+
+impl InterruptFabric for X86_64 {
+    fn allocate(&mut self) -> Result<(u16, MsiMessage), FabricError> {
+        msi::allocate()
+    }
+
+    fn release(&mut self, line: u16) -> Result<(), FabricError> {
+        msi::release(line)
     }
 }
 
