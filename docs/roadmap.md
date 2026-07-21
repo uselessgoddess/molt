@@ -121,18 +121,50 @@ cannot proceed without.
 
 - [ ] x86_64 page tables owned by the kernel rather than the bootloader, so
       `Audit::accepts` runs on both platforms and not just RISC-V
-- [ ] cache attributes actually programmed into hardware: PAT on x86_64, and
+- [x] cache attributes actually programmed into hardware: PAT on x86_64, and
       the `Svpbmt`/PMA question answered on RISC-V
-- [ ] a device window mapped through `Inventory::device`, with the UART as the
-      first consumer that stops being an identity-mapped assumption
+- [x] a device window mapped through `Inventory::device`, and readable back out
+      of the live tables by the audit
 
 Nothing before this point maps a device. Nothing after it should map one
 without the audit being able to see it.
 
+Two of the three landed with Stage 2.2, which needed them. `map_device` selects
+PAT entry 3 through `PCD | PWT`, refuses to map a window at all if that entry is
+not uncached, and reports any other bit combination as write-back — so a leaf
+whose memory type the audit does not recognise fails the audit rather than being
+assumed benign. RISC-V's answer is that Sv39 without `Svpbmt` has no
+cacheability bits: ordering comes from platform PMAs keyed on the physical
+address, and its mapping log records which ranges are device so the audit reads
+back what was intended. The first consumer turned out to be PCI configuration
+space rather than the UART, which is still a port on x86_64 and an SBI call on
+RISC-V.
+
+The remaining item is the one that cannot be finessed. Until the kernel owns its
+own tables, the bootloader's write-back direct map still aliases every physical
+page including MMIO, so an uncached device window on x86_64 has a write-back
+alias over it. `map_device` documents this under its own heading rather than
+this stage claiming a property it does not have.
+
 ### Stage 2.2 — PCI enumeration and interrupts
 
-- [ ] PCI configuration space enumerated through typed device windows
-- [ ] MSI/MSI-X vectors routed to the existing interrupt path
+- [x] PCI configuration space enumerated through typed device windows
+- [x] BARs sized non-destructively from the caller's point of view, and
+      classified through `Inventory::device` before anything maps them
+- [x] MSI/MSI-X vectors routed to the existing interrupt path, with the message
+      minted by the platform fabric and unforgeable by a driver
+- [x] `InterruptSlab`: arrivals counted in interrupt context, awaited as
+      futures, with generations that refuse a stale token
+- [x] `MOLT_PCI_OK` on both platforms; `MOLT_BAR_OK`, `MOLT_MSI_OK`, and
+      `MOLT_INTERRUPT_OK` on x86_64, where an `edu` device proves an interrupt
+      raised by a device actually reaches the slab
+- [x] `docs/pci.md`
+
+Two limits are recorded rather than checked off. Bus mastering is enabled
+nowhere, because without an IOMMU a DMA-capable device is as privileged as the
+kernel and Stage 2.3 is where that trade has to be made explicitly. And RISC-V
+mints no MSI vectors: its fabric reports `Unsupported` until there is an AIA
+driver, so the RISC-V smoke enumerates and stops.
 
 ### Stage 2.3 — VirtIO block
 
