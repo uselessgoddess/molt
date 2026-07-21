@@ -163,12 +163,18 @@ the wrong vtable.
 
 ## What this stage does not do
 
-**Bus mastering is not enabled anywhere.** A device with
-`Command::BUS_MASTER` set can write anywhere in physical memory. Until there is
-an IOMMU that is a trust decision, not a driver convenience, so the caller has
-to ask for it in as many words — and Stage 2.3 will be the first place that
-asks. This is a real limit, not a deferred nicety: on this kernel a DMA-capable
-device is as privileged as the kernel.
+**Bus mastering is granted in exactly one place, and it is not free.** A
+device with `Command::BUS_MASTER` set can write anywhere in physical memory,
+and until there is an IOMMU that is a trust decision rather than a driver
+convenience. Nothing in `molt-pci` sets it; the kernel sets it for the one
+function it routes an MSI to, in `route`, because an MSI is a DMA write — the
+device posts the message to the local APIC's address, and a function that may
+not initiate transactions cannot post it. QEMU makes that concrete by dropping
+the write into a disabled bus-master address space, and the interrupt never
+arrives. So "MSI without bus mastering" is not a stricter configuration, it is
+a broken one, and the capability model has to say so rather than imply that
+interrupts are cheaper than DMA. On this kernel an interrupt-capable device is
+as privileged as the kernel.
 
 **Device windows are never unmapped.** On both platforms `map_device` bumps a
 cursor through a region of its own — `0xffff_9300_0000_0000` on x86_64,

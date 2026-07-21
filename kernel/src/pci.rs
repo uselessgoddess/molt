@@ -210,8 +210,19 @@ fn route<P: Platform>(
 
     // Memory decode goes on last: by now the vector is routed and the registers
     // are mapped, so the first access the device can answer has somewhere to go.
+    //
+    // Bus mastering goes on with it, and it is worth being blunt about why: an
+    // MSI *is* a DMA write. The device posts the message to `0xfee0_0000`, and
+    // a function that may not initiate transactions cannot post it — QEMU drops
+    // the write into a disabled bus-master address space and the interrupt
+    // simply never happens. So there is no such thing as "MSI without bus
+    // mastering", and pretending otherwise would be a comforting lie in the
+    // capability model. Granting it here grants this device the whole physical
+    // address space until there is an IOMMU, which is why the kernel does it in
+    // one visible place, for one device it chose, rather than in `molt-pci`
+    // where every caller would inherit it.
     let command = function.command().ok()?;
-    function.set_command(command.with(Command::MEMORY)).ok()?;
+    function.set_command(command.with(Command::MEMORY).with(Command::BUS_MASTER)).ok()?;
 
     Some(Routed { registers, token })
 }

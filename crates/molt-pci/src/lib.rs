@@ -31,7 +31,9 @@
 //! It never enables bus mastering on its own. A device with
 //! [`Command::BUS_MASTER`] set can write anywhere in physical memory, and until
 //! the kernel programs an IOMMU that is a trust decision, not a driver
-//! convenience. The caller has to ask for it in as many words.
+//! convenience. The caller has to ask for it in as many words — including when
+//! it routes an MSI, which is a memory write from the device like any other and
+//! is silently dropped without the bit.
 
 #![no_std]
 

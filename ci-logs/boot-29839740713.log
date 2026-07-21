@@ -1,0 +1,74 @@
+Build images and boot in QEMU	Run just smoke	﻿2026-07-21T14:35:25.8593869Z ##[group]Run just smoke
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:25.8594324Z ^[[36;1mjust smoke^[[0m
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:25.8661872Z shell: /usr/bin/bash -e {0}
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:25.8662161Z env:
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:25.8662374Z   CARGO_INCREMENTAL: 0
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:25.8662651Z   CARGO_PROFILE_DEV_DEBUG: 0
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:25.8662901Z   CARGO_TERM_COLOR: always
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:25.8663143Z   RUST_BACKTRACE: short
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:25.8663395Z   CARGO_UNSTABLE_SPARSE_REGISTRY: true
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:25.8663918Z   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:25.8664212Z   CACHE_ON_FAILURE: true
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:25.8664442Z ##[endgroup]
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:25.8781175Z cargo smoke x86_64
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:25.9381661Z ^[[1m^[[92m    Updating^[[0m crates.io index
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:26.2595598Z ^[[1m^[[92m   Compiling^[[0m xtask v0.1.0 (/home/runner/work/molt/molt/xtask)
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:26.5817386Z ^[[1m^[[92m    Finished^[[0m `dev` profile [unoptimized] target(s) in 0.67s
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:26.5867245Z ^[[1m^[[92m     Running^[[0m `target/debug/xtask smoke x86_64`
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:26.5899781Z == smoke: x86_64 boot ==
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:26.6597875Z ^[[1m^[[92m   Compiling^[[0m molt-arch v0.1.0 (/home/runner/work/molt/molt/crates/molt-arch)
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:26.6599696Z ^[[1m^[[92m   Compiling^[[0m molt-kernel v0.1.0 (/home/runner/work/molt/molt/kernel)
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:26.7610089Z ^[[1m^[[92m   Compiling^[[0m molt-core v0.1.0 (/home/runner/work/molt/molt/crates/molt-core)
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:26.9476991Z ^[[1m^[[92m   Compiling^[[0m molt-pci v0.1.0 (/home/runner/work/molt/molt/crates/molt-pci)
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:26.9995676Z ^[[1m^[[92m   Compiling^[[0m molt-x86_64 v0.1.0 (/home/runner/work/molt/molt/crates/platforms/x86_64)
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:27.8083297Z ^[[1m^[[92m    Finished^[[0m `release` profile [optimized] target(s) in 1.21s
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.5983675Z error: QEMU reported Some(35); expected exit status 33
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.5984870Z INFO : Framebuffer info: FrameBufferInfo { byte_len: 2764800, width: 1280, height: 720, pixel_format: Bgr, bytes_per_pixel: 3, stride: 1280 }
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.5986304Z error: recipe `smoke-x86_64` failed on line 40 with exit code 1
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.5987453Z INFO : 4th Stage
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.5990322Z INFO : BiosInfo { stage_4: Region { start: 130000, len: 240c8 }, kernel: Region { start: 1000000, len: 17f00 }, ramdisk: Region { start: 1018000, len: 0 }, config_file: Region { start: 1018000, len: 0 }, last_used_addr: 1017fff, framebuffer: BiosFramebufferInfo { region: Region { start: fd000000, len: 2a3000 }, width: 500, height: 2d0, bytes_per_pixel: 3, stride: 500, pixel_format: Bgr }, memory_map_addr: 11f20, memory_map_len: 9 }
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.5999020Z INFO : BIOS boot
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6003805Z INFO : Elf file loaded at Pointer {
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6004647Z     addr: 0x0000000001000000,
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6005055Z     metadata: 98048,
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6005369Z }
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6005686Z INFO : virtual_address_offset: 0x10000000000
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6006793Z INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(4), offset: 0, virtual_addr: 0, physical_addr: 0, file_size: 328c, mem_size: 328c, align: 1000 })
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6008883Z INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(5), offset: 3290, virtual_addr: 4290, physical_addr: 4290, file_size: ba15, mem_size: ba15, align: 1000 })
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6010707Z INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(6), offset: eca8, virtual_addr: 10ca8, physical_addr: 10ca8, file_size: 1218, mem_size: 1358, align: 1000 })
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6011837Z INFO : Mapping bss section
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6012785Z INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(6), offset: fec0, virtual_addr: 12ec0, physical_addr: 12ec0, file_size: 748, mem_size: 6b5c, align: 1000 })
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6013513Z INFO : Mapping bss section
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6013787Z INFO : Entry point at: 0x100000066e0
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6014081Z INFO : Creating GDT at PhysAddr(0x104b000)
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6014820Z INFO : Map framebuffer
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6015055Z INFO : Map physical memory
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6015291Z INFO : Allocate bootinfo
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6015527Z INFO : Create Memory Map
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6015768Z INFO : Create bootinfo
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6016073Z INFO : Jumping to kernel entry point at VirtAddr(0x100000066e0)
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6016414Z MOLT: booting
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6016621Z MOLT: memory regions=12
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6017037Z MOLT_EXCEPTION_OK
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6017259Z MOLT_MAPPING_OK
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6017515Z MOLT_WX_OK
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6017731Z MOLT_DEVICE_WINDOW_OK
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6017953Z MOLT_TIMER_OK
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6018619Z MOLT_CANCELLATION_OK
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6018933Z MOLT_STALE_COMPLETION_OK
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6019249Z MOLT_RESTART_OK
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6019455Z MOLT_PHYSMAP_OK
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6019662Z MOLT_FRAME_OWNER_OK
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6019900Z MOLT_PCI: 00:00.0 8086:29c0 class 06
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6020167Z MOLT_PCI: 00:01.0 1234:1111 class 03
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6020466Z MOLT_BAR_OK: bar 0 at 0xfd000000 for 0x1000000 bytes
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6020772Z MOLT_PCI: 00:02.0 8086:10d3 class 02
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6021019Z MOLT_PCI: 00:03.0 1234:11e8 class 00
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6021352Z MOLT_MSI_OK: line 0 vector 0x50 at 0xfee00000 via capability 0x40
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6021701Z MOLT_PCI: 00:1f.0 8086:2918 class 06
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6021956Z MOLT_PCI: 00:1f.2 8086:2922 class 01
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6022211Z MOLT_PCI: 00:1f.3 8086:2930 class 0c
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6022467Z MOLT_PCI_OK: 7 functions on bus 0
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6022764Z MOLT_PANIC: panicked at kernel/src/pci.rs:238:9:
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6023110Z the device raised an interrupt that never arrived
+Build images and boot in QEMU	Run just smoke	2026-07-21T14:35:31.6033443Z ##[error]Process completed with exit code 1.
