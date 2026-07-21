@@ -488,6 +488,14 @@ pub trait Platform {
         Err(PlatformError::Unsupported)
     }
 
+    /// Maps an MMIO window through [`Inventory::device`] and reaches a device
+    /// through it, then audits the address space with the window declared.
+    ///
+    /// [`Inventory::device`]: memory::Inventory::device
+    fn verify_device_window(&mut self, _boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
     fn arm_timer(&mut self, _initial_count: u32) -> Result<(), PlatformError> {
         Err(PlatformError::Unsupported)
     }

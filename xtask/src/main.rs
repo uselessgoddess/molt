@@ -14,6 +14,7 @@ const BOOT_MARKERS: &[&str] = &[
     "MOLT_EXCEPTION_OK",
     "MOLT_MAPPING_OK",
     "MOLT_WX_OK",
+    "MOLT_DEVICE_WINDOW_OK",
     "MOLT_TIMER_OK",
     "MOLT_CANCELLATION_OK",
     "MOLT_STALE_COMPLETION_OK",
@@ -101,7 +102,9 @@ impl Case {
 
 fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
     match (arch, case) {
-        (Arch::Riscv64, Case::Boot) => &["MOLT_SBI_CONSOLE:"],
+        // The UART line arrives through the mapped window rather than SBI, so
+        // seeing it is the evidence that the window itself works.
+        (Arch::Riscv64, Case::Boot) => &["MOLT_SBI_CONSOLE:", "MOLT_UART_WINDOW:"],
         _ => &[],
     }
 }
