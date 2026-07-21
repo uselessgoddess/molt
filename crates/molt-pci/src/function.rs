@@ -7,6 +7,7 @@ use crate::bar::{Bar, Bars};
 use crate::capability::Capabilities;
 use crate::config::{self, Config};
 use crate::error::Error;
+use crate::msi::Msi;
 use crate::msix::MsiX;
 
 /// Who made the device and what it is, as the vendor assigned it.
@@ -187,5 +188,13 @@ impl<'c, C: Config + ?Sized> Function<'c, C> {
     /// The MSI-X capability, or [`Error::Missing`] on a device that has none.
     pub fn msix(self) -> Result<MsiX<'c, C>, Error> {
         MsiX::of(self)
+    }
+
+    /// The MSI capability, or [`Error::Missing`] on a device that has none.
+    ///
+    /// A device may implement both, and where it does the kernel takes MSI-X:
+    /// asking for this one is asking for the older form on purpose.
+    pub fn msi(self) -> Result<Msi<'c, C>, Error> {
+        Msi::of(self)
     }
 }

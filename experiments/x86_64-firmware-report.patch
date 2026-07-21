@@ -1,0 +1,33 @@
+Prints what the loader hands the kernel on `-machine q35`, before any of the
+Stage 2.2 code trusts it: the RSDP pointer, and every firmware memory region
+with its kind. The question it answers is whether the ECAM window QEMU places
+at 0xb000_0000 appears in the firmware map as a reserved region — in which case
+`Inventory::device` refuses it and the typed-window path needs a different
+rule — or as a hole, which is what `Kind::Device` requires.
+
+Apply with `git apply experiments/x86_64-firmware-report.patch`, run
+`cargo smoke x86_64`, then revert.
+
+--- a/crates/platforms/x86_64/src/lib.rs
++++ b/crates/platforms/x86_64/src/lib.rs
+@@ pub fn start
+     let memory_map = BootloaderMemoryMap::new(&raw.memory_regions);
++    emergency_write("MOLT_RSDP: ");
++    emergency_hex(raw.rsdp_addr.into_option().unwrap_or(0));
++    emergency_write("\n");
++    for region in raw.memory_regions.iter() {
++        emergency_write("MOLT_REGION: ");
++        emergency_hex(region.start);
++        emergency_write(" ");
++        emergency_hex(region.end);
++        emergency_write(" ");
++        emergency_hex(match region.kind {
++            BootMemoryRegionKind::Usable => 0,
++            BootMemoryRegionKind::Bootloader => 1,
++            BootMemoryRegionKind::UnknownUefi(tag) | BootMemoryRegionKind::UnknownBios(tag) => {
++                0x1000 + tag as u64
++            }
++            _ => 2,
++        });
++        emergency_write("\n");
++    }

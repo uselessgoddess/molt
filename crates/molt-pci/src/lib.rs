@@ -21,6 +21,7 @@ pub mod ecam;
 pub mod error;
 pub mod function;
 pub mod message;
+pub mod msi;
 pub mod msix;
 pub mod scan;
 
@@ -32,5 +33,6 @@ pub use crate::ecam::Ecam;
 pub use crate::error::Error;
 pub use crate::function::{Command, Function, Id};
 pub use crate::message::Message;
+pub use crate::msi::Msi;
 pub use crate::msix::{MsiX, Table};
 pub use crate::scan::scan;

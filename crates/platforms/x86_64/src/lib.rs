@@ -3,6 +3,7 @@
 
 //! x86_64 boot adaptation and hardware implementations.
 
+mod acpi;
 mod apic;
 mod interrupts;
 mod memory;
@@ -64,6 +65,11 @@ pub fn start(raw: &'static mut BootloaderInfo, kernel: fn(BootInfo<'_>, &mut X86
     let kernel_image = ImageRange::new(raw.kernel_image_offset, raw.kernel_len);
     let boot_info =
         BootInfo::new(&memory_map, physical_memory_offset).with_kernel_image(kernel_image);
+    // The firmware description tables are not in the memory map and not in the
+    // boot info the kernel sees; the loader reports where they start and
+    // nothing else knows. Keeping it here rather than widening `BootInfo` is
+    // deliberate: ACPI is this platform's business, not the kernel's.
+    acpi::remember(raw.rsdp_addr.into_option());
     let mut platform = X86_64::new();
     kernel(boot_info, &mut platform)
 }
@@ -133,8 +139,10 @@ impl Platform for X86_64 {
         // The kernel's own tables come up before the APIC, not after: the
         // loader's direct map is the only way to reach MMIO until they exist,
         // and it stops being live the moment `CR3` is written.
-        let apic_window = memory::init(boot_info)?;
-        apic::init(apic_window)
+        let windows = memory::init(boot_info)?;
+        apic::init(windows.apic)?;
+        pci::init(windows.configuration);
+        Ok(())
     }
 
     fn verify_exception_path(&mut self) -> bool {

@@ -276,11 +276,20 @@ fn qemu_x86_64_command(image: &Path) -> Command {
         command.arg("-L").arg(firmware);
     }
     command.args([
+        // ECAM only exists on a PCI Express host bridge, and the default i440fx
+        // machine has none: on it the kernel would find no MCFG table and skip
+        // the whole enumeration path, so the smoke run would prove nothing.
+        "-machine",
+        "q35",
         "-display",
         "none",
         "-no-reboot",
         "-device",
         "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        // A device with a BAR and MSI-X vectors to enumerate, chosen because it
+        // needs no driver: the kernel reads its window and its table and stops.
+        "-device",
+        "pci-testdev",
         "-drive",
     ]);
     command.arg(format!("format=raw,file={}", image.display()));

@@ -52,9 +52,32 @@ const TEST_PAGE: u64 = 0x0000_5555_5555_0000;
 /// Where the kernel maps the local APIC.
 const APIC_WINDOW: u64 = 0xffff_9200_0000_0000;
 
-/// Declared ranges: the image, two boot windows, the APIC, and one entry per
-/// usable RAM region — firmware maps are chatty, so this is generous.
+/// Where the kernel maps configuration space. The aperture is up to 256 MiB —
+/// one 1 MiB window per bus — so it gets a slot of its own rather than a page.
+const ECAM_WINDOW: u64 = 0xffff_9300_0000_0000;
+
+/// Declared ranges: the image, two boot windows, the APIC, configuration
+/// space, and one entry per usable RAM region — firmware maps are chatty, so
+/// this is generous.
 type Log = Declared<64>;
+
+/// The device windows [`init`] mapped, in the addresses the kernel now uses.
+///
+/// Both stop being reachable through the loader's direct map the moment `CR3`
+/// changes, and neither has any other name afterwards, so `init` hands them
+/// back rather than leaving each driver to find its own.
+pub struct Windows {
+    pub apic: u64,
+    pub configuration: Option<Configuration>,
+}
+
+/// Configuration space, mapped, and the buses it answers for.
+#[derive(Clone, Copy, Debug)]
+pub struct Configuration {
+    pub base: u64,
+    pub first: u8,
+    pub last: u8,
+}
 
 /// The address space [`init`] built, kept so later probes can extend it.
 struct Space {
@@ -80,14 +103,28 @@ fn active() -> Result<&'static mut Space, PlatformError> {
 }
 
 /// Builds the kernel's own address space and switches `CR3` to it.
-///
-/// Returns the virtual address of the local APIC window, because the APIC stops
-/// being reachable through the loader's direct map the moment `CR3` changes.
-pub fn init(boot_info: &BootInfo<'_>) -> Result<u64, PlatformError> {
+pub fn init(boot_info: &BootInfo<'_>) -> Result<Windows, PlatformError> {
     let offset = boot_info.physical_offset().ok_or(PlatformError::MissingPhysicalMemoryMap)?;
     let image = boot_info.kernel_image().ok_or(PlatformError::Mapping(MappingError::Unmapped))?;
     let map = boot_info.memory_map();
     let mut frames = X86Frames(BootFrameAllocator::new(map));
+    // Firmware description tables live in reserved memory, which the kernel's
+    // own map deliberately does not cover: this is the last moment they can be
+    // read at all, so where configuration space is gets settled here.
+    //
+    // SAFETY: `CR3` still names the loader's tables, whose direct map at
+    // `offset` covers every physical address, and it is not written below until
+    // this borrow is gone.
+    let aperture = crate::acpi::configuration(&unsafe { crate::acpi::Direct::new(offset) })
+        // A second segment group would need a second window; nothing the kernel
+        // enumerates yet lives outside the first, and mapping one it cannot
+        // reach would only declare a range no driver asks for.
+        .filter(|found| found.group == 0)
+        .and_then(|found| {
+            let span = Span::new(found.base, found.base + found.span()).ok()?;
+            let window = Inventory::new(map).aperture(span).ok()?;
+            Some((found, window))
+        });
 
     let root = frames.allocate_frame().ok_or(out_of_frames())?;
     // SAFETY: the loader's direct map is still live and covers every physical
@@ -127,6 +164,13 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<u64, PlatformError> {
     let boot_info_end = BOOT_INFO_BASE + BOOT_INFO_WINDOW;
     clone(&mut space, &mut frames, &mut log, &live, BOOT_INFO_BASE, boot_info_end, Contents::Ram)?;
     device_window(&mut space, &mut frames, &mut log, map, crate::apic::APIC_MMIO, APIC_WINDOW)?;
+    let configuration = match aperture {
+        Some((segment, window)) => {
+            map_device(&mut space, &mut frames, &mut log, window, ECAM_WINDOW)?;
+            Some(Configuration { base: ECAM_WINDOW, first: segment.first, last: segment.last })
+        }
+        None => None,
+    };
 
     // SAFETY: PAT is architectural on every CPU that supports it, and this
     // configuration is the reset one, restated so a firmware that reprogrammed
@@ -142,7 +186,7 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<u64, PlatformError> {
     unsafe { Cr3::write(root, Cr3Flags::empty()) };
     // SAFETY: same reasoning as `active`; this runs once on the boot CPU.
     unsafe { *ACTIVE.0.get() = Some(Space { root, offset, cursor, log }) };
-    Ok(APIC_WINDOW)
+    Ok(Windows { apic: APIC_WINDOW, configuration })
 }
 
 /// Maps every firmware-usable RAM region at `offset + physical`.
@@ -238,9 +282,45 @@ fn device_window(
     // Refuses anything firmware claimed as RAM, so a mistyped register base
     // cannot become a device mapping over the kernel's own memory.
     let window = Inventory::new(map).device(span).map_err(|_| address_error())?;
+    map_device(space, frames, log, window, virtual_address)
+}
+
+/// Maps a whole device window, however many frames it covers.
+///
+/// A single register block is one frame, but configuration space is a quarter
+/// of a gigabyte, and a leaf per page of it would be a hundred thousand table
+/// entries to build and to walk on every audit. Wherever both ends line up, a
+/// 2 MiB leaf carries the same rights and the same memory type as the pages it
+/// replaces, so the window is described in a hundred-odd leaves instead.
+fn map_device(
+    space: &mut OffsetPageTable<'_>,
+    frames: &mut X86Frames<'_>,
+    log: &mut Log,
+    window: Device,
+    virtual_address: u64,
+) -> Result<(), PlatformError> {
     let (rights, cache) = window.mapping(Rights::READ_WRITE).map_err(PlatformError::Mapping)?;
-    map_4k(space, frames, virtual_address, window.span().start(), leaf_flags(rights, cache))?;
-    log.push(MappedRange::device(virtual_address, virtual_address + Size4KiB::SIZE))
+    let flags = leaf_flags(rights, cache);
+    let span = window.span();
+    let mut physical = span.start();
+    while physical < span.end() {
+        let at = virtual_address + (physical - span.start());
+        let large = at % Size2MiB::SIZE == 0
+            && physical % Size2MiB::SIZE == 0
+            && span.end() - physical >= Size2MiB::SIZE;
+        if large {
+            let page = Page::<Size2MiB>::containing_address(VirtAddr::new(at));
+            let frame = PhysFrame::containing_address(PhysAddr::new(physical));
+            // SAFETY: the frame is inside a window `Inventory` proved firmware
+            // did not claim as RAM, and each physical address is mapped once.
+            unsafe { space.map_to(page, frame, flags, frames) }.map_err(map_error)?.ignore();
+            physical += Size2MiB::SIZE;
+        } else {
+            map_4k(space, frames, at, physical, flags)?;
+            physical += Size4KiB::SIZE;
+        }
+    }
+    log.push(MappedRange::device(virtual_address, virtual_address + span.bytes()))
         .map_err(PlatformError::Mapping)
 }
 

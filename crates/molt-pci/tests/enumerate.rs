@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use molt_pci::address::WINDOW;
 use molt_pci::bar::Width;
 use molt_pci::config::Config;
-use molt_pci::{Address, Command, Ecam, Error, Function, capability, scan};
+use molt_pci::{Address, Command, Ecam, Error, Function, Message, capability, scan};
 
 /// One function's configuration space, with read-only bits modelled: a write
 /// only lands where the device implements writable bits, which is what makes
@@ -69,6 +69,20 @@ impl Space {
         self.writable[usize::from(at) / 4] = 0xc000_0000;
         self.set(at + 4, table | u32::from(bar));
         self.set(at + 8, table | u32::from(bar));
+        self
+    }
+
+    /// An MSI capability that can ask for `vectors`, with a 64-bit message
+    /// address where `wide`. Only the enable bit and the vector-count field of
+    /// control are writable, as on a device: what it is *capable* of is not the
+    /// kernel's to change.
+    fn msi(mut self, at: u16, vectors: u16, wide: bool) -> Self {
+        let control = u32::from(vectors.trailing_zeros() as u16) << 1 | u32::from(wide) << 7;
+        self.set(at, u32::from(capability::MSI) | control << 16);
+        self.writable[usize::from(at) / 4] = 0x0071_0000;
+        for word in 1..4 {
+            self.writable[usize::from(at) / 4 + word] = !0;
+        }
         self
     }
 
@@ -270,6 +284,65 @@ fn a_function_without_msix_says_so() {
     let bus = Bus::of(at(0, 1, 0), Space::endpoint(0x1b36, 0x0005));
 
     assert_eq!(Function::probe(&bus, at(0, 1, 0)).unwrap().msix().err(), Some(Error::Missing));
+}
+
+#[test]
+fn msi_carries_its_message_in_configuration_space() {
+    let space = Space::endpoint(0x1234, 0x11e8).capabilities(0x60).msi(0x60, 1, true);
+    let bus = Bus::of(at(0, 1, 0), space);
+    let msi = Function::probe(&bus, at(0, 1, 0)).unwrap().msi().unwrap();
+
+    assert_eq!((msi.vectors(), msi.wide()), (1, true));
+    assert_eq!(msi.program(Message::new(0xfee0_0000, 0x41)), Ok(()));
+    assert_eq!(bus.read(at(0, 1, 0), 0x64), 0xfee0_0000);
+    assert_eq!(bus.read(at(0, 1, 0), 0x68), 0, "the upper half was left unwritten");
+    assert_eq!(bus.read(at(0, 1, 0), 0x6c) as u16, 0x41, "a wide device holds data at +12");
+    assert!(!msi.enabled(), "programming a message turned delivery on");
+
+    msi.enable();
+    assert!(msi.enabled());
+}
+
+#[test]
+fn a_narrow_device_holds_its_data_one_word_lower() {
+    let space = Space::endpoint(0x1234, 0x11e8).capabilities(0x60).msi(0x60, 1, false);
+    let bus = Bus::of(at(0, 1, 0), space);
+    let msi = Function::probe(&bus, at(0, 1, 0)).unwrap().msi().unwrap();
+
+    assert_eq!(msi.program(Message::new(0xfee0_0000, 0x41)), Ok(()));
+    assert_eq!(bus.read(at(0, 1, 0), 0x68) as u16, 0x41);
+}
+
+#[test]
+fn a_narrow_device_refuses_an_address_it_cannot_hold() {
+    let space = Space::endpoint(0x1234, 0x11e8).capabilities(0x60).msi(0x60, 1, false);
+    let bus = Bus::of(at(0, 1, 0), space);
+    let msi = Function::probe(&bus, at(0, 1, 0)).unwrap().msi().unwrap();
+
+    assert_eq!(msi.program(Message::new(0x1_fee0_0000, 0x41)), Err(Error::Address));
+    assert_eq!(bus.read(at(0, 1, 0), 0x64), 0, "a truncated address was written anyway");
+}
+
+#[test]
+fn a_device_that_wants_a_block_is_given_one_vector() {
+    let space = Space::endpoint(0x1234, 0x11e8).capabilities(0x60).msi(0x60, 8, true);
+    let bus = Bus::of(at(0, 1, 0), space);
+    let msi = Function::probe(&bus, at(0, 1, 0)).unwrap().msi().unwrap();
+
+    assert_eq!(msi.vectors(), 8, "the device asked for eight");
+    msi.program(Message::new(0xfee0_0000, 0x41)).unwrap();
+    assert_eq!(
+        bus.read(at(0, 1, 0), 0x60) >> 16 & 0x70,
+        0,
+        "the device was left free to drive the low bits of the vector",
+    );
+}
+
+#[test]
+fn a_function_without_msi_says_so() {
+    let bus = Bus::of(at(0, 1, 0), Space::endpoint(0x1b36, 0x0005));
+
+    assert_eq!(Function::probe(&bus, at(0, 1, 0)).unwrap().msi().err(), Some(Error::Missing));
 }
 
 #[test]

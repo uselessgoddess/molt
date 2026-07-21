@@ -514,6 +514,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "molt-pci"
+version = "0.1.0"
+
+[[package]]
 name = "molt-riscv"
 version = "0.1.0"
 dependencies = [
@@ -526,6 +530,8 @@ version = "0.1.0"
 dependencies = [
  "bootloader_api",
  "molt-arch",
+ "molt-core",
+ "molt-pci",
  "spin",
  "x86_64",
 ]
