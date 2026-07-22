@@ -509,8 +509,16 @@ version = "0.1.0"
 dependencies = [
  "molt-arch",
  "molt-core",
+ "molt-pci",
  "molt-riscv",
  "molt-x86_64",
+]
+
+[[package]]
+name = "molt-pci"
+version = "0.1.0"
+dependencies = [
+ "molt-arch",
 ]
 
 [[package]]

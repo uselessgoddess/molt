@@ -15,6 +15,8 @@
 mod csr;
 // Decoding an SBI error involves no registers, so it stays testable on the host.
 mod error;
+// Reading a device tree is byte parsing, so it stays testable on the host too.
+pub mod fdt;
 #[cfg(target_arch = "riscv64")]
 mod paging;
 #[cfg(target_arch = "riscv64")]
@@ -52,12 +54,14 @@ mod imp {
     use core::arch::{asm, global_asm};
     use core::fmt::Write as _;
 
+    use molt_arch::memory::{Device, Rights};
     use molt_arch::{
-        BootInfo, ExitStatus, FRAME_SIZE, MemoryMap, MemoryRegion, MemoryRegionKind, Platform,
-        PlatformError, SerialPort, SerialWriter,
+        BootInfo, ConfigSpace, DeviceMapper, ExitStatus, FRAME_SIZE, FabricError, InterruptFabric,
+        MappingError, MemoryMap, MemoryRegion, MemoryRegionKind, Mmio, MsiMessage, Platform,
+        PlatformError, SerialPort, SerialWriter, Sink,
     };
 
-    use crate::{csr, paging, sbi, trap};
+    use crate::{csr, fdt, paging, sbi, trap};
 
     /// One past the top of the QEMU `virt` board's default 128 MiB of RAM.
     const RAM_END: u64 = 0x8800_0000;
@@ -89,13 +93,15 @@ _start:
     #[doc(hidden)]
     pub fn start(
         _hartid: usize,
-        _device_tree: usize,
+        device_tree: usize,
         kernel: fn(BootInfo<'_>, &mut RiscV) -> !,
     ) -> ! {
         let memory_map = RiscVMemoryMap::new();
         // Sv39 identity-maps physical memory, so the physical offset is zero.
         let boot_info = BootInfo::new(&memory_map, Some(0));
-        let mut platform = RiscV::new();
+        // The pointer is kept rather than read here: the tree is the only
+        // description of where PCI lives, and nothing has asked for PCI yet.
+        let mut platform = RiscV::new().with_device_tree(device_tree);
         kernel(boot_info, &mut platform)
     }
 
@@ -139,17 +145,59 @@ _start:
     /// Concrete services for the current RISC-V supervisor boot target.
     pub struct RiscV {
         serial: SbiSerial,
+        /// The device tree pointer OpenSBI passed in `a1`, or zero when it
+        /// passed none. Firmware leaves the blob in memory for the life of the
+        /// kernel, so keeping the address is enough; keeping a borrow of it
+        /// would tie the platform to a lifetime nothing else in `Platform` has.
+        device_tree: usize,
     }
 
     impl RiscV {
         pub const fn new() -> Self {
-            Self { serial: SbiSerial::new() }
+            Self { serial: SbiSerial::new(), device_tree: 0 }
+        }
+
+        /// Records where firmware left the flattened device tree.
+        pub const fn with_device_tree(mut self, address: usize) -> Self {
+            self.device_tree = address;
+            self
         }
     }
 
     impl Default for RiscV {
         fn default() -> Self {
             Self::new()
+        }
+    }
+
+    impl DeviceMapper for RiscV {
+        fn map_device(
+            &mut self,
+            window: Device,
+            rights: Rights,
+        ) -> Result<Mmio<'static>, MappingError> {
+            paging::map_device(window, rights)
+        }
+    }
+
+    /// No message-signalled interrupts on this platform, and no pretending.
+    ///
+    /// A QEMU `virt` machine started without `aia=aplic-imsic` has no MSI
+    /// controller at all: there is no address a device could write to raise an
+    /// interrupt, so there is no honest [`MsiMessage`] to return. PCI devices
+    /// there deliver INTx through the PLIC instead, which is a different
+    /// delivery path — a shared, level-triggered line claimed and completed at
+    /// the controller — and Stage 2.2 does not build it. Returning
+    /// [`FabricError::Unsupported`] makes a driver that needs a vector say so;
+    /// inventing a message would make it write into whatever sits at the
+    /// address we invented.
+    impl InterruptFabric for RiscV {
+        fn allocate(&mut self) -> Result<(u16, MsiMessage), FabricError> {
+            Err(FabricError::Unsupported)
+        }
+
+        fn release(&mut self, _line: u16) -> Result<(), FabricError> {
+            Err(FabricError::Unsupported)
         }
     }
 
@@ -190,6 +238,30 @@ _start:
 
         fn verify_device_window(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
             paging::verify_device_window(boot_info)
+        }
+
+        /// The ECAM window the device tree describes, if firmware described one.
+        ///
+        /// Every failure collapses to [`PlatformError::MissingConfigSpace`]:
+        /// the caller's only question is whether there is a configuration
+        /// space to enumerate, and a blob with bad magic and a blob without a
+        /// PCI node are the same answer to it. The parse detail stays in
+        /// [`fdt::FdtError`](crate::fdt::FdtError) for whoever is debugging.
+        fn config_space(
+            &mut self,
+            _boot_info: &BootInfo<'_>,
+        ) -> Result<ConfigSpace, PlatformError> {
+            // SAFETY: `device_tree` is zero — refused without a load — or the
+            // pointer OpenSBI passed to `_start`, which firmware leaves mapped
+            // and immutable, and the tree is only borrowed for this call.
+            unsafe { fdt::config_space_at(self.device_tree) }
+                .map_err(|_| PlatformError::MissingConfigSpace)
+        }
+
+        /// Interrupt routing is not built on this platform; see
+        /// [`InterruptFabric`] for why there is nothing to route yet.
+        fn route_interrupts(&mut self, _sink: &'static dyn Sink) -> Result<(), PlatformError> {
+            Err(PlatformError::Fabric(FabricError::Unsupported))
         }
 
         fn arm_timer(&mut self, initial_count: u32) -> Result<(), PlatformError> {

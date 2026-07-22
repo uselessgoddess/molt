@@ -59,7 +59,26 @@ fn a_device_window_inside_ram_is_refused() {
     let inventory = Inventory::new(&map);
 
     assert_eq!(inventory.device(Span::new(0x1000, 0x2000).unwrap()), Err(Error::Kind));
-    assert_eq!(inventory.device(Span::new(0x4000, 0x5000).unwrap()), Err(Error::Kind));
+    assert_eq!(
+        inventory.device(Span::new(0x5000, 0x6000).unwrap()),
+        Err(Error::Kind),
+        "usable RAM is not a device window whichever end of the map it is at",
+    );
+}
+
+/// The x86_64 case: firmware reports the ECAM window as an explicit e820
+/// reservation rather than leaving a hole, and the same physical range has to
+/// stay mappable as a device.
+#[test]
+fn a_firmware_reservation_is_a_device_window() {
+    let map = map();
+    let inventory = Inventory::new(&map);
+    let span = Span::new(0x4000, 0x5000).unwrap();
+
+    assert_eq!(inventory.classify(span), Ok(Kind::Reserved));
+    let window = inventory.device(span).expect("a reserved range is not the kernel's RAM");
+
+    assert_eq!(window.mapping(Rights::READ_WRITE), Ok((Rights::READ_WRITE, Cache::Device)));
 }
 
 #[test]

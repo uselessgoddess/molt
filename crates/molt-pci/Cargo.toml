@@ -1,0 +1,12 @@
+[package]
+name = "molt-pci"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+molt-arch.workspace = true
+
+[lib]
+bench = false

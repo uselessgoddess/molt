@@ -3,12 +3,16 @@
 
 //! x86_64 boot adaptation and hardware implementations.
 
+pub mod acpi;
+
 mod apic;
 mod interrupts;
 mod memory;
+mod msi;
 
 use core::arch::asm;
 
+use acpi::AcpiError;
 #[doc(hidden)]
 pub use bootloader_api::config::Mapping as BootMapping;
 use bootloader_api::info::{MemoryRegionKind as BootMemoryRegionKind, MemoryRegions};
@@ -16,9 +20,11 @@ use bootloader_api::info::{MemoryRegionKind as BootMemoryRegionKind, MemoryRegio
 pub use bootloader_api::{
     BootInfo as BootloaderInfo, BootloaderConfig, entry_point as __bootloader_entry_point,
 };
+use molt_arch::memory::{Device, Rights};
 use molt_arch::{
-    BootInfo, ExitStatus, ImageRange, MemoryMap, MemoryRegion, MemoryRegionKind, Platform,
-    PlatformError, SerialPort,
+    BootInfo, ConfigSpace, DeviceMapper, ExitStatus, FabricError, ImageRange, InterruptFabric,
+    MappingError, MemoryMap, MemoryRegion, MemoryRegionKind, Mmio, MsiMessage, Platform,
+    PlatformError, SerialPort, Sink,
 };
 
 /// Where the loader must place the boot stack, and how large it is.
@@ -64,7 +70,10 @@ pub fn start(raw: &'static mut BootloaderInfo, kernel: fn(BootInfo<'_>, &mut X86
     let kernel_image = ImageRange::new(raw.kernel_image_offset, raw.kernel_len);
     let boot_info =
         BootInfo::new(&memory_map, physical_memory_offset).with_kernel_image(kernel_image);
-    let mut platform = X86_64::new();
+    // The RSDP is captured here because this is the only place it exists: it is
+    // a field of the bootloader's structure, not of the memory map, and there
+    // is no way to find it again later that is not a guess.
+    let mut platform = X86_64::new().with_rsdp(raw.rsdp_addr.as_ref().copied());
     kernel(boot_info, &mut platform)
 }
 
@@ -107,11 +116,53 @@ impl MemoryMap for BootloaderMemoryMap<'_> {
 /// Concrete services for the current x86_64 boot target.
 pub struct X86_64 {
     serial: Com1,
+    /// The physical address firmware reported for the ACPI RSDP.
+    rsdp: Option<u64>,
+    /// What the MCFG table said, read before the kernel's tables went live.
+    space: Option<ConfigSpace>,
 }
 
 impl X86_64 {
     pub const fn new() -> Self {
-        Self { serial: Com1 }
+        Self { serial: Com1, rsdp: None, space: None }
+    }
+
+    const fn with_rsdp(mut self, rsdp: Option<u64>) -> Self {
+        self.rsdp = rsdp;
+        self
+    }
+
+    /// Walks ACPI for the configuration space, through the loader's direct map.
+    ///
+    /// Firmware reports the RSDP address and molt walks from there rather than
+    /// scanning low memory for the signature: the scan is a guess that finds a
+    /// stale table on machines that kept one, and UEFI does not put the RSDP
+    /// where the scan looks in the first place. A machine with no MCFG is not a
+    /// failure to report — it is a machine with no configuration space — so
+    /// this answers `None` and the caller says so on the serial line.
+    fn acpi_config_space(&self, boot_info: &BootInfo<'_>) -> Option<ConfigSpace> {
+        let space = match (self.rsdp, boot_info.physical_offset()) {
+            (Some(rsdp), Some(offset)) => {
+                // SAFETY: `rsdp` is the address the bootloader took from
+                // firmware, and `offset` is the loader's direct map, still live
+                // at this point in `initialize` — `CR3` has not been written.
+                unsafe { acpi::config_space(rsdp, offset) }
+            }
+            _ => Err(AcpiError::Absent),
+        };
+
+        match space {
+            Ok(space) => Some(space),
+            // Named, not swallowed: "no configuration space" and "the tables
+            // were there and molt did not believe them" are different bugs, and
+            // the serial line is the only place a boot can say which it hit.
+            Err(reason) => {
+                emergency_write("MOLT_ACPI_SKIPPED: ");
+                emergency_write(acpi::reason(reason));
+                emergency_write("\n");
+                None
+            }
+        }
     }
 }
 
@@ -130,6 +181,14 @@ impl Platform for X86_64 {
 
     fn initialize(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
         interrupts::init();
+        // ACPI is read here, before anything else, because this is the last
+        // moment it is readable at all: firmware tables sit in reserved memory,
+        // the kernel's own direct map covers only usable RAM, and the loader's
+        // map stops being live the moment `CR3` is written. What survives the
+        // switch is the ECAM base this walk found, not the tables it found it
+        // in — and the window over that base is mapped like any other device.
+        self.space = self.acpi_config_space(boot_info);
+
         // The kernel's own tables come up before the APIC, not after: the
         // loader's direct map is the only way to reach MMIO until they exist,
         // and it stops being live the moment `CR3` is written.
@@ -147,6 +206,16 @@ impl Platform for X86_64 {
 
     fn verify_image_protection(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
         memory::verify_image_protection(boot_info)
+    }
+
+    /// The configuration space ACPI's MCFG table described, read at boot.
+    fn config_space(&mut self, _boot_info: &BootInfo<'_>) -> Result<ConfigSpace, PlatformError> {
+        self.space.ok_or(PlatformError::MissingConfigSpace)
+    }
+
+    fn route_interrupts(&mut self, sink: &'static dyn Sink) -> Result<(), PlatformError> {
+        msi::route(sink);
+        Ok(())
     }
 
     fn verify_device_window(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
@@ -175,6 +244,26 @@ impl Platform for X86_64 {
             out_u32(0xf4, code);
         }
         halt_forever()
+    }
+}
+
+impl DeviceMapper for X86_64 {
+    fn map_device(
+        &mut self,
+        window: Device,
+        rights: Rights,
+    ) -> Result<Mmio<'static>, MappingError> {
+        memory::map_device(window, rights)
+    }
+}
+
+impl InterruptFabric for X86_64 {
+    fn allocate(&mut self) -> Result<(u16, MsiMessage), FabricError> {
+        msi::allocate()
+    }
+
+    fn release(&mut self, line: u16) -> Result<(), FabricError> {
+        msi::release(line)
     }
 }
 
