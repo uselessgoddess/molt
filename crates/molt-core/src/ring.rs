@@ -16,8 +16,8 @@ pub struct SpscRing<T, const N: usize> {
     tail: AtomicUsize,
 }
 
-// SAFETY: safe construction yields exactly one producer and one consumer.
-// A value crosses threads only when `T: Send`, with release/acquire publication.
+// SAFETY: safe construction yields exactly one producer and one consumer, and a
+// value crosses threads only when `T: Send`, with release/acquire publication.
 unsafe impl<T: Send, const N: usize> Sync for SpscRing<T, N> {}
 
 impl<T, const N: usize> SpscRing<T, N> {
@@ -63,7 +63,7 @@ impl<T, const N: usize> SpscRing<T, N> {
             return Err(value);
         }
 
-        // SAFETY: only the unique producer writes this slot. The acquire load
+        // SAFETY: only the unique producer writes this slot, and the acquire load
         // above observes the consumer's release before a wrapped slot is reused.
         self.slots[tail % N].with_mut(|slot| unsafe {
             (*slot).write(value);

@@ -71,10 +71,6 @@ fn poll_race_keeps_wake() {
 
 #[test]
 fn cancel_race_reuses_slot() {
-    // A cancel racing a completion is serialized by the slot's claim flag: the
-    // waiter observes exactly one terminal outcome (the delivered value or a
-    // cancellation) and the slot is always returned to a reusable empty state
-    // without corruption, regardless of which side wins.
     for _ in 0..1024 {
         let slab = Arc::new(CompletionSlab::<usize, 1>::new());
         let token = slab.reserve().unwrap();
@@ -93,8 +89,6 @@ fn cancel_race_reuses_slot() {
         let _ = complete.join().unwrap();
         let _ = cancel.join().unwrap();
 
-        // The waiter never observes a torn value: it is either the completion
-        // (if it won and was not yet consumed) or a cancellation.
         let wake = Arc::new(CountWake(AtomicUsize::new(0)));
         let waker = Waker::from(wake);
         let mut cx = Context::from_waker(&waker);
@@ -105,8 +99,6 @@ fn cancel_race_reuses_slot() {
             other => panic!("unexpected terminal outcome: {other:?}"),
         }
 
-        // Whatever raced, the slot is free again: a fresh reservation succeeds
-        // with a new id and a stale completion against the old id is rejected.
         let reused = slab.reserve().unwrap();
         assert_ne!(reused.request_id(), token.request_id());
         assert_eq!(slab.complete(token.request_id(), 9), Err(CompletionError::Stale));
@@ -115,8 +107,6 @@ fn cancel_race_reuses_slot() {
 
 #[test]
 fn producers_keep_slots() {
-    // Independent producers completing distinct slots must each land in their
-    // own slot without clobbering a neighbour.
     let slab = Arc::new(CompletionSlab::<usize, 8>::new());
     let tokens: Vec<_> = (0..8).map(|_| slab.reserve().unwrap()).collect();
     assert_eq!(slab.reserve(), Err(CompletionError::Full));

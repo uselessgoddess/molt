@@ -1,14 +1,6 @@
-//! SBI error codes, decoded away from the `ecall` that produces them.
-//!
-//! This is the half of the interface that has nothing to do with RISC-V
-//! registers, so it stays outside the target-gated modules and can be tested
-//! on the host.
+//! Host-testable SBI error decoding.
 
-/// What an SBI implementation reported in `a0`.
-///
-/// An unrecognised code keeps its raw value rather than collapsing into a
-/// generic failure: the reason for moving off the legacy console call was that
-/// it discards exactly this information.
+/// Decoded SBI error, preserving unrecognised raw codes in [`Self::Other`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SbiError {
     Failed,
@@ -24,7 +16,7 @@ pub enum SbiError {
 }
 
 impl SbiError {
-    /// Decodes one `a0` value. `SBI_SUCCESS` (zero) is not an error.
+    /// Decodes an `a0` error code, returning `None` for `SBI_SUCCESS`.
     pub const fn from_code(code: isize) -> Option<Self> {
         Some(match code {
             0 => return None,

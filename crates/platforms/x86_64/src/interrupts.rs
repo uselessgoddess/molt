@@ -17,8 +17,7 @@ const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 #[repr(align(16))]
 struct ExceptionStack(UnsafeCell<[u8; 4096 * 5]>);
 
-// SAFETY: only the CPU selected by the TSS uses this storage, exclusively as
-// the double-fault stack. Normal Rust code never reads or writes its contents.
+// SAFETY: the TSS-selected CPU exclusively uses this storage as its double-fault stack.
 unsafe impl Sync for ExceptionStack {}
 
 static DOUBLE_FAULT_STACK: ExceptionStack = ExceptionStack(UnsafeCell::new([0; 4096 * 5]));

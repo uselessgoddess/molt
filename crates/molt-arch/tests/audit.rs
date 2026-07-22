@@ -25,7 +25,6 @@ impl PageWalk for Table {
     }
 }
 
-/// `.text` and `.rodata`, one 4 KiB leaf each, mapped as they should be.
 fn image() -> Vec<Leaf> {
     vec![
         Leaf::new(TEXT, FRAME_SIZE, read_execute()),
@@ -57,7 +56,6 @@ fn correct_image_passes_the_audit() {
 fn writable_page_between_correct_probes_is_caught() {
     let ranges = image_ranges();
     let mut leaves = image();
-    // Exactly what probing `__text_start` and `__text_end - 1` would miss.
     leaves[1] = Leaf::new(TEXT + FRAME_SIZE, FRAME_SIZE, PageProtection::new(true, true, true));
     let table = Table(leaves);
 
@@ -77,8 +75,6 @@ fn hole_in_declared_range_is_caught() {
 #[test]
 fn megapage_over_image_sections_is_caught() {
     let ranges = image_ranges();
-    // One 2 MiB leaf cannot hold `.text` and `.rodata` at once, so mapping the
-    // image with it hands `.rodata` execute rights.
     let table = Table(vec![Leaf::new(TEXT, 2 * 1024 * 1024, read_execute())]);
 
     assert_eq!(Audit::new(&ranges).cover(&table), Err(MappingError::Granularity));
@@ -108,14 +104,13 @@ fn megapage_reaching_past_its_range_is_caught() {
 #[test]
 fn mapping_nobody_declared_is_caught() {
     let ranges = image_ranges();
-    // A reserved or firmware range mapped read/write is exactly this shape.
     let stray = Leaf::new(0x1000_0000, FRAME_SIZE, read_write());
 
     assert_eq!(Audit::new(&ranges).accepts(stray), Err(MappingError::Unexpected));
 }
 
 #[test]
-fn imag_without_named_sections_enforces_wx() {
+fn image_without_named_sections_enforces_wx() {
     let ranges = [MappedRange::image(TEXT, TEXT + FRAME_SIZE)];
     let audit = Audit::new(&ranges);
 
@@ -158,7 +153,7 @@ fn executable_device_window_is_caught() {
 }
 
 #[test]
-fn declarations_merge_into_ono() {
+fn declarations_merge_into_one() {
     let mut declared = Declared::<4>::new();
 
     declared.push(MappedRange::ram(RAM, RAM + FRAME_SIZE)).unwrap();

@@ -1,7 +1,7 @@
 # Style
 
-Rules that rustfmt and clippy cannot check. Everything they can check is
-already settled by `rustfmt.toml` and `just pre`; do not argue with them.
+These conventions cover judgments that formatting cannot settle. Automated
+checks enforce the objective subset through `just pre`; review covers the rest.
 
 The theme is that Molt is read more than it is written, by one person who was
 not in the room when the code was written. Short is a means, not the goal:
@@ -31,30 +31,35 @@ unsafe { write_csr!(stvec, base & !0b11) }
 That comment earns its line because `& !0b11` is a spec detail, not a fact
 about Rust. A comment restating the expression would not.
 
-Comment the decision, not the mechanism: a rejected alternative, a hardware
-constraint, a measured number, an ordering that looks stronger than needed.
-When a comment is long, it is because the reasoning is long — see the module
-doc on `executor.rs` for why the slot states are separate atomics. That is
-allowed. Filler is not.
+Keep decisions, hardware constraints, invariants, measured numbers, and
+non-obvious orderings. Delete narration, headings, restated control flow, and
+comments that only expand a name. Tests need a comment only when the scenario
+cannot be made clear in the test name and assertions.
 
-Delete commented-out code. Git has it.
+Write in the present tense, as if the code had always worked this way. History,
+resolved problems, and commented-out code belong in Git.
 
 ## Documentation
 
-One sentence first, on its own line, stating what the item is. Then, only if
-the reader still needs it, the invariant, the cost, or the caller's obligation.
+Public APIs start with a one-sentence summary. Add only information the name,
+signature, and types do not provide: invariants, costs, failure conditions, or
+caller obligations. Private items need rustdoc only when they carry a contract
+that is not evident from the code.
 
 ```rust
 /// Marks the task's poll complete, preserving any wake that arrived during it.
 ```
 
-Document the type or module, not every method on it. A method whose name and
-signature already say everything needs no doc comment. Modules carry the
-design rationale; that is where a paragraph belongs.
+Document the type or module, not every obvious method. Put genuine design
+rationale in the narrowest relevant module and keep it proportional to the
+decision it preserves.
 
 Every `unsafe fn` has a `# Safety` section stating what the caller must
 guarantee. Every `unsafe` block has a `// SAFETY:` comment saying why that
-guarantee holds here. No exceptions — this is the one place verbosity wins.
+guarantee holds. One sentence: the condition that makes the block sound, not a
+tour of everything that could go wrong. Several conditions join with a
+semicolon; they do not become several sentences. The comment is never optional
+— that is the exception verbosity does not get to make.
 
 ## Tests
 

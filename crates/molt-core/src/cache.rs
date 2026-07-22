@@ -1,14 +1,8 @@
 //! Cache layout for contended words.
 //!
-//! False-sharing is workload-specific, so layout is selected in code for each
-//! primitive: `Executor<N>` is compact, while `Executor<N, Padded>` puts every
-//! state word on its own cache line. The same choice applies to
-//! `CompletionSlab<C, N, Padded>`.
-//!
-//! On a 4-core x86_64 Linux VM, padding took roughly 50% off contended wakes
-//! and added roughly 8% to completion round trips. It also grew
-//! `Executor<256>` from 256 bytes to 32 KiB. Both variants therefore remain
-//! explicit and can be benchmarked in the same binary.
+//! Padding halved contended wake time but added 8% to completion round trips on
+//! the reference x86_64 VM, while growing `Executor<256>` from 256 bytes to
+//! 32 KiB. Callers therefore choose compact or padded storage explicitly.
 
 use core::borrow::Borrow;
 use core::ops::{Deref, DerefMut};
@@ -44,8 +38,7 @@ impl CacheLayout for Padded {
 }
 
 /// Pads and aligns a value to a target-appropriate cache line.
-// x86_64 prefetches adjacent lines; aarch64 and powerpc64 can use 128-byte
-// lines. These values follow crossbeam-utils rather than assuming one host.
+// Match crossbeam-utils: some targets use or prefetch 128-byte lines.
 #[cfg_attr(
     any(
         target_arch = "x86_64",

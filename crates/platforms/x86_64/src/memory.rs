@@ -1,22 +1,8 @@
-//! The x86_64 address space the kernel builds for itself.
+//! Kernel-owned x86_64 translation tables.
 //!
-//! Until now the bootloader's tables stayed live for the whole of boot. That
-//! made [`Audit::accepts`] impossible on this platform: the loader maps its own
-//! framebuffer, page tables, and identity regions, so a sweep of the live
-//! tables would have reported dozens of leaves the kernel never declared, and
-//! the check had to be dropped to the outward-only [`Audit::cover`]. It also
-//! left nowhere to put an MMIO window with its own memory type, because
-//! everything reachable went through the loader's write-back direct map — the
-//! local APIC included.
-//!
-//! [`init`] therefore builds a fresh four-level table from frames the kernel
-//! allocates, containing exactly four things: a direct map of firmware-usable
-//! RAM, the kernel image cloned page by page with the rights the loader gave
-//! each page, the pinned boot stack and boot-info windows, and the APIC device
-//! window. Then it loads `CR3`. Everything the CPU touches after that
-//! instruction — the code it is executing, its stack, the tables themselves —
-//! is in that list, and everything in that list is declared, so both directions
-//! of the audit run here.
+//! [`init`] maps usable RAM, clones the live image and boot windows, adds an
+//! uncacheable APIC window, and loads `CR3`. Owning the exact declared set
+//! enables both directions of [`Audit`] without inheriting loader mappings.
 
 use core::cell::UnsafeCell;
 
@@ -36,31 +22,18 @@ use x86_64::{PhysAddr, VirtAddr};
 
 use crate::{BOOT_INFO_BASE, BOOT_INFO_WINDOW, STACK_BASE, STACK_SIZE};
 
-/// How far past the reported image length `mapped_end` will follow the loader.
-///
-/// This is a runaway guard, not a size the kernel is expected to reach: the
-/// walk stops at the loader's first unmapped page, and the kernel image plus
-/// its `.bss` is a couple of megabytes. Without a bound, a loader that mapped
-/// the image right up against another window would make the walk cross into
-/// it, one 4 KiB page walk at a time. 64 MiB caps that at 16K probes — a few
-/// milliseconds even under QEMU — while leaving two orders of magnitude of
-/// headroom over the real image.
+/// Maximum contiguous mapping scanned beyond the image's reported file length.
 const IMAGE_LIMIT: u64 = 64 * 1024 * 1024;
 
 const TEST_PAGE: u64 = 0x0000_5555_5555_0000;
 
-/// Where the kernel maps the local APIC.
 const APIC_WINDOW: u64 = 0xffff_9200_0000_0000;
 
-/// Declared ranges: the image, two boot windows, the APIC, and one entry per
-/// usable RAM region — firmware maps are chatty, so this is generous.
 type Log = Declared<64>;
 
-/// The address space [`init`] built, kept so later probes can extend it.
 struct Space {
     root: PhysFrame<Size4KiB>,
     offset: u64,
-    /// Where frame allocation stopped, so a probe does not reissue a table frame.
     cursor: FrameCursor,
     log: Log,
 }
@@ -79,10 +52,7 @@ fn active() -> Result<&'static mut Space, PlatformError> {
     unsafe { &mut *ACTIVE.0.get() }.as_mut().ok_or(PlatformError::Mapping(MappingError::Unmapped))
 }
 
-/// Builds the kernel's own address space and switches `CR3` to it.
-///
-/// Returns the virtual address of the local APIC window, because the APIC stops
-/// being reachable through the loader's direct map the moment `CR3` changes.
+/// Builds the kernel address space and returns its local APIC window.
 pub fn init(boot_info: &BootInfo<'_>) -> Result<u64, PlatformError> {
     let offset = boot_info.physical_offset().ok_or(PlatformError::MissingPhysicalMemoryMap)?;
     let image = boot_info.kernel_image().ok_or(PlatformError::Mapping(MappingError::Unmapped))?;
@@ -105,50 +75,32 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<u64, PlatformError> {
 
     let mut log = Log::new();
     direct_map(&mut space, &mut frames, &mut log, map, offset)?;
-    // The image, the stack, and the boot info keep the virtual addresses the
-    // loader chose: `CR3` is written from code running at its image address,
-    // with locals on the boot stack, so any shift would fault on the next
-    // instruction. Their rights are read back out of the loader's tables
-    // rather than assumed, so a section it mapped wrongly fails the audit
-    // instead of being silently re-created correctly here.
-    //
-    // `kernel_len` is the ELF file length, so it stops short of the `.bss`
-    // pages the loader also mapped. Following the loader's mapping to its first
-    // hole is what keeps kernel statics — the audit log, the APIC window base —
-    // addressable after the switch.
+    // Preserve the live virtual addresses and observed rights across the CR3 switch.
+    // The reported file length excludes mapped zero-fill sections such as `.bss`.
     let image_end = mapped_end(&live, image.start(), image.end())?;
     clone(&mut space, &mut frames, &mut log, &live, image.start(), image_end, Contents::Image)?;
-    // The loader places a guard page at the fixed address and the stack above
-    // it, so the usable stack ends one page past `STACK_BASE + STACK_SIZE`.
-    // Cloning the extra page is what keeps `RSP` mapped across the `CR3` write;
-    // unmapped pages inside the window are skipped, so the guard stays a hole.
+    // Include the stack's upper page while preserving the unmapped guard page.
     let stack_end = STACK_BASE + STACK_SIZE + 2 * Size4KiB::SIZE;
     clone(&mut space, &mut frames, &mut log, &live, STACK_BASE, stack_end, Contents::Ram)?;
     let boot_info_end = BOOT_INFO_BASE + BOOT_INFO_WINDOW;
     clone(&mut space, &mut frames, &mut log, &live, BOOT_INFO_BASE, boot_info_end, Contents::Ram)?;
     device_window(&mut space, &mut frames, &mut log, map, crate::apic::APIC_MMIO, APIC_WINDOW)?;
 
-    // SAFETY: PAT is architectural on every CPU that supports it, and this
-    // configuration is the reset one, restated so a firmware that reprogrammed
-    // it cannot turn the uncacheable slot the device windows select into
-    // something else.
+    // SAFETY: every x86_64 CPU has PAT, and the reset layout preserves active entries.
     unsafe { write_pat() };
 
     let cursor = frames.0.cursor();
     // SAFETY: the executing code, its stack, the boot info, the tables reached
     // through `offset`, and the APIC window are all present in `root`, so
-    // translation can be switched over in place. `Cr3Flags::empty()` keeps
-    // write-through and cache-disable off for the table walk itself.
+    // translation can switch in place, and `Cr3Flags::empty()` leaves the table
+    // walk write-back cacheable.
     unsafe { Cr3::write(root, Cr3Flags::empty()) };
     // SAFETY: same reasoning as `active`; this runs once on the boot CPU.
     unsafe { *ACTIVE.0.get() = Some(Space { root, offset, cursor, log }) };
     Ok(APIC_WINDOW)
 }
 
-/// Maps every firmware-usable RAM region at `offset + physical`.
-///
-/// Only usable regions are mapped: firmware, loader, and MMIO holes get no
-/// mapping at all, which is what makes a stray leaf over them detectable.
+/// Direct-maps only firmware-usable RAM.
 fn direct_map(
     space: &mut OffsetPageTable<'_>,
     frames: &mut X86Frames<'_>,
@@ -157,8 +109,6 @@ fn direct_map(
     offset: u64,
 ) -> Result<(), PlatformError> {
     for region in UsableRegions::above(map, 0) {
-        // Staying inside the region rather than rounding outward keeps the
-        // leaves from covering a neighbour nobody declared.
         let start = align_up(region.start())?;
         let end = align_down(region.end());
         if start >= end {
@@ -189,12 +139,7 @@ fn direct_map(
     Ok(())
 }
 
-/// Re-creates the loader's mapping of `[start, end)` in the kernel's tables.
-///
-/// Pages the loader left unmapped — the stack guard page, the tail of the
-/// boot-info window — are skipped rather than invented, and each run of cloned
-/// pages is declared as it is found, so a hole never turns into a declared
-/// range with nothing behind it.
+/// Clones mapped pages and their live rights, preserving holes.
 fn clone(
     space: &mut OffsetPageTable<'_>,
     frames: &mut X86Frames<'_>,
@@ -212,8 +157,6 @@ fn clone(
             virtual_address += Size4KiB::SIZE;
             continue;
         };
-        // Round-trip the rights through `Rights` so a page the loader mapped
-        // both writable and executable is refused here, not cloned.
         let granted = protection(flags, frame.size());
         let rights = Rights::page_protected(granted).map_err(PlatformError::Mapping)?;
         let physical = frame.start_address().as_u64() + (virtual_address & (frame.size() - 1));
@@ -235,8 +178,6 @@ fn device_window(
     virtual_address: u64,
 ) -> Result<(), PlatformError> {
     let span = Span::frames(physical, 1).map_err(|_| address_error())?;
-    // Refuses anything firmware claimed as RAM, so a mistyped register base
-    // cannot become a device mapping over the kernel's own memory.
     let window = Inventory::new(map).device(span).map_err(|_| address_error())?;
     let (rights, cache) = window.mapping(Rights::READ_WRITE).map_err(PlatformError::Mapping)?;
     map_4k(space, frames, virtual_address, window.span().start(), leaf_flags(rights, cache))?;
@@ -244,10 +185,7 @@ fn device_window(
         .map_err(PlatformError::Mapping)
 }
 
-/// Page-table flags for `rights` and `cache`.
-///
-/// `PCD|PWT` selects PAT entry 3, which [`write_pat`] pins to uncacheable: the
-/// memory type an MMIO window has to have for a register write to be a write.
+/// Page-table flags, using PAT entry 3 for device memory.
 fn leaf_flags(rights: Rights, cache: Cache) -> PageTableFlags {
     let mut flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
     if rights.is_write() {
@@ -262,12 +200,7 @@ fn leaf_flags(rights: Rights, cache: Cache) -> PageTableFlags {
     flags
 }
 
-/// The rights and memory type a live leaf grants.
-///
-/// The kernel never sets the PAT bit itself, so the memory type is the entry
-/// selected by `PCD|PWT` alone. Only entry 3 is uncacheable, and everything
-/// else reads back as write-back — the direction that makes an MMIO window
-/// mapped with the wrong bits fail its audit rather than pass it.
+/// Decodes rights and the PAT entry selected by `PCD|PWT`.
 fn protection(flags: PageTableFlags, size: u64) -> PageProtection {
     let index = u8::from(flags.contains(PageTableFlags::NO_CACHE)) << 1
         | u8::from(flags.contains(PageTableFlags::WRITE_THROUGH));
@@ -290,8 +223,7 @@ fn protection(flags: PageTableFlags, size: u64) -> PageProtection {
 /// set neither bit or both are unaffected.
 unsafe fn write_pat() {
     const IA32_PAT: u32 = 0x277;
-    // WB, WT, UC-, UC, repeated in the high half: the reset value, written
-    // rather than assumed so firmware cannot have moved UC off entry 3.
+    // Architectural reset layout: WB, WT, UC-, UC in each half.
     const CONFIG: u64 = 0x0007_0406_0007_0406;
     // SAFETY: IA32_PAT is architectural on any CPU reporting PAT support, which
     // every x86_64 CPU does, and the value sets no reserved encoding.
@@ -315,8 +247,6 @@ fn map_4k(
 
 pub fn verify_owned_mapping(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
     let state = active()?;
-    // Resume where `init` stopped: a fresh allocator over the same map would
-    // hand back the frames the live tables are built from.
     let mut frames = X86Frames(BootFrameAllocator::resume(boot_info.memory_map(), state.cursor));
     let mut space = state.mapper();
 
@@ -325,8 +255,7 @@ pub fn verify_owned_mapping(boot_info: &BootInfo<'_>) -> Result<(), PlatformErro
     let mut mapping = OwnedPage::map(&mut space, &mut frames, page, permissions)?;
     mapping.write_and_verify(0x4d4f_4c54_5f57_585e)?;
     drop(mapping);
-    // The probe leaf is gone again, so the audit that runs next sees exactly
-    // the ranges `init` declared and nothing more.
+    // Remove the probe before auditing the declared mappings.
     state.cursor = frames.0.cursor();
     Ok(())
 }
@@ -336,17 +265,13 @@ pub fn verify_image_protection(_boot_info: &BootInfo<'_>) -> Result<(), Platform
     let space = state.mapper();
     let audit = state.log.audit();
     audit.cover(&MapperWalk { mapper: &space }).map_err(PlatformError::Mapping)?;
-    // A full sweep of the live tables catches anything mapped that the kernel
-    // never declared — the check the loader's tables could never have passed.
     sweep(state.offset, state.root, &audit)
 }
 
 /// Reads the APIC through the window `init` mapped and audits the result.
 pub fn verify_device_window(_boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
     let state = active()?;
-    // CPUID answers independently of the MMU, so an ID that matches proves the
-    // window reaches the APIC and not some other frame that happens to be
-    // readable — a stale direct-mapped alias would answer differently.
+    // Compare against CPUID to detect a readable mapping of the wrong frame.
     let expected = (core::arch::x86_64::__cpuid(1).ebx >> 24) as u8;
     // SAFETY: `APIC_WINDOW` is mapped read/write and uncacheable to the APIC's
     // own frame; the ID register is a naturally aligned 32-bit MMIO location.
@@ -355,11 +280,7 @@ pub fn verify_device_window(_boot_info: &BootInfo<'_>) -> Result<(), PlatformErr
         return Err(PlatformError::InvalidHardware);
     }
 
-    // The read alone proves only half the window. RISC-V drives its UART
-    // through the mapping; do the same here on the one APIC register that is
-    // writable without disturbing interrupt delivery — the task priority
-    // register, which the kernel leaves at zero. Write a priority class, read
-    // it back through the same window, then restore it.
+    // Round-trip the task-priority register without disturbing interrupt delivery.
     // SAFETY: `APIC_WINDOW + 0x80` is the naturally aligned 32-bit TPR of the
     // APIC frame this window maps read/write and uncacheable.
     let observed = unsafe {
@@ -393,7 +314,6 @@ impl Space {
     }
 }
 
-/// Hands every present leaf of the live tables to `audit`.
 fn sweep(offset: u64, root: PhysFrame<Size4KiB>, audit: &Audit<'_>) -> Result<(), PlatformError> {
     walk(offset, root, 3, 0, audit)
 }
@@ -427,8 +347,6 @@ fn walk(
     Ok(())
 }
 
-/// Sign-extends bit 47 the way the hardware does, so a higher-half leaf's
-/// address matches the range the kernel declared it under.
 const fn canonical(address: u64) -> u64 {
     ((address << 16) as i64 >> 16) as u64
 }
@@ -437,15 +355,13 @@ fn table_pointer(offset: u64, frame: PhysFrame<Size4KiB>) -> *mut PageTable {
     (offset + frame.start_address().as_u64()) as *mut PageTable
 }
 
-/// [`PageWalk`] over the live x86_64 tables.
 struct MapperWalk<'m, 't> {
     mapper: &'m OffsetPageTable<'t>,
 }
 
 impl PageWalk for MapperWalk<'_, '_> {
     fn leaf(&self, address: u64) -> Option<Leaf> {
-        // Report the actual leaf size, not always 4 KiB, so a 2 MiB huge page
-        // across the image surfaces as a granularity error.
+        // Preserve huge-page size so the audit sees crossed boundaries.
         let TranslateResult::Mapped { frame, flags, .. } =
             self.mapper.translate(VirtAddr::new(address))
         else {
@@ -482,8 +398,8 @@ impl<'m, 't> OwnedPage<'m, 't> {
         let frame = frames.allocate_frame().ok_or(out_of_frames())?;
         let rights = Rights::new(true, permissions.is_write(), permissions.is_execute())
             .map_err(PlatformError::Mapping)?;
-        // SAFETY: TEST_PAGE is a dedicated, otherwise-unused virtual page and `frame` is a fresh
-        // unique frame. W^X was validated by `Rights` before flags were constructed.
+        // SAFETY: TEST_PAGE is a dedicated, otherwise-unused virtual page mapped to a fresh unique
+        // frame, with W^X validated by `Rights` before the flags were constructed.
         unsafe { mapper.map_to(page, frame, leaf_flags(rights, Cache::WriteBack), frames) }
             .map_err(map_error)?
             .flush();
@@ -512,12 +428,10 @@ impl Drop for OwnedPage<'_, '_> {
     }
 }
 
-/// The shared [`molt_arch::align_down`] at this platform's page size.
 fn align_down(address: u64) -> u64 {
     molt_arch::align_down(address, Size4KiB::SIZE)
 }
 
-/// The shared [`molt_arch::align_up`] at this platform's page size.
 fn align_up(address: u64) -> Result<u64, PlatformError> {
     molt_arch::align_up(address, Size4KiB::SIZE).ok_or(address_error())
 }
@@ -534,6 +448,11 @@ fn out_of_frames() -> PlatformError {
     PlatformError::Mapping(MappingError::OutOfFrames)
 }
 
+/// Returns the active level-4 table through its physical direct map.
+///
+/// # Safety
+///
+/// `physical_offset` must map the active root, with unique access during boot.
 unsafe fn active_level_4_table(physical_offset: VirtAddr) -> &'static mut PageTable {
     let (level_4_frame, _) = Cr3::read();
     let physical = level_4_frame.start_address().as_u64();
@@ -543,11 +462,7 @@ unsafe fn active_level_4_table(physical_offset: VirtAddr) -> &'static mut PageTa
     unsafe { &mut *pointer }
 }
 
-/// Extends `end` to the end of the loader's contiguous mapping from `start`.
-///
-/// A reported image length covers the file image only; the loader maps the
-/// zeroed sections beyond it, and those pages are as much the kernel as the
-/// ones that came from the file.
+/// Extends the file-backed image end through its contiguous zero-fill mapping.
 fn mapped_end(live: &OffsetPageTable<'_>, start: u64, end: u64) -> Result<u64, PlatformError> {
     use x86_64::structures::paging::Translate;
 

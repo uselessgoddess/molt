@@ -13,8 +13,6 @@ impl MemoryMap for TestMap {
     }
 }
 
-/// RAM below the hole, firmware in the middle, RAM again above it. Everything
-/// from 0x8000 up is a hole, which is where an MMIO window would live.
 fn map() -> TestMap {
     TestMap([
         MemoryRegion::new(0x1000, 0x4000, MemoryRegionKind::Usable),

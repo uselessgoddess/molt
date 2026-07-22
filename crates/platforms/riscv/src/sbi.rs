@@ -1,30 +1,20 @@
 //! Thin wrappers over the RISC-V Supervisor Binary Interface.
 //!
-//! OpenSBI runs in M-mode beneath the kernel and exposes console, timer, and
-//! system-reset services through the `ecall` instruction. These helpers keep
-//! the register placement of the SBI calling convention in one audited place.
+//! Console, timer, and reset calls keep their `ecall` register ABI here.
 
 use core::arch::asm;
 
 use crate::error::SbiError;
 
-/// Legacy console extension: write one byte to the debug console.
 const EXT_CONSOLE_PUTCHAR: usize = 0x01;
-/// Base extension: version and extension queries.
 const EXT_BASE: usize = 0x10;
-/// Debug console extension (`DBCN`).
 const EXT_DEBUG_CONSOLE: usize = 0x4442_434e;
-/// Timer extension (`TIME`): program the next supervisor timer interrupt.
 const EXT_TIMER: usize = 0x5449_4d45;
-/// System-reset extension (`SRST`): shut the machine down.
 const EXT_SYSTEM_RESET: usize = 0x5352_5354;
 
-/// `sbi_probe_extension`, function 3 of the base extension.
 const FID_PROBE_EXTENSION: usize = 3;
-/// `sbi_debug_console_write`, function 0 of DBCN.
 const FID_CONSOLE_WRITE: usize = 0;
 
-/// The `(a0, a1)` pair every non-legacy SBI call returns.
 struct SbiReturn {
     error: isize,
     value: usize,
@@ -39,7 +29,6 @@ impl SbiReturn {
     }
 }
 
-/// Reports whether the SBI implementation provides `extension`.
 pub fn probe(extension: usize) -> bool {
     // SAFETY: the base extension's probe takes the extension ID in a0 and
     // touches no memory.
@@ -47,7 +36,6 @@ pub fn probe(extension: usize) -> bool {
     matches!(probed.into_result(), Ok(available) if available != 0)
 }
 
-/// Reports whether the debug console extension is available.
 pub fn has_debug_console() -> bool {
     probe(EXT_DEBUG_CONSOLE)
 }
@@ -60,20 +48,14 @@ pub fn debug_console_write(bytes: &[u8]) -> Result<usize, SbiError> {
     if bytes.is_empty() {
         return Ok(0);
     }
-    // DBCN takes a *physical* base address split across two registers. The
-    // kernel identity-maps everything it can address, so the pointer is already
-    // the physical address; the high half is zero on this 64-bit ABI.
+    // Identity mapping makes the slice pointer DBCN's physical base address.
     let base = bytes.as_ptr() as usize;
-    // SAFETY: `console_write` takes the length in a0 and the physical base
-    // address in a1/a2. The slice outlives the call, and M-mode only reads it.
+    // SAFETY: the live slice supplies DBCN's length and read-only physical address.
     let written = unsafe { call(EXT_DEBUG_CONSOLE, FID_CONSOLE_WRITE, bytes.len(), base, 0) };
     written.into_result()
 }
 
-/// Writes a single byte through the legacy console extension.
-///
-/// The legacy call's return value is reserved, so a dropped byte is silent.
-/// This exists only as the fallback for firmware without DBCN.
+/// Writes one byte through the error-blind legacy fallback.
 pub fn console_putchar(byte: u8) {
     // SAFETY: the legacy console extension takes the byte in a0 and clobbers no memory.
     unsafe {
@@ -81,7 +63,6 @@ pub fn console_putchar(byte: u8) {
     }
 }
 
-/// Programs the next supervisor timer interrupt for absolute time `deadline`.
 pub fn set_timer(deadline: u64) {
     // SAFETY: the TIME extension's `set_timer` function takes the deadline in a0.
     unsafe {
@@ -89,7 +70,6 @@ pub fn set_timer(deadline: u64) {
     }
 }
 
-/// Requests an orderly shutdown, reporting success or failure to the host.
 pub fn shutdown(success: bool) -> ! {
     const RESET_TYPE_SHUTDOWN: usize = 0x0000_0000;
     const REASON_NONE: usize = 0x0000_0000;
@@ -108,7 +88,7 @@ pub fn shutdown(success: bool) -> ! {
     }
 }
 
-/// Issues one SBI call, returning its `(error, value)` pair.
+/// Issues one SBI call.
 ///
 /// # Safety
 ///
@@ -124,8 +104,7 @@ unsafe fn call(
 ) -> SbiReturn {
     let error: isize;
     let value: usize;
-    // SAFETY: register placement follows the SBI calling convention. `readonly`
-    // rather than `nomem`: DBCN reads a buffer this call passes by address.
+    // SAFETY: registers follow the SBI ABI; `readonly` permits DBCN buffer reads.
     unsafe {
         asm!(
             "ecall",

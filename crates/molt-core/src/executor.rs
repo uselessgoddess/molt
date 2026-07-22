@@ -1,38 +1,9 @@
 //! Allocation-free bounded ready scheduling.
 //!
-//! Each task owns one [`AtomicU8`] slot state. Packing several slots into a
-//! single `AtomicU64` was considered to shrink the scan and enable SIMD-style
-//! word loads, but rejected: at the `1..=256` capacity here the whole array is
-//! at most 256 bytes (four cache lines), so the linear scan is already cheap,
-//! while a shared word would make [`wake`](Executor::wake) — a lock-free path
-//! reachable from interrupt context — contend across otherwise independent
-//! tasks and turn every slot's compare-exchange into a retry against its
-//! neighbours. Per-slot atomics keep each task's state machine independent and
-//! free of that false sharing, which is worth more than a marginally tighter
-//! scan. Separate words still share a cache line, though; the [`Padded`] layout
-//! lets individual executors spend memory to avoid that.
-//!
-//! [`Executor::waker`] bridges this ready queue to [`core::task::Waker`]. The
-//! returned waker points straight at the task's own state word rather than at
-//! an owned, cloned [`Waker`]: waking is one bit-set on that word, cloning
-//! copies one pointer, and dropping is a no-op. That keeps the completion hot
-//! path free of allocation, waker copies, and any user vtable indirection
-//! beyond the single unavoidable [`RawWaker`] call, which is the [`TaskId`]-
-//! direct integration Stage 1 calls for.
-//!
-//! Pointing at the state word rather than at the executor also keeps the waker
-//! within the provenance it was built from: it only ever touches the one
-//! [`AtomicU8`] it was handed, so no pointer arithmetic escapes the slot it
-//! borrows, and the vtable needs no capacity parameter.
-//!
-//! The executor owns readiness, not task-local state. A [`crate::cell::Supervisor`]
-//! may drop and respawn a Cell while keeping its stable [`TaskId`]; the new
-//! generation resumes through the same slot. The fixed array is therefore a
-//! scheduler resource, not Cell state. An allocator-backed scheduler can add a
-//! dynamic store when runtime capacity or migration exists, without moving
-//! Cell ownership into this primitive. Such a store must pin slot addresses:
-//! resizing in place would invalidate every [`Waker`] already handed out, so a
-//! capacity change needs a new store generation and a drain of the old one.
+//! Per-task atomics avoid contention between unrelated wakes; [`Padded`] trades
+//! memory for cache-line isolation. [`Executor::waker`] points directly at a
+//! pinned slot, making wake and clone allocation-free while preserving pointer
+//! provenance. Slot addresses must remain stable for every outstanding waker.
 
 use core::borrow::Borrow;
 use core::task::{RawWaker, RawWakerVTable, Waker};
@@ -143,24 +114,14 @@ impl<const N: usize, L: CacheLayout> Executor<N, L> {
 
     /// Builds a [`Waker`] that marks `task` ready in this executor.
     ///
-    /// Waking it is a direct [`Executor::wake`] atomic bit-set with no
-    /// allocation, no waker clone, and no user vtable indirection beyond the one
-    /// [`RawWaker`] call — the [`TaskId`]-direct hot path Stage 1 asks for. A
-    /// completion slab can register this waker and notify the task by index.
-    ///
-    /// Requires `&'static self` because a [`Waker`] erases lifetimes and may be
-    /// cloned or moved anywhere; a Molt executor is a singleton `static`, so its
-    /// slot states live for the whole program and the erased pointer stays
-    /// valid.
+    /// The static receiver keeps the slot pointer valid after lifetime erasure.
     pub fn waker(&'static self, task: TaskId) -> Waker {
         let state: &'static AtomicU8 = self.states[task.0 as usize].borrow();
-        // SAFETY: `state` borrows one slot of a `'static` executor, so it stays
-        // live and shared-borrowable forever, which is what `VTABLE` requires.
+        // SAFETY: `state` is a shared slot in a static executor, as `VTABLE` requires.
         unsafe { Waker::from_raw(RawWaker::new((state as *const AtomicU8).cast(), &VTABLE)) }
     }
 }
 
-/// Sets the ready bit on an occupied slot, leaving free slots untouched.
 fn set_ready(state: &AtomicU8) {
     let mut current = state.load(Ordering::Acquire);
     while current & OCCUPIED != 0 && current & READY == 0 {
@@ -189,8 +150,7 @@ unsafe fn clone_raw(data: *const ()) -> RawWaker {
 ///
 /// `data` must be a slot-state pointer produced by [`Executor::waker`].
 unsafe fn wake_raw(data: *const ()) {
-    // SAFETY: per this function's contract `data` borrows a slot of a `'static`
-    // executor, so it is live and safe to borrow shared.
+    // SAFETY: the contract guarantees a live, shared slot pointer.
     set_ready(unsafe { &*data.cast::<AtomicU8>() });
 }
 

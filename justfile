@@ -15,6 +15,9 @@ test:
     cargo nextest run --workspace
     cargo test --workspace --doc
 
+doc:
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --exclude molt-kernel --no-deps
+
 miri:
     MIRIFLAGS="-Zmiri-strict-provenance" cargo miri test --package molt-core
 
@@ -31,7 +34,7 @@ riscv64gc-check:
 bench-check:
     cargo bench --package molt-core --no-run
 
-pre: fmt-check lint test x86_64-check riscv64gc-check bench-check
+pre: fmt-check lint test doc x86_64-check riscv64gc-check bench-check
 
 image:
     cargo image

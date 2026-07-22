@@ -21,7 +21,6 @@ fn wakes_coalesce() {
     executor.complete_poll(second);
     assert_eq!(executor.next_ready(), None);
 
-    // A wake arriving after the task was dequeued remains visible.
     executor.wake(first);
     assert_eq!(executor.next_ready(), Some(first));
     executor.complete_poll(first);
