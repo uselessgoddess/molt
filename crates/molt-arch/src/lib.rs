@@ -152,11 +152,7 @@ pub const fn align_up(value: u64, alignment: u64) -> Option<u64> {
     }
 }
 
-/// A page-aligned span of physical memory the firmware reported as usable.
-///
-/// Alignment goes inward — the start rounds up, the end rounds down — so a
-/// range never claims a byte the firmware did not hand out. A region that is
-/// too small or too badly aligned to hold a whole frame disappears instead.
+/// The complete aligned frames inside a firmware-usable region.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UsableRange {
     start: u64,
@@ -192,12 +188,7 @@ impl UsableRange {
     }
 }
 
-/// The usable RAM of a memory map above a floor, one aligned range at a time.
-///
-/// The frame allocator hands out frames from this iterator and the boot page
-/// tables map exactly what it yields, so the memory the kernel writes to and
-/// the memory it maps cannot drift apart. The floor is what keeps the loaded
-/// image, and everything the firmware put below it, out of both.
+/// Aligned usable RAM above a floor, shared by allocation and direct mapping.
 pub struct UsableRegions<'m> {
     map: &'m dyn MemoryMap,
     region: usize,
@@ -233,11 +224,7 @@ pub struct FrameAllocator<'m> {
     next: u64,
 }
 
-/// Where a [`FrameAllocator`] stopped, so a later one can carry on.
-///
-/// A platform that maps in two passes — a boot address space, then a page
-/// mapped into it — cannot keep the borrowing allocator alive between them.
-/// Restarting it would hand out the frames the first pass already owns.
+/// A resumable [`FrameAllocator`] position.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameCursor {
     floor: u64,
@@ -250,11 +237,7 @@ impl<'map> FrameAllocator<'map> {
         Self::above(map, 0)
     }
 
-    /// Hands out frames from usable RAM at or above `floor`.
-    ///
-    /// A platform whose firmware reports the RAM its own image sits in as
-    /// usable passes the end of that image, so the allocator cannot hand back
-    /// a frame the kernel is running from.
+    /// Hands out usable frames at or above `floor`.
     pub const fn above(map: &'map dyn MemoryMap, floor: u64) -> Self {
         Self { map, floor, region: 0, next: 0 }
     }
@@ -271,13 +254,11 @@ impl<'map> FrameAllocator<'map> {
     pub fn allocate(&mut self) -> Option<PhysicalFrame> {
         while self.region < self.map.len() {
             let range = self.map.region(self.region).and_then(|region| {
-                // The same aligned view of usable memory the boot page tables
-                // map, so a handed-out frame is always a mapped frame.
+                // Allocation and direct mapping share this aligned view.
                 UsableRange::of(region, self.floor)
             });
             if let Some(range) = range {
-                // A cursor below the range means allocation in it has not
-                // started; every range starts at least one frame above zero.
+                // A lower cursor has not reached this range.
                 self.next = self.next.max(range.start());
                 let end = self.next.checked_add(FRAME_SIZE)?;
                 if end <= range.end() {
@@ -303,24 +284,17 @@ pub enum MappingError {
     Unmapped,
     /// The granted rights do not match what the section is allowed to hold.
     Permissions,
-    /// A leaf reaches past the range it maps, so it also covers memory that
-    /// was declared with different rights.
+    /// A leaf reaches beyond its declared range.
     Straddling,
-    /// The leaf is coarser than the range allows: one 2 MiB leaf cannot give
-    /// `.text` and `.rodata` the different rights each of them needs.
+    /// A leaf is too coarse for the range's rights boundary.
     Granularity,
     /// A translation exists where the kernel declared no mapping at all.
     Unexpected,
-    /// The cacheability does not match the memory behind the mapping: a
-    /// write-back MMIO window, or device ordering imposed on plain RAM.
+    /// Cacheability does not match the mapped memory.
     Cacheability,
 }
 
-/// The rights a live translation table actually grants a virtual address.
-///
-/// This is read back out of the hardware tables rather than remembered from
-/// the request, so a platform that maps a section correctly and then relaxes
-/// it still fails the check.
+/// Rights read from a live translation-table leaf.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PageProtection {
     read: bool,
@@ -330,12 +304,7 @@ pub struct PageProtection {
 }
 
 impl PageProtection {
-    /// The rights of a leaf, assuming the ordinary cacheable memory type.
-    ///
-    /// A platform that reports device leaves must say so with [`Self::cached`]:
-    /// the default is write-back, and a device range audited as write-back
-    /// fails. Defaulting the other way would let a platform that ignores its
-    /// memory-type bits pass an MMIO audit it never actually performed.
+    /// Creates rights for ordinary write-back memory.
     pub const fn new(read: bool, write: bool, execute: bool) -> Self {
         Self { read, write, execute, cache: Cache::WriteBack }
     }
@@ -369,11 +338,11 @@ impl PageProtection {
 /// A kernel-image section, named by the rights its pages may hold.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImageSection {
-    /// Executable code: readable and executable, never writable.
+    /// Executable code.
     Text,
-    /// Constants: readable only.
+    /// Read-only constants.
     Rodata,
-    /// Mutable state, including `.bss` and the boot stack: readable, writable.
+    /// Writable data, including `.bss` and the boot stack.
     Data,
 }
 
@@ -495,8 +464,7 @@ pub trait Platform {
         Err(PlatformError::Unsupported)
     }
 
-    /// Maps an MMIO window through [`Inventory::device`] and reaches a device
-    /// through it, then audits the address space with the window declared.
+    /// Maps, exercises, and audits an MMIO window from [`Inventory::device`].
     ///
     /// [`Inventory::device`]: memory::Inventory::device
     fn verify_device_window(&mut self, _boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {

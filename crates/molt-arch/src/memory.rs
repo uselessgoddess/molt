@@ -1,29 +1,9 @@
 //! Typed physical memory: what a span holds, who owns it, and what a mapping
 //! of it may grant.
 //!
-//! A bare [`FrameAllocator`](crate::FrameAllocator) hands out a `u64` and
-//! records nothing about what happens to it, which is survivable while the only
-//! consumer is the boot page table and fatal once a driver, a DMA engine, and a
-//! ring all want frames from the same pool.
-//!
-//! Three things are separated here, because collapsing them is what makes a
-//! memory model hard to reason about later:
-//!
-//! - [`Kind`] is what physical memory *is* — RAM the firmware handed out, the
-//!   loaded image, firmware's own reservations, or a hole where devices live.
-//!   It comes from the boot memory map and never from a caller's opinion.
-//! - [`Owner`] is who holds a span *now*. It is metadata the kernel maintains
-//!   in a [`FrameTable`], and it is what makes "this frame is already the page
-//!   table's" a returned error rather than a silent double allocation.
-//! - [`Rights`] and [`Cache`] are what a *mapping* of that memory may grant.
-//!   They are checked against the kind, so `Kind::Device` cannot be mapped
-//!   executable or write-back no matter which caller asks.
-//!
-//! [`Frames`] is the ownership token that ties the three together: it can only
-//! come from [`FrameTable::claim`], it is not `Copy`, and returning the memory
-//! consumes it. That is deliberately Theseus's discipline (a mapping is a
-//! value, not an address) with seL4's rule at the edge (memory is typed before
-//! it is handed to something the compiler cannot check), and no CSpace.
+//! [`Kind`] comes from firmware, [`Owner`] records the current holder, and
+//! [`Rights`] plus [`Cache`] constrain mappings. A non-copy [`Frames`] token
+//! makes each claim explicit and must be consumed to release it.
 
 use core::ops::Range;
 
@@ -54,9 +34,7 @@ pub struct Span {
 }
 
 impl Span {
-    /// Rejects anything the rest of this module would otherwise have to
-    /// re-check: an empty span, an inverted one, or one whose bounds do not
-    /// name whole frames.
+    /// Rejects empty, inverted, or unaligned bounds.
     pub const fn new(start: u64, end: u64) -> Result<Self, Error> {
         if start >= end || start % FRAME_SIZE != 0 || end % FRAME_SIZE != 0 {
             return Err(Error::Misaligned);
@@ -112,19 +90,12 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// Checks a requested mapping of this kind of memory against its rules.
-    ///
-    /// The invariants are the reason this returns `Result` rather than the
-    /// caller assembling flags: W^X is already enforced by [`Rights`], and
-    /// what is left is the part a driver gets wrong — an executable or
-    /// write-back MMIO window, and a mapping of memory that belongs to
-    /// firmware.
+    /// Checks mapping rights and cache policy against this memory kind.
     pub const fn allows(self, rights: Rights, cache: Cache) -> Result<(), MappingError> {
         match self {
             Self::Ram | Self::Image => match cache {
                 Cache::WriteBack => Ok(()),
-                // Device memory ordering for RAM is not a safety bug, but it
-                // is never what the caller meant, and it costs a great deal.
+                // Device ordering on RAM is valid but always unintended here.
                 Cache::Device => Err(MappingError::Cacheability),
             },
             Self::Device => {
@@ -132,9 +103,7 @@ impl Kind {
                     return Err(MappingError::Permissions);
                 }
                 match cache {
-                    // A write-back MMIO window turns a register write into a
-                    // store that reaches the device whenever a cache line
-                    // happens to be evicted, if at all.
+                    // Write-back caching does not preserve MMIO register semantics.
                     Cache::WriteBack => Err(MappingError::Cacheability),
                     Cache::Device => Ok(()),
                 }
@@ -146,9 +115,7 @@ impl Kind {
 
 /// Rights a mapping grants, with W^X enforced at construction.
 ///
-/// This is [`MapPermissions`](crate::MapPermissions) with the read bit made
-/// explicit, because device and DMA mappings need to say "readable, not
-/// writable" where a page-table mapping only says "writable, not executable".
+/// Unlike [`MapPermissions`](crate::MapPermissions), includes an explicit read bit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Rights {
     read: bool,
@@ -165,8 +132,7 @@ impl Rights {
         if write && execute {
             return Err(MappingError::WritableExecutable);
         }
-        // A write-only or execute-only mapping is expressible on neither of
-        // Molt's targets, so accepting one here would only move the surprise.
+        // Neither target supports write-only or execute-only mappings.
         if !read {
             return Err(MappingError::Permissions);
         }
@@ -198,10 +164,7 @@ impl TryFrom<PageProtection> for Rights {
     }
 }
 
-/// The cacheability a mapping asks the MMU for.
-///
-/// Two values, because the third useful one (write-combining framebuffers)
-/// has no consumer yet and an unused enum variant is an untested one.
+/// Cache policies supported by current mapping consumers.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Cache {
     /// Ordinary cacheable memory.
@@ -211,35 +174,23 @@ pub enum Cache {
     Device,
 }
 
-/// Who holds a span of physical memory.
-///
-/// The identifiers are opaque `u32`s rather than `molt-core` types because
-/// `molt-arch` is the layer below it; the kernel supplies whatever a
-/// `CellId` or device index means.
+/// Who holds a span, using architecture-layer opaque identifiers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Owner {
     /// General kernel data structures.
     Kernel,
-    /// Translation tables. Named separately because releasing one while it is
-    /// live unmaps memory that is being used to unmap memory.
+    /// Live translation tables.
     Tables,
-    /// A DMA buffer a device can write to whether or not the CPU still maps it.
+    /// A DMA buffer that may remain device-accessible without a CPU mapping.
     Device(u32),
     /// Memory a cell owns and loses on restart.
     Cell(u32),
 }
 
-/// A claimed span of physical memory, and the proof that it was claimed.
+/// A non-copy proof that a [`FrameTable`] assigned a span to one owner.
 ///
-/// There is no constructor: a `Frames` can only come from
-/// [`FrameTable::claim`], it does not implement `Copy` or `Clone`, and
-/// [`FrameTable::release`] consumes it. So the compiler, not a convention,
-/// is what stops the same frames being handed to two owners.
-///
-/// It has no `Drop` on purpose. Releasing needs the table, a `Drop` cannot
-/// reach one without a global, and a global frame table is the thing this
-/// stage is trying not to need yet. `#[must_use]` catches the case that
-/// matters — memory claimed and immediately dropped on the floor.
+/// Release consumes the token; explicit release avoids requiring a global table
+/// from `Drop`.
 #[derive(Debug, Eq, PartialEq)]
 #[must_use = "claimed frames are leaked unless they are released or stored"]
 pub struct Frames {
@@ -257,24 +208,14 @@ impl Frames {
     }
 }
 
-/// Per-frame ownership over one span of physical memory.
-///
-/// The storage is a caller-supplied slice, one entry per frame, so the table
-/// costs exactly what the caller decided to track and `molt-arch` still
-/// allocates nothing. Tracking all of RAM is one static array; tracking the
-/// frames a driver may be handed is a much smaller one, and the choice
-/// belongs to the kernel rather than to this type.
+/// Per-frame ownership backed by caller-supplied storage.
 pub struct FrameTable<'s> {
     base: Span,
     slots: &'s mut [Option<Owner>],
 }
 
 impl<'s> FrameTable<'s> {
-    /// Tracks `base`, using one slot per frame.
-    ///
-    /// Extra slots are accepted and ignored; too few are an error, because a
-    /// table that silently covers less than it claims would report a frame
-    /// outside its slice as free.
+    /// Tracks `base` with one slot per frame, rejecting undersized storage.
     pub fn over(base: Span, slots: &'s mut [Option<Owner>]) -> Result<Self, Error> {
         if (slots.len() as u64) < base.count() {
             return Err(Error::Range);
@@ -297,11 +238,7 @@ impl<'s> FrameTable<'s> {
         Ok(Frames { span, owner })
     }
 
-    /// Returns claimed frames to the free pool.
-    ///
-    /// The owner check cannot fail for frames this table issued; it exists so
-    /// that frames issued by a *different* table are rejected instead of
-    /// clearing slots that describe unrelated memory.
+    /// Releases frames issued by this table and rejects foreign tokens.
     pub fn release(&mut self, frames: Frames) -> Result<(), Error> {
         let range = self.range(frames.span)?;
         if self.slots[range.clone()].iter().any(|slot| *slot != Some(frames.owner)) {
@@ -319,7 +256,7 @@ impl<'s> FrameTable<'s> {
         Ok(self.slots[((address - self.base.start()) / FRAME_SIZE) as usize])
     }
 
-    /// How many frames are currently claimed, for a boot-time audit line.
+    /// Returns the number of claimed frames.
     pub fn claimed(&self) -> usize {
         self.slots.iter().filter(|slot| slot.is_some()).count()
     }
@@ -333,12 +270,9 @@ impl<'s> FrameTable<'s> {
     }
 }
 
-/// The boot memory map read as typed physical memory rather than as regions.
+/// Typed classification derived from the boot memory map.
 ///
-/// This is what makes "map me this physical address" impossible to write: a
-/// caller asks the inventory what a span is, and the inventory answers from
-/// firmware's map. A driver that wants an MMIO window gets one only where
-/// firmware left a hole, and never inside RAM or the kernel image.
+/// Device windows can only come from holes outside RAM and the kernel image.
 #[derive(Clone, Copy)]
 pub struct Inventory<'m> {
     map: &'m dyn MemoryMap,
@@ -350,11 +284,7 @@ impl<'m> Inventory<'m> {
         Self { map, image: None }
     }
 
-    /// Records where the loader placed the kernel image, in physical addresses.
-    ///
-    /// A platform whose image range is only known virtually leaves this unset;
-    /// the image then classifies as [`Kind::Ram`], which is weaker but not
-    /// wrong, and the frame allocator's floor still keeps it out of the pool.
+    /// Records the kernel image's physical range when the platform provides it.
     pub const fn with_image(mut self, image: Span) -> Self {
         self.image = Some(image);
         self
@@ -382,11 +312,7 @@ impl<'m> Inventory<'m> {
         Kind::Device
     }
 
-    /// The kind of every frame in `span`, when they agree.
-    ///
-    /// A span that straddles two kinds is [`Error::Mixed`] rather than the
-    /// kind of its first frame: a request covering RAM *and* a device hole is
-    /// a bug in the caller, and answering it would map one of the two wrong.
+    /// Returns the common kind of `span`, or [`Error::Mixed`] at a boundary.
     pub fn classify(&self, span: Span) -> Result<Kind, Error> {
         let kind = self.kind(span.start());
         let mut address = span.start() + FRAME_SIZE;
@@ -408,11 +334,7 @@ impl<'m> Inventory<'m> {
     }
 }
 
-/// An MMIO window: a span the firmware map does not claim as RAM.
-///
-/// Carrying the proof in a type means a mapping routine takes a `Device` and
-/// not a `u64`, so "the driver mapped an arbitrary physical address" stops
-/// being a review question.
+/// An MMIO span proven to lie outside firmware-described memory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use]
 pub struct Device {
@@ -424,11 +346,7 @@ impl Device {
         self.span
     }
 
-    /// Checks a requested mapping of this window and reports its policy.
-    ///
-    /// The cache policy is not the caller's to choose, which is the point:
-    /// there is exactly one correct answer for MMIO and it is returned rather
-    /// than requested.
+    /// Validates `rights` and returns the mandatory device cache policy.
     pub const fn mapping(self, rights: Rights) -> Result<(Rights, Cache), MappingError> {
         match Kind::Device.allows(rights, Cache::Device) {
             Ok(()) => Ok((rights, Cache::Device)),

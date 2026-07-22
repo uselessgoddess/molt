@@ -48,7 +48,6 @@ fn resumed_allocator_skips_taken_frames() {
 fn usable_ranges_are_aligned_inward() {
     let map = TestMap([
         MemoryRegion::new(0x3101, 0x6100, MemoryRegionKind::Usable),
-        // Not one whole frame survives the inward alignment.
         MemoryRegion::new(0x7001, 0x7fff, MemoryRegionKind::Usable),
         MemoryRegion::new(0x9000, 0xb000, MemoryRegionKind::Reserved),
     ]);

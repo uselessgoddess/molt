@@ -1,16 +1,7 @@
 //! Exhaustive audit of a live address space against what the kernel declared.
 //!
-//! Probing a handful of addresses proves those addresses are right and says
-//! nothing about the pages between them: a `.text` page mapped writable by a
-//! stray megapage sits happily between two correct probes. An audit instead
-//! walks every page of every declared range, and — where the kernel owns the
-//! tables — every leaf the tables hold, so the mapped set and the declared set
-//! have to be the same set.
-//!
-//! [`Audit::cover`] is the outward direction: everything declared is mapped
-//! with exactly the rights its contents allow. [`Audit::accepts`] is the
-//! inward one: nothing else is mapped at all, and no large leaf reaches past
-//! the range it belongs to. Firmware-owned tables can only afford the first.
+//! [`Audit::cover`] checks every declared page; [`Audit::accepts`] rejects
+//! undeclared or over-wide leaves when the kernel can walk the complete table.
 
 use crate::memory::{Kind, Rights};
 use crate::{FRAME_SIZE, ImageSection, MappingError, PageProtection};
@@ -55,18 +46,13 @@ pub trait PageWalk {
 /// What a declared range holds, and therefore what its pages may grant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Contents {
-    /// A named image section: exactly its rights, on 4 KiB leaves, because a
-    /// larger leaf would have to share rights with the next section.
+    /// A named image section with exact rights and 4 KiB leaves.
     Section(ImageSection),
-    /// A loaded image whose section bounds the kernel cannot name, only the
-    /// span: W^X and 4 KiB leaves, whichever section a page belongs to.
+    /// An image span with W^X and 4 KiB leaves but unknown section bounds.
     Image,
-    /// Free RAM: readable and writable, never executable. A megapage leaf is
-    /// welcome here — the whole range carries one set of rights.
+    /// Writable, non-executable RAM at any leaf size.
     Ram,
-    /// An MMIO window: never executable, and never cacheable. A leaf whose
-    /// platform does not report its memory type reads back as write-back and
-    /// fails here, which is the direction an unaudited attribute should fail.
+    /// Uncacheable, non-executable MMIO.
     Device,
 }
 
@@ -144,13 +130,7 @@ impl MappedRange {
     }
 }
 
-/// The declared ranges of one address space, without an allocator.
-///
-/// A kernel that owns its tables has to remember what it mapped in order to
-/// audit it later, and it has to do so while building the very address space
-/// an allocation would need. `N` is the capacity; [`push`](Self::push) merges a
-/// range into the previous one when they touch and hold the same contents, so
-/// cloning a window page by page costs one entry rather than one per page.
+/// Fixed-capacity declared ranges, coalesced by [`push`](Self::push).
 #[derive(Clone, Copy, Debug)]
 pub struct Declared<const N: usize> {
     ranges: [MappedRange; N],
@@ -215,8 +195,7 @@ impl<'ranges> Audit<'ranges> {
             let mut address = range.start;
             while address < range.end {
                 let leaf = walk.leaf(address).ok_or(MappingError::Unmapped)?;
-                // A walk that reports a leaf ending at or before the address it
-                // was asked about would spin here forever.
+                // Reject a malformed walk before it can stall the audit.
                 if leaf.end() <= address {
                     return Err(MappingError::Backend);
                 }
@@ -227,8 +206,7 @@ impl<'ranges> Audit<'ranges> {
         Ok(())
     }
 
-    /// Checks a leaf found in the live tables against the declared ranges: it
-    /// must lie wholly inside one of them and grant what that one allows.
+    /// Checks that a live leaf lies within and obeys one declared range.
     pub fn accepts(&self, leaf: Leaf) -> Result<(), MappingError> {
         for range in self.ranges {
             if leaf.start < range.start || leaf.start >= range.end {
