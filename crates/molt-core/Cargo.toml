@@ -5,17 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
-# The library has no `#[bench]` functions, and its harness rejects the Criterion
-# flags `just bench-track` passes to every bench target.
+# Criterion flags apply only to the named bench targets.
 [lib]
 bench = false
 
 [dev-dependencies]
 criterion = "0.7"
 
-# `sync` reaches into loom for its atomics, so this is a dependency of the
-# library itself — but only ever of a `--cfg loom` build. No shipped target
-# links it.
+# Shipped targets never link this `--cfg loom` dependency.
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
 

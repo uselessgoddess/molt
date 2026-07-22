@@ -2,16 +2,11 @@
 
 use core::arch::asm;
 
-/// `sstatus.SIE` — global supervisor interrupt enable.
 pub const SSTATUS_SIE: usize = 1 << 1;
-/// `sie.STIE` — supervisor timer interrupt enable.
 pub const SIE_STIE: usize = 1 << 5;
 
-/// Trap cause bit set when the trap is an interrupt rather than an exception.
 pub const CAUSE_INTERRUPT: usize = 1 << (usize::BITS as usize - 1);
-/// Exception code for a supervisor timer interrupt.
 pub const INTERRUPT_TIMER: usize = 5;
-/// Exception code for an executed `ebreak`.
 pub const EXCEPTION_BREAKPOINT: usize = 3;
 
 macro_rules! read_csr {
@@ -39,7 +34,6 @@ pub fn sepc() -> usize {
     unsafe { read_csr!(sepc) }
 }
 
-/// Reads the monotonic `time` counter.
 pub fn time() -> u64 {
     // SAFETY: reading a supervisor CSR has no side effects.
     unsafe { read_csr!(time) as u64 }

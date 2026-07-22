@@ -1,20 +1,8 @@
-//! Sv39 boot address space that maps the kernel image one section at a time.
+//! Kernel-owned Sv39 translation tables.
 //!
-//! The earlier version identity-mapped all of RAM with a single RWX gigapage.
-//! That kept the kernel running, but it also meant `.text` was writable and
-//! `.data` was executable, so the W^X contract `MapPermissions` enforces on
-//! x86_64 held nowhere on RISC-V. [`init`] instead walks the linker-exported
-//! section bounds and gives each span exactly the rights it needs — `.text`
-//! read/execute, `.rodata` read-only, `.data`/`.bss`/boot stack read/write up
-//! to `__kernel_end`, and only firmware-declared usable RAM above that as free
-//! RAM. Reserved regions, firmware, and MMIO holes get no mapping at all.
-//!
-//! Two checks are built on top of it. [`verify_owned_mapping`] maps one private
-//! page with [`MapPermissions`]-derived flags and round-trips a value through
-//! the MMU. [`verify_image_protection`] reads the live page tables back and
-//! walks every declared range, confirming each page holds the rights it was
-//! mapped with — the check that would have failed against the old gigapage,
-//! and that a probe of a handful of addresses would have missed.
+//! [`init`] maps each image section with W^X rights and only firmware-usable RAM
+//! beyond the image. Reserved ranges and device holes remain unmapped so the
+//! live-table audit can reject stray leaves.
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
@@ -26,28 +14,22 @@ use molt_arch::{
     PageProtection, PhysicalFrame, PlatformError, UsableRegions,
 };
 
-/// Sv39 page-table entry flags.
-const PTE_V: u64 = 1 << 0; // valid
-const PTE_R: u64 = 1 << 1; // readable
-const PTE_W: u64 = 1 << 2; // writable
-const PTE_X: u64 = 1 << 3; // executable
-const PTE_A: u64 = 1 << 6; // accessed
-const PTE_D: u64 = 1 << 7; // dirty
+const PTE_V: u64 = 1 << 0;
+const PTE_R: u64 = 1 << 1;
+const PTE_W: u64 = 1 << 2;
+const PTE_X: u64 = 1 << 3;
+const PTE_A: u64 = 1 << 6;
+const PTE_D: u64 = 1 << 7;
 
-/// Permission bits: a non-zero mask is what distinguishes a leaf from a pointer.
+/// Non-zero permission bits distinguish a leaf from a table pointer.
 const PTE_RWX: u64 = PTE_R | PTE_W | PTE_X;
 
-/// `satp.MODE` value selecting three-level Sv39 translation.
 const SATP_MODE_SV39: u64 = 8 << 60;
 
-/// Bytes spanned by a level-0 leaf.
 const PAGE_4K: usize = 4096;
-/// Bytes spanned by a level-1 leaf (a megapage).
 const PAGE_2M: usize = 2 * 1024 * 1024;
 
-/// A private virtual address, outside the mapped image, for the probe page.
 const PROBE_VA: usize = 0x2000_0000;
-/// Distinctive payload written through the probe mapping ("MOLT_WX").
 const PROBE_VALUE: u64 = 0x004d_4f4c_545f_5758;
 
 unsafe extern "C" {
@@ -59,29 +41,19 @@ unsafe extern "C" {
     static __kernel_end: u8;
 }
 
-/// The largest number of usable free-RAM ranges the audit stores inline.
-///
-/// The QEMU `virt` build exposes one contiguous span, and no plausible RISC-V
-/// board grows this to double digits; growing it here is a one-line change.
 const MAX_RAM_RANGES: usize = 8;
 
-/// Every mapped range the boot address space declares: three image sections,
-/// the free-RAM regions, and the device window [`verify_device_window`] adds.
 type MappingLog = Declared<{ 3 + MAX_RAM_RANGES + 1 }>;
 
-/// Address of a linker-defined symbol.
 macro_rules! bound {
     ($symbol:ident) => {
         (&raw const $symbol) as usize
     };
 }
 
-/// The boot address space, kept so later probes can extend it.
 struct BootPaging {
     root: *mut u64,
-    /// Where frame allocation stopped, so a probe does not reissue a table frame.
     cursor: FrameCursor,
-    /// Every mapped range, in the order [`init`] built them.
     log: MappingLog,
 }
 
@@ -93,31 +65,19 @@ unsafe impl Sync for Active {}
 
 static ACTIVE: Active = Active(UnsafeCell::new(None));
 
-/// Borrows the boot address space, or reports that [`init`] has not run.
 fn active() -> Result<&'static mut BootPaging, PlatformError> {
     // SAFETY: single boot hart, traps do not touch this cell, and the returned
     // borrow is confined to one call.
     unsafe { &mut *ACTIVE.0.get() }.as_mut().ok_or(PlatformError::Mapping(MappingError::Unmapped))
 }
 
-/// Builds the per-section boot address space and enables Sv39 translation.
-///
-/// Free RAM is mapped only for firmware-reported usable regions above the
-/// image, so reserved ranges, firmware, and MMIO holes get no S-mode mapping
-/// at all. The paging tables and the frame allocator see the same set of
-/// pages because [`UsableRegions`] and [`FrameAllocator::above`] share a floor.
+/// Builds the per-section boot address space and enables Sv39.
 pub fn init(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
     let kernel_end = bound!(__kernel_end) as u64;
     let mut frames = FrameAllocator::above(boot_info.memory_map(), kernel_end);
     let root = alloc_table(&mut frames)?;
 
     let mut log = MappingLog::new();
-    // Identity mappings throughout: `satp` is enabled from code that is running
-    // at its physical address, so any virtual-to-physical shift would fault on
-    // the instruction right after the `csrw`.
-    //
-    // The OpenSBI region below the payload address is deliberately left out: it
-    // is M-mode firmware, and nothing in S-mode has any business reaching it.
     map_section(
         root,
         &mut frames,
@@ -134,10 +94,6 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
         bound!(__rodata_start),
         bound!(__rodata_end),
     )?;
-    // `.data`, `.bss`, and the boot stack are one writable span that stops at
-    // `__kernel_end`. Free RAM above it is mapped separately, once per usable
-    // region: mapping through firmware or MMIO holes is exactly what an audit
-    // would flag next.
     map_section(
         root,
         &mut frames,
@@ -184,8 +140,6 @@ fn map_section(
         ImageSection::Data => PTE_R | PTE_W,
     };
     map_range(root, frames, start, end, flags, Granularity::Small)?;
-    // The audit walks the range page by page and needs its aligned bounds, so
-    // it agrees with whatever [`map_range`] actually gave the MMU.
     let aligned_start = align_down(start, PAGE_4K) as u64;
     let aligned_end =
         align_up(end, PAGE_4K).ok_or(PlatformError::Mapping(MappingError::InvalidAddress))? as u64;
@@ -195,12 +149,8 @@ fn map_section(
 
 pub fn verify_owned_mapping(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
     let state = active()?;
-    // Resume where `init` stopped: a fresh allocator over the same map would
-    // hand back the frames the live page tables are built from.
     let mut frames = FrameAllocator::resume(boot_info.memory_map(), state.cursor);
 
-    // Derive the probe's leaf flags from W^X-checked permissions. A writable
-    // RISC-V leaf must also be readable, and must never be executable here.
     let permissions = MapPermissions::new(true, false).map_err(PlatformError::Mapping)?;
     let mut leaf = PTE_A | PTE_D;
     if permissions.is_write() {
@@ -230,8 +180,7 @@ pub fn verify_owned_mapping(boot_info: &BootInfo<'_>) -> Result<(), PlatformErro
             Ok(())
         }
     };
-    // Clear the probe leaf whether the round-trip passed or not, so the audit
-    // that runs next sees exactly the ranges [`init`] declared, nothing more.
+    // Remove the probe before auditing the declared mappings.
     // SAFETY: nothing else references `PROBE_VA` after this scope, and the
     // fence retires the stale translation before another access can hit it.
     unsafe {
@@ -270,34 +219,20 @@ pub fn verify_image_protection(boot_info: &BootInfo<'_>) -> Result<(), PlatformE
     let inventory = Inventory::new(boot_info.memory_map());
     let walk = TableWalk { root: state.root, inventory: &inventory };
     state.log.audit().cover(&walk).map_err(PlatformError::Mapping)?;
-    // A full sweep of the live tables catches anything mapped that the kernel
-    // never declared — a stray writable range through firmware or MMIO would
-    // fail here rather than escape the outward-only check above.
     walk_leaves(state.root, &state.log.audit(), &inventory)
 }
 
-/// The QEMU `virt` board's NS16550A transmitter, the first mapped device.
 const UART_MMIO: u64 = 0x1000_0000;
-/// Where that window lives in the kernel's address space — deliberately not
-/// its physical address, so nothing can reach the UART by assuming identity.
 const UART_WINDOW: usize = 0x3000_0000;
-/// Transmitter holding register, and the line status whose bit 5 means "empty".
 const UART_THR: usize = 0;
 const UART_LSR: usize = 5;
 const UART_LSR_THRE: u8 = 1 << 5;
 
-/// Maps the UART through [`Inventory::device`] and writes a line through it.
-///
-/// Everything before this reached hardware either through an identity mapping
-/// or through firmware, so this is the first evidence that a device is
-/// reachable *because* the kernel mapped it, with the rights and the memory
-/// type its window says it may have, and that the audit sees it that way too.
+/// Maps, exercises, and audits a typed UART device window.
 pub fn verify_device_window(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
     let state = active()?;
     let inventory = Inventory::new(boot_info.memory_map());
     let span = Span::frames(UART_MMIO, 1).map_err(|_| address_error())?;
-    // Refuses anything firmware claimed as RAM, so a mistyped constant cannot
-    // become a device mapping over the kernel's own memory.
     let window = inventory.device(span).map_err(|_| address_error())?;
     let (rights, cache) = window.mapping(Rights::READ_WRITE).map_err(PlatformError::Mapping)?;
     debug_assert_eq!(cache, Cache::Device);
@@ -324,8 +259,6 @@ pub fn verify_device_window(boot_info: &BootInfo<'_>) -> Result<(), PlatformErro
         }
     }
 
-    // Re-audit with the window declared: `cover` proves the leaf is uncacheable
-    // and unexecutable, and the sweep proves nothing else appeared with it.
     let walk = TableWalk { root: state.root, inventory: &inventory };
     state.log.audit().cover(&walk).map_err(PlatformError::Mapping)?;
     walk_leaves(state.root, &state.log.audit(), &inventory)
@@ -350,7 +283,6 @@ fn address_error() -> PlatformError {
     PlatformError::Mapping(MappingError::InvalidAddress)
 }
 
-/// Walks the live translation tables and hands every present leaf to `audit`.
 fn walk_leaves(
     root: *const u64,
     audit: &Audit<'_>,
@@ -382,7 +314,6 @@ fn walk_table(
                 .map_err(PlatformError::Mapping)?;
             continue;
         }
-        // A pointer entry — walk into the child table it names.
         if level == 0 {
             return Err(PlatformError::Mapping(MappingError::Backend));
         }
@@ -392,19 +323,10 @@ fn walk_table(
     Ok(())
 }
 
-/// The rights and memory type a live Sv39 leaf grants.
+/// Decodes leaf rights and the physical memory attribute.
 ///
-/// Sv39 has no memory-type bits: `Svpbmt` adds them, it is an extension the
-/// QEMU `virt` board's `rv64` CPU does not implement, and S-mode cannot even
-/// ask without parsing the device tree. So the memory type of a leaf here is
-/// not a property of the entry at all — it is the PMA of the physical address
-/// the entry names, fixed by the platform. Classifying that address through
-/// [`Inventory`] therefore reports what the hardware actually does: RAM and
-/// image frames are write-back — as is firmware-reserved RAM — and anything in
-/// a hole of the firmware map is
-/// I/O-ordered. When `Svpbmt` is present it becomes an override on top of this
-/// answer — a PBMT field of zero still means "whatever the PMA says" — so the
-/// classification stays correct and gains a bit to read instead.
+/// This target lacks `Svpbmt`, so the firmware map supplies the PMA: described
+/// memory is write-back and holes are device-ordered.
 fn protection(entry: u64, inventory: &Inventory<'_>) -> PageProtection {
     let physical = (entry >> 10) << 12;
     let cache = match inventory.kind(physical) {
@@ -414,7 +336,6 @@ fn protection(entry: u64, inventory: &Inventory<'_>) -> PageProtection {
     PageProtection::new(entry & PTE_R != 0, entry & PTE_W != 0, entry & PTE_X != 0).cached(cache)
 }
 
-/// [`PageWalk`] over the live Sv39 tables the kernel built.
 struct TableWalk<'i> {
     root: *const u64,
     inventory: &'i Inventory<'i>,
@@ -426,9 +347,8 @@ impl PageWalk for TableWalk<'_> {
         let mut table = self.root;
         let mut level = 2;
         loop {
-            // SAFETY: `table` points at a 512-entry Sv39 table frame — the
-            // root by construction, or a child table `init` mapped read-only
-            // through the identity map. The index is masked to nine bits.
+            // SAFETY: `table` is a readable 512-entry root or identity-mapped child,
+            // and the index is masked to nine bits.
             let entry = unsafe { *table.add(index(va, level)) };
             if entry & PTE_V == 0 {
                 return None;
@@ -487,13 +407,13 @@ fn map_leaf(
 ) -> Result<(), PlatformError> {
     let mut table = root;
     for above in ((level + 1)..=2).rev() {
-        // SAFETY: `table` always points at a valid 512-entry table frame.
+        // SAFETY: `table` points to a valid 512-entry table frame.
         let entry = unsafe { &mut *table.add(index(va, above)) };
         if *entry & PTE_V == 0 {
             let next = alloc_table(frames)?;
-            *entry = pte(next as u64, 0); // a pointer entry clears R/W/X.
+            *entry = pte(next as u64, 0);
         } else if *entry & PTE_RWX != 0 {
-            // Splitting a live leaf is not implemented; ranges are mapped once.
+            // Ranges are mapped once; splitting a leaf is unsupported.
             return Err(PlatformError::Mapping(MappingError::Backend));
         }
         table = ((*entry >> 10) << 12) as *mut u64;
@@ -505,27 +425,22 @@ fn map_leaf(
     Ok(())
 }
 
-/// Index into the level-`level` table for `va`.
 fn index(va: usize, level: usize) -> usize {
     (va >> (12 + 9 * level)) & 0x1ff
 }
 
-/// The shared [`molt_arch::align_down`] on this platform's address width.
 fn align_down(value: usize, alignment: usize) -> usize {
     molt_arch::align_down(value as u64, alignment as u64) as usize
 }
 
-/// The shared [`molt_arch::align_up`] on this platform's address width.
 fn align_up(value: usize, alignment: usize) -> Option<usize> {
     molt_arch::align_up(value as u64, alignment as u64).map(|value| value as usize)
 }
 
-/// Assembles an Sv39 PTE from a physical address and permission flags.
 fn pte(pa: u64, flags: u64) -> u64 {
     ((pa >> 12) << 10) | flags | PTE_V
 }
 
-/// Allocates one frame and returns its physical base address.
 fn alloc_frame(frames: &mut FrameAllocator<'_>) -> Result<u64, PlatformError> {
     frames
         .allocate()
@@ -533,7 +448,6 @@ fn alloc_frame(frames: &mut FrameAllocator<'_>) -> Result<u64, PlatformError> {
         .ok_or(PlatformError::Mapping(MappingError::OutOfFrames))
 }
 
-/// Allocates and zeroes one frame for use as a page table.
 fn alloc_table(frames: &mut FrameAllocator<'_>) -> Result<*mut u64, PlatformError> {
     let frame = alloc_frame(frames)?;
     let table = frame as *mut u64;

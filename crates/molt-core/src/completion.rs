@@ -1,14 +1,8 @@
-//! Bounded, lock-free completion and waker ownership managed by the executor side.
+//! Bounded, lock-free completion storage.
 //!
-//! Each slot is an atomic state machine rather than a spin lock, so the slab is
-//! safe to touch from interrupt context and cannot deadlock under timer
-//! preemption or SMP. A slot moves through `EMPTY -> RESERVING -> OCCUPIED`,
-//! optionally to `OCCUPIED | READY` once a result is published, and back to
-//! `EMPTY` when the result is consumed or the request is cancelled. A transient
-//! `CLAIM` flag gives whichever party performs the terminal transition
-//! exclusive, wait-free access to the slot's value; the waker is handled
-//! separately by the lock-free [`AtomicWaker`]. Acquire/Release pairing on the
-//! state word publishes the [`UnsafeCell`] payload between producer and consumer.
+//! Each slot moves from reservation to occupancy and optionally readiness; a
+//! transient `CLAIM` bit serializes completion, consumption, and cancellation.
+//! Acquire/Release operations publish the payload without a spin lock.
 
 use core::borrow::Borrow;
 use core::future::Future;
@@ -40,13 +34,9 @@ impl CompletionToken {
     }
 }
 
-/// The slot holds a reserved request; its value cell is uninitialized of result.
 const OCCUPIED: u8 = 0b0001;
-/// A result has been published into the value cell (implies `OCCUPIED`).
 const READY: u8 = 0b0010;
-/// A terminal transition (complete, consume, or cancel) owns the value cell.
 const CLAIM: u8 = 0b0100;
-/// A reservation is mid-flight; the request id is not yet published.
 const RESERVING: u8 = 0b1000;
 
 struct Slot<C> {
@@ -56,10 +46,7 @@ struct Slot<C> {
     waker: AtomicWaker,
 }
 
-// SAFETY: `state` serializes every access to `result`. The `RESERVING` and
-// `CLAIM` flags grant a single party exclusive access across each critical
-// transition, and Acquire/Release pairing on `state` publishes writes to the
-// `UnsafeCell` before another party observes the corresponding state.
+// SAFETY: `RESERVING` and `CLAIM` serialize `result`, with `state` publishing it.
 unsafe impl<C: Send> Sync for Slot<C> {}
 
 impl<C> Slot<C> {
@@ -161,8 +148,7 @@ impl<C, const N: usize, L: CacheLayout> CompletionSlab<C, N, L> {
             if slot.request_id.load(Ordering::Relaxed) != target {
                 continue;
             }
-            // Claim exclusive access before writing the result; on success no
-            // other party can consume, cancel, or reserve this slot.
+            // Claim the slot against concurrent consumption or cancellation.
             if slot
                 .state
                 .compare_exchange(OCCUPIED, OCCUPIED | CLAIM, Ordering::AcqRel, Ordering::Relaxed)
@@ -170,8 +156,7 @@ impl<C, const N: usize, L: CacheLayout> CompletionSlab<C, N, L> {
             {
                 continue;
             }
-            // Re-check the id: the slot could have been cancelled and reused
-            // (EMPTY -> OCCUPIED) between the load above and the claim.
+            // Cancellation may have reused the slot before the claim.
             if slot.request_id.load(Ordering::Relaxed) != target {
                 slot.state.store(OCCUPIED, Ordering::Release);
                 continue;
@@ -221,8 +206,7 @@ impl<C, const N: usize, L: CacheLayout> CompletionSlab<C, N, L> {
                 return false;
             }
             if state & CLAIM != 0 {
-                // A terminal transition is briefly in flight; it neither blocks
-                // nor allocates, so retry until it releases the claim.
+                // A terminal transition briefly owns the slot.
                 spin_loop();
                 continue;
             }
@@ -268,8 +252,7 @@ impl<C, const N: usize, L: CacheLayout> CompletionSlab<C, N, L> {
             }
             if state & READY != 0 {
                 if state & CLAIM != 0 {
-                    // A concurrent cancel is clearing the slot; let it win and
-                    // report cancellation on the next observation.
+                    // Let the concurrent cancellation finish.
                     spin_loop();
                     continue;
                 }
@@ -294,8 +277,7 @@ impl<C, const N: usize, L: CacheLayout> CompletionSlab<C, N, L> {
                     None => Poll::Ready(Err(CompletionError::Cancelled)),
                 };
             }
-            // No result yet: register and re-check so a completion that lands
-            // between the check and the registration is not missed.
+            // Re-check after registration to close the lost-wakeup window.
             slot.waker.register(cx.waker());
             let recheck = slot.state.load(Ordering::Acquire);
             if slot.request_id.load(Ordering::Relaxed) != target {
@@ -330,9 +312,6 @@ mod loom_tests {
     use super::CompletionSlab;
     use crate::waker::Flag;
 
-    /// The slab's whole purpose: a completion landing while a task parks must
-    /// still wake it. If `poll` reports `Pending`, the completion that ran
-    /// concurrently is obliged to have fired the waker.
     #[test]
     fn race_wakes_waiter() {
         loom::model(|| {
@@ -355,8 +334,6 @@ mod loom_tests {
         });
     }
 
-    /// A cancel racing a completion must leave the slot empty and reusable,
-    /// with exactly one of the two winning the claim.
     #[test]
     fn race_releases_slot() {
         loom::model(|| {

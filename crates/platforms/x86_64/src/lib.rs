@@ -21,18 +21,11 @@ use molt_arch::{
     PlatformError, SerialPort,
 };
 
-/// Where the loader must place the boot stack, and how large it is.
-///
-/// The kernel re-creates the stack mapping in its own tables before switching
-/// `CR3`, and it cannot ask the loader afterwards where the stack went — the
-/// boot info does not say. Pinning the address is what makes the window
-/// findable, so it is a fixed address rather than a dynamic one.
+/// Fixed boot-stack window cloned into kernel-owned page tables.
 pub const STACK_BASE: u64 = 0xffff_9000_0000_0000;
 pub const STACK_SIZE: u64 = 128 * 1024;
 
-/// Where the loader must place [`BootloaderInfo`], and the window the kernel
-/// clones around it. The structure's length depends on the firmware memory
-/// map, so the window is sized for the largest map and holes are skipped.
+/// Fixed boot-info window cloned into kernel-owned page tables.
 pub const BOOT_INFO_BASE: u64 = 0xffff_9100_0000_0000;
 pub const BOOT_INFO_WINDOW: u64 = 2 * 1024 * 1024;
 
@@ -130,9 +123,7 @@ impl Platform for X86_64 {
 
     fn initialize(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
         interrupts::init();
-        // The kernel's own tables come up before the APIC, not after: the
-        // loader's direct map is the only way to reach MMIO until they exist,
-        // and it stops being live the moment `CR3` is written.
+        // Build the MMIO-capable address space before initializing the APIC.
         let apic_window = memory::init(boot_info)?;
         apic::init(apic_window)
     }
@@ -231,6 +222,11 @@ pub(crate) fn emergency_byte(byte: u8) {
     }
 }
 
+/// Writes one byte to an I/O port.
+///
+/// # Safety
+///
+/// The caller must own `port` and satisfy its device protocol.
 unsafe fn out_u8(port: u16, value: u8) {
     // SAFETY: callers own the I/O port they pass to this architecture-private function.
     unsafe {
@@ -243,6 +239,11 @@ unsafe fn out_u8(port: u16, value: u8) {
     }
 }
 
+/// Writes one word to an I/O port.
+///
+/// # Safety
+///
+/// The caller must own `port` and satisfy its device protocol.
 unsafe fn out_u32(port: u16, value: u32) {
     // SAFETY: callers own the I/O port they pass to this architecture-private function.
     unsafe {
@@ -255,6 +256,11 @@ unsafe fn out_u32(port: u16, value: u32) {
     }
 }
 
+/// Reads one byte from an I/O port.
+///
+/// # Safety
+///
+/// The caller must own `port` and satisfy its device protocol.
 unsafe fn in_u8(port: u16) -> u8 {
     let value: u8;
     // SAFETY: callers own the I/O port they pass to this architecture-private function.

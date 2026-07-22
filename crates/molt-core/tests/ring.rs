@@ -28,7 +28,7 @@ fn preserves_fifo_order() {
 }
 
 #[test]
-fn drop_penging_values() {
+fn drop_pending_values() {
     let drops = AtomicUsize::new(0);
 
     {

@@ -83,7 +83,7 @@ fn spans_name_whole_frames() {
 }
 
 #[test]
-fn we_rights_rejected() {
+fn write_execute_rights_rejected() {
     assert_eq!(Rights::new(true, true, true), Err(MappingError::WritableExecutable));
     assert_eq!(Rights::new(false, true, false), Err(MappingError::Permissions));
     assert!(Rights::new(true, false, true).unwrap().is_execute());
