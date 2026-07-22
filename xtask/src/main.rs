@@ -24,7 +24,6 @@ const BOOT_MARKERS: &[&str] = &[
     "MOLT_BOOT_OK",
 ];
 
-/// Marker the platform panic handlers print before terminating.
 const PANIC_MARKER: &str = "MOLT_PANIC:";
 
 const QEMU_X86_64_SUCCESS: i32 = (0x10 << 1) | 1;
@@ -75,12 +74,9 @@ enum Arch {
     Riscv64,
 }
 
-/// What a smoke run boots and what it expects to see.
 #[derive(Clone, Copy)]
 enum Case {
-    /// The shipped kernel: every boot marker, then a success exit.
     Boot,
-    /// The `panic-smoke` build: a panic report, then a failure exit.
     Panic,
 }
 
@@ -291,8 +287,7 @@ fn qemu_riscv64_command(kernel: &Path) -> Command {
     let qemu =
         env::var_os("MOLT_QEMU_RISCV64").unwrap_or_else(|| OsString::from("qemu-system-riscv64"));
     let mut command = Command::new(qemu);
-    // OpenSBI (`-bios default`) loads the ELF at its S-mode payload address and
-    // an orderly SBI shutdown exits QEMU through the `virt` board's test device.
+    // OpenSBI loads the ELF at its S-mode payload address.
     command.args(["-machine", "virt", "-display", "none", "-no-reboot", "-bios", "default"]);
     command.arg("-kernel").arg(kernel);
     command
@@ -322,8 +317,7 @@ fn check_exit_status(arch: Arch, case: Case, status: ExitStatus) -> Result<(), S
     let expected = match (arch, case) {
         (Arch::X86_64, Case::Boot) => QEMU_X86_64_SUCCESS,
         (Arch::X86_64, Case::Panic) => QEMU_X86_64_FAILURE,
-        // An SBI shutdown exits QEMU cleanly whatever the reason, so the marker
-        // check is what distinguishes a terminal state from an early panic.
+        // Serial markers distinguish success and panic because SBI exits both with zero.
         (Arch::Riscv64, _) => 0,
     };
     if status.code() == Some(expected) {

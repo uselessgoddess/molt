@@ -24,11 +24,7 @@ const TIMER_MASKED: u32 = 1 << 16;
 static APIC_VIRTUAL_BASE: AtomicU64 = AtomicU64::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
-/// Brings up the local APIC through the `window` the kernel mapped for it.
-///
-/// The window replaces the loader's direct map: it is the kernel's own leaf,
-/// uncacheable and non-executable, so an APIC register write is a write to the
-/// APIC rather than a store that reaches it whenever a cache line is evicted.
+/// Initializes the local APIC through an uncacheable kernel-owned window.
 pub fn init(window: u64) -> Result<(), PlatformError> {
     let features = core::arch::x86_64::__cpuid(1);
     if features.edx & (1 << 9) == 0 {
@@ -40,8 +36,7 @@ pub fn init(window: u64) -> Result<(), PlatformError> {
     base |= APIC_ENABLE;
     // SAFETY: only the APIC enable bit is changed; the firmware-selected base is preserved.
     unsafe { write_msr(IA32_APIC_BASE, base) };
-    // The window is mapped for the architectural base; firmware that relocated
-    // the APIC would leave it pointing at the wrong frame, so refuse instead.
+    // The window maps the architectural base, so reject firmware relocation.
     if base & APIC_BASE_MASK != APIC_MMIO {
         return Err(PlatformError::InvalidHardware);
     }
@@ -49,10 +44,9 @@ pub fn init(window: u64) -> Result<(), PlatformError> {
 
     write(REG_SPURIOUS, APIC_SOFTWARE_ENABLE | u32::from(SPURIOUS_VECTOR))?;
     write(REG_LVT_TIMER, TIMER_MASKED | u32::from(TIMER_VECTOR))?;
-    write(REG_DIVIDE, 0b0011)?; // divide the bus clock by 16
+    write(REG_DIVIDE, 0b0011)?; // divide by 16
     TICKS.store(0, Ordering::Release);
-    // SAFETY: masking both legacy PICs keeps their firmware vector assignments (notably IRQ 8)
-    // from colliding with CPU exception vectors while the kernel routes interrupts through the APIC.
+    // SAFETY: masking both legacy PICs prevents their vectors from colliding with CPU exceptions.
     unsafe {
         super::out_u8(0x21, 0xff);
         super::out_u8(0xa1, 0xff);
@@ -100,12 +94,16 @@ fn write(offset: u64, value: u32) -> Result<(), PlatformError> {
         return Err(PlatformError::InvalidHardware);
     }
     let address = base.checked_add(offset).ok_or(PlatformError::InvalidHardware)?;
-    // SAFETY: `init` derives this direct-mapped address from IA32_APIC_BASE; APIC registers
-    // are naturally aligned 32-bit MMIO locations and volatile access is required.
+    // SAFETY: `init` provides an aligned APIC MMIO address that requires volatile access.
     unsafe { core::ptr::write_volatile(address as *mut u32, value) };
     Ok(())
 }
 
+/// Reads an architectural model-specific register.
+///
+/// # Safety
+///
+/// `msr` must be readable at privilege level zero.
 unsafe fn read_msr(msr: u32) -> u64 {
     let low: u32;
     let high: u32;

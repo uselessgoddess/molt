@@ -26,8 +26,6 @@ molt-riscv = { path = "crates/platforms/riscv" }
 molt-x86_64 = { path = "crates/platforms/x86_64" }
 spin = { version = "0.12.2", default-features = false, features = ["once"] }
 
-# platform 
-
 bootloader_api = "0.11.15"
 x86_64 = { version = "0.15.5", default-features = false, features = [
     "abi_x86_interrupt",
