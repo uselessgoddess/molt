@@ -135,7 +135,7 @@ torn write is rejected at the checksum rather than by whatever the region
 offsets would otherwise have pointed at. `Super::check` then refuses a
 structurally impossible volume: a region starting inside the superblock copies,
 a region running past the end, a sums region whose length disagrees with the
-data block count.
+data block count, or metadata and data regions whose occupied blocks overlap.
 
 **An object** is a kind, a start index, a count, and a size. For a directory the
 range is into the entries region and the size is zero; for a file the range is
@@ -374,6 +374,12 @@ shell to print it — `Missing`, `Kind`, `Name`, `Range`, `Checksum`, `Corrupt` 
 and wraps the layers below it rather than flattening them: a device failure
 stays `Device(BlockError)`, a stale handle stays `Handle(CapabilityError)`.
 
+**Completion backpressure loses nothing.** Submission and completion queues are
+independent even though they have the same capacity. If a reply cannot be
+published, `Fs` retains that completion and stops draining submissions until the
+client makes room, so an operation is applied once and its answer is not
+discarded.
+
 ## The shell
 
 `molt-shell` is a client and nothing more, and that is its job: it exists to
@@ -426,7 +432,7 @@ line editor away and needs a serial `read` before it is worth writing.
   it deliberately is a Stage 4 item, and the region layout is what makes it
   cheap when it comes.
 - **No `BlockOp` ring.** Above.
-- **crc32c is a software table.** No `SSE4.2` or `Zbc` path. It is 75 lines and
+- **crc32c uses a software fallback.** No `SSE4.2` or `Zbc` path. It is 75 lines and
   the disk it runs against is a boot-time image; the moment it shows up in a
   profile, the intrinsic is a one-file change.
 
@@ -444,7 +450,8 @@ past it.
 The service tests cover the protocol rather than the format: an open walks from
 the root handle, a read lands in a registered buffer and nowhere else, a closed
 handle goes stale, a revoked owner loses every handle at once, and a table with
-no free slot refuses rather than overwrites.
+no free slot refuses rather than overwrites. A full completion queue also
+preserves the next result until the client makes room.
 
 The shell tests run scripts against a mounted image and compare what was
 printed, which is the only test that can catch a protocol that is technically

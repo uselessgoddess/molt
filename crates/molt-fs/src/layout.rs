@@ -194,21 +194,36 @@ impl Super {
     /// Rejects a superblock whose regions do not fit the volume it describes.
     fn check(&self) -> Result<(), FsError> {
         let data_end = self.data_at.checked_add(self.data_blocks).ok_or(FsError::Corrupt)?;
-        if data_end > self.blocks {
+        let sum_bytes = self.data_blocks.checked_mul(4).ok_or(FsError::Corrupt)?;
+        if self.data_at < SUPERS || data_end > self.blocks {
             return Err(FsError::Corrupt);
         }
-        if self.region(Area::Sums).bytes != self.data_blocks * 4 {
+        if self.region(Area::Sums).bytes != sum_bytes {
             return Err(FsError::Corrupt);
         }
-        for area in Area::ALL {
+        for (index, area) in Area::ALL.into_iter().enumerate() {
             let region = self.region(area);
             let end = region.at.checked_add(region.blocks()).ok_or(FsError::Corrupt)?;
             if region.at < SUPERS || end > self.blocks {
                 return Err(FsError::Corrupt);
             }
+            if overlaps(region.at, end, self.data_at, data_end) {
+                return Err(FsError::Corrupt);
+            }
+            for &other in &Area::ALL[..index] {
+                let other = self.region(other);
+                let other_end = other.at.checked_add(other.blocks()).ok_or(FsError::Corrupt)?;
+                if overlaps(region.at, end, other.at, other_end) {
+                    return Err(FsError::Corrupt);
+                }
+            }
         }
         Ok(())
     }
+}
+
+fn overlaps(left: u64, left_end: u64, right: u64, right_end: u64) -> bool {
+    left < left_end && right < right_end && left < right_end && right < left_end
 }
 
 /// What an object is.
@@ -419,6 +434,38 @@ mod tests {
         let mut block = [0u8; BLOCK];
         let mut parsed = volume();
         parsed.set_region(Area::Objects, Region { at: 15, bytes: 2 * BLOCK as u64, crc: 0 });
+        parsed.encode(&mut block);
+
+        assert_eq!(Super::parse(&block), Err(FsError::Corrupt));
+    }
+
+    #[test]
+    fn overlapping_regions_refused() {
+        let mut block = [0u8; BLOCK];
+        let mut parsed = volume();
+        parsed.set_region(Area::Extents, Region { at: 2, bytes: 16, crc: 0 });
+        parsed.encode(&mut block);
+
+        assert_eq!(Super::parse(&block), Err(FsError::Corrupt));
+    }
+
+    #[test]
+    fn metadata_over_data_refused() {
+        let mut block = [0u8; BLOCK];
+        let mut parsed = volume();
+        parsed.set_region(Area::Names, Region { at: parsed.data_at, bytes: 1, crc: 0 });
+        parsed.encode(&mut block);
+
+        assert_eq!(Super::parse(&block), Err(FsError::Corrupt));
+    }
+
+    #[test]
+    fn sum_length_overflow_refused() {
+        let mut block = [0u8; BLOCK];
+        let mut parsed = volume();
+        parsed.blocks = u64::MAX;
+        parsed.data_at = 4;
+        parsed.data_blocks = u64::MAX / 4 + 1;
         parsed.encode(&mut block);
 
         assert_eq!(Super::parse(&block), Err(FsError::Corrupt));

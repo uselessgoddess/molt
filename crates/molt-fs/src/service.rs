@@ -19,12 +19,17 @@ use crate::volume::Volume;
 pub struct Fs<'buf, D, const N: usize> {
     volume: Volume<'buf, D>,
     open: CapabilityTable<Object, N>,
+    pending: Option<Completion<Result<FsDone, FsError>>>,
 }
 
 impl<'buf, D: Device, const N: usize> Fs<'buf, D, N> {
     /// Mounts `device`, using `block` as the volume's only buffer.
     pub fn mount(device: D, block: &'buf mut [u8; BLOCK]) -> Result<Self, FsError> {
-        Ok(Self { volume: Volume::mount(device, block)?, open: CapabilityTable::new() })
+        Ok(Self {
+            volume: Volume::mount(device, block)?,
+            open: CapabilityTable::new(),
+            pending: None,
+        })
     }
 
     /// The checkpoint the mounted volume carries.
@@ -87,8 +92,8 @@ impl<'buf, D: Device, const N: usize> Fs<'buf, D, N> {
 
     /// Drains the submission queue, answering every operation it held.
     ///
-    /// Returns how many were served, so a caller can tell a round that did
-    /// work from one that only spun.
+    /// Returns how many completions were published, so a caller can tell a
+    /// round that did work from one blocked behind a full completion queue.
     pub fn serve<const M: usize, const R: usize>(
         &mut self,
         owner: CellId,
@@ -96,15 +101,25 @@ impl<'buf, D: Device, const N: usize> Fs<'buf, D, N> {
         buffers: &mut BufferRegistry<'_, M>,
     ) -> usize {
         let mut served = 0;
+        if let Some(completion) = self.pending.take() {
+            match driver.try_complete(completion) {
+                Ok(()) => served += 1,
+                Err(completion) => {
+                    self.pending = Some(completion);
+                    return served;
+                }
+            }
+        }
         while let Some(submission) = driver.try_next() {
             let id = submission.id();
             let result = self.apply(owner, submission.into_operation(), buffers);
-            // Both queues of a ring hold the same number of entries, so a
-            // submission that came out has a completion slot to go back into.
-            if driver.try_complete(Completion::new(id, result)).is_err() {
-                break;
+            match driver.try_complete(Completion::new(id, result)) {
+                Ok(()) => served += 1,
+                Err(completion) => {
+                    self.pending = Some(completion);
+                    break;
+                }
             }
-            served += 1;
         }
         served
     }
@@ -296,5 +311,28 @@ mod tests {
                 stat: Stat { kind: Kind::File, size: 11, entries: 0 },
             })
         );
+    }
+
+    #[test]
+    fn full_completion_queue_preserves_next_result() {
+        let bytes = image();
+        let mut block = [0u8; BLOCK];
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("mount");
+        let mut buffers = BufferRegistry::<1>::new();
+        let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 1>::new();
+        let (mut client, mut driver) = ring.split();
+        let root = fs.root(OWNER).expect("root handle");
+
+        let first = FsOp::Entry { dir: root, index: 0 };
+        client.try_submit(Submission::new(RequestId::new(1), first)).expect("free slot");
+        assert_eq!(fs.serve(OWNER, &mut driver, &mut buffers), 1);
+
+        let second = FsOp::Entry { dir: root, index: 1 };
+        client.try_submit(Submission::new(RequestId::new(2), second)).expect("free slot");
+        assert_eq!(fs.serve(OWNER, &mut driver, &mut buffers), 0);
+        assert_eq!(client.try_completion().expect("first completion").id(), RequestId::new(1));
+
+        assert_eq!(fs.serve(OWNER, &mut driver, &mut buffers), 1);
+        assert_eq!(client.try_completion().expect("second completion").id(), RequestId::new(2));
     }
 }
