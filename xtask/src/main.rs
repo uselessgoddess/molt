@@ -10,6 +10,9 @@ use bootloader::{BiosBoot, UefiBoot};
 const X86_64_TARGET: &str = "x86_64-unknown-none";
 const RISCV64_TARGET: &str = "riscv64gc-unknown-none-elf";
 
+/// One disk sector, the unit the virtio smoke disk is signed in.
+const SECTOR: usize = 512;
+
 const BOOT_MARKERS: &[&str] = &[
     "MOLT_EXCEPTION_OK",
     "MOLT_MAPPING_OK",
@@ -100,7 +103,14 @@ impl Case {
 fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
     match (arch, case) {
         (Arch::Riscv64, Case::Boot) => &["MOLT_SBI_CONSOLE:", "MOLT_UART_WINDOW:"],
-        (Arch::X86_64, Case::Boot) => &["MOLT_BAR_OK:", "MOLT_MSI_OK:", "MOLT_INTERRUPT_OK:"],
+        (Arch::X86_64, Case::Boot) => &[
+            "MOLT_BAR_OK:",
+            "MOLT_MSI_OK:",
+            "MOLT_INTERRUPT_OK:",
+            "MOLT_VIRTIO_OK:",
+            "MOLT_BLOCK_OK:",
+            "MOLT_VIRTIO_RESET_OK:",
+        ],
         _ => &[],
     }
 }
@@ -136,7 +146,7 @@ fn smoke_case(arch: Arch, case: Case) -> Result<(), String> {
     let (command, binary) = match arch {
         Arch::X86_64 => {
             let images = build_images(case)?;
-            (qemu_x86_64_command(&images.bios), "qemu-system-x86_64")
+            (qemu_x86_64_command(&images.bios)?, "qemu-system-x86_64")
         }
         Arch::Riscv64 => {
             let kernel = build_kernel(RISCV64_TARGET, case)?;
@@ -258,7 +268,7 @@ fn build_kernel(target: &str, case: Case) -> Result<PathBuf, String> {
 }
 
 fn run_qemu_interactive(image: &Path) -> Result<(), String> {
-    let status = qemu_x86_64_command(image)
+    let status = qemu_x86_64_command(image)?
         .arg("-no-shutdown")
         .arg("-serial")
         .arg("mon:stdio")
@@ -267,7 +277,8 @@ fn run_qemu_interactive(image: &Path) -> Result<(), String> {
     check_exit_status(Arch::X86_64, Case::Boot, status)
 }
 
-fn qemu_x86_64_command(image: &Path) -> Command {
+fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
+    let disk = virtio_disk()?;
     let qemu = env::var_os("MOLT_QEMU").unwrap_or_else(|| OsString::from("qemu-system-x86_64"));
     let mut command = Command::new(qemu);
     if let Some(firmware) = env::var_os("MOLT_QEMU_FIRMWARE") {
@@ -283,10 +294,35 @@ fn qemu_x86_64_command(image: &Path) -> Command {
         "-no-reboot",
         "-device",
         "isa-debug-exit,iobase=0xf4,iosize=0x04",
-        "-drive",
     ]);
-    command.arg(format!("format=raw,file={}", image.display()));
-    command
+    command.arg("-drive").arg(format!("format=raw,file={}", image.display()));
+    // The read-only smoke disk rides a modern virtio-blk function so the driver
+    // meets `disable-legacy=on` hardware rather than the legacy transport.
+    command.arg("-drive").arg(format!("if=none,id=molt-disk,format=raw,file={}", disk.display()));
+    command.arg("-device").arg("virtio-blk-pci,drive=molt-disk,disable-legacy=on");
+    Ok(command)
+}
+
+/// A raw one-megabyte disk whose sector zero carries the signature and byte
+/// pattern `kernel/src/virtio.rs` checks the read back against.
+fn virtio_disk() -> Result<PathBuf, String> {
+    const SIGNATURE: &[u8; 8] = b"MOLTDISK";
+    const DISK_BYTES: usize = 1 << 20;
+
+    let image_dir = target_dir(&workspace_root()).join("molt");
+    fs::create_dir_all(&image_dir)
+        .map_err(|error| format!("failed to create {}: {error}", image_dir.display()))?;
+    let path = image_dir.join("molt-disk.img");
+
+    let mut disk = vec![0u8; DISK_BYTES];
+    for (offset, byte) in disk[..SECTOR].iter_mut().enumerate() {
+        *byte = match SIGNATURE.get(offset) {
+            Some(&signed) => signed,
+            None => (offset as u8) ^ 0x5a,
+        };
+    }
+    fs::write(&path, &disk).map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+    Ok(path)
 }
 
 fn qemu_riscv64_command(kernel: &Path) -> Command {
