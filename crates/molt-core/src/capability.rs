@@ -176,6 +176,29 @@ impl<T, const N: usize> CapabilityTable<T, N> {
         slot.resource.as_mut().ok_or(CapabilityError::Stale)
     }
 
+    /// Drops one resource, leaving every capability naming it stale.
+    ///
+    /// A holder closing what it opened needs this; waiting for the owning cell
+    /// to die would leak the slot for as long as the cell lives.
+    pub fn revoke<R: CapabilityRights>(
+        &mut self,
+        capability: Capability<R>,
+    ) -> Result<T, CapabilityError> {
+        let index = capability.index();
+        let generation = capability.generation();
+        let slot = self.slots.get_mut(index).ok_or(CapabilityError::Invalid)?;
+        if slot.generation != generation {
+            return Err(CapabilityError::Stale);
+        }
+        if !slot.rights.contains(R::MASK) {
+            return Err(CapabilityError::InsufficientRights);
+        }
+        let resource = slot.resource.take().ok_or(CapabilityError::Stale)?;
+        slot.rights = Rights(0);
+        slot.advance_generation();
+        Ok(resource)
+    }
+
     pub fn revoke_owner(&mut self, owner: CellId) -> usize {
         let mut revoked = 0;
         for slot in &mut self.slots {

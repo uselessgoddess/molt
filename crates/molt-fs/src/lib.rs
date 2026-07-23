@@ -30,6 +30,8 @@ use molt_core::capability::CapabilityError;
 mod crc;
 mod layout;
 mod name;
+mod op;
+mod service;
 mod volume;
 
 #[cfg(feature = "format")]
@@ -37,6 +39,8 @@ pub mod format;
 
 pub use crate::layout::{BLOCK, Kind, MAX_NAME, Object, SUPERS, VERSION};
 pub use crate::name::Name;
+pub use crate::op::{Dir, File, FsDone, FsOp, Handle};
+pub use crate::service::Fs;
 pub use crate::volume::Volume;
 
 /// Why a filesystem operation failed.
