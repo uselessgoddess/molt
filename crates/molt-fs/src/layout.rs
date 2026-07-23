@@ -166,6 +166,10 @@ impl Super {
     }
 
     /// Writes the superblock into `block`, stamping its checksum last.
+    ///
+    /// Encoders belong to the image builder — a mounted volume only reads — so
+    /// they compile away with the `format` feature.
+    #[cfg(any(feature = "format", test))]
     pub fn encode(&self, block: &mut [u8]) {
         let block = &mut block[..SUPER_BYTES];
         block.fill(0);
@@ -275,6 +279,7 @@ impl Extent {
         Ok(Self { logical: u32_at(record, 0), blocks: u32_at(record, 4), block: u64_at(record, 8) })
     }
 
+    #[cfg(any(feature = "format", test))]
     pub fn encode(&self, record: &mut [u8]) {
         let record = &mut record[..EXTENT_BYTES];
         record.fill(0);
@@ -310,6 +315,7 @@ impl Entry {
         Ok(Self { name_at: u32_at(record, 0), name_len, object: u32_at(record, 8) })
     }
 
+    #[cfg(any(feature = "format", test))]
     pub fn encode(&self, record: &mut [u8]) {
         let record = &mut record[..ENTRY_BYTES];
         record.fill(0);
@@ -337,6 +343,7 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(word)
 }
 
+#[cfg(any(feature = "format", test))]
 fn put_u16(bytes: &mut [u8], at: usize, value: u16) {
     bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
 }

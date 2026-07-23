@@ -543,6 +543,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "molt-shell"
+version = "0.1.0"
+dependencies = [
+ "molt-block",
+ "molt-core",
+ "molt-fs",
+]
+
+[[package]]
 name = "molt-virtio"
 version = "0.1.0"
 dependencies = [
