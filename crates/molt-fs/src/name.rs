@@ -81,7 +81,7 @@ mod tests {
 
     #[test]
     fn name_keeps_its_bytes() {
-        let name = Name::new(b"molt.txt").expect("a short name");
+        let name = Name::new(b"molt.txt").expect("short name");
 
         assert_eq!(name.as_str(), Some("molt.txt"));
     }

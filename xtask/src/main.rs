@@ -457,16 +457,16 @@ mod tests {
     #[test]
     fn smoke_disk_mounts_and_reads_back() {
         let tree = workspace_root().join(DISK_TREE);
-        let image = lay_out(&tree).expect("an image of the smoke tree");
+        let image = lay_out(&tree).expect("image of the smoke tree");
         let mut block = [0u8; BLOCK];
         let mut fs =
             Fs::<_, 4>::mount(Loopback::new(&image).expect("whole sectors"), &mut block).unwrap();
 
         let mut bytes = [0u8; WINDOW];
         let mut buffers = BufferRegistry::<1>::new();
-        let buffer = buffers.register_write(OWNER, &mut bytes).expect("a free slot");
-        let root = fs.root(OWNER).expect("a root handle");
-        let name = Name::try_from("hello.txt").expect("a legal name");
+        let buffer = buffers.register_write(OWNER, &mut bytes).expect("free slot");
+        let root = fs.root(OWNER).expect("root handle");
+        let name = Name::try_from("hello.txt").expect("legal name");
         let opened = fs.apply(OWNER, FsOp::Open { dir: root, name }, &mut buffers).expect("open");
         let Some(Handle::File(file)) = opened.handle() else {
             panic!("hello.txt opened as a directory: {opened:?}");
@@ -474,10 +474,10 @@ mod tests {
 
         let window = BufferOperation::new(buffer, 0, WINDOW);
         let read = fs.apply(OWNER, FsOp::Read { file, buffer: window, offset: 0 }, &mut buffers);
-        let on_disk = fs::read(tree.join("hello.txt")).expect("the file the image was built from");
+        let on_disk = fs::read(tree.join("hello.txt")).expect("file the image was built from");
 
         assert_eq!(read, Ok(FsDone::Read(on_disk.len())));
-        let taken = buffers.resolve_write(window).expect("the same buffer");
+        let taken = buffers.resolve_write(window).expect("same buffer");
         assert_eq!(&taken[..on_disk.len()], &on_disk[..]);
     }
 }
