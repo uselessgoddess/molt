@@ -529,6 +529,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "molt-virtio"
+version = "0.1.0"
+dependencies = [
+ "molt-arch",
+ "molt-pci",
+]
+
+[[package]]
 name = "molt-x86_64"
 version = "0.1.0"
 dependencies = [
