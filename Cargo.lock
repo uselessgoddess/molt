@@ -511,6 +511,7 @@ dependencies = [
  "molt-core",
  "molt-pci",
  "molt-riscv",
+ "molt-virtio",
  "molt-x86_64",
 ]
 

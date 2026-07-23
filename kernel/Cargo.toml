@@ -21,6 +21,7 @@ panic-smoke = []
 molt-arch.workspace = true
 molt-core.workspace = true
 molt-pci.workspace = true
+molt-virtio.workspace = true
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 molt-x86_64.workspace = true
