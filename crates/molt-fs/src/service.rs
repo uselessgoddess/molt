@@ -155,13 +155,13 @@ mod tests {
 
     fn image() -> alloc::vec::Vec<u8> {
         let mut tree = Tree::new();
-        tree.file("hello.txt", b"hello, molt".to_vec()).expect("a legal name");
-        tree.dir("docs").expect("a legal name").file("readme", b"read me".to_vec()).unwrap();
-        build(&tree, 1).expect("an image that fits")
+        tree.file("hello.txt", b"hello, molt".to_vec()).expect("legal name");
+        tree.dir("docs").expect("legal name").file("readme", b"read me".to_vec()).unwrap();
+        build(&tree, 1).expect("image that fits")
     }
 
     fn name(text: &str) -> Name {
-        Name::try_from(text).expect("a legal name")
+        Name::try_from(text).expect("legal name")
     }
 
     #[test]
@@ -171,10 +171,10 @@ mod tests {
         let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("mount");
         let mut buffers = BufferRegistry::<1>::new();
 
-        let root = fs.root(OWNER).expect("a root handle");
+        let root = fs.root(OWNER).expect("root handle");
         let opened = fs
             .apply(OWNER, FsOp::Open { dir: root, name: name("docs") }, &mut buffers)
-            .expect("an open directory");
+            .expect("open directory");
 
         let Some(Handle::Dir(docs)) = opened.handle() else {
             panic!("the root's subdirectory opened as a file: {opened:?}");
@@ -191,12 +191,12 @@ mod tests {
         let mut target = [0u8; 32];
         let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("mount");
         let mut buffers = BufferRegistry::<1>::new();
-        let buffer = buffers.register_write(OWNER, &mut target).expect("a free slot");
+        let buffer = buffers.register_write(OWNER, &mut target).expect("free slot");
 
-        let root = fs.root(OWNER).expect("a root handle");
+        let root = fs.root(OWNER).expect("root handle");
         let opened = fs
             .apply(OWNER, FsOp::Open { dir: root, name: name("hello.txt") }, &mut buffers)
-            .expect("an open file");
+            .expect("open file");
         let Some(Handle::File(file)) = opened.handle() else {
             panic!("a file opened as a directory: {opened:?}");
         };
@@ -204,7 +204,7 @@ mod tests {
         let read = fs.apply(OWNER, FsOp::Read { file, buffer: window, offset: 0 }, &mut buffers);
 
         assert_eq!(read, Ok(FsDone::Read(11)));
-        assert_eq!(buffers.resolve_write(window).expect("the same buffer"), b"hello, molt");
+        assert_eq!(buffers.resolve_write(window).expect("same buffer"), b"hello, molt");
     }
 
     #[test]
@@ -214,7 +214,7 @@ mod tests {
         let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("mount");
         let mut buffers = BufferRegistry::<1>::new();
 
-        let root = fs.root(OWNER).expect("a root handle");
+        let root = fs.root(OWNER).expect("root handle");
         let stat = fs.apply(OWNER, FsOp::Stat(Handle::Dir(root)), &mut buffers);
 
         assert_eq!(stat, Ok(FsDone::Stat(Stat { kind: Kind::Dir, size: 0, entries: 2 })));
@@ -227,7 +227,7 @@ mod tests {
         let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("mount");
         let mut buffers = BufferRegistry::<1>::new();
 
-        let root = fs.root(OWNER).expect("a root handle");
+        let root = fs.root(OWNER).expect("root handle");
         let closed = fs.apply(OWNER, FsOp::Close(Handle::Dir(root)), &mut buffers);
         let after = fs.apply(OWNER, FsOp::Entry { dir: root, index: 0 }, &mut buffers);
 
@@ -242,9 +242,9 @@ mod tests {
         let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("mount");
         let mut buffers = BufferRegistry::<1>::new();
 
-        let root = fs.root(OWNER).expect("a root handle");
+        let root = fs.root(OWNER).expect("root handle");
         fs.apply(OWNER, FsOp::Open { dir: root, name: name("docs") }, &mut buffers)
-            .expect("an open directory");
+            .expect("open directory");
 
         assert_eq!(fs.revoke(OWNER), 2);
     }
@@ -256,7 +256,7 @@ mod tests {
         let mut fs = Fs::<_, 1>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("mount");
         let mut buffers = BufferRegistry::<1>::new();
 
-        let root = fs.root(OWNER).expect("a root handle");
+        let root = fs.root(OWNER).expect("root handle");
         let opened = fs.apply(OWNER, FsOp::Open { dir: root, name: name("docs") }, &mut buffers);
 
         assert_eq!(opened, Err(FsError::Handles));
@@ -271,15 +271,15 @@ mod tests {
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
         let (mut client, mut driver) = ring.split();
 
-        let root = fs.root(OWNER).expect("a root handle");
+        let root = fs.root(OWNER).expect("root handle");
         for (id, index) in [(1, 0), (2, 1)] {
             let op = FsOp::Entry { dir: root, index };
-            client.try_submit(Submission::new(RequestId::new(id), op)).expect("a free slot");
+            client.try_submit(Submission::new(RequestId::new(id), op)).expect("free slot");
         }
         let served = fs.serve(OWNER, &mut driver, &mut buffers);
 
         assert_eq!(served, 2);
-        let first = client.try_completion().expect("a completion");
+        let first = client.try_completion().expect("completion");
         assert_eq!(first.id(), RequestId::new(1));
         assert_eq!(
             first.into_result(),
@@ -288,7 +288,7 @@ mod tests {
                 stat: Stat { kind: Kind::Dir, size: 0, entries: 1 },
             })
         );
-        let second = client.try_completion().expect("a completion");
+        let second = client.try_completion().expect("completion");
         assert_eq!(
             second.into_result(),
             Ok(FsDone::Entry {

@@ -37,11 +37,11 @@ pub fn smoke<P: Platform>(platform: &mut P, device: impl Device) {
 
     let mut bytes = [0u8; WINDOW];
     let mut registry = BufferRegistry::<1>::new();
-    let scratch = registry.register_read_write(OWNER, &mut bytes).expect("a free buffer slot");
+    let scratch = registry.register_read_write(OWNER, &mut bytes).expect("free buffer slot");
     let buffers = RefCell::new(registry);
     let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, RING>::new();
     let (client, mut driver) = ring.split();
-    let session = Session::new(client, &buffers, scratch, WINDOW).expect("a registered scratch");
+    let session = Session::new(client, &buffers, scratch, WINDOW).expect("registered scratch");
 
     // The console borrows the serial port for as long as the shell runs, so the
     // marker below waits until it is given back.
@@ -57,7 +57,7 @@ pub fn smoke<P: Platform>(platform: &mut P, device: impl Device) {
             },
         )
     };
-    ran.expect("a shell that meets only errors it can print");
+    ran.expect("shell that meets only errors it can print");
     report!(platform, "MOLT_SHELL_OK: script ran to the end");
 }
 

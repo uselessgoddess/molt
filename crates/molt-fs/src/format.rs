@@ -229,8 +229,8 @@ mod tests {
 
     #[test]
     fn empty_tree_still_mounts_as_volume() {
-        let image = build(&Tree::new(), 1).expect("an image that fits");
-        let superblock = Super::parse(&image).expect("a superblock");
+        let image = build(&Tree::new(), 1).expect("image that fits");
+        let superblock = Super::parse(&image).expect("superblock");
 
         assert_eq!(superblock.generation, 1);
         assert_eq!(superblock.data_blocks, 0);
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn both_superblock_copies_written() {
-        let image = build(&Tree::new(), 3).expect("an image that fits");
+        let image = build(&Tree::new(), 3).expect("image that fits");
 
         assert_eq!(Super::parse(&image), Super::parse(&image[BLOCK..]));
     }
@@ -246,9 +246,9 @@ mod tests {
     #[test]
     fn image_covers_whole_blocks() {
         let mut tree = Tree::new();
-        tree.file("a", vec![1; BLOCK + 1]).expect("a legal name");
+        tree.file("a", vec![1; BLOCK + 1]).expect("legal name");
 
-        let image = build(&tree, 1).expect("an image that fits");
+        let image = build(&tree, 1).expect("image that fits");
 
         assert_eq!(image.len() % BLOCK, 0);
     }
@@ -256,18 +256,18 @@ mod tests {
     #[test]
     fn hole_costs_no_data_block() {
         let mut tree = Tree::new();
-        tree.file("sparse", vec![0; 4 * BLOCK]).expect("a legal name");
+        tree.file("sparse", vec![0; 4 * BLOCK]).expect("legal name");
 
-        let image = build(&tree, 1).expect("an image that fits");
+        let image = build(&tree, 1).expect("image that fits");
 
-        assert_eq!(Super::parse(&image).expect("a superblock").data_blocks, 0);
+        assert_eq!(Super::parse(&image).expect("superblock").data_blocks, 0);
     }
 
     #[test]
     fn directory_reopens_instead_of_duplicating() {
         let mut tree = Tree::new();
-        tree.dir("docs").expect("a legal name").file("one", vec![]).expect("a legal name");
-        tree.dir("docs").expect("a legal name").file("two", vec![]).expect("a legal name");
+        tree.dir("docs").expect("legal name").file("one", vec![]).expect("legal name");
+        tree.dir("docs").expect("legal name").file("two", vec![]).expect("legal name");
 
         assert_eq!(tree.nodes.len(), 1);
     }
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn directory_over_file_refused() {
         let mut tree = Tree::new();
-        tree.file("name", vec![]).expect("a legal name");
+        tree.file("name", vec![]).expect("legal name");
 
         assert_eq!(tree.dir("name").err(), Some(FsError::Kind));
     }
