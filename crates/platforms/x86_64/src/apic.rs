@@ -13,6 +13,7 @@ pub const APIC_MMIO: u64 = 0xfee0_0000;
 const IA32_APIC_BASE: u32 = 0x1b;
 const APIC_ENABLE: u64 = 1 << 11;
 const APIC_BASE_MASK: u64 = 0xffff_f000;
+const REG_ID: u64 = 0x020;
 const REG_EOI: u64 = 0x0b0;
 const REG_SPURIOUS: u64 = 0x0f0;
 const REG_LVT_TIMER: u64 = 0x320;
@@ -69,6 +70,27 @@ pub fn arm(initial_count: u32) -> Result<(), PlatformError> {
     write(REG_INITIAL_COUNT, initial_count)
 }
 
+/// This processor's local APIC identifier, or zero before [`init`] ran.
+///
+/// Zero is also a legal APIC ID, and that is deliberately not distinguished:
+/// molt starts one processor, so an MSI addressed to destination zero reaches
+/// it either way.
+pub fn id() -> u8 {
+    let base = APIC_VIRTUAL_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return 0;
+    }
+    // SAFETY: `init` derived this direct-mapped base from IA32_APIC_BASE; the
+    // ID register is a naturally aligned 32-bit MMIO location.
+    let raw = unsafe { core::ptr::read_volatile((base + REG_ID) as *const u32) };
+    (raw >> 24) as u8
+}
+
+/// Signals end-of-interrupt to the local APIC.
+pub fn eoi() {
+    let _ = write(REG_EOI, 0);
+}
+
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Acquire)
 }
@@ -86,7 +108,7 @@ pub extern "x86-interrupt" fn timer_interrupt(
     _frame: x86_64::structures::idt::InterruptStackFrame,
 ) {
     TICKS.fetch_add(1, Ordering::Release);
-    let _ = write(REG_EOI, 0);
+    eoi();
 }
 
 pub extern "x86-interrupt" fn spurious_interrupt(

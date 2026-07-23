@@ -142,6 +142,23 @@ never takes, so it could rot silently. `cargo smoke` now also boots a
 `panic-smoke` build per architecture and requires both the `MOLT_PANIC:` marker
 and a failure exit status.
 
+**Markers that only one machine can produce.** Stage 2.2 added the first ones.
+`MOLT_PCI_OK` is required everywhere, but `MOLT_BAR_OK`, `MOLT_MSI_OK`, and
+`MOLT_INTERRUPT_OK` are x86_64-only, because RISC-V mints no MSI vectors yet and
+would have to fake one to print them. `arch_markers` is where that lives, beside
+the RISC-V-only `MOLT_SBI_CONSOLE:`. The rule this follows is the same one the
+hardware-boot item follows: a marker asserts a property the machine actually
+has, and a machine that lacks it says so on the serial line rather than being
+excused quietly.
+
+**The x86_64 smoke boots `q35` with `-device edu`.** Both halves are load-bearing.
+The default `pc` machine publishes no ACPI `MCFG` table, so there is no
+configuration space to enumerate and the PCI smoke would pass by skipping
+itself. And `edu` is the one function on the machine whose interrupt can be
+raised on demand from software, which is what makes asserting a *delivery*
+possible rather than just asserting that a capability was written. See
+[`docs/pci.md`](pci.md).
+
 ## Conventions
 
 Test naming and shape are in [the style guide](style.md). Two rules matter more

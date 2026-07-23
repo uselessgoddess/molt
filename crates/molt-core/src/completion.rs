@@ -11,7 +11,6 @@
 //! state word publishes the [`UnsafeCell`] payload between producer and consumer.
 
 use core::borrow::Borrow;
-use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 

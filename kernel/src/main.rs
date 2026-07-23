@@ -2,7 +2,6 @@
 #![no_main]
 
 use core::fmt::Write;
-use core::future::Future;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 
@@ -14,6 +13,10 @@ use molt_core::capability::{CapabilityError, CapabilityTable, ReadWrite};
 use molt_core::cell::{Cell, CellId, Supervisor};
 use molt_core::completion::{CompletionError, CompletionSlab};
 use molt_core::ring::{Completion, IoRing, Submission};
+
+mod pci;
+
+use molt_kernel::report;
 
 #[cfg(target_arch = "x86_64")]
 molt_x86_64::entry_point!(kernel_main);
@@ -30,7 +33,7 @@ fn write_line<P: Platform>(platform: &mut P, arguments: core::fmt::Arguments<'_>
     let _ = writeln!(SerialWriter::new(platform.serial()), "{arguments}");
 }
 
-macro_rules! println {
+macro_rules! report {
     ($dst:expr, $($arg:tt)*) => {
         write_line($dst, core::format_args!($($arg)*))
     };
@@ -41,31 +44,31 @@ fn kernel_main<P: Platform>(boot_info: BootInfo<'_>, platform: &mut P) -> ! {
     #[cfg(feature = "panic-smoke")]
     panic!("panic-smoke");
 
-    println!(platform, "MOLT: booting");
-    println!(platform, "MOLT: memory regions={}", boot_info.memory_map().len());
+    report!(platform, "MOLT: booting");
+    report!(platform, "MOLT: memory regions={}", boot_info.memory_map().len());
 
     smoke(&boot_info, platform);
 
-    println!(platform, "MOLT_BOOT_OK");
+    report!(platform, "MOLT_BOOT_OK");
     platform.terminate(ExitStatus::Success)
 }
 
 fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     platform.initialize(boot_info).expect("initialize traps and timer source");
     assert!(platform.verify_exception_path(), "breakpoint handler did not return");
-    println!(platform, "MOLT_EXCEPTION_OK");
+    report!(platform, "MOLT_EXCEPTION_OK");
 
     platform.verify_owned_mapping(boot_info).expect("owned W^X mapping probe");
-    println!(platform, "MOLT_MAPPING_OK");
+    report!(platform, "MOLT_MAPPING_OK");
 
     platform.verify_image_protection(boot_info).expect("kernel image obeys W^X");
-    println!(platform, "MOLT_WX_OK");
+    report!(platform, "MOLT_WX_OK");
 
     platform.verify_device_window(boot_info).expect("device window mapped and reachable");
-    println!(platform, "MOLT_DEVICE_WINDOW_OK");
+    report!(platform, "MOLT_DEVICE_WINDOW_OK");
 
     run_timer_future(platform);
-    println!(platform, "MOLT_TIMER_OK");
+    report!(platform, "MOLT_TIMER_OK");
 
     let slab = CompletionSlab::<u32, 2>::new();
     let cancelled = slab.reserve().expect("free cancellation slot");
@@ -75,17 +78,19 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
         Err(CompletionError::Stale),
         "cancelled request accepted a stale completion"
     );
-    println!(platform, "MOLT_CANCELLATION_OK");
-    println!(platform, "MOLT_STALE_COMPLETION_OK");
+    report!(platform, "MOLT_CANCELLATION_OK");
+    report!(platform, "MOLT_STALE_COMPLETION_OK");
 
     verify_cell_restart();
-    println!(platform, "MOLT_RESTART_OK");
+    report!(platform, "MOLT_RESTART_OK");
 
     let usable = verify_inventory(boot_info);
-    println!(platform, "MOLT_PHYSMAP_OK");
+    report!(platform, "MOLT_PHYSMAP_OK");
 
     verify_frame_ownership(usable);
-    println!(platform, "MOLT_FRAME_OWNER_OK");
+    report!(platform, "MOLT_FRAME_OWNER_OK");
+
+    pci::smoke(boot_info, platform);
 }
 
 const OWNED_FRAMES: u64 = 4;

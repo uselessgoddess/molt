@@ -137,6 +137,16 @@ frames.release(queue)?;
   (`MappingError::Permissions`) and may not be write-back
   (`MappingError::Cacheability`); RAM may not be mapped with device ordering;
   `Reserved` may not be mapped at all.
+- `Inventory::device` accepts `Kind::Reserved` as well as `Kind::Device`, and
+  hands back a window governed by the `Device` policy either way. Stage 2.2
+  forced this: the two firmwares describe one ECAM window differently — a
+  device tree leaves it as a hole in the memory node, e820 lists it as an
+  explicit reservation — and refusing the reservation would have made
+  enumeration impossible on x86_64 for a reason that is about the format of the
+  map rather than about the memory. `Kind::Ram` and `Kind::Image` stay refused,
+  which is the property the check exists for. Note that this only widens what
+  may become a *window*: `Kind::allows` still refuses to map `Reserved`
+  directly, so nothing gained a way to map RAM.
 - `Rights` is read/write/execute with W^X rejected at construction, and a
   read bit made explicit because DMA needs "readable, not writable" and
   Stage 1's `MapPermissions` could not say that.
