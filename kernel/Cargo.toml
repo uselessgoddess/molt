@@ -19,6 +19,7 @@ panic-smoke = []
 
 [dependencies]
 molt-arch.workspace = true
+molt-block.workspace = true
 molt-core.workspace = true
 molt-pci.workspace = true
 molt-virtio.workspace = true

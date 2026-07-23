@@ -496,6 +496,10 @@ name = "molt-arch"
 version = "0.1.0"
 
 [[package]]
+name = "molt-block"
+version = "0.1.0"
+
+[[package]]
 name = "molt-core"
 version = "0.1.0"
 dependencies = [
@@ -508,6 +512,7 @@ name = "molt-kernel"
 version = "0.1.0"
 dependencies = [
  "molt-arch",
+ "molt-block",
  "molt-core",
  "molt-pci",
  "molt-riscv",
@@ -534,6 +539,7 @@ name = "molt-virtio"
 version = "0.1.0"
 dependencies = [
  "molt-arch",
+ "molt-block",
  "molt-pci",
 ]
 

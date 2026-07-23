@@ -1,9 +1,10 @@
 use molt_arch::dma::Arena;
 use molt_arch::memory::{Inventory, Owner, Rights};
 use molt_arch::{BootInfo, FrameAllocator, Platform, SerialWriter};
+use molt_block::{Device, SECTOR};
 use molt_kernel::report;
 use molt_pci::{Bus, Command, bus_span};
-use molt_virtio::{Block, SECTOR, Transport};
+use molt_virtio::{Block, Transport};
 
 /// QEMU's modern virtio-blk-pci function (`disable-legacy=on`).
 const VIRTIO_VENDOR: u16 = 0x1af4;
@@ -61,6 +62,9 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let notify = registers
         .subwindow(delta + transport.notify().offset() as u64, transport.notify().length() as u64)
         .expect("the notify structure inside the BAR");
+    let config = registers
+        .subwindow(delta + transport.device().offset() as u64, transport.device().length() as u64)
+        .expect("the device-configuration structure inside the BAR");
 
     let command = function.command().expect("the command register");
     function
@@ -80,7 +84,7 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let arena = Arena::claim(&mut allocator, offset, BLOCK_TAG, &mut slots)
         .expect("contiguous device frames past the kernel's own");
 
-    let mut block = Block::start(common, notify, transport.notify_multiplier(), arena)
+    let mut block = Block::start(common, notify, config, transport.notify_multiplier(), arena)
         .expect("the device completes its handshake");
 
     let mut sector = [0u8; SECTOR];
