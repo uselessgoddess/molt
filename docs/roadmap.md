@@ -169,13 +169,32 @@ orders it — is deliberately absent rather than stubbed; see `docs/virtio.md`.
 
 ### Stage 2.4 — Something to run
 
-- [ ] read-only filesystem and an async shell cell
-- [ ] deterministic integration tests using QEMU virtual devices
+- [x] `molt-block`: a `Device` trait every storage driver implements, so a
+      filesystem never sees a virtqueue and a loopback disk tests it on the host
+- [x] MoltROFS: a read-only, checksummed, extent-based format with a
+      generation-stamped superblock kept in two copies
+- [x] `FsOp`/`FsCompletion` over an `IoRing`, addressed by `Capability<Dir>` and
+      `Capability<File>` with no paths and no ambient root
+- [x] `cargo xtask mkfs <tree> <image>`, which lays a directory tree out as a
+      mountable image
+- [x] an async shell — `ls`, `cat`, `help` — driven by one task over that ring
+- [x] `MOLT_FS_OK` and `MOLT_SHELL_OK` on x86_64, with the shell's own output
+      required on the serial line so the markers cover disk to console
+- [x] `docs/fs.md`
 
 Acceptance: the kernel maps every device window through a typed, audited path,
-completes block I/O through a ring using frames it owns, and reclaims those
-frames deterministically on reset — with the live-table audit passing on both
-platforms.
+completes block I/O through a ring using frames it owns, reclaims those frames
+deterministically on reset, and prints a file from that disk through a
+filesystem addressed only by capability — with the live-table audit passing on
+both platforms.
+
+Two decisions are recorded rather than checked off. The filesystem is not a cell
+yet: the ring is the seam a cell boundary would need and it is load-bearing
+today, but wrapping `Fs` in `Cell` before there is a second client and a remount
+story would buy a layer whose content is the word "wraps". And the block driver
+is called rather than awaited: a `BlockOp` ring worth having comes with
+readahead and a cache, both of which want the writable filesystem's structure.
+Both are argued in `docs/fs.md`.
 
 ## Stage 3 — Services and networking
 

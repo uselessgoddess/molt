@@ -189,12 +189,16 @@ What no host test can show is that a queue built from claimed frames, a device
 brought up over a mapped BAR, and a physical address handed across the DMA
 boundary all describe the same disk. The only proof is a sector reading back
 correct, so the x86_64 smoke attaches a `virtio-blk-pci,disable-legacy=on`
-function backed by a raw disk `xtask` signs — `MOLTDISK` and an offset-keyed
-byte pattern in sector zero — brings the device up, reads sector zero, checks it
-against the signature, and resets. It requires `MOLT_VIRTIO_OK`,
-`MOLT_BLOCK_OK`, and `MOLT_VIRTIO_RESET_OK` on the serial line, the last of
-which is the queue-reset ordering proving itself: the device stopped, then the
-frames came back.
+function backed by a MoltROFS image `xtask mkfs` lays out from the `disk/` tree,
+brings the device up, reads sector zero, checks it against the volume's
+`MOLTROFS` magic, and resets. It requires `MOLT_VIRTIO_OK`, `MOLT_BLOCK_OK`, and
+`MOLT_VIRTIO_RESET_OK` on the serial line, the last of which is the queue-reset
+ordering proving itself: the device stopped, then the frames came back.
+
+The disk is a real filesystem rather than a signed pattern so that one artifact
+carries the whole path: the same bytes this driver reads are what Stage 2.4's
+filesystem mounts and its shell prints, and the markers between `MOLT_BLOCK_OK`
+and `MOLT_VIRTIO_RESET_OK` are that filesystem's. See [`docs/fs.md`](fs.md).
 
 The RISC-V smoke does not run it. The `virt` board hands out no DMA frames to
 this path — `free_frames` is `None` — so the driver reports

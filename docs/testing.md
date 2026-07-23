@@ -159,6 +159,24 @@ raised on demand from software, which is what makes asserting a *delivery*
 possible rather than just asserting that a capability was written. See
 [`docs/pci.md`](pci.md).
 
+**The smoke disk is a filesystem, not a pattern.** Stage 2.4 replaced the signed
+sector the virtio smoke used to read with a real MoltROFS image: `cargo xtask
+mkfs <tree> <image>` lays a host directory tree out as a mountable volume, and
+the smoke builds one from the `disk/` tree in the repository. One artifact then
+proves the whole path, because the markers it produces are the same bytes seen
+at four heights — `MOLT_BLOCK_OK` for the sector, `MOLT_FS_OK` for the mount,
+and then the shell's own `molt> cat hello.txt` and `hello, molt` lines before
+`MOLT_SHELL_OK`. Requiring the shell's output rather than only its marker is the
+point: a marker says a component ran, and the echoed file says the file's
+contents survived the driver, the format, and the ring. See
+[`docs/fs.md`](fs.md).
+
+Everything under those markers that can be tested without a machine is. The
+`Device` trait has a `Loopback` implementation over bytes in memory, so
+`molt-fs` mounts real images built by its own writer on the host, and `xtask`
+lays out the smoke tree and mounts it back — which keeps the image honest even
+where QEMU is not installed.
+
 ## Conventions
 
 Test naming and shape are in [the style guide](style.md). Two rules matter more
