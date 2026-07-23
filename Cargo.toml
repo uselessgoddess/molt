@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/molt-arch",
     "xtask",
+    "crates/molt-block",
     "crates/molt-core",
     "crates/molt-pci",
     "crates/molt-virtio",
@@ -12,6 +13,7 @@ members = [
 default-members = [
     "xtask",
     "crates/molt-arch",
+    "crates/molt-block",
     "crates/molt-core",
     "crates/molt-pci",
     "crates/molt-virtio",
@@ -25,6 +27,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 molt-arch = { path = "crates/molt-arch" }
+molt-block = { path = "crates/molt-block" }
 molt-core = { path = "crates/molt-core" }
 molt-pci = { path = "crates/molt-pci" }
 molt-virtio = { path = "crates/molt-virtio" }

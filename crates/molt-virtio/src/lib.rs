@@ -8,9 +8,12 @@
 //! read sectors and, on [`reset`](Block::reset), to reclaim every frame only
 //! after the device has been told to stop.
 //!
+//! Above the driver there is only [`molt_block::Device`], which [`Block`]
+//! implements: sectors in, sectors out, with the virtqueue invisible.
+//!
 //! The write path is deliberately absent. Stage 2.4's filesystem is read-only,
 //! so the driver never issues a flush and never hands the device a writable
-//! sector — the one operation is [`read`](Block::read).
+//! sector — the one operation is a read.
 
 #![no_std]
 
@@ -26,9 +29,10 @@ mod transport;
 
 use molt_arch::MmioError;
 use molt_arch::dma::DmaError;
+use molt_block::BlockError;
 use molt_pci::PciError;
 
-pub use crate::block::{Block, SECTOR};
+pub use crate::block::Block;
 pub use crate::config::Common;
 pub use crate::notify::Notify;
 pub use crate::queue::{Queue, Segment, Used};
@@ -71,5 +75,20 @@ impl From<MmioError> for VirtioError {
 impl From<DmaError> for VirtioError {
     fn from(error: DmaError) -> Self {
         Self::Dma(error)
+    }
+}
+
+/// Collapses a driver failure into what a filesystem can act on.
+///
+/// Everything that is not a timeout or an out-of-range request is the device
+/// refusing to answer correctly, which no caller above can distinguish or
+/// retry differently.
+impl From<VirtioError> for BlockError {
+    fn from(error: VirtioError) -> Self {
+        match error {
+            VirtioError::Timeout => Self::Timeout,
+            VirtioError::Dma(DmaError::Range) => Self::Range,
+            _ => Self::Device,
+        }
     }
 }
