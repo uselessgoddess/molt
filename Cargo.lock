@@ -511,6 +511,7 @@ dependencies = [
  "molt-core",
  "molt-pci",
  "molt-riscv",
+ "molt-virtio",
  "molt-x86_64",
 ]
 
@@ -526,6 +527,14 @@ name = "molt-riscv"
 version = "0.1.0"
 dependencies = [
  "molt-arch",
+]
+
+[[package]]
+name = "molt-virtio"
+version = "0.1.0"
+dependencies = [
+ "molt-arch",
+ "molt-pci",
 ]
 
 [[package]]

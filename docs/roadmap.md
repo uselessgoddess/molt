@@ -154,10 +154,18 @@ driver, so the RISC-V smoke enumerates and stops.
 
 ### Stage 2.3 — VirtIO block
 
-- [ ] a VirtIO block driver whose queues are `Owner::Device` frames
-- [ ] registered DMA buffers; no raw physical address in a public operation
-- [ ] cancellation, timeout, queue reset, and backpressure semantics
-- [ ] queue reset that reclaims frames only after the device is told to stop
+- [x] a VirtIO block driver whose queues are `Owner::Device` frames
+- [x] registered DMA buffers; no raw physical address in a public operation
+- [x] cancellation, timeout, queue reset, and backpressure semantics
+- [x] queue reset that reclaims frames only after the device is told to stop
+- [x] `MOLT_VIRTIO_OK`, `MOLT_BLOCK_OK`, and `MOLT_VIRTIO_RESET_OK` on x86_64,
+      where a signed virtio-blk disk proves a sector read completes through a
+      ring the kernel owns and the reset returns its frames
+- [x] `docs/virtio.md`
+
+The read path is the whole path this stage builds. Stage 2.4's filesystem is
+read-only, so the write side — a `VIRTIO_BLK_T_OUT` chain and the flush that
+orders it — is deliberately absent rather than stubbed; see `docs/virtio.md`.
 
 ### Stage 2.4 — Something to run
 

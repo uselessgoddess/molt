@@ -22,6 +22,7 @@ mod msi;
 
 use core::fmt;
 
+use molt_arch::memory::Span;
 use molt_arch::pci::BUS_STRIDE;
 use molt_arch::{ConfigSpace, Mmio, MmioError};
 
@@ -109,13 +110,13 @@ impl fmt::Display for Address {
 /// Buses are mapped one at a time rather than all at once: a whole segment is
 /// 256 MiB of window for what is usually a handful of functions, and a mapping
 /// that large is a large thing to get wrong.
-pub fn bus_span(space: ConfigSpace, bus: u8) -> Result<molt_arch::memory::Span, PciError> {
+pub fn bus_span(space: ConfigSpace, bus: u8) -> Result<Span, PciError> {
     if bus < space.first_bus() || bus > space.last_bus() {
         return Err(PciError::Address);
     }
     let span = space.span().map_err(|_| PciError::Address)?;
     let start = span.start() + (bus - space.first_bus()) as u64 * BUS_STRIDE;
-    molt_arch::memory::Span::new(start, start + BUS_STRIDE).map_err(|_| PciError::Address)
+    Span::new(start, start + BUS_STRIDE).map_err(|_| PciError::Address)
 }
 
 /// The functions that answer on one mapped bus.

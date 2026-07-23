@@ -14,6 +14,7 @@ use molt_core::completion::{CompletionError, CompletionSlab};
 use molt_core::ring::{Completion, IoRing, Submission};
 
 mod pci;
+mod virtio;
 
 use molt_kernel::report;
 
@@ -80,6 +81,7 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     report!(platform, "MOLT_FRAME_OWNER_OK");
 
     pci::smoke(boot_info, platform);
+    virtio::smoke(boot_info, platform);
 }
 
 const OWNED_FRAMES: u64 = 4;
