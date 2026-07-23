@@ -19,6 +19,7 @@ mod register {
     pub const DRIVER_FEATURE: u64 = 0x0c;
     pub const NUM_QUEUES: u64 = 0x12;
     pub const DEVICE_STATUS: u64 = 0x14;
+    pub const CONFIG_GENERATION: u64 = 0x15;
     pub const QUEUE_SELECT: u64 = 0x16;
     pub const QUEUE_SIZE: u64 = 0x18;
     pub const QUEUE_ENABLE: u64 = 0x1c;
@@ -118,6 +119,14 @@ impl<'w> Common<'w> {
         self.window.write_u32(register::DRIVER_FEATURE_SELECT, 1)?;
         self.window.write_u32(register::DRIVER_FEATURE, (features >> 32) as u32)?;
         Ok(())
+    }
+
+    /// The counter a device bumps around a device-configuration change.
+    ///
+    /// A multi-word config field is only coherent if this reads the same before
+    /// and after the field itself.
+    pub fn config_generation(&self) -> Result<u8, VirtioError> {
+        Ok(self.window.read_u8(register::CONFIG_GENERATION)?)
     }
 
     pub fn num_queues(&self) -> Result<u16, VirtioError> {

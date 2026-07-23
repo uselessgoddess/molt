@@ -1,17 +1,17 @@
 [package]
-name = "xtask"
+name = "molt-fs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
 
-[lints]
-workspace = true
+[features]
+default = ["format"]
+format = []
 
 [dependencies]
-bootloader = "0.11.15"
-molt-fs = { workspace = true, features = ["format"] }
-
-[dev-dependencies]
 molt-block.workspace = true
 molt-core.workspace = true
+
+[lib]
+bench = false

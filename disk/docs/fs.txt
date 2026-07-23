@@ -1,0 +1,4 @@
+MoltROFS, read-only.
+
+Built by `cargo xtask mkfs`, mounted by the kernel over virtio-blk, and
+read by the shell through the same ring any other cell would use.

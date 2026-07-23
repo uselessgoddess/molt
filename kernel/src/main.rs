@@ -13,6 +13,7 @@ use molt_core::cell::{Cell, CellId, Supervisor};
 use molt_core::completion::{CompletionError, CompletionSlab};
 use molt_core::ring::{Completion, IoRing, Submission};
 
+mod fs;
 mod pci;
 mod virtio;
 

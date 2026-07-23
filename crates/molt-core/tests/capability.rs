@@ -26,6 +26,18 @@ fn typed_caps_revoked_by_cell() {
 }
 
 #[test]
+fn revoked_cap_frees_its_slot() {
+    let owner = CellId::new(3);
+    let mut table = CapabilityTable::<Buffer, 1>::new();
+    let read = table.insert::<Read>(owner, Buffer(5)).unwrap();
+
+    assert_eq!(table.revoke(read), Ok(Buffer(5)));
+    assert_eq!(table.get(read), Err(CapabilityError::Stale));
+    assert_eq!(table.revoke(read), Err(CapabilityError::Stale));
+    assert!(table.insert::<Read>(owner, Buffer(6)).is_ok(), "the slot stayed taken");
+}
+
+#[test]
 fn attenuation_cannot_add_rights() {
     let mut table = CapabilityTable::<Buffer, 1>::new();
     let read = table.insert::<Read>(CellId::new(1), Buffer(1)).unwrap();
