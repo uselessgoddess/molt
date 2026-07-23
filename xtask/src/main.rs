@@ -157,6 +157,12 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
             "MOLT_INTERRUPT_OK:",
             "MOLT_VIRTIO_OK:",
             "MOLT_BLOCK_OK:",
+            "MOLT_FS_OK:",
+            // The shell's own output, so the markers cover the whole path from
+            // the disk to the console and not just the mount.
+            "molt> cat hello.txt",
+            "hello, molt",
+            "MOLT_SHELL_OK:",
             "MOLT_VIRTIO_RESET_OK:",
         ],
         _ => &[],

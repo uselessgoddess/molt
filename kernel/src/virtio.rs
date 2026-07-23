@@ -10,8 +10,8 @@ use molt_virtio::{Block, Transport};
 const VIRTIO_VENDOR: u16 = 0x1af4;
 const VIRTIO_BLOCK: u16 = 0x1042;
 
-/// The signature `xtask` writes at the start of sector zero.
-const SIGNATURE: [u8; 8] = *b"MOLTDISK";
+/// What a MoltROFS volume starts with, which is what `xtask` puts on the disk.
+const SIGNATURE: [u8; 8] = molt_fs::MAGIC;
 const DMA_FRAMES: usize = 8;
 const BLOCK_TAG: u32 = 0xb10c;
 
@@ -89,16 +89,13 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
 
     let mut sector = [0u8; SECTOR];
     block.read(0, &mut sector).expect("sector zero reads back");
-    verify(&sector);
-    report!(platform, "MOLT_BLOCK_OK: sector zero matches the signed disk");
+    assert_eq!(&sector[..SIGNATURE.len()], &SIGNATURE, "sector zero holds no volume signature");
+    report!(platform, "MOLT_BLOCK_OK: sector zero carries the volume signature");
+
+    // The filesystem borrows the driver, so the device is still this function's
+    // to stop afterwards.
+    crate::fs::smoke(platform, &mut block);
 
     block.reset().expect("the device stops and its frames return");
     report!(platform, "MOLT_VIRTIO_RESET_OK: device stopped and frames reclaimed");
-}
-
-fn verify(sector: &[u8; SECTOR]) {
-    assert_eq!(&sector[..SIGNATURE.len()], &SIGNATURE, "sector zero lacks the disk signature");
-    for (index, &byte) in sector.iter().enumerate().skip(SIGNATURE.len()) {
-        assert_eq!(byte, (index as u8) ^ 0x5a, "sector zero byte {index} broke the pattern");
-    }
 }
