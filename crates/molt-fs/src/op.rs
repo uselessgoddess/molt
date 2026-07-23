@@ -77,17 +77,29 @@ pub enum FsOp {
     Close(Handle),
 }
 
+/// What an object is: a file's length, or a directory's entry count.
+///
+/// A listing carries this per entry because the volume has already read the
+/// object record to answer at all — asking again through [`FsOp::Stat`] would
+/// cost a round trip per name for something the first answer knew.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Stat {
+    pub kind: Kind,
+    pub size: u64,
+    pub entries: u32,
+}
+
 /// What an operation produced.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FsDone {
     /// A handle to what was opened.
     Opened(Handle),
-    /// One directory entry: its name and what kind of object it names.
-    Entry { name: Name, kind: Kind },
+    /// One directory entry: its name and what it names.
+    Entry { name: Name, stat: Stat },
     /// How many bytes landed in the buffer; short only at the end of a file.
     Read(usize),
-    /// What a handle refers to: a file's length, or a directory's entry count.
-    Stat { kind: Kind, size: u64, entries: u32 },
+    /// What a handle refers to.
+    Stat(Stat),
     /// The handle is gone.
     Closed,
 }
