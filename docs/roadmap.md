@@ -173,7 +173,7 @@ orders it — is deliberately absent rather than stubbed; see `docs/virtio.md`.
       filesystem never sees a virtqueue and a loopback disk tests it on the host
 - [x] MoltROFS: a read-only, checksummed, extent-based format with a
       generation-stamped superblock kept in two copies
-- [x] `FsOp`/`FsCompletion` over an `IoRing`, addressed by `Capability<Dir>` and
+- [x] `FsOp`/`FsDone` over an `IoRing`, addressed by `Capability<Dir>` and
       `Capability<File>` with no paths and no ambient root
 - [x] `cargo xtask mkfs <tree> <image>`, which lays a directory tree out as a
       mountable image
