@@ -19,6 +19,20 @@ pub trait Device {
     fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError>;
 }
 
+/// Reading through a borrow, so a caller can mount a driver it still owns.
+///
+/// A filesystem takes its device by value; a kernel that has to reset the same
+/// driver afterwards lends it instead.
+impl<D: Device + ?Sized> Device for &mut D {
+    fn sectors(&self) -> u64 {
+        (**self).sectors()
+    }
+
+    fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        (**self).read(sector, buf)
+    }
+}
+
 /// Checks `buf` against the device geometry, returning the sectors it spans.
 pub fn bounds(sectors: u64, sector: u64, buf: &[u8]) -> Result<u64, BlockError> {
     if buf.len() % SECTOR != 0 {
