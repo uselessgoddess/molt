@@ -1,0 +1,17 @@
+[package]
+name = "molt-fs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = ["format"]
+format = []
+
+[dependencies]
+molt-block.workspace = true
+molt-core.workspace = true
+
+[lib]
+bench = false

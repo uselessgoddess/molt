@@ -5,6 +5,7 @@ members = [
     "xtask",
     "crates/molt-block",
     "crates/molt-core",
+    "crates/molt-fs",
     "crates/molt-pci",
     "crates/molt-virtio",
     "crates/platforms/*",
@@ -15,6 +16,7 @@ default-members = [
     "crates/molt-arch",
     "crates/molt-block",
     "crates/molt-core",
+    "crates/molt-fs",
     "crates/molt-pci",
     "crates/molt-virtio",
     "crates/platforms/*",
@@ -29,6 +31,7 @@ rust-version = "1.85"
 molt-arch = { path = "crates/molt-arch" }
 molt-block = { path = "crates/molt-block" }
 molt-core = { path = "crates/molt-core" }
+molt-fs = { path = "crates/molt-fs" }
 molt-pci = { path = "crates/molt-pci" }
 molt-virtio = { path = "crates/molt-virtio" }
 molt-riscv = { path = "crates/platforms/riscv" }
