@@ -447,6 +447,10 @@ use. Reads cover the boundary cases that a hand-written offset loop gets wrong â
 across a block boundary, from a hole in a sparse file, at the end of a file, and
 past it.
 
+A checksum-valid but impossible extent is still refused: physical block
+arithmetic is checked before a data read, so a malformed address cannot wrap
+into another region or panic the reader.
+
 The service tests cover the protocol rather than the format: an open walks from
 the root handle, a read lands in a registered buffer and nowhere else, a closed
 handle goes stale, a revoked owner loses every handle at once, and a table with

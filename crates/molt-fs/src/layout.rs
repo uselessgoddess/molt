@@ -304,11 +304,14 @@ impl Extent {
     }
 
     /// The physical block holding `logical`, if this extent covers it.
-    pub const fn covers(&self, logical: u32) -> Option<u64> {
+    pub fn covers(&self, logical: u32) -> Result<Option<u64>, FsError> {
         if logical < self.logical || logical - self.logical >= self.blocks {
-            return None;
+            return Ok(None);
         }
-        Some(self.block + (logical - self.logical) as u64)
+        match self.block.checked_add((logical - self.logical) as u64) {
+            Some(block) => Ok(Some(block)),
+            None => Err(FsError::Corrupt),
+        }
     }
 }
 
@@ -485,8 +488,8 @@ mod tests {
     fn extent_covers_its_own_blocks_only() {
         let extent = Extent { logical: 4, blocks: 2, block: 100 };
 
-        assert_eq!(extent.covers(5), Some(101));
-        assert_eq!(extent.covers(6), None, "an extent claimed a block past its end");
+        assert_eq!(extent.covers(5), Ok(Some(101)));
+        assert_eq!(extent.covers(6), Ok(None), "an extent claimed a block past its end");
     }
 
     #[test]

@@ -139,7 +139,7 @@ impl<'buf, D: Device> Volume<'buf, D> {
             let middle = low + (high - low) / 2;
             let index = file.start.checked_add(middle).ok_or(FsError::Corrupt)?;
             let extent = Extent::parse(self.record(Area::Extents, index as u64, EXTENT_BYTES)?)?;
-            if let Some(block) = extent.covers(logical) {
+            if let Some(block) = extent.covers(logical)? {
                 return Ok(Some(block));
             }
             if extent.logical < logical {
@@ -261,8 +261,9 @@ mod tests {
     use molt_block::Loopback;
 
     use super::Volume;
+    use crate::crc::crc32c;
     use crate::format::{Tree, build};
-    use crate::layout::{Area, BLOCK, Kind};
+    use crate::layout::{Area, BLOCK, Kind, Super};
     use crate::{FsError, MAX_NAME};
 
     fn image() -> alloc::vec::Vec<u8> {
@@ -384,6 +385,28 @@ mod tests {
         let file = volume.object(id).expect("file object");
 
         assert_eq!(volume.read(&file, 0, &mut [0; 8]), Err(FsError::Checksum));
+    }
+
+    #[test]
+    fn extent_physical_overflow_refused() {
+        let mut bytes = image();
+        let mut superblock = Super::parse(&bytes[..BLOCK]).expect("superblock");
+        let mut extents = superblock.region(Area::Extents);
+        let at = extents.at as usize * BLOCK;
+        bytes[at + 8..at + 16].copy_from_slice(&u64::MAX.to_le_bytes());
+        extents.crc = crc32c(&bytes[at..at + extents.bytes as usize]);
+        superblock.set_region(Area::Extents, extents);
+        for copy in 0..super::SUPERS {
+            superblock.encode(&mut bytes[copy as usize * BLOCK..]);
+        }
+
+        let mut buffer = [0u8; BLOCK];
+        let mut volume = mount(&bytes, &mut buffer);
+        let root = volume.object(volume.root()).expect("root object");
+        let id = volume.lookup(&root, b"big.bin").expect("name in the root");
+        let file = volume.object(id).expect("file object");
+
+        assert_eq!(volume.read(&file, BLOCK as u64, &mut [0; 8]), Err(FsError::Corrupt));
     }
 
     #[test]
