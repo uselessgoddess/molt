@@ -105,7 +105,7 @@ fn read_tree(tree: &mut Tree, dir: &Path) -> Result<(), String> {
             .file_name()
             .into_string()
             .map_err(|name| format!("{name:?} is not a UTF-8 name"))?;
-        let kind = entry.file_type().map_err(|error| read(error))?;
+        let kind = entry.file_type().map_err(&read)?;
         let named = |error| format!("{} cannot go into an image: {error:?}", path.display());
         if kind.is_dir() {
             read_tree(tree.dir(&name).map_err(named)?, &path)?;
