@@ -325,11 +325,15 @@ impl<'m> Inventory<'m> {
         Ok(kind)
     }
 
-    /// A device window at `span`, if firmware left that span to devices.
+    /// A device window at `span`, if firmware did not claim it as memory.
+    ///
+    /// [`Kind::Reserved`] qualifies alongside [`Kind::Device`]: e820 reports
+    /// ECAM as an explicit reservation, a device tree leaves it as a hole —
+    /// same window, two formats. [`Kind::Ram`] and [`Kind::Image`] stay refused.
     pub fn device(&self, span: Span) -> Result<Device, Error> {
         match self.classify(span)? {
-            Kind::Device => Ok(Device { span }),
-            _ => Err(Error::Kind),
+            Kind::Device | Kind::Reserved => Ok(Device { span }),
+            Kind::Ram | Kind::Image => Err(Error::Kind),
         }
     }
 }

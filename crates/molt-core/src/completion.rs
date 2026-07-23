@@ -5,7 +5,6 @@
 //! Acquire/Release operations publish the payload without a spin lock.
 
 use core::borrow::Borrow;
-use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 

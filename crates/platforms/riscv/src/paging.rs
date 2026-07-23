@@ -8,10 +8,10 @@ use core::arch::asm;
 use core::cell::UnsafeCell;
 
 use molt_arch::audit::{Audit, Declared, Leaf, MappedRange, PageWalk};
-use molt_arch::memory::{Cache, Inventory, Kind, Rights, Span};
+use molt_arch::memory::{Cache, Device, Inventory, Kind, Rights, Span};
 use molt_arch::{
-    BootInfo, FrameAllocator, FrameCursor, ImageSection, MapPermissions, MappingError,
-    PageProtection, PhysicalFrame, PlatformError, UsableRegions,
+    BootInfo, FrameAllocator, FrameCursor, FramePool, ImageSection, MapPermissions, MappingError,
+    Mmio, PageProtection, PhysicalFrame, PlatformError, UsableRegions,
 };
 
 const PTE_V: u64 = 1 << 0;
@@ -41,9 +41,20 @@ unsafe extern "C" {
     static __kernel_end: u8;
 }
 
+/// Usable free-RAM ranges the audit stores inline. QEMU `virt` exposes one.
 const MAX_RAM_RANGES: usize = 8;
 
-type MappingLog = Declared<{ 3 + MAX_RAM_RANGES + 1 }>;
+/// Device windows the kernel may map: UART, ECAM, and a handful of BARs.
+const MAX_DEVICE_RANGES: usize = 8;
+
+/// Three image sections, free-RAM regions, and device windows.
+type MappingLog = Declared<{ 3 + MAX_RAM_RANGES + MAX_DEVICE_RANGES }>;
+
+/// Page-table frames drained at boot for mappings made after the memory map
+/// is gone. One level-0 table per 2 MiB a window spans, one level-1 per
+/// gigabyte; the largest window is one ECAM bus (256 functions, one table).
+/// Running short is `MappingError::OutOfFrames`, not corruption.
+const TABLE_FRAMES: usize = 160;
 
 macro_rules! bound {
     ($symbol:ident) => {
@@ -54,7 +65,14 @@ macro_rules! bound {
 struct BootPaging {
     root: *mut u64,
     cursor: FrameCursor,
+    /// Table frames drained out of the boot allocator while the memory map was
+    /// still borrowable, for mappings made after it is gone.
+    pool: FramePool<TABLE_FRAMES>,
+    /// Every mapped range, in the order [`init`] built them.
     log: MappingLog,
+    /// The next free device address; bumps forward and never back, so a window
+    /// handed out once is never handed out again.
+    devices: usize,
 }
 
 struct Active(UnsafeCell<Option<BootPaging>>);
@@ -112,20 +130,26 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
         log.push(MappedRange::ram(range.start(), range.end())).map_err(PlatformError::Mapping)?;
     }
 
+    let mut pool = FramePool::empty();
+    pool.fill(&mut frames);
+
     let cursor = frames.cursor();
     // SAFETY: every address the kernel executes from, reads, or writes — code,
     // constants, stack, and the page tables themselves — was just identity
     // mapped, so translation can be switched on in place.
     unsafe {
         enable_sv39(root as u64);
-        *ACTIVE.0.get() = Some(BootPaging { root, cursor, log });
+    }
+    // SAFETY: same reasoning as `active`; this runs once on the boot hart.
+    unsafe {
+        *ACTIVE.0.get() = Some(BootPaging { root, cursor, pool, log, devices: DEVICE_REGION });
     }
     Ok(())
 }
 
 fn map_section(
     root: *mut u64,
-    frames: &mut FrameAllocator<'_>,
+    frames: &mut dyn Frames,
     log: &mut MappingLog,
     section: ImageSection,
     start: usize,
@@ -261,6 +285,65 @@ pub fn verify_device_window(boot_info: &BootInfo<'_>) -> Result<(), PlatformErro
     walk_leaves(state.root, &state.log.audit(), &inventory)
 }
 
+/// Where device windows live: 128 GiB, clear of RAM and inside Sv39's lower
+/// canonical half. Not identity-mapped — a driver that reaches a device by
+/// guessing its physical address has not been given a capability.
+const DEVICE_REGION: usize = 0x20_0000_0000;
+const DEVICE_REGION_END: usize = DEVICE_REGION + (1 << 30);
+
+/// Maps one device window into the boot address space.
+///
+/// Sv39 without `Svpbmt` has no cacheability bits in a PTE: uncached ordering
+/// comes from the physical address's PMA. The check that matters is
+/// [`Inventory::device`] refusing a span firmware called RAM — a window into
+/// RAM would be cacheable by hardware regardless of what this code asks.
+pub fn map_device(window: Device, rights: Rights) -> Result<Mmio<'static>, MappingError> {
+    let (rights, _cache) = window.mapping(rights)?;
+    let span = window.span();
+    let bytes = usize::try_from(span.bytes()).map_err(|_| MappingError::InvalidAddress)?;
+
+    let state = active().map_err(mapping_error)?;
+    let base = state.devices;
+    let end = base.checked_add(bytes).ok_or(MappingError::InvalidAddress)?;
+    if end > DEVICE_REGION_END {
+        return Err(MappingError::OutOfFrames);
+    }
+
+    state.log.push(MappedRange::device(base as u64, end as u64))?;
+    let mut address = 0;
+    while address < bytes {
+        // Level zero only: a megapage would reach past the window.
+        map_leaf(
+            state.root,
+            &mut state.pool,
+            base + address,
+            span.start() + address as u64,
+            leaf_flags(rights),
+            0,
+        )
+        .map_err(mapping_error)?;
+        address += PAGE_4K;
+    }
+    // SAFETY: the new leaves are in memory; the fence retires any negative
+    // caching of the window from before it was mapped.
+    unsafe {
+        asm!("sfence.vma", options(nostack));
+    }
+
+    state.devices = end.next_multiple_of(PAGE_2M);
+    // SAFETY: every frame of `span` was just mapped at `base`, never
+    // executable, and never unmapped. The cursor only moves forward.
+    Ok(unsafe { Mmio::new(base as *mut u8, span.bytes()) })
+}
+
+/// The mapping error inside a [`PlatformError`], for the paths that report one.
+fn mapping_error(error: PlatformError) -> MappingError {
+    match error {
+        PlatformError::Mapping(error) => error,
+        _ => MappingError::Backend,
+    }
+}
+
 /// Sv39 leaf flags for `rights`, with access and dirty pre-set.
 fn leaf_flags(rights: Rights) -> u64 {
     let mut flags = PTE_A;
@@ -364,6 +447,23 @@ impl PageWalk for TableWalk<'_> {
     }
 }
 
+/// Somewhere page-table frames come from.
+trait Frames {
+    fn take(&mut self) -> Option<u64>;
+}
+
+impl Frames for FrameAllocator<'_> {
+    fn take(&mut self) -> Option<u64> {
+        self.allocate().map(PhysicalFrame::start)
+    }
+}
+
+impl<const N: usize> Frames for FramePool<N> {
+    fn take(&mut self) -> Option<u64> {
+        self.allocate().map(PhysicalFrame::start)
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Granularity {
     Small,
@@ -372,7 +472,7 @@ enum Granularity {
 
 fn map_range(
     root: *mut u64,
-    frames: &mut FrameAllocator<'_>,
+    frames: &mut dyn Frames,
     start: usize,
     end: usize,
     rights: u64,
@@ -396,7 +496,7 @@ fn map_range(
 
 fn map_leaf(
     root: *mut u64,
-    frames: &mut FrameAllocator<'_>,
+    frames: &mut dyn Frames,
     va: usize,
     pa: u64,
     flags: u64,
@@ -438,14 +538,13 @@ fn pte(pa: u64, flags: u64) -> u64 {
     ((pa >> 12) << 10) | flags | PTE_V
 }
 
-fn alloc_frame(frames: &mut FrameAllocator<'_>) -> Result<u64, PlatformError> {
-    frames
-        .allocate()
-        .map(PhysicalFrame::start)
-        .ok_or(PlatformError::Mapping(MappingError::OutOfFrames))
+/// Allocates one frame and returns its physical base address.
+fn alloc_frame(frames: &mut dyn Frames) -> Result<u64, PlatformError> {
+    frames.take().ok_or(PlatformError::Mapping(MappingError::OutOfFrames))
 }
 
-fn alloc_table(frames: &mut FrameAllocator<'_>) -> Result<*mut u64, PlatformError> {
+/// Allocates and zeroes one frame for use as a page table.
+fn alloc_table(frames: &mut dyn Frames) -> Result<*mut u64, PlatformError> {
     let frame = alloc_frame(frames)?;
     let table = frame as *mut u64;
     // SAFETY: every frame the allocator hands out is identity mapped — before

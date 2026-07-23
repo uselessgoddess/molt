@@ -34,7 +34,7 @@ riscv64gc-check:
 bench-check:
     cargo bench --package molt-core --no-run
 
-pre: fmt-check lint test doc x86_64-check riscv64gc-check bench-check
+pre: fmt-check lint test doc x86_64-check riscv64gc-check bench-check loom
 
 image:
     cargo image

@@ -21,6 +21,7 @@ const BOOT_MARKERS: &[&str] = &[
     "MOLT_RESTART_OK",
     "MOLT_PHYSMAP_OK",
     "MOLT_FRAME_OWNER_OK",
+    "MOLT_PCI_OK",
     "MOLT_BOOT_OK",
 ];
 
@@ -99,6 +100,7 @@ impl Case {
 fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
     match (arch, case) {
         (Arch::Riscv64, Case::Boot) => &["MOLT_SBI_CONSOLE:", "MOLT_UART_WINDOW:"],
+        (Arch::X86_64, Case::Boot) => &["MOLT_BAR_OK:", "MOLT_MSI_OK:", "MOLT_INTERRUPT_OK:"],
         _ => &[],
     }
 }
@@ -272,6 +274,10 @@ fn qemu_x86_64_command(image: &Path) -> Command {
         command.arg("-L").arg(firmware);
     }
     command.args([
+        "-machine",
+        "q35",
+        "-device",
+        "edu",
         "-display",
         "none",
         "-no-reboot",

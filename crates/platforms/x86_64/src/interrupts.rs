@@ -10,7 +10,7 @@ use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::structures::tss::TaskStateSegment;
 
-use crate::{apic, emergency_write};
+use crate::{apic, emergency_write, msi};
 
 const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
@@ -69,6 +69,8 @@ pub fn init() {
         }
         idt[apic::TIMER_VECTOR].set_handler_fn(apic::timer_interrupt);
         idt[apic::SPURIOUS_VECTOR].set_handler_fn(apic::spurious_interrupt);
+
+        msi::install(&mut idt);
         idt
     });
     idt.load();
