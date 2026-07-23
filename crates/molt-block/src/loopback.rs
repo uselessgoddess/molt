@@ -67,6 +67,22 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_device_reads_like_owned() {
+        // Taking the device by value is what a filesystem does when it mounts.
+        fn first_sector(mut device: impl Device) -> [u8; SECTOR] {
+            let mut sector = [0u8; SECTOR];
+            device.read(0, &mut sector).expect("first sector");
+            sector
+        }
+
+        let image = [0xa5u8; SECTOR];
+        let mut device = Loopback::new(&image).expect("whole sectors");
+
+        assert_eq!(first_sector(&mut device), image);
+        assert_eq!(device.sectors(), 1, "lending it back does not consume it");
+    }
+
+    #[test]
     fn partial_image_refused() {
         assert!(matches!(Loopback::new(&[0; SECTOR + 1]), Err(BlockError::Unaligned)));
     }
