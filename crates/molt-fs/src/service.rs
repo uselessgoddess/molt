@@ -12,7 +12,7 @@ use molt_core::ring::{Completion, IoDriver};
 
 use crate::FsError;
 use crate::layout::{BLOCK, Kind, Object};
-use crate::op::{Dir, File, FsDone, FsOp, Handle};
+use crate::op::{Dir, File, FsDone, FsOp, Handle, Stat};
 use crate::volume::Volume;
 
 /// A mounted volume behind a capability table.
@@ -67,21 +67,14 @@ impl<'buf, D: Device, const N: usize> Fs<'buf, D, N> {
             FsOp::Entry { dir, index } => {
                 let parent = *self.open.get(dir)?;
                 let (name, object) = self.volume.entry(&parent, index)?;
-                Ok(FsDone::Entry { name, kind: self.volume.object(object)?.kind })
+                Ok(FsDone::Entry { name, stat: stat(&self.volume.object(object)?) })
             }
             FsOp::Read { file, buffer, offset } => {
                 let object = *self.open.get(file)?;
                 let target = buffers.resolve_write(buffer)?;
                 self.volume.read(&object, offset, target).map(FsDone::Read)
             }
-            FsOp::Stat(handle) => {
-                let object = self.object(handle)?;
-                let entries = match object.kind {
-                    Kind::Dir => object.count,
-                    Kind::File => 0,
-                };
-                Ok(FsDone::Stat { kind: object.kind, size: object.size, entries })
-            }
+            FsOp::Stat(handle) => Ok(FsDone::Stat(stat(&self.object(handle)?))),
             FsOp::Close(handle) => {
                 match handle {
                     Handle::Dir(dir) => self.open.revoke(dir)?,
@@ -137,6 +130,14 @@ impl<'buf, D: Device, const N: usize> Fs<'buf, D, N> {
     }
 }
 
+/// A directory counts entries and has no length; a file is the reverse.
+fn stat(object: &Object) -> Stat {
+    match object.kind {
+        Kind::Dir => Stat { kind: Kind::Dir, size: 0, entries: object.count },
+        Kind::File => Stat { kind: Kind::File, size: object.size, entries: 0 },
+    }
+}
+
 #[cfg(all(test, feature = "format"))]
 mod tests {
     use molt_block::Loopback;
@@ -147,7 +148,7 @@ mod tests {
     use super::Fs;
     use crate::format::{Tree, build};
     use crate::layout::{BLOCK, Kind};
-    use crate::op::{FsDone, FsOp, Handle};
+    use crate::op::{FsDone, FsOp, Handle, Stat};
     use crate::{FsError, Name};
 
     const OWNER: CellId = CellId::new(4);
@@ -216,7 +217,7 @@ mod tests {
         let root = fs.root(OWNER).expect("a root handle");
         let stat = fs.apply(OWNER, FsOp::Stat(Handle::Dir(root)), &mut buffers);
 
-        assert_eq!(stat, Ok(FsDone::Stat { kind: Kind::Dir, size: 0, entries: 2 }));
+        assert_eq!(stat, Ok(FsDone::Stat(Stat { kind: Kind::Dir, size: 0, entries: 2 })));
     }
 
     #[test]
@@ -280,11 +281,20 @@ mod tests {
         assert_eq!(served, 2);
         let first = client.try_completion().expect("a completion");
         assert_eq!(first.id(), RequestId::new(1));
-        assert_eq!(first.into_result(), Ok(FsDone::Entry { name: name("docs"), kind: Kind::Dir }));
+        assert_eq!(
+            first.into_result(),
+            Ok(FsDone::Entry {
+                name: name("docs"),
+                stat: Stat { kind: Kind::Dir, size: 0, entries: 1 },
+            })
+        );
         let second = client.try_completion().expect("a completion");
         assert_eq!(
             second.into_result(),
-            Ok(FsDone::Entry { name: name("hello.txt"), kind: Kind::File })
+            Ok(FsDone::Entry {
+                name: name("hello.txt"),
+                stat: Stat { kind: Kind::File, size: 11, entries: 0 },
+            })
         );
     }
 }

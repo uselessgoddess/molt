@@ -39,7 +39,7 @@ pub mod format;
 
 pub use crate::layout::{BLOCK, Kind, MAX_NAME, Object, SUPERS, VERSION};
 pub use crate::name::Name;
-pub use crate::op::{Dir, File, FsDone, FsOp, Handle};
+pub use crate::op::{Dir, File, FsDone, FsOp, Handle, Stat};
 pub use crate::service::Fs;
 pub use crate::volume::Volume;
 
