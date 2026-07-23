@@ -1,0 +1,13 @@
+[package]
+name = "molt-virtio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+molt-arch.workspace = true
+molt-pci.workspace = true
+
+[lib]
+bench = false

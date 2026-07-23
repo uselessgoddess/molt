@@ -69,6 +69,14 @@ fn active() -> Result<&'static mut Space, PlatformError> {
     unsafe { &mut *ACTIVE.0.get() }.as_mut().ok_or(PlatformError::Mapping(MappingError::Unmapped))
 }
 
+/// A cursor past the RAM the address space is already built out of.
+///
+/// Boot drained tables and cloned windows up to this point; a driver resumes a
+/// [`BootFrameAllocator`] here to back DMA out of frames no live mapping owns.
+pub fn free_frames() -> Option<FrameCursor> {
+    active().ok().map(|state| state.cursor)
+}
+
 /// Builds the kernel address space and returns its local APIC window.
 pub fn init(boot_info: &BootInfo<'_>) -> Result<u64, PlatformError> {
     let offset = boot_info.physical_offset().ok_or(PlatformError::MissingPhysicalMemoryMap)?;
