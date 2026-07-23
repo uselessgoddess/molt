@@ -1104,6 +1104,9 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "bootloader",
+ "molt-block",
+ "molt-core",
+ "molt-fs",
 ]
 
 [[package]]

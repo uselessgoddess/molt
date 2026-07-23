@@ -6,12 +6,13 @@ use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
 use bootloader::{BiosBoot, UefiBoot};
+use molt_fs::format::{Tree, build};
 
 const X86_64_TARGET: &str = "x86_64-unknown-none";
 const RISCV64_TARGET: &str = "riscv64gc-unknown-none-elf";
 
-/// One disk sector, the unit the virtio smoke disk is signed in.
-const SECTOR: usize = 512;
+/// The tree the smoke disk is built from, relative to the workspace root.
+const DISK_TREE: &str = "disk";
 
 const BOOT_MARKERS: &[&str] = &[
     "MOLT_EXCEPTION_OK",
@@ -64,12 +65,59 @@ fn run() -> Result<(), String> {
             }
             smoke(selection.as_deref())
         }
+        Some("mkfs") => match (args.next(), args.next(), args.next()) {
+            (Some(tree), Some(image), None) => mkfs(Path::new(&tree), Path::new(&image)),
+            _ => Err(usage()),
+        },
         _ => Err(usage()),
     }
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <image|boot|smoke [x86_64|riscv64|all]>".into()
+    "usage: cargo xtask <image|boot|smoke [x86_64|riscv64|all]|mkfs <tree> <image>>".into()
+}
+
+/// Writes the tree at `tree` out as a mountable MoltROFS image.
+fn mkfs(tree: &Path, image: &Path) -> Result<(), String> {
+    let bytes = lay_out(tree)?;
+    fs::write(image, &bytes)
+        .map_err(|error| format!("failed to write {}: {error}", image.display()))?;
+    println!("{}: {} bytes from {}", image.display(), bytes.len(), tree.display());
+    Ok(())
+}
+
+fn lay_out(tree: &Path) -> Result<Vec<u8>, String> {
+    let mut root = Tree::new();
+    read_tree(&mut root, tree)?;
+    build(&root, 1).map_err(|error| format!("failed to lay out {}: {error:?}", tree.display()))
+}
+
+/// Reads `dir` into `tree`, in name order so the image is reproducible.
+fn read_tree(tree: &mut Tree, dir: &Path) -> Result<(), String> {
+    let read = |error| format!("failed to read {}: {error}", dir.display());
+    let mut entries: Vec<fs::DirEntry> =
+        fs::read_dir(dir).map_err(read)?.collect::<Result<_, _>>().map_err(read)?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+
+    for entry in entries {
+        let path = entry.path();
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|name| format!("{name:?} is not a UTF-8 name"))?;
+        let kind = entry.file_type().map_err(|error| read(error))?;
+        let named = |error| format!("{} cannot go into an image: {error:?}", path.display());
+        if kind.is_dir() {
+            read_tree(tree.dir(&name).map_err(named)?, &path)?;
+        } else if kind.is_file() {
+            let bytes = fs::read(&path)
+                .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+            tree.file(&name, bytes).map_err(named)?;
+        } else {
+            return Err(format!("{} is neither file nor directory", path.display()));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -301,23 +349,19 @@ fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
     Ok(command)
 }
 
+/// Builds the disk the smoke test hands to QEMU.
+///
+/// It is a real MoltROFS image rather than a signed pattern, so the block read
+/// and the shell's `cat` prove the same bytes end to end.
 fn virtio_disk() -> Result<PathBuf, String> {
-    const SIGNATURE: &[u8; 8] = b"MOLTDISK";
-    const DISK_BYTES: usize = 1 << 20;
-
-    let image_dir = target_dir(&workspace_root()).join("molt");
+    let root = workspace_root();
+    let image_dir = target_dir(&root).join("molt");
     fs::create_dir_all(&image_dir)
         .map_err(|error| format!("failed to create {}: {error}", image_dir.display()))?;
     let path = image_dir.join("molt-disk.img");
 
-    let mut disk = vec![0u8; DISK_BYTES];
-    for (offset, byte) in disk[..SECTOR].iter_mut().enumerate() {
-        *byte = match SIGNATURE.get(offset) {
-            Some(&signed) => signed,
-            None => (offset as u8) ^ 0x5a,
-        };
-    }
-    fs::write(&path, &disk)
+    let image = lay_out(&root.join(DISK_TREE))?;
+    fs::write(&path, &image)
         .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
     Ok(path)
 }
@@ -386,4 +430,48 @@ fn target_dir(root: &Path) -> PathBuf {
 
 fn cargo() -> OsString {
     env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use molt_block::Loopback;
+    use molt_core::buffer::{BufferOperation, BufferRegistry};
+    use molt_core::capability::CellId;
+    use molt_fs::{BLOCK, Fs, FsDone, FsOp, Handle, Name};
+
+    use super::{DISK_TREE, lay_out, workspace_root};
+
+    const OWNER: CellId = CellId::new(1);
+    const WINDOW: usize = 64;
+
+    /// The disk QEMU is handed must be a volume the kernel can mount, and the
+    /// bytes in it must be the ones on disk here.
+    #[test]
+    fn smoke_disk_mounts_and_reads_back() {
+        let tree = workspace_root().join(DISK_TREE);
+        let image = lay_out(&tree).expect("an image of the smoke tree");
+        let mut block = [0u8; BLOCK];
+        let mut fs =
+            Fs::<_, 4>::mount(Loopback::new(&image).expect("whole sectors"), &mut block).unwrap();
+
+        let mut bytes = [0u8; WINDOW];
+        let mut buffers = BufferRegistry::<1>::new();
+        let buffer = buffers.register_write(OWNER, &mut bytes).expect("a free slot");
+        let root = fs.root(OWNER).expect("a root handle");
+        let name = Name::try_from("hello.txt").expect("a legal name");
+        let opened = fs.apply(OWNER, FsOp::Open { dir: root, name }, &mut buffers).expect("open");
+        let Some(Handle::File(file)) = opened.handle() else {
+            panic!("hello.txt opened as a directory: {opened:?}");
+        };
+
+        let window = BufferOperation::new(buffer, 0, WINDOW);
+        let read = fs.apply(OWNER, FsOp::Read { file, buffer: window, offset: 0 }, &mut buffers);
+        let on_disk = fs::read(tree.join("hello.txt")).expect("the file the image was built from");
+
+        assert_eq!(read, Ok(FsDone::Read(on_disk.len())));
+        let taken = buffers.resolve_write(window).expect("the same buffer");
+        assert_eq!(&taken[..on_disk.len()], &on_disk[..]);
+    }
 }
