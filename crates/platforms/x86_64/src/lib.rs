@@ -22,9 +22,9 @@ pub use bootloader_api::{
 };
 use molt_arch::memory::{Device, Rights};
 use molt_arch::{
-    BootInfo, ConfigSpace, DeviceMapper, ExitStatus, FabricError, ImageRange, InterruptFabric,
-    MappingError, MemoryMap, MemoryRegion, MemoryRegionKind, Mmio, MsiMessage, Platform,
-    PlatformError, SerialPort, Sink,
+    BootInfo, ConfigSpace, DeviceMapper, ExitStatus, FabricError, FrameCursor, ImageRange,
+    InterruptFabric, MappingError, MemoryMap, MemoryRegion, MemoryRegionKind, Mmio, MsiMessage,
+    Platform, PlatformError, SerialPort, Sink,
 };
 
 /// Fixed boot-stack window cloned into kernel-owned page tables.
@@ -220,6 +220,10 @@ impl Platform for X86_64 {
 
     fn wait_for_timer_change(&mut self, previous: u64) {
         apic::wait_for_change(previous);
+    }
+
+    fn free_frames(&self) -> Option<FrameCursor> {
+        memory::free_frames()
     }
 
     fn terminate(&mut self, status: ExitStatus) -> ! {

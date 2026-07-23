@@ -3,6 +3,7 @@
 //! Hardware-independent contracts shared by the kernel and architecture crates.
 
 pub mod audit;
+pub mod dma;
 pub mod irq;
 pub mod memory;
 pub mod mmio;
@@ -559,6 +560,15 @@ pub trait Platform: DeviceMapper + InterruptFabric {
         while self.monotonic_ticks() == previous {
             core::hint::spin_loop();
         }
+    }
+
+    /// A cursor past the RAM the kernel's own tables and image already own.
+    ///
+    /// A driver resumes a [`FrameAllocator`] here to back DMA out of frames no
+    /// live mapping claims. A platform that cannot say returns `None`, and the
+    /// driver goes without.
+    fn free_frames(&self) -> Option<FrameCursor> {
+        None
     }
 
     fn terminate(&mut self, status: ExitStatus) -> !;
