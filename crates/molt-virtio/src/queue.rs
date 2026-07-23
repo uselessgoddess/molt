@@ -103,7 +103,7 @@ pub struct Queue {
 impl Queue {
     /// Lays a queue of `size` descriptors over its three regions.
     ///
-    /// `size` must be a power of two no larger than [`MAX_SIZE`], and each
+    /// `size` must be a power of two no larger than `MAX_SIZE`, and each
     /// region must be large enough for its structure; anything else is a
     /// programming error the device would turn into silent corruption.
     pub fn new(
@@ -131,7 +131,16 @@ impl Queue {
         for slot in 0..size {
             free[slot as usize] = size - 1 - slot;
         }
-        Ok(Self { descriptors, driver, device, size, free, available: size, avail_idx: 0, used_seen: 0 })
+        Ok(Self {
+            descriptors,
+            driver,
+            device,
+            size,
+            free,
+            available: size,
+            avail_idx: 0,
+            used_seen: 0,
+        })
     }
 
     pub const fn size(&self) -> u16 {

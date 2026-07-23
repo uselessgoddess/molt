@@ -4,7 +4,7 @@
 //! A driver hands the device physical addresses and touches the same bytes
 //! through a CPU pointer. [`Region`] carries the pair, so a public operation
 //! never passes a raw physical address around, and [`Arena`] hands regions out
-//! of one span of [`Owner::Device`](crate::memory::Owner::Device) frames it
+//! of one span of [`Owner::Device`] frames it
 //! reclaims as a whole once the device has been told to stop.
 
 use crate::memory::{Error as MemoryError, FrameTable, Frames, Owner, Span};
@@ -187,7 +187,7 @@ impl Region {
 /// whole.
 ///
 /// The arena claims a bounded, contiguous span as a single
-/// [`Owner::Device`](crate::memory::Owner::Device) [`Frames`] token, then
+/// [`Owner::Device`] [`Frames`] token, then
 /// bump-allocates frame-granular regions out of it. It is reclaimed by
 /// [`reset`](Arena::reset), which the caller invokes only after the device has
 /// been told to stop touching the frames.
@@ -378,7 +378,10 @@ mod tests {
         let mut allocator = FrameAllocator::new(&map);
         let mut slots = [None; 2];
 
-        assert_eq!(Arena::claim(&mut allocator, 0, 0, &mut slots).err(), Some(DmaError::NotContiguous));
+        assert_eq!(
+            Arena::claim(&mut allocator, 0, 0, &mut slots).err(),
+            Some(DmaError::NotContiguous)
+        );
     }
 
     #[test]

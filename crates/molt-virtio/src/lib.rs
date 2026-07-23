@@ -24,15 +24,15 @@ mod queue;
 mod request;
 mod transport;
 
+use molt_arch::MmioError;
+use molt_arch::dma::DmaError;
+use molt_pci::PciError;
+
 pub use crate::block::{Block, SECTOR};
 pub use crate::config::Common;
 pub use crate::notify::Notify;
 pub use crate::queue::{Queue, Segment, Used};
 pub use crate::transport::{Location, Structure, Transport};
-
-use molt_arch::MmioError;
-use molt_arch::dma::DmaError;
-use molt_pci::PciError;
 
 /// Why a VirtIO request was refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

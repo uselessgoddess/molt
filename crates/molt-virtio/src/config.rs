@@ -141,7 +141,12 @@ impl<'w> Common<'w> {
     }
 
     /// Programs the selected queue's three ring physical addresses.
-    pub fn set_queue_rings(&mut self, desc: u64, driver: u64, device: u64) -> Result<(), VirtioError> {
+    pub fn set_queue_rings(
+        &mut self,
+        desc: u64,
+        driver: u64,
+        device: u64,
+    ) -> Result<(), VirtioError> {
         self.window.write_u64(register::QUEUE_DESC, desc)?;
         self.window.write_u64(register::QUEUE_DRIVER, driver)?;
         self.window.write_u64(register::QUEUE_DEVICE, device)?;

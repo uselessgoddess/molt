@@ -113,7 +113,7 @@ impl<'slots, 'w> Block<'slots, 'w> {
     /// Reads `sector` into `buf`, which must fit in the data region.
     ///
     /// Submits the three-descriptor read chain, kicks the device, and polls its
-    /// completion. A device that does not answer within [`TIMEOUT_SPINS`] has
+    /// completion. A device that does not answer within `TIMEOUT_SPINS` has
     /// its request cancelled — the slot stays reserved until the device returns
     /// it — and the read fails with [`VirtioError::Timeout`].
     pub fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), VirtioError> {

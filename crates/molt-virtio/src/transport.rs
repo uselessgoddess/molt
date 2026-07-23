@@ -172,7 +172,14 @@ mod tests {
 
         /// Adds a `virtio_pci_cap` of `config_type` at `offset`, chaining it
         /// onto the capability list.
-        fn cap(&mut self, offset: usize, config_type: u8, bar: u8, at: u32, length: u32) -> &mut Self {
+        fn cap(
+            &mut self,
+            offset: usize,
+            config_type: u8,
+            bar: u8,
+            at: u32,
+            length: u32,
+        ) -> &mut Self {
             match self.last {
                 Some(previous) => self.bytes[previous + 1] = offset as u8,
                 None => {

@@ -70,7 +70,8 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
 
     // The BAR is classified against the same firmware map the kernel's RAM came
     // from, so a device claiming a base inside RAM is refused rather than mapped.
-    let bar = function.bar(bar_index).expect("a readable BAR").expect("the BAR the transport named");
+    let bar =
+        function.bar(bar_index).expect("a readable BAR").expect("the BAR the transport named");
     let span = bar.span().expect("a frame-aligned BAR span");
     let device = inventory.device(span).expect("a BAR outside the kernel's RAM");
     let registers = platform.map_device(device, Rights::READ_WRITE).expect("a mappable BAR");

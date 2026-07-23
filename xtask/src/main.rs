@@ -321,7 +321,8 @@ fn virtio_disk() -> Result<PathBuf, String> {
             None => (offset as u8) ^ 0x5a,
         };
     }
-    fs::write(&path, &disk).map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+    fs::write(&path, &disk)
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
     Ok(path)
 }
 
