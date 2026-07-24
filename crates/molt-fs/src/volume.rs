@@ -274,7 +274,7 @@ mod tests {
         build(&tree, 1).expect("image that fits")
     }
 
-    fn mount<'a>(bytes: &'a [u8], block: &'a mut [u8; BLOCK]) -> Volume<'a, Loopback<'a>> {
+    fn mount<'a>(bytes: &'a [u8], block: &'a mut [u8; BLOCK]) -> Volume<'a, Loopback<&'a [u8]>> {
         Volume::mount(Loopback::new(bytes).expect("whole sectors"), block).expect("live volume")
     }
 

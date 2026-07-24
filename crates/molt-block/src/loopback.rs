@@ -1,35 +1,56 @@
 //! A device backed by bytes that are already in memory.
 
-use crate::{BlockError, Device, SECTOR, bounds};
+use crate::{BlockError, Device, Disk, SECTOR, bounds};
 
 /// Storage read straight out of an image the caller holds.
 ///
 /// This is what a filesystem test runs on, and what a kernel serves a built-in
 /// image from: the same [`Device`] the virtio driver offers, with none of the
-/// hardware. It borrows rather than owns, so `molt-block` needs no allocator.
-pub struct Loopback<'i> {
-    image: &'i [u8],
+/// hardware. The backing is whatever holds the bytes — a borrowed `&[u8]` for
+/// a read-only image, an owned `Vec<u8>` or `&mut [u8]` for one a checkpoint
+/// writes — so `molt-block` still needs no allocator of its own.
+pub struct Loopback<B> {
+    image: B,
 }
 
-impl<'i> Loopback<'i> {
+impl<B: AsRef<[u8]>> Loopback<B> {
     /// Wraps `image`, which must be a whole number of sectors.
-    pub fn new(image: &'i [u8]) -> Result<Self, BlockError> {
-        if image.len() % SECTOR != 0 {
+    pub fn new(image: B) -> Result<Self, BlockError> {
+        if image.as_ref().len() % SECTOR != 0 {
             return Err(BlockError::Unaligned);
         }
         Ok(Self { image })
     }
+
+    /// Hands the backing bytes back, as a crash test does to remount them.
+    pub fn into_inner(self) -> B {
+        self.image
+    }
 }
 
-impl Device for Loopback<'_> {
+impl<B: AsRef<[u8]>> Device for Loopback<B> {
     fn sectors(&self) -> u64 {
-        (self.image.len() / SECTOR) as u64
+        (self.image.as_ref().len() / SECTOR) as u64
     }
 
     fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
         bounds(self.sectors(), sector, buf)?;
         let at = sector as usize * SECTOR;
-        buf.copy_from_slice(&self.image[at..at + buf.len()]);
+        buf.copy_from_slice(&self.image.as_ref()[at..at + buf.len()]);
+        Ok(())
+    }
+}
+
+impl<B: AsRef<[u8]> + AsMut<[u8]>> Disk for Loopback<B> {
+    fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), BlockError> {
+        bounds(self.sectors(), sector, buf)?;
+        let at = sector as usize * SECTOR;
+        self.image.as_mut()[at..at + buf.len()].copy_from_slice(buf);
+        Ok(())
+    }
+
+    // Memory is durable the instant it is written, so ordering is already kept.
+    fn flush(&mut self) -> Result<(), BlockError> {
         Ok(())
     }
 }
@@ -37,7 +58,7 @@ impl Device for Loopback<'_> {
 #[cfg(test)]
 mod tests {
     use super::Loopback;
-    use crate::{BlockError, Device, SECTOR};
+    use crate::{BlockError, Device, Disk, SECTOR};
 
     #[test]
     fn sector_reads_back_what_image_holds() {
@@ -84,5 +105,30 @@ mod tests {
     #[test]
     fn partial_image_refused() {
         assert!(matches!(Loopback::new(&[0; SECTOR + 1]), Err(BlockError::Unaligned)));
+    }
+
+    #[test]
+    fn write_lands_where_a_read_finds_it() {
+        let mut device = Loopback::new([0u8; 2 * SECTOR]).expect("whole sectors");
+
+        device.write(1, &[0xa5; SECTOR]).expect("second sector");
+        let mut sector = [0u8; SECTOR];
+        device.read(1, &mut sector).expect("second sector");
+
+        assert_eq!(sector, [0xa5; SECTOR], "the write did not reach the sector");
+    }
+
+    #[test]
+    fn write_past_end_refused() {
+        let mut device = Loopback::new([0u8; SECTOR]).expect("whole sectors");
+
+        assert_eq!(device.write(1, &[0; SECTOR]), Err(BlockError::Range));
+    }
+
+    #[test]
+    fn partial_sector_write_refused() {
+        let mut device = Loopback::new([0u8; SECTOR]).expect("whole sectors");
+
+        assert_eq!(device.write(0, &[0; SECTOR + 1]), Err(BlockError::Unaligned));
     }
 }
