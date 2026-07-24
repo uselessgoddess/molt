@@ -174,7 +174,8 @@ impl<'w> Common<'w> {
 mod tests {
     use molt_arch::Mmio;
 
-    use super::{Common, register};
+    use super::{Common, VERSION_1, register};
+    use crate::VirtioError;
 
     fn common(bytes: &mut [u8]) -> Common<'_> {
         // SAFETY: the slice outlives the borrow, is uniquely borrowed, and no
@@ -202,6 +203,39 @@ mod tests {
         common.add_status(super::status::DRIVER).expect("a legal write");
 
         assert_eq!(registers[register::DEVICE_STATUS as usize], 0b11);
+    }
+
+    #[test]
+    fn negotiate_keeps_offered_feature() {
+        let mut registers = [0u8; 64];
+        // A flat register file returns the same dword for both feature halves,
+        // so bit 0 stands in for VERSION_1 (bit 32) and bit 9 for the wanted one.
+        registers[register::DEVICE_FEATURE as usize] = 0b1;
+        registers[register::DEVICE_FEATURE as usize + 1] = 0b10;
+        let mut common = common(&mut registers);
+
+        let accepted = common.negotiate(1 << 9).expect("a modern device");
+
+        assert_eq!(accepted, VERSION_1 | (1 << 9), "the offered feature was dropped");
+    }
+
+    #[test]
+    fn negotiate_drops_unoffered_feature() {
+        let mut registers = [0u8; 64];
+        registers[register::DEVICE_FEATURE as usize] = 0b1;
+        let mut common = common(&mut registers);
+
+        let accepted = common.negotiate(1 << 9).expect("a modern device");
+
+        assert_eq!(accepted, VERSION_1, "an unoffered feature was accepted");
+    }
+
+    #[test]
+    fn legacy_device_refused() {
+        let mut registers = [0u8; 64];
+        let mut common = common(&mut registers);
+
+        assert_eq!(common.negotiate(0), Err(VirtioError::Features));
     }
 
     #[test]

@@ -3,21 +3,23 @@
 //!
 //! [`Block::start`] runs the modern initialization sequence and programs a
 //! single queue out of an [`Arena`] of device-owned frames. [`Block::read`]
-//! issues one read request and polls the used ring for it, giving up with
-//! [`VirtioError::Timeout`] after a bounded spin so a wedged device cannot hang
-//! the caller. [`Block::reset`] stops the device *before* it hands the frames
-//! back, so no in-flight DMA can land in a reclaimed frame.
+//! and [`Block::write`] issue one request and poll the used ring for it, giving
+//! up with [`VirtioError::Timeout`] after a bounded spin so a wedged device
+//! cannot hang the caller. [`Block::reset`] stops the device *before* it hands
+//! the frames back, so no in-flight DMA can land in a reclaimed frame.
 //!
-//! The write path is absent by design: Stage 2.4's filesystem is read-only, so
-//! the driver never marks a sector writable to the device or issues a flush.
+//! A write is durable only once [`Block::flush`] returns: the device is free to
+//! hold it in a cache until then. The flush is a real `VIRTIO_BLK_T_FLUSH`
+//! request when the device offers `VIRTIO_BLK_F_FLUSH`, and a no-op when it does
+//! not — a device without a volatile cache needs none.
 //!
-//! [`molt_block::Device`] is how anything above reaches this: the filesystem
-//! reads sectors, not virtqueues, and gets the same contract from a loopback
-//! image.
+//! [`molt_block::Device`] and [`molt_block::Write`] are how anything above
+//! reaches this: the filesystem reads and writes sectors, not virtqueues, and
+//! gets the same contract from a loopback image.
 
 use molt_arch::Mmio;
 use molt_arch::dma::{Arena, DmaError, Region};
-use molt_block::{BlockError, Device};
+use molt_block::{BlockError, Device, Write};
 
 use crate::VirtioError;
 use crate::config::{Common, status};
@@ -27,6 +29,16 @@ use crate::request::{Completion, Requests};
 
 /// A block read request (`VIRTIO_BLK_T_IN`).
 const VIRTIO_BLK_T_IN: u32 = 0;
+
+/// A block write request (`VIRTIO_BLK_T_OUT`).
+const VIRTIO_BLK_T_OUT: u32 = 1;
+
+/// A cache flush request (`VIRTIO_BLK_T_FLUSH`).
+const VIRTIO_BLK_T_FLUSH: u32 = 4;
+
+/// The feature bit for a device with a flushable write cache
+/// (`VIRTIO_BLK_F_FLUSH`, §5.2.3).
+const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
 
 /// The status byte a device writes on success (`VIRTIO_BLK_S_OK`).
 const VIRTIO_BLK_S_OK: u8 = 0;
@@ -68,16 +80,17 @@ pub struct Block<'slots, 'w> {
     arena: Arena<'slots>,
     notify_off: u16,
     capacity: u64,
+    flushable: bool,
 }
 
 impl<'slots, 'w> Block<'slots, 'w> {
     /// Brings a device up over its `common`, `notify`, and `device` windows,
     /// allocating every ring and buffer from `arena`.
     ///
-    /// Runs the modern handshake, negotiates only `VIRTIO_F_VERSION_1` (the
-    /// driver needs no block feature to read), and programs queue zero. A device
-    /// that offers no usable queue, or rejects the feature set, is refused
-    /// rather than left half-initialized.
+    /// Runs the modern handshake, negotiates `VIRTIO_BLK_F_FLUSH` on top of
+    /// `VIRTIO_F_VERSION_1` when the device offers it, and programs queue zero.
+    /// A device that offers no usable queue, or rejects the feature set, is
+    /// refused rather than left half-initialized.
     pub fn start(
         common: Mmio<'w>,
         notify: Mmio<'w>,
@@ -89,7 +102,8 @@ impl<'slots, 'w> Block<'slots, 'w> {
         common.reset()?;
         common.add_status(status::ACKNOWLEDGE)?;
         common.add_status(status::DRIVER)?;
-        common.negotiate(0)?;
+        let accepted = common.negotiate(VIRTIO_BLK_F_FLUSH)?;
+        let flushable = accepted & VIRTIO_BLK_F_FLUSH != 0;
 
         // The capacity is only meaningful once the features are settled.
         let capacity = capacity(&common, &device)?;
@@ -126,6 +140,7 @@ impl<'slots, 'w> Block<'slots, 'w> {
             arena,
             notify_off,
             capacity,
+            flushable,
         })
     }
 
@@ -136,27 +151,78 @@ impl<'slots, 'w> Block<'slots, 'w> {
 
     /// Reads `sector` into `buf` in one request; `buf` must fit the data region.
     ///
-    /// Submits the three-descriptor read chain, kicks the device, and polls its
-    /// completion. A device that does not answer within `TIMEOUT_SPINS` has
-    /// its request cancelled — the slot stays reserved until the device returns
-    /// it — and the read fails with [`VirtioError::Timeout`].
-    fn transfer(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), VirtioError> {
+    /// Submits the three-descriptor read chain — the device writes the data —
+    /// and copies the answer out of the data region once it lands.
+    fn transfer_in(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), VirtioError> {
         if buf.len() as u64 > self.data.len() {
             return Err(DmaError::Range.into());
         }
 
-        self.control.write_u32(0, VIRTIO_BLK_T_IN)?;
-        self.control.write_u32(4, 0)?;
-        self.control.write_u64(8, sector)?;
-        // Poison the status so a device that answers without writing it is
-        // caught rather than read as success.
-        self.control.write_u8(STATUS_AT, 0xff)?;
-
-        let head = self.queue.push(&[
+        self.header(VIRTIO_BLK_T_IN, sector)?;
+        self.run(&[
             Segment::readable(self.control.physical(), HEADER_LEN),
             Segment::writable(self.data.physical(), buf.len() as u32),
             Segment::writable(self.control.physical() + STATUS_AT, 1),
         ])?;
+        self.data.read_into(0, buf)?;
+        Ok(())
+    }
+
+    /// Writes `buf` to `sector` in one request; `buf` must fit the data region.
+    ///
+    /// The mirror of [`transfer_in`](Self::transfer_in): the data descriptor is
+    /// readable this time, so the device takes the bytes rather than filling
+    /// them. The write may sit in the device's cache until a [`flush`](Self::flush).
+    fn transfer_out(&mut self, sector: u64, buf: &[u8]) -> Result<(), VirtioError> {
+        if buf.len() as u64 > self.data.len() {
+            return Err(DmaError::Range.into());
+        }
+
+        self.data.write_from(0, buf)?;
+        self.header(VIRTIO_BLK_T_OUT, sector)?;
+        self.run(&[
+            Segment::readable(self.control.physical(), HEADER_LEN),
+            Segment::readable(self.data.physical(), buf.len() as u32),
+            Segment::writable(self.control.physical() + STATUS_AT, 1),
+        ])
+    }
+
+    /// Empties the device's write cache, if it has one.
+    ///
+    /// A device that never offered `VIRTIO_BLK_F_FLUSH` has no volatile cache,
+    /// so there is nothing to empty and the flush is a no-op. Otherwise it is a
+    /// data-less `VIRTIO_BLK_T_FLUSH` request that returns only once every
+    /// earlier write is durable.
+    fn barrier(&mut self) -> Result<(), VirtioError> {
+        if !self.flushable {
+            return Ok(());
+        }
+        self.header(VIRTIO_BLK_T_FLUSH, 0)?;
+        self.run(&[
+            Segment::readable(self.control.physical(), HEADER_LEN),
+            Segment::writable(self.control.physical() + STATUS_AT, 1),
+        ])
+    }
+
+    /// Lays the request header down and poisons the status byte.
+    ///
+    /// Poisoning means a device that answers without writing the status is
+    /// caught rather than read as success.
+    fn header(&mut self, kind: u32, sector: u64) -> Result<(), VirtioError> {
+        self.control.write_u32(0, kind)?;
+        self.control.write_u32(4, 0)?;
+        self.control.write_u64(8, sector)?;
+        self.control.write_u8(STATUS_AT, 0xff)?;
+        Ok(())
+    }
+
+    /// Submits one built request, kicks the device, and polls its completion.
+    ///
+    /// A device that does not answer within `TIMEOUT_SPINS` has its request
+    /// cancelled — the slot stays reserved until the device returns it — and the
+    /// call fails with [`VirtioError::Timeout`].
+    fn run(&mut self, chain: &[Segment]) -> Result<(), VirtioError> {
+        let head = self.queue.push(chain)?;
         let token = self.requests.issue(head);
         self.notify.signal(0, self.notify_off)?;
 
@@ -166,7 +232,6 @@ impl<'slots, 'w> Block<'slots, 'w> {
                     if self.control.read_u8(STATUS_AT)? != VIRTIO_BLK_S_OK {
                         return Err(VirtioError::Device);
                     }
-                    self.data.read_into(0, buf)?;
                     return Ok(());
                 }
             }
@@ -199,8 +264,25 @@ impl Device for Block<'_, '_> {
         molt_block::bounds(self.capacity, sector, buf)?;
         for (index, chunk) in buf.chunks_mut(TRANSFER).enumerate() {
             let at = sector + (index * TRANSFER / molt_block::SECTOR) as u64;
-            self.transfer(at, chunk)?;
+            self.transfer_in(at, chunk)?;
         }
+        Ok(())
+    }
+}
+
+impl Write for Block<'_, '_> {
+    /// Splits `buf` into transfers the data region can hold, one request each.
+    fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), BlockError> {
+        molt_block::bounds(self.capacity, sector, buf)?;
+        for (index, chunk) in buf.chunks(TRANSFER).enumerate() {
+            let at = sector + (index * TRANSFER / molt_block::SECTOR) as u64;
+            self.transfer_out(at, chunk)?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), BlockError> {
+        self.barrier()?;
         Ok(())
     }
 }
