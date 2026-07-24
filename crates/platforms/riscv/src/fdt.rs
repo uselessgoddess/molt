@@ -412,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn ecam_window_comes_from_the_pci_node() {
+    fn ecam_window_from_pci_node() {
         let bytes = tree(&[
             ("compatible", b"pci-host-ecam-generic\0"),
             ("reg", &reg(0x3000_0000, 0x1000_0000)),
@@ -430,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn pci_domain_becomes_the_segment() {
+    fn pci_domain_becomes_segment() {
         let bytes = tree(&[
             ("compatible", b"pci-host-ecam-generic\0"),
             ("reg", &reg(0x3000_0000, 0x1000_0000)),
@@ -443,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn bus_range_narrows_the_last_bus() {
+    fn bus_range_narrows_last_bus() {
         let bytes = tree(&[
             ("compatible", b"pci-host-ecam-generic\0"),
             ("reg", &reg(0x3000_0000, 0x1000_0000)),
@@ -456,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn window_too_small_for_the_bus_range_is_refused() {
+    fn small_window_for_bus_range_refused() {
         let bytes =
             tree(&[("compatible", b"pci-host-ecam-generic\0"), ("reg", &reg(0x3000_0000, 0x1000))]);
 
@@ -466,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn tree_without_a_pci_node_is_missing() {
+    fn tree_without_pci_node_missing() {
         let bytes = tree(&[("compatible", b"virtio,mmio\0"), ("reg", &reg(0x1000_1000, 0x1000))]);
 
         let space = DeviceTree::new(&bytes).expect("a well-formed blob").config_space();
@@ -475,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn a_null_device_tree_pointer_is_refused_without_a_load() {
+    fn null_device_tree_pointer_refused() {
         // SAFETY: zero is the one address `config_space_at` promises to answer
         // without dereferencing anything.
         let space = unsafe { super::config_space_at(0) };
@@ -484,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn a_device_tree_in_memory_yields_its_ecam_window() {
+    fn device_tree_yields_ecam_window() {
         let bytes = tree(&[
             ("compatible", b"pci-host-ecam-generic\0"),
             ("reg", &reg(0x3000_0000, 0x1000_0000)),
@@ -500,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn bad_magic_is_refused() {
+    fn bad_magic_refused() {
         let mut bytes = tree(&[("compatible", b"pci-host-ecam-generic\0")]);
 
         bytes[0] ^= 0xff;
@@ -509,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_struct_block_is_refused() {
+    fn truncated_struct_block_refused() {
         let mut bytes = tree(&[
             ("compatible", b"pci-host-ecam-generic\0"),
             ("reg", &reg(0x3000_0000, 0x1000_0000)),

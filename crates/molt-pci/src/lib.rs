@@ -186,7 +186,7 @@ mod tests {
     use crate::fake::Space;
 
     #[test]
-    fn ecam_offset_matches_the_specified_encoding() {
+    fn ecam_offset_matches_encoding() {
         let address = Address::new(3, 31, 7).expect("a legal function number");
 
         assert_eq!(address.offset(), 31 << 15 | 7 << 12);
@@ -195,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bus_window_covers_one_bus() {
+    fn bus_window_covers_one_bus() {
         let space = ConfigSpace::new(0xb000_0000, 0, 0, 0xff).expect("firmware bus range");
 
         let span = bus_span(space, 2).expect("a bus inside the reported range");
@@ -205,14 +205,14 @@ mod tests {
     }
 
     #[test]
-    fn a_bus_outside_the_reported_range_is_refused() {
+    fn bus_outside_range_refused() {
         let space = ConfigSpace::new(0xb000_0000, 0, 0, 3).expect("firmware bus range");
 
         assert_eq!(bus_span(space, 4).err(), Some(PciError::Address));
     }
 
     #[test]
-    fn scanning_finds_every_function_that_answers() {
+    fn scan_finds_answering_functions() {
         let mut space = Space::new();
         space.function(0, 0).header(0x1234, 0x0001);
         space.function(5, 0).header(0x1234, 0x0002);
@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn a_single_function_device_is_probed_once() {
+    fn single_function_device_probed_once() {
         let mut space = Space::new();
         // Function 0 is single-function, so 00:00.1 must never be read even
         // though this fixture answers there.
@@ -243,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn a_multifunction_device_reports_its_other_functions() {
+    fn multifunction_device_reports_functions() {
         let mut space = Space::new();
         space.function(0, 0).header(0x1234, 0x0001).multifunction();
         space.function(0, 3).header(0x1234, 0x0004);

@@ -86,7 +86,7 @@ mod tests {
     use super::{Completion, Requests};
 
     #[test]
-    fn a_live_request_completes_and_frees_its_slot() {
+    fn live_request_completes_and_frees_slot() {
         let mut requests = Requests::<4>::new();
         requests.issue(1);
 
@@ -97,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_requests_completion_is_stale() {
+    fn cancelled_request_completion_stale() {
         let mut requests = Requests::<4>::new();
         let token = requests.issue(2);
 
@@ -106,7 +106,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reused_head_rejects_the_old_token() {
+    fn reused_head_rejects_old_token() {
         let mut requests = Requests::<4>::new();
         let stale = requests.issue(3);
         requests.complete(3);

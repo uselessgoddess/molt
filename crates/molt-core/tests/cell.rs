@@ -62,7 +62,7 @@ impl RestartHooks for Hooks {
 }
 
 #[test]
-fn managed_restart_is_ordered_and_replaces_the_owned_arena() {
+fn managed_restart_ordered_replaces_owned_arena() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let mut supervisor = Supervisor::<Counter, Arena>::with_arena(
         CellId::new(9),

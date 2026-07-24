@@ -41,7 +41,7 @@ fn image_ranges() -> [MappedRange; 2] {
 }
 
 #[test]
-fn correct_image_passes_the_audit() {
+fn correct_image_passes_audit() {
     let ranges = image_ranges();
     let audit = Audit::new(&ranges);
     let table = Table(image());
@@ -53,7 +53,7 @@ fn correct_image_passes_the_audit() {
 }
 
 #[test]
-fn writable_page_between_correct_probes_is_caught() {
+fn writable_page_between_probes_caught() {
     let ranges = image_ranges();
     let mut leaves = image();
     leaves[1] = Leaf::new(TEXT + FRAME_SIZE, FRAME_SIZE, PageProtection::new(true, true, true));
@@ -63,7 +63,7 @@ fn writable_page_between_correct_probes_is_caught() {
 }
 
 #[test]
-fn hole_in_declared_range_is_caught() {
+fn hole_in_declared_range_caught() {
     let ranges = image_ranges();
     let mut leaves = image();
     leaves.remove(1);
@@ -73,7 +73,7 @@ fn hole_in_declared_range_is_caught() {
 }
 
 #[test]
-fn megapage_over_image_sections_is_caught() {
+fn megapage_over_image_sections_caught() {
     let ranges = image_ranges();
     let table = Table(vec![Leaf::new(TEXT, 2 * 1024 * 1024, read_execute())]);
 
@@ -94,7 +94,7 @@ fn free_ram_may_use_megapages_but_never_execute() {
 }
 
 #[test]
-fn megapage_reaching_past_its_range_is_caught() {
+fn megapage_past_range_caught() {
     let ranges = [MappedRange::ram(RAM, RAM + FRAME_SIZE)];
     let leaf = Leaf::new(RAM, 2 * 1024 * 1024, read_write());
 
@@ -102,7 +102,7 @@ fn megapage_reaching_past_its_range_is_caught() {
 }
 
 #[test]
-fn mapping_nobody_declared_is_caught() {
+fn undeclared_mapping_caught() {
     let ranges = image_ranges();
     let stray = Leaf::new(0x1000_0000, FRAME_SIZE, read_write());
 
@@ -131,7 +131,7 @@ fn image_without_named_sections_enforces_wx() {
 }
 
 #[test]
-fn cacheable_device_window_is_caught() {
+fn cacheable_device_window_caught() {
     let uart = 0x1000_0000;
     let ranges = [MappedRange::device(uart, uart + FRAME_SIZE)];
     let audit = Audit::new(&ranges);
@@ -145,7 +145,7 @@ fn cacheable_device_window_is_caught() {
 }
 
 #[test]
-fn executable_device_window_is_caught() {
+fn executable_device_window_caught() {
     let uart = 0x1000_0000;
     let leaf = Leaf::new(uart, FRAME_SIZE, read_execute().cached(Cache::Device));
 

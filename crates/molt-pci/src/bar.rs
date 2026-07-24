@@ -180,7 +180,7 @@ mod tests {
     use crate::{Address, PciError};
 
     #[test]
-    fn a_thirty_two_bit_bar_reports_its_size() {
+    fn bar32_reports_size() {
         let bar = decode(0, 0xfebc_0000, 0xffff_0000, None).expect("an implemented BAR");
 
         assert_eq!(bar.base(), 0xfebc_0000);
@@ -189,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sixty_four_bit_bar_joins_both_halves() {
+    fn bar64_joins_both_halves() {
         let bar = decode(2, 0x0000_000c, 0xffc0_0000, Some((0x0000_0008, 0xffff_ffff)))
             .expect("an implemented BAR");
 
@@ -199,13 +199,13 @@ mod tests {
     }
 
     #[test]
-    fn an_unimplemented_bar_reports_nothing() {
+    fn unimplemented_bar_reports_nothing() {
         assert_eq!(decode(0, 0, 0, None), None);
         assert_eq!(decode(0, 0, 0, Some((0, 0))), None);
     }
 
     #[test]
-    fn a_thirty_two_bit_bar_does_not_borrow_the_next_register() {
+    fn bar32_ignores_next_register() {
         // The upper half of a 32-bit BAR is not a register, so the mask above
         // bit 31 is not writable and must not lengthen the window.
         let bar = decode(0, 0xfebc_0000, 0xffff_fff0, None).expect("an implemented BAR");
@@ -214,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn an_io_bar_keeps_its_two_reserved_bits() {
+    fn io_bar_keeps_reserved_bits() {
         let bar = decode(1, 0xc001, 0xffff_fffd, None).expect("an implemented BAR");
 
         assert_eq!(bar.base(), 0xc000);
@@ -223,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn a_span_rounds_out_to_whole_frames() {
+    fn span_rounds_to_whole_frames() {
         let bar = Bar {
             index: 0,
             base: 0xfebc_1000,
@@ -238,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn sizing_restores_the_register_and_the_command() {
+    fn sizing_restores_register_and_command() {
         let mut space = Space::new();
         space.function(0, 0).header(0x1234, 0x0001).register(0x10, 0xfebc_0000);
         let mut function = Function::probe(space.config(0, 0), Address::new(0, 0, 0).unwrap())
@@ -254,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bar_index_the_header_does_not_have_is_refused() {
+    fn out_of_range_bar_index_refused() {
         let mut space = Space::new();
         space.function(0, 0).header(0x1234, 0x0001);
         let mut function = Function::probe(space.config(0, 0), Address::new(0, 0, 0).unwrap())
