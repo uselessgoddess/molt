@@ -11,8 +11,8 @@ use alloc::vec::Vec;
 use crate::FsError;
 use crate::crc::crc32c;
 use crate::layout::{
-    Area, BLOCK, ENTRY_BYTES, EXTENT_BYTES, Entry, Extent, Kind, OBJECT_BYTES, Object, Region,
-    SUPERS, Super,
+    Area, BLOCK, DEFAULT_LOG_BLOCKS, ENTRY_BYTES, EXTENT_BYTES, Entry, Extent, Kind, OBJECT_BYTES,
+    Object, Region, SUPERS, Super,
 };
 use crate::name::Name;
 
@@ -66,9 +66,17 @@ impl Tree {
 
 /// Lays `tree` out as a mountable image stamped with `generation`.
 pub fn build(tree: &Tree, generation: u64) -> Result<Vec<u8>, FsError> {
+    build_with_log(tree, generation, DEFAULT_LOG_BLOCKS)
+}
+
+/// Lays `tree` out with `log_blocks` in each of three rotating log banks.
+pub fn build_with_log(tree: &Tree, generation: u64, log_blocks: u32) -> Result<Vec<u8>, FsError> {
+    if log_blocks == 0 {
+        return Err(FsError::Range);
+    }
     let mut image = Image::default();
     let root = image.dir(tree)?;
-    image.finish(root, generation)
+    image.finish(root, generation, log_blocks)
 }
 
 #[derive(Default)]
@@ -152,7 +160,7 @@ impl Image {
     }
 
     /// Places the regions, checksums them, and writes both superblock copies.
-    fn finish(mut self, root: u32, generation: u64) -> Result<Vec<u8>, FsError> {
+    fn finish(mut self, root: u32, generation: u64, log_blocks: u32) -> Result<Vec<u8>, FsError> {
         let data_blocks = (self.data.len() / BLOCK) as u64;
         let sizes = [
             self.objects.len() * OBJECT_BYTES,
@@ -162,15 +170,20 @@ impl Image {
             data_blocks as usize * 4,
         ];
 
-        let mut superblock = Super { generation, root, data_blocks, ..Super::default() };
+        let mut superblock =
+            Super { generation, root, data_blocks, log_blocks, ..Super::default() };
         let mut at = SUPERS;
-        for (area, bytes) in Area::ALL.into_iter().zip(sizes) {
+        for (area, bytes) in Area::BASE.into_iter().zip(sizes) {
             let region = Region { at, bytes: bytes as u64, crc: 0 };
             superblock.set_region(area, region);
             at += region.blocks();
         }
         superblock.data_at = at;
-        superblock.blocks = at + data_blocks;
+        let log_at = at.checked_add(data_blocks).ok_or(FsError::Range)?;
+        let log_span =
+            u64::from(log_blocks).checked_mul(crate::layout::LOG_BANKS).ok_or(FsError::Range)?;
+        superblock.blocks = log_at.checked_add(log_span).ok_or(FsError::Range)?;
+        superblock.set_region(Area::Log, Region { at: log_at, bytes: 0, crc: crc32c(&[]) });
 
         // Extents were addressed from the start of the data region.
         for extent in &mut self.extents {
@@ -191,7 +204,7 @@ impl Image {
         ];
 
         let mut image = vec![0; superblock.blocks as usize * BLOCK];
-        for (area, bytes) in Area::ALL.into_iter().zip(regions) {
+        for (area, bytes) in Area::BASE.into_iter().zip(regions) {
             let mut region = superblock.region(area);
             region.crc = crc32c(&bytes);
             superblock.set_region(area, region);
