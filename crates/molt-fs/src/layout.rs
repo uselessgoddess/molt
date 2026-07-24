@@ -1,4 +1,4 @@
-//! The on-disk shape of a volume: superblock, regions, and the three records.
+//! On-disk shape of a volume: superblocks, regions, and base records.
 //!
 //! Every number is little-endian and every record size divides [`BLOCK`], so no
 //! record straddles a block boundary and a reader needs exactly one block of
@@ -15,7 +15,7 @@ pub const BLOCK: usize = 4096;
 pub const MAGIC: [u8; 8] = *b"MOLTROFS";
 
 /// The format this crate reads.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 3;
 
 /// Superblock copies at the start of the volume.
 ///
@@ -24,7 +24,22 @@ pub const VERSION: u32 = 1;
 pub const SUPERS: u64 = 2;
 
 /// How much of block zero the superblock occupies.
-pub const SUPER_BYTES: usize = 192;
+pub const SUPER_BYTES: usize = 244;
+
+/// Log banks kept so newest and previous checkpoints remain intact while a
+/// third bank receives the next generation.
+pub const LOG_BANKS: u64 = 3;
+
+/// Log capacity an image builder reserves unless its caller chooses another.
+#[cfg(feature = "format")]
+pub const DEFAULT_LOG_BLOCKS: u32 = 64;
+
+/// COW metadata nodes an image builder reserves by default.
+#[cfg(feature = "format")]
+pub const DEFAULT_TREE_BLOCKS: u32 = MAX_TREE_BLOCKS;
+
+/// Largest tree arena mount can track without dynamic allocation.
+pub const MAX_TREE_BLOCKS: u32 = 256;
 
 /// Where each superblock field sits.
 mod field {
@@ -37,7 +52,11 @@ mod field {
     pub const DATA_AT: usize = 40;
     pub const DATA_BLOCKS: usize = 48;
     pub const REGIONS: usize = 64;
-    pub const CRC: usize = 188;
+    pub const LOG_BLOCKS: usize = 208;
+    pub const TREE_AT: usize = 216;
+    pub const TREE_BLOCKS: usize = 224;
+    pub const TREE_ROOT: usize = 232;
+    pub const CRC: usize = 240;
 }
 
 /// One region descriptor: where it starts, how long it is, what it hashes to.
@@ -68,11 +87,16 @@ pub enum Area {
     Names,
     /// One crc32c per data block.
     Sums,
+    /// Typed create and write records committed by the active checkpoint.
+    Log,
 }
 
 impl Area {
-    pub const ALL: [Self; 5] =
+    #[cfg(feature = "format")]
+    pub const BASE: [Self; 5] =
         [Self::Objects, Self::Extents, Self::Entries, Self::Names, Self::Sums];
+    pub const ALL: [Self; 6] =
+        [Self::Objects, Self::Extents, Self::Entries, Self::Names, Self::Sums, Self::Log];
 
     const fn index(self) -> usize {
         match self {
@@ -81,6 +105,7 @@ impl Area {
             Self::Entries => 2,
             Self::Names => 3,
             Self::Sums => 4,
+            Self::Log => 5,
         }
     }
 }
@@ -108,6 +133,10 @@ pub struct Super {
     pub root: u32,
     pub data_at: u64,
     pub data_blocks: u64,
+    pub log_blocks: u32,
+    pub tree_at: u64,
+    pub tree_blocks: u32,
+    pub tree_root: u64,
     pub(crate) regions: [Region; Area::ALL.len()],
 }
 
@@ -148,6 +177,10 @@ impl Super {
             root: u32_at(block, field::ROOT),
             data_at: u64_at(block, field::DATA_AT),
             data_blocks: u64_at(block, field::DATA_BLOCKS),
+            log_blocks: u32_at(block, field::LOG_BLOCKS),
+            tree_at: u64_at(block, field::TREE_AT),
+            tree_blocks: u32_at(block, field::TREE_BLOCKS),
+            tree_root: u64_at(block, field::TREE_ROOT),
             regions: [Region::default(); Area::ALL.len()],
         };
         for area in Area::ALL {
@@ -167,9 +200,7 @@ impl Super {
 
     /// Writes the superblock into `block`, stamping its checksum last.
     ///
-    /// Encoders belong to the image builder — a mounted volume only reads — so
-    /// they compile away with the `format` feature.
-    #[cfg(any(feature = "format", test))]
+    /// The image builder writes both initial copies; sync writes one new copy.
     pub fn encode(&self, block: &mut [u8]) {
         let block = &mut block[..SUPER_BYTES];
         block.fill(0);
@@ -181,6 +212,10 @@ impl Super {
         put_u32(block, field::ROOT, self.root);
         put_u64(block, field::DATA_AT, self.data_at);
         put_u64(block, field::DATA_BLOCKS, self.data_blocks);
+        put_u32(block, field::LOG_BLOCKS, self.log_blocks);
+        put_u64(block, field::TREE_AT, self.tree_at);
+        put_u32(block, field::TREE_BLOCKS, self.tree_blocks);
+        put_u64(block, field::TREE_ROOT, self.tree_root);
         for area in Area::ALL {
             let region = self.region(area);
             let at = field::REGIONS + area.index() * REGION_BYTES;
@@ -194,8 +229,20 @@ impl Super {
     /// Rejects a superblock whose regions do not fit the volume it describes.
     fn check(&self) -> Result<(), FsError> {
         let data_end = self.data_at.checked_add(self.data_blocks).ok_or(FsError::Corrupt)?;
+        let log_span = u64::from(self.log_blocks).checked_mul(LOG_BANKS).ok_or(FsError::Corrupt)?;
+        let log_start = self.blocks.checked_sub(log_span).ok_or(FsError::Corrupt)?;
+        let tree_end =
+            self.tree_at.checked_add(u64::from(self.tree_blocks)).ok_or(FsError::Corrupt)?;
         let sum_bytes = self.data_blocks.checked_mul(4).ok_or(FsError::Corrupt)?;
-        if self.data_at < SUPERS || data_end > self.blocks {
+        if self.log_blocks == 0
+            || self.tree_blocks == 0
+            || self.tree_blocks > MAX_TREE_BLOCKS
+            || self.data_at < SUPERS
+            || data_end > self.tree_at
+            || tree_end > log_start
+            || (self.tree_root != 0
+                && (self.tree_root < self.tree_at || self.tree_root >= tree_end))
+        {
             return Err(FsError::Corrupt);
         }
         if self.region(Area::Sums).bytes != sum_bytes {
@@ -207,7 +254,18 @@ impl Super {
             if region.at < SUPERS || end > self.blocks {
                 return Err(FsError::Corrupt);
             }
-            if overlaps(region.at, end, self.data_at, data_end) {
+            if area == Area::Log {
+                let bank_bytes =
+                    u64::from(self.log_blocks).checked_mul(BLOCK as u64).ok_or(FsError::Corrupt)?;
+                let in_bank = (0..LOG_BANKS)
+                    .any(|bank| region.at == log_start + bank * u64::from(self.log_blocks));
+                if !in_bank || region.bytes > bank_bytes {
+                    return Err(FsError::Corrupt);
+                }
+            } else if end > self.tree_at {
+                return Err(FsError::Corrupt);
+            }
+            if area != Area::Log && overlaps(region.at, end, self.data_at, data_end) {
                 return Err(FsError::Corrupt);
             }
             for &other in &Area::ALL[..index] {
@@ -219,6 +277,16 @@ impl Super {
             }
         }
         Ok(())
+    }
+
+    /// First block of log bank `bank`.
+    pub fn log_bank(&self, bank: u64) -> Result<u64, FsError> {
+        if bank >= LOG_BANKS {
+            return Err(FsError::Corrupt);
+        }
+        let span = u64::from(self.log_blocks).checked_mul(LOG_BANKS).ok_or(FsError::Corrupt)?;
+        let start = self.blocks.checked_sub(span).ok_or(FsError::Corrupt)?;
+        Ok(start + bank * u64::from(self.log_blocks))
     }
 }
 
@@ -382,10 +450,13 @@ mod tests {
     fn volume() -> Super {
         let mut parsed = Super {
             generation: 7,
-            blocks: 16,
+            blocks: 32,
             root: 0,
-            data_at: 14,
+            data_at: 10,
             data_blocks: 2,
+            log_blocks: 4,
+            tree_at: 12,
+            tree_blocks: 8,
             ..Super::default()
         };
         for area in Area::ALL {
@@ -393,6 +464,7 @@ mod tests {
         }
         parsed.set_region(Area::Objects, Region { at: 2, bytes: 32, crc: 1 });
         parsed.set_region(Area::Sums, Region { at: 3, bytes: 8, crc: 2 });
+        parsed.set_region(Area::Log, Region { at: 20, bytes: 0, crc: 0 });
         parsed
     }
 
@@ -436,7 +508,7 @@ mod tests {
     fn region_past_end_refused() {
         let mut block = [0u8; BLOCK];
         let mut parsed = volume();
-        parsed.set_region(Area::Objects, Region { at: 15, bytes: 2 * BLOCK as u64, crc: 0 });
+        parsed.set_region(Area::Objects, Region { at: 31, bytes: 2 * BLOCK as u64, crc: 0 });
         parsed.encode(&mut block);
 
         assert_eq!(Super::parse(&block), Err(FsError::Corrupt));
@@ -457,6 +529,16 @@ mod tests {
         let mut block = [0u8; BLOCK];
         let mut parsed = volume();
         parsed.set_region(Area::Names, Region { at: parsed.data_at, bytes: 1, crc: 0 });
+        parsed.encode(&mut block);
+
+        assert_eq!(Super::parse(&block), Err(FsError::Corrupt));
+    }
+
+    #[test]
+    fn tree_root_outside_arena_refused() {
+        let mut block = [0u8; BLOCK];
+        let mut parsed = volume();
+        parsed.tree_root = parsed.tree_at + u64::from(parsed.tree_blocks);
         parsed.encode(&mut block);
 
         assert_eq!(Super::parse(&block), Err(FsError::Corrupt));
