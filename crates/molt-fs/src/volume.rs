@@ -28,6 +28,7 @@ pub struct Volume<'buf, D> {
     superblock: Super,
     active_copy: u64,
     previous_log: Option<u64>,
+    previous_tree: Option<u64>,
 }
 
 impl<'buf, D: Device> Volume<'buf, D> {
@@ -69,12 +70,26 @@ impl<'buf, D: Device> Volume<'buf, D> {
                 continue;
             }
 
-            let previous_log = copies
+            let previous = copies
                 .iter()
                 .enumerate()
                 .find(|(copy, _)| *copy != active_copy as usize)
-                .and_then(|(_, parsed)| parsed.map(|parsed| parsed.region(Area::Log).at));
-            return Ok(Self { device, block, cached: None, superblock, active_copy, previous_log });
+                .and_then(|(_, parsed)| *parsed)
+                .filter(|parsed| {
+                    parsed.blocks.saturating_mul(SECTORS) <= device.sectors()
+                        && verify_checkpoint(&mut device, block, *parsed).is_ok()
+                });
+            let previous_log = previous.map(|parsed| parsed.region(Area::Log).at);
+            let previous_tree = previous.map(|parsed| parsed.tree_root).filter(|root| *root != 0);
+            return Ok(Self {
+                device,
+                block,
+                cached: None,
+                superblock,
+                active_copy,
+                previous_log,
+                previous_tree,
+            });
         }
         Err(last_error)
     }
@@ -101,8 +116,13 @@ impl<'buf, D: Device> Volume<'buf, D> {
         self.previous_log
     }
 
+    pub(crate) const fn previous_tree(&self) -> Option<u64> {
+        self.previous_tree
+    }
+
     pub(crate) fn commit(&mut self, copy: u64, checkpoint: Super) {
         self.previous_log = Some(self.superblock.region(Area::Log).at);
+        self.previous_tree = (self.superblock.tree_root != 0).then_some(self.superblock.tree_root);
         self.superblock = checkpoint;
         self.active_copy = copy;
         self.cached = None;
@@ -318,6 +338,21 @@ impl<D: Writable> Volume<'_, D> {
         Ok(())
     }
 
+    pub(crate) fn write_tree_block(&mut self, at: u64, block: &[u8; BLOCK]) -> Result<(), FsError> {
+        let checkpoint = self.checkpoint();
+        let end = checkpoint
+            .tree_at
+            .checked_add(u64::from(checkpoint.tree_blocks))
+            .ok_or(FsError::Corrupt)?;
+        if at < checkpoint.tree_at || at >= end {
+            return Err(FsError::Corrupt);
+        }
+        let sector = at.checked_mul(SECTORS).ok_or(FsError::Corrupt)?;
+        self.device.write(sector, block).map_err(FsError::Device)?;
+        self.cached = None;
+        Ok(())
+    }
+
     pub(crate) fn checksum(&mut self, block: u64, bytes: u64) -> Result<u32, FsError> {
         let mut crc = Crc::new();
         let mut left = bytes;
@@ -373,7 +408,7 @@ fn verify_checkpoint<D: Device>(
             return Err(FsError::Checksum);
         }
     }
-    Ok(())
+    crate::btree::verify(device, block, superblock)
 }
 
 #[cfg(all(test, feature = "format"))]

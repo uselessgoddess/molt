@@ -11,8 +11,8 @@ use alloc::vec::Vec;
 use crate::FsError;
 use crate::crc::crc32c;
 use crate::layout::{
-    Area, BLOCK, DEFAULT_LOG_BLOCKS, ENTRY_BYTES, EXTENT_BYTES, Entry, Extent, Kind, OBJECT_BYTES,
-    Object, Region, SUPERS, Super,
+    Area, BLOCK, DEFAULT_LOG_BLOCKS, DEFAULT_TREE_BLOCKS, ENTRY_BYTES, EXTENT_BYTES, Entry, Extent,
+    Kind, OBJECT_BYTES, Object, Region, SUPERS, Super,
 };
 use crate::name::Name;
 
@@ -71,12 +71,22 @@ pub fn build(tree: &Tree, generation: u64) -> Result<Vec<u8>, FsError> {
 
 /// Lays `tree` out with `log_blocks` in each of three rotating log banks.
 pub fn build_with_log(tree: &Tree, generation: u64, log_blocks: u32) -> Result<Vec<u8>, FsError> {
-    if log_blocks == 0 {
+    build_with_capacity(tree, generation, log_blocks, DEFAULT_TREE_BLOCKS)
+}
+
+/// Lays `tree` out with explicit log and COW metadata capacity.
+pub fn build_with_capacity(
+    tree: &Tree,
+    generation: u64,
+    log_blocks: u32,
+    tree_blocks: u32,
+) -> Result<Vec<u8>, FsError> {
+    if log_blocks == 0 || tree_blocks == 0 || tree_blocks > crate::layout::MAX_TREE_BLOCKS {
         return Err(FsError::Range);
     }
     let mut image = Image::default();
     let root = image.dir(tree)?;
-    image.finish(root, generation, log_blocks)
+    image.finish(root, generation, log_blocks, tree_blocks)
 }
 
 #[derive(Default)]
@@ -160,7 +170,13 @@ impl Image {
     }
 
     /// Places the regions, checksums them, and writes both superblock copies.
-    fn finish(mut self, root: u32, generation: u64, log_blocks: u32) -> Result<Vec<u8>, FsError> {
+    fn finish(
+        mut self,
+        root: u32,
+        generation: u64,
+        log_blocks: u32,
+        tree_blocks: u32,
+    ) -> Result<Vec<u8>, FsError> {
         let data_blocks = (self.data.len() / BLOCK) as u64;
         let sizes = [
             self.objects.len() * OBJECT_BYTES,
@@ -171,7 +187,7 @@ impl Image {
         ];
 
         let mut superblock =
-            Super { generation, root, data_blocks, log_blocks, ..Super::default() };
+            Super { generation, root, data_blocks, log_blocks, tree_blocks, ..Super::default() };
         let mut at = SUPERS;
         for (area, bytes) in Area::BASE.into_iter().zip(sizes) {
             let region = Region { at, bytes: bytes as u64, crc: 0 };
@@ -179,7 +195,9 @@ impl Image {
             at += region.blocks();
         }
         superblock.data_at = at;
-        let log_at = at.checked_add(data_blocks).ok_or(FsError::Range)?;
+        superblock.tree_at = at.checked_add(data_blocks).ok_or(FsError::Range)?;
+        let log_at =
+            superblock.tree_at.checked_add(u64::from(tree_blocks)).ok_or(FsError::Range)?;
         let log_span =
             u64::from(log_blocks).checked_mul(crate::layout::LOG_BANKS).ok_or(FsError::Range)?;
         superblock.blocks = log_at.checked_add(log_span).ok_or(FsError::Range)?;
@@ -236,9 +254,9 @@ fn index(value: usize) -> Result<u32, FsError> {
 mod tests {
     use alloc::vec;
 
-    use super::{Tree, build};
+    use super::{Tree, build, build_with_capacity};
     use crate::FsError;
-    use crate::layout::{BLOCK, Super};
+    use crate::layout::{BLOCK, MAX_TREE_BLOCKS, Super};
 
     #[test]
     fn empty_tree_still_mounts_as_volume() {
@@ -247,6 +265,7 @@ mod tests {
 
         assert_eq!(superblock.generation, 1);
         assert_eq!(superblock.data_blocks, 0);
+        assert_eq!(superblock.tree_blocks, MAX_TREE_BLOCKS);
     }
 
     #[test]
@@ -274,6 +293,15 @@ mod tests {
         let image = build(&tree, 1).expect("image that fits");
 
         assert_eq!(Super::parse(&image).expect("superblock").data_blocks, 0);
+    }
+
+    #[test]
+    fn invalid_tree_capacity_refused() {
+        assert_eq!(build_with_capacity(&Tree::new(), 1, 1, 0), Err(FsError::Range));
+        assert_eq!(
+            build_with_capacity(&Tree::new(), 1, 1, MAX_TREE_BLOCKS + 1),
+            Err(FsError::Range)
+        );
     }
 
     #[test]

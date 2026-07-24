@@ -15,9 +15,8 @@ fn tree_splits_and_remounts() {
     let mut bytes = image();
     {
         let mut block = [0; BLOCK];
-        let mut journal =
-            Journal::mount(Loopback::writable(&mut bytes).expect("disk"), &mut block)
-                .expect("mount");
+        let mut journal = Journal::mount(Loopback::writable(&mut bytes).expect("disk"), &mut block)
+            .expect("mount");
         for index in 0..40 {
             journal.create(journal.root(), name(index), Kind::File).expect("create");
         }
@@ -33,6 +32,7 @@ fn tree_splits_and_remounts() {
         Journal::mount(Loopback::new(&bytes).expect("disk"), &mut block).expect("remount");
     for index in 0..40 {
         assert!(journal.lookup(journal.root(), &name(index)).is_ok(), "missing key {index}");
+        assert_eq!(journal.entry(journal.root(), index as u32).expect("entry").0, name(index));
     }
 }
 
@@ -42,9 +42,8 @@ fn root_swing_hides_unsynced_tree() {
     let stable_root;
     {
         let mut block = [0; BLOCK];
-        let mut journal =
-            Journal::mount(Loopback::writable(&mut bytes).expect("disk"), &mut block)
-                .expect("mount");
+        let mut journal = Journal::mount(Loopback::writable(&mut bytes).expect("disk"), &mut block)
+            .expect("mount");
         journal.create(journal.root(), name(1), Kind::File).expect("create");
         journal.sync().expect("sync");
         stable_root = journal.tree_stats().expect("stats").root;
@@ -67,9 +66,8 @@ fn cache_hit_skips_device_read() {
     let mut bytes = image();
     {
         let mut block = [0; BLOCK];
-        let mut journal =
-            Journal::mount(Loopback::writable(&mut bytes).expect("disk"), &mut block)
-                .expect("mount");
+        let mut journal = Journal::mount(Loopback::writable(&mut bytes).expect("disk"), &mut block)
+            .expect("mount");
         journal.create(journal.root(), name(0), Kind::File).expect("create");
         journal.sync().expect("sync");
     }

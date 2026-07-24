@@ -1,11 +1,12 @@
 //! MoltFS, a checksummed writable filesystem over [`molt_block::Writable`].
 //!
 //! `xtask mkfs` lays out immutable objects, extents, entries, names, sums, and
-//! data. Runtime creates and writes are typed records in one of three rotating
-//! log banks. A sync flushes a complete bank before publishing it through the
-//! older of two generation-stamped superblocks, then flushes the superblock.
-//! Power loss therefore leaves either the previous generation or the complete
-//! new generation mountable, without fsck.
+//! data. Runtime metadata lives in a checksummed copy-on-write B+ tree while
+//! create and write payloads live in one of three rotating log banks. A sync
+//! flushes both before publishing their root through the older of two
+//! generation-stamped superblocks, then flushes the superblock. Power loss
+//! therefore leaves either the previous generation or the complete new
+//! generation mountable, without fsck.
 //!
 //! [`Volume`] is the reader, needing one block of buffer and nothing else.
 //! [`Journal`] adds allocation-free replay and mutation, and [`Fs`] wraps it in
@@ -26,6 +27,7 @@ use molt_block::BlockError;
 use molt_core::buffer::BufferError;
 use molt_core::capability::CapabilityError;
 
+mod btree;
 mod crc;
 mod journal;
 mod layout;
@@ -38,6 +40,7 @@ mod volume;
 #[cfg(feature = "format")]
 pub mod format;
 
+pub use crate::btree::{CacheStats, TreeStats};
 pub use crate::journal::Journal;
 pub use crate::layout::{BLOCK, Kind, MAGIC, MAX_NAME, Object, SUPERS, VERSION};
 pub use crate::name::Name;
@@ -76,7 +79,7 @@ pub enum FsError {
     Buffer(BufferError),
     /// No free handle left in the table.
     Handles,
-    /// The mutation log or object-id space is full.
+    /// The tree arena, mutation log, or object-id space is full.
     Full,
 }
 
