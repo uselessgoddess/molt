@@ -1,16 +1,17 @@
 use molt_arch::dma::Arena;
 use molt_arch::memory::{Inventory, Owner, Rights};
 use molt_arch::{BootInfo, FrameAllocator, Platform, SerialWriter};
+use molt_block::{Device, SECTOR};
 use molt_kernel::report;
 use molt_pci::{Bus, Command, bus_span};
-use molt_virtio::{Block, SECTOR, Transport};
+use molt_virtio::{Block, Transport};
 
 /// QEMU's modern virtio-blk-pci function (`disable-legacy=on`).
 const VIRTIO_VENDOR: u16 = 0x1af4;
 const VIRTIO_BLOCK: u16 = 0x1042;
 
-/// The signature `xtask` writes at the start of sector zero.
-const SIGNATURE: [u8; 8] = *b"MOLTDISK";
+/// What a MoltROFS volume starts with, which is what `xtask` puts on the disk.
+const SIGNATURE: [u8; 8] = molt_fs::MAGIC;
 const DMA_FRAMES: usize = 8;
 const BLOCK_TAG: u32 = 0xb10c;
 
@@ -61,6 +62,9 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let notify = registers
         .subwindow(delta + transport.notify().offset() as u64, transport.notify().length() as u64)
         .expect("the notify structure inside the BAR");
+    let config = registers
+        .subwindow(delta + transport.device().offset() as u64, transport.device().length() as u64)
+        .expect("the device-configuration structure inside the BAR");
 
     let command = function.command().expect("the command register");
     function
@@ -80,21 +84,18 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let arena = Arena::claim(&mut allocator, offset, BLOCK_TAG, &mut slots)
         .expect("contiguous device frames past the kernel's own");
 
-    let mut block = Block::start(common, notify, transport.notify_multiplier(), arena)
+    let mut block = Block::start(common, notify, config, transport.notify_multiplier(), arena)
         .expect("the device completes its handshake");
 
     let mut sector = [0u8; SECTOR];
     block.read(0, &mut sector).expect("sector zero reads back");
-    verify(&sector);
-    report!(platform, "MOLT_BLOCK_OK: sector zero matches the signed disk");
+    assert_eq!(&sector[..SIGNATURE.len()], &SIGNATURE, "sector zero holds no volume signature");
+    report!(platform, "MOLT_BLOCK_OK: sector zero carries the volume signature");
+
+    // The filesystem borrows the driver, so the device is still this function's
+    // to stop afterwards.
+    crate::fs::smoke(platform, &mut block);
 
     block.reset().expect("the device stops and its frames return");
     report!(platform, "MOLT_VIRTIO_RESET_OK: device stopped and frames reclaimed");
-}
-
-fn verify(sector: &[u8; SECTOR]) {
-    assert_eq!(&sector[..SIGNATURE.len()], &SIGNATURE, "sector zero lacks the disk signature");
-    for (index, &byte) in sector.iter().enumerate().skip(SIGNATURE.len()) {
-        assert_eq!(byte, (index as u8) ^ 0x5a, "sector zero byte {index} broke the pattern");
-    }
 }

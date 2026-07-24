@@ -10,9 +10,14 @@
 //!
 //! The write path is absent by design: Stage 2.4's filesystem is read-only, so
 //! the driver never marks a sector writable to the device or issues a flush.
+//!
+//! [`molt_block::Device`] is how anything above reaches this: the filesystem
+//! reads sectors, not virtqueues, and gets the same contract from a loopback
+//! image.
 
 use molt_arch::Mmio;
 use molt_arch::dma::{Arena, DmaError, Region};
+use molt_block::{BlockError, Device};
 
 use crate::VirtioError;
 use crate::config::{Common, status};
@@ -26,8 +31,13 @@ const VIRTIO_BLK_T_IN: u32 = 0;
 /// The status byte a device writes on success (`VIRTIO_BLK_S_OK`).
 const VIRTIO_BLK_S_OK: u8 = 0;
 
-/// A sector is 512 bytes, the unit `read` addresses in.
-pub const SECTOR: usize = 512;
+/// Where the block device's capacity, in sectors, sits in its configuration
+/// structure (§5.2.4).
+const CAPACITY_AT: u64 = 0;
+
+/// How many times a capacity read retries a device that changes its
+/// configuration underneath it.
+const CONFIG_SPINS: u32 = 16;
 
 /// The request header the device reads: type, reserved, sector.
 const HEADER_LEN: u32 = 16;
@@ -38,8 +48,11 @@ const STATUS_AT: u64 = HEADER_LEN as u64;
 /// The control region holds the header and the trailing status byte.
 const CONTROL_BYTES: u64 = HEADER_LEN as u64 + 1;
 
-/// The data region is one frame, enough for any single-sector read.
+/// The data region is one frame, which bounds a single transfer.
 const DATA_BYTES: u64 = 4096;
+
+/// The largest read the driver issues as one request.
+const TRANSFER: usize = DATA_BYTES as usize;
 
 /// How long `read` polls the used ring before declaring the request timed out.
 const TIMEOUT_SPINS: u32 = 50_000_000;
@@ -54,11 +67,12 @@ pub struct Block<'slots, 'w> {
     data: Region,
     arena: Arena<'slots>,
     notify_off: u16,
+    capacity: u64,
 }
 
 impl<'slots, 'w> Block<'slots, 'w> {
-    /// Brings a device up over its `common` and `notify` windows, allocating
-    /// every ring and buffer from `arena`.
+    /// Brings a device up over its `common`, `notify`, and `device` windows,
+    /// allocating every ring and buffer from `arena`.
     ///
     /// Runs the modern handshake, negotiates only `VIRTIO_F_VERSION_1` (the
     /// driver needs no block feature to read), and programs queue zero. A device
@@ -67,6 +81,7 @@ impl<'slots, 'w> Block<'slots, 'w> {
     pub fn start(
         common: Mmio<'w>,
         notify: Mmio<'w>,
+        device: Mmio<'w>,
         notify_multiplier: u32,
         mut arena: Arena<'slots>,
     ) -> Result<Self, VirtioError> {
@@ -75,6 +90,9 @@ impl<'slots, 'w> Block<'slots, 'w> {
         common.add_status(status::ACKNOWLEDGE)?;
         common.add_status(status::DRIVER)?;
         common.negotiate(0)?;
+
+        // The capacity is only meaningful once the features are settled.
+        let capacity = capacity(&common, &device)?;
 
         common.select_queue(0)?;
         let size = clamp_queue(common.queue_size()?)?;
@@ -107,16 +125,22 @@ impl<'slots, 'w> Block<'slots, 'w> {
             data,
             arena,
             notify_off,
+            capacity,
         })
     }
 
-    /// Reads `sector` into `buf`, which must fit in the data region.
+    /// How many sectors the device reports holding.
+    pub const fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    /// Reads `sector` into `buf` in one request; `buf` must fit the data region.
     ///
     /// Submits the three-descriptor read chain, kicks the device, and polls its
     /// completion. A device that does not answer within `TIMEOUT_SPINS` has
     /// its request cancelled — the slot stays reserved until the device returns
     /// it — and the read fails with [`VirtioError::Timeout`].
-    pub fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), VirtioError> {
+    fn transfer(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), VirtioError> {
         if buf.len() as u64 > self.data.len() {
             return Err(DmaError::Range.into());
         }
@@ -163,6 +187,38 @@ impl<'slots, 'w> Block<'slots, 'w> {
         arena.reset()?;
         Ok(())
     }
+}
+
+impl Device for Block<'_, '_> {
+    fn sectors(&self) -> u64 {
+        self.capacity
+    }
+
+    /// Splits `buf` into transfers the data region can hold, one request each.
+    fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        molt_block::bounds(self.capacity, sector, buf)?;
+        for (index, chunk) in buf.chunks_mut(TRANSFER).enumerate() {
+            let at = sector + (index * TRANSFER / molt_block::SECTOR) as u64;
+            self.transfer(at, chunk)?;
+        }
+        Ok(())
+    }
+}
+
+/// Reads the device's capacity, in sectors.
+///
+/// A 64-bit configuration field is two accesses wide, so the read is only
+/// coherent if the device's configuration generation did not move across it.
+fn capacity(common: &Common<'_>, device: &Mmio<'_>) -> Result<u64, VirtioError> {
+    for _ in 0..CONFIG_SPINS {
+        let before = common.config_generation()?;
+        let low = device.read_u32(CAPACITY_AT)?;
+        let high = device.read_u32(CAPACITY_AT + 4)?;
+        if common.config_generation()? == before {
+            return Ok((high as u64) << 32 | low as u64);
+        }
+    }
+    Err(VirtioError::Device)
 }
 
 fn clamp_queue(device_max: u16) -> Result<u16, VirtioError> {

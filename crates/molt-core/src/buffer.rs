@@ -1,6 +1,8 @@
 //! Registered buffers used by capability-based I/O operations.
 
-use crate::capability::{Capability, CapabilityError, CapabilityTable, Read, ReadWrite, Write};
+use crate::capability::{
+    Capability, CapabilityError, CapabilityRights, CapabilityTable, Read, ReadWrite, Write,
+};
 use crate::cell::CellId;
 
 /// An I/O buffer range represented entirely by a typed capability and bounds.
@@ -117,7 +119,7 @@ impl<'buffer, const N: usize> BufferRegistry<'buffer, N> {
         self.table.revoke_owner(owner)
     }
 
-    fn register<R: crate::capability::CapabilityRights>(
+    fn register<R: CapabilityRights>(
         &mut self,
         owner: CellId,
         bytes: &'buffer mut [u8],
