@@ -10,7 +10,7 @@ use molt_virtio::{Block, Transport};
 const VIRTIO_VENDOR: u16 = 0x1af4;
 const VIRTIO_BLOCK: u16 = 0x1042;
 
-/// What a MoltROFS volume starts with, which is what `xtask` puts on the disk.
+/// What a MoltFS volume starts with, which is what `xtask` puts on the disk.
 const SIGNATURE: [u8; 8] = molt_fs::MAGIC;
 const DMA_FRAMES: usize = 8;
 const BLOCK_TAG: u32 = 0xb10c;
