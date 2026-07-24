@@ -4,8 +4,8 @@ Status: Stage 2.3 decision record, July 2026.
 
 Why a queue is built out of frames the kernel owns rather than memory the device
 names, where a physical address is allowed to exist, what the four request
-semantics actually promise, and why there is no write path. Written as the
-record for `molt-arch::dma` and the `molt-virtio` crate.
+semantics actually promise, and how Stage 3 orders writes and flushes. Written
+as the record for `molt-arch::dma` and the `molt-virtio` crate.
 
 ## The shape of the problem
 
@@ -140,25 +140,23 @@ modern one and has exactly one point of policy: `negotiate` always demands
 `VIRTIO_F_VERSION_1` and refuses a device that will not offer it. There is no
 legacy fallback. A device that clears `FEATURES_OK` after the driver writes it,
 or that offers no modern transport, is refused rather than driven through an
-interface with a different memory model. The block driver negotiates *no* block
-feature bits beyond that — a bare `VIRTIO_BLK_T_IN` read needs none — so the
-feature word it writes back is just the version bit.
+interface with a different memory model. The block driver also refuses
+`VIRTIO_BLK_F_RO` and requires `VIRTIO_BLK_F_FLUSH`. A device without a
+durability boundary cannot satisfy the filesystem checkpoint contract and is
+refused during startup.
 
 `clamp_queue` caps the device's advertised queue depth at what the driver can
 host without a heap and refuses a device that offers no queue at all. The device
 picking a smaller queue than it advertised, or a non-power-of-two size, is a
 `VirtioError::Device` rather than a ring laid out wrong.
 
-## What this stage does not do
+## Write ordering
 
-**There is no write path, and that is a decision, not a gap.** Stage 2.4's
-filesystem is read-only, so the driver never issues `VIRTIO_BLK_T_OUT`, never
-marks a data segment writable *by the device toward the disk*, and never issues
-the flush that would have to order such a write against a completion. Adding a
-half-tested write path now — with no consumer and no crash-consistency story —
-would be code the roadmap explicitly defers to Stage 3's writable filesystem.
-The one public operation is `read`. When there is something that writes, the
-flush ordering and the `VIRTIO_F_FLUSH` negotiation come with it.
+`VIRTIO_BLK_T_OUT` uses a device-readable data descriptor.
+`VIRTIO_BLK_T_FLUSH` carries only request and status descriptors, with sector
+zero. `molt-block::Writable` exposes both without exposing a virtqueue. One
+outstanding request at a time keeps completion order deterministic, and MoltFS
+places explicit flushes between log data and the superblock that names it.
 
 **Bus mastering is granted for this device, once, and it is not free.** The same
 trade [`docs/pci.md`](pci.md) recorded for MSI applies with full force here: a
@@ -189,15 +187,15 @@ What no host test can show is that a queue built from claimed frames, a device
 brought up over a mapped BAR, and a physical address handed across the DMA
 boundary all describe the same disk. The only proof is a sector reading back
 correct, so the x86_64 smoke attaches a `virtio-blk-pci,disable-legacy=on`
-function backed by a MoltROFS image `xtask mkfs` lays out from the `disk/` tree,
-brings the device up, reads sector zero, checks it against the volume's
-`MOLTROFS` magic, and resets. It requires `MOLT_VIRTIO_OK`, `MOLT_BLOCK_OK`, and
-`MOLT_VIRTIO_RESET_OK` on the serial line, the last of which is the queue-reset
-ordering proving itself: the device stopped, then the frames came back.
+function backed by a MoltFS image `xtask mkfs` lays out from the `disk/` tree,
+brings the device up, reads sector zero, commits a filesystem write, and resets.
+It requires `MOLT_VIRTIO_OK`, `MOLT_BLOCK_OK`, `MOLT_FS_WRITE_OK`, and
+`MOLT_VIRTIO_RESET_OK` on the serial line. The last marker proves queue-reset
+ordering: the device stopped, then frames came back.
 
 The disk is a real filesystem rather than a signed pattern so that one artifact
-carries the whole path: the same bytes this driver reads are what Stage 2.4's
-filesystem mounts and its shell prints, and the markers between `MOLT_BLOCK_OK`
+carries the whole path: the same bytes this driver reads are what MoltFS writes,
+mounts, and prints through its shell, and the markers between `MOLT_BLOCK_OK`
 and `MOLT_VIRTIO_RESET_OK` are that filesystem's. See [`docs/fs.md`](fs.md).
 
 The RISC-V smoke does not run it. The `virt` board hands out no DMA frames to

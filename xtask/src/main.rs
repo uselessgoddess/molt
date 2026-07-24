@@ -77,7 +77,7 @@ fn usage() -> String {
     "usage: cargo xtask <image|boot|smoke [x86_64|riscv64|all]|mkfs <tree> <image>>".into()
 }
 
-/// Writes the tree at `tree` out as a mountable MoltROFS image.
+/// Writes the tree at `tree` out as a mountable MoltFS image.
 fn mkfs(tree: &Path, image: &Path) -> Result<(), String> {
     let bytes = lay_out(tree)?;
     fs::write(image, &bytes)
@@ -158,6 +158,7 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
             "MOLT_VIRTIO_OK:",
             "MOLT_BLOCK_OK:",
             "MOLT_FS_OK:",
+            "MOLT_FS_WRITE_OK:",
             "molt> cat hello.txt",
             "hello, molt",
             "MOLT_SHELL_OK:",
@@ -355,8 +356,8 @@ fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
 
 /// Builds the disk the smoke test hands to QEMU.
 ///
-/// It is a real MoltROFS image rather than a signed pattern, so the block read
-/// and the shell's `cat` prove the same bytes end to end.
+/// It is a real MoltFS image rather than a signed pattern, so block I/O, a
+/// durable runtime write, and the shell's `cat` prove the same disk end to end.
 fn virtio_disk() -> Result<PathBuf, String> {
     let root = workspace_root();
     let image_dir = target_dir(&root).join("molt");
@@ -443,7 +444,7 @@ mod tests {
     use molt_block::Loopback;
     use molt_core::buffer::{BufferOperation, BufferRegistry};
     use molt_core::capability::CellId;
-    use molt_fs::{BLOCK, Fs, FsDone, FsOp, Handle, Name};
+    use molt_fs::{BLOCK, Fs, FsDone, FsOp, Handle, Kind, Name};
 
     use super::{DISK_TREE, lay_out, workspace_root};
 
@@ -451,29 +452,86 @@ mod tests {
     const WINDOW: usize = 64;
 
     #[test]
-    fn smoke_disk_mounts_reads() {
+    fn smoke_disk_mounts_reads_and_writes() {
         let tree = workspace_root().join(DISK_TREE);
-        let image = lay_out(&tree).expect("image of the smoke tree");
+        let on_disk = fs::read(tree.join("hello.txt")).expect("file the image was built from");
+        let mut image = lay_out(&tree).expect("image of the smoke tree");
+        {
+            let mut block = [0u8; BLOCK];
+            let mut fs = Fs::<_, 4>::mount(
+                Loopback::writable(&mut image).expect("whole sectors"),
+                &mut block,
+            )
+            .unwrap();
+
+            let mut bytes = [0u8; WINDOW];
+            let mut buffers = BufferRegistry::<1>::new();
+            let buffer = buffers.register_read_write(OWNER, &mut bytes).expect("free slot");
+            let target = buffers.write_capability(buffer).expect("write right");
+            let root = fs.root(OWNER).expect("root handle");
+            let name = Name::try_from("hello.txt").expect("legal name");
+            let opened =
+                fs.apply(OWNER, FsOp::Open { dir: root, name }, &mut buffers).expect("open");
+            let Some(Handle::File(file)) = opened.handle() else {
+                panic!("hello.txt opened as a directory: {opened:?}");
+            };
+
+            let window = BufferOperation::new(target, 0, WINDOW);
+            let read =
+                fs.apply(OWNER, FsOp::Read { file, buffer: window, offset: 0 }, &mut buffers);
+            assert_eq!(read, Ok(FsDone::Read(on_disk.len())));
+            assert_eq!(
+                &buffers.resolve_write(window).expect("same buffer")[..on_disk.len()],
+                &on_disk
+            );
+
+            let source = buffers.read_capability(buffer).expect("read right");
+            let created = fs
+                .apply(
+                    OWNER,
+                    FsOp::Create {
+                        dir: root,
+                        name: Name::try_from("runtime.txt").unwrap(),
+                        kind: Kind::File,
+                    },
+                    &mut buffers,
+                )
+                .expect("create");
+            let Some(Handle::File(runtime)) = created.handle() else {
+                panic!("runtime.txt opened as a directory: {created:?}");
+            };
+            let write = FsOp::Write {
+                file: runtime,
+                buffer: BufferOperation::new(source, 0, on_disk.len()),
+                offset: 0,
+            };
+            assert_eq!(fs.apply(OWNER, write, &mut buffers), Ok(FsDone::Written(on_disk.len())));
+            assert_eq!(fs.apply(OWNER, FsOp::Sync, &mut buffers), Ok(FsDone::Synced(2)));
+        }
+
         let mut block = [0u8; BLOCK];
+        let mut bytes = [0u8; WINDOW];
         let mut fs =
             Fs::<_, 4>::mount(Loopback::new(&image).expect("whole sectors"), &mut block).unwrap();
-
-        let mut bytes = [0u8; WINDOW];
         let mut buffers = BufferRegistry::<1>::new();
         let buffer = buffers.register_write(OWNER, &mut bytes).expect("free slot");
         let root = fs.root(OWNER).expect("root handle");
-        let name = Name::try_from("hello.txt").expect("legal name");
-        let opened = fs.apply(OWNER, FsOp::Open { dir: root, name }, &mut buffers).expect("open");
+        let opened = fs
+            .apply(
+                OWNER,
+                FsOp::Open { dir: root, name: Name::try_from("runtime.txt").unwrap() },
+                &mut buffers,
+            )
+            .expect("open durable file");
         let Some(Handle::File(file)) = opened.handle() else {
-            panic!("hello.txt opened as a directory: {opened:?}");
+            panic!("runtime.txt opened as a directory: {opened:?}");
         };
-
         let window = BufferOperation::new(buffer, 0, WINDOW);
-        let read = fs.apply(OWNER, FsOp::Read { file, buffer: window, offset: 0 }, &mut buffers);
-        let on_disk = fs::read(tree.join("hello.txt")).expect("file the image was built from");
 
-        assert_eq!(read, Ok(FsDone::Read(on_disk.len())));
-        let taken = buffers.resolve_write(window).expect("same buffer");
-        assert_eq!(&taken[..on_disk.len()], &on_disk[..]);
+        assert_eq!(
+            fs.apply(OWNER, FsOp::Read { file, buffer: window, offset: 0 }, &mut buffers),
+            Ok(FsDone::Read(on_disk.len()))
+        );
+        assert_eq!(&buffers.resolve_write(window).expect("same buffer")[..on_disk.len()], &on_disk);
     }
 }

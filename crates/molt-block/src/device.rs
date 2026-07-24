@@ -19,6 +19,19 @@ pub trait Device {
     fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError>;
 }
 
+/// Sector-addressed storage that can make writes durable.
+///
+/// [`write`](Self::write) only promises that later reads through the same
+/// device observe the bytes. [`flush`](Self::flush) is the persistence
+/// boundary: when it returns, every earlier write must survive power loss.
+pub trait Disk: Device {
+    /// Writes consecutive sectors from `buf` starting at `sector`.
+    fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), BlockError>;
+
+    /// Makes every preceding write durable before returning.
+    fn flush(&mut self) -> Result<(), BlockError>;
+}
+
 impl<D: Device + ?Sized> Device for &mut D {
     fn sectors(&self) -> u64 {
         (**self).sectors()
@@ -26,6 +39,16 @@ impl<D: Device + ?Sized> Device for &mut D {
 
     fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
         (**self).read(sector, buf)
+    }
+}
+
+impl<D: Disk + ?Sized> Disk for &mut D {
+    fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), BlockError> {
+        (**self).write(sector, buf)
+    }
+
+    fn flush(&mut self) -> Result<(), BlockError> {
+        (**self).flush()
     }
 }
 

@@ -5,15 +5,12 @@
 //! initialization handshake and programs a queue; [`Queue`] is one split
 //! virtqueue laid over [`Region`](molt_arch::dma::Region)s the device reads and
 //! writes; [`Notify`] kicks the device; and [`Block`] ties them together to
-//! read sectors and, on [`reset`](Block::reset), to reclaim every frame only
-//! after the device has been told to stop.
+//! read and write sectors, flush them durably, and, on [`reset`](Block::reset),
+//! reclaim every frame only after the device has been told to stop.
 //!
-//! Above the driver there is only [`molt_block::Device`], which [`Block`]
-//! implements: sectors in, sectors out, with the virtqueue invisible.
-//!
-//! The write path is deliberately absent. Stage 2.4's filesystem is read-only,
-//! so the driver never issues a flush and never hands the device a writable
-//! sector — the one operation is a read.
+//! Above the driver there are only [`molt_block::Device`] and
+//! [`molt_block::Writable`], which [`Block`] implements: sectors in, sectors
+//! out, with the virtqueue invisible.
 
 #![no_std]
 
@@ -52,6 +49,8 @@ pub enum VirtioError {
     Dma(DmaError),
     /// The device would not accept the features the driver requires.
     Features,
+    /// The device advertises itself as read-only.
+    ReadOnly,
     /// The device reported a size or layout the driver cannot honour.
     Device,
     /// The submission ring is full; the caller must drain completions first.
@@ -83,6 +82,7 @@ impl From<VirtioError> for BlockError {
         match error {
             VirtioError::Timeout => Self::Timeout,
             VirtioError::Dma(DmaError::Range) => Self::Range,
+            VirtioError::ReadOnly => Self::ReadOnly,
             _ => Self::Device,
         }
     }

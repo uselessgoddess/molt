@@ -1,18 +1,18 @@
-//! MoltROFS, a read-only filesystem sitting on any [`molt_block::Device`].
+//! MoltFS, a checksummed writable filesystem over [`molt_block::Writable`].
 //!
-//! An image is written once by `xtask mkfs` and never modified, so the crate
-//! carries no allocator, no journal, and no write path. What it does carry is
-//! the parts a writable successor needs: a generation-stamped superblock kept
-//! in two copies, a checksum over every metadata region, and a crc32c over
-//! every data block. A checkpoint that overwrites the older copy and only then
-//! becomes the newer one is the whole of crash consistency here — a torn write
-//! leaves the previous checkpoint intact, and [`Volume::mount`] takes the
-//! newest copy that verifies.
+//! `xtask mkfs` lays out immutable objects, extents, entries, names, sums, and
+//! data. Runtime metadata lives in a checksummed copy-on-write B+ tree while
+//! create and write payloads live in one of three rotating log banks. A sync
+//! flushes both before publishing their root through the older of two
+//! generation-stamped superblocks, then flushes the superblock. Power loss
+//! therefore leaves either the previous generation or the complete new
+//! generation mountable, without fsck.
 //!
 //! [`Volume`] is the reader, needing one block of buffer and nothing else.
-//! [`Fs`] wraps it in the ring protocol every other cell talks: typed [`FsOp`]
-//! submissions in, [`FsDone`] completions out, with directories and files named
-//! by capability rather than by path.
+//! [`Journal`] adds allocation-free replay and mutation, and [`Fs`] wraps it in
+//! the ring protocol every other cell talks: typed [`FsOp`] submissions in,
+//! [`FsDone`] completions out, with directories and files named by capability
+//! rather than by path.
 //!
 //! See `docs/fs.md` for the format and the decisions behind it.
 
@@ -27,8 +27,11 @@ use molt_block::BlockError;
 use molt_core::buffer::BufferError;
 use molt_core::capability::CapabilityError;
 
+mod btree;
 mod crc;
+mod journal;
 mod layout;
+mod log;
 mod name;
 mod op;
 mod service;
@@ -37,6 +40,8 @@ mod volume;
 #[cfg(feature = "format")]
 pub mod format;
 
+pub use crate::btree::{CacheStats, TreeStats};
+pub use crate::journal::Journal;
 pub use crate::layout::{BLOCK, Kind, MAGIC, MAX_NAME, Object, SUPERS, VERSION};
 pub use crate::name::Name;
 pub use crate::op::{Dir, File, FsDone, FsOp, Handle, Stat};
@@ -56,13 +61,15 @@ pub enum FsError {
     Corrupt,
     /// No such object, entry, or name.
     Missing,
+    /// The name already exists in that directory.
+    Exists,
     /// A name that is empty, overlong, or holds a separator.
     Name,
     /// A directory operation on a file, or the reverse.
     Kind,
     /// An offset past the end of what it addresses.
     Range,
-    /// The device below refused the read.
+    /// The device below refused an operation.
     Device(BlockError),
     /// A root grant asked for after the bootstrap was sealed.
     Sealed,
@@ -72,6 +79,8 @@ pub enum FsError {
     Buffer(BufferError),
     /// No free handle left in the table.
     Handles,
+    /// The tree arena, mutation log, or object-id space is full.
+    Full,
 }
 
 impl From<BlockError> for FsError {

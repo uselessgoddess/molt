@@ -6,12 +6,12 @@
 //! subtree cannot address anything outside it, which is what a chroot is for
 //! elsewhere and what the type is here.
 //!
-//! Data never travels in an operation. A read names a registered buffer, which
-//! only the supervisor-owned registry can turn into memory, so the driver
-//! writes into the client's buffer without either side handing out a pointer.
+//! Data never travels in an operation. Reads and writes name registered
+//! buffers, which only the supervisor-owned registry can turn into memory, so
+//! neither side hands out a pointer.
 
 use molt_core::buffer::BufferOperation;
-use molt_core::capability::{Capability, CapabilityRights, Rights, Write};
+use molt_core::capability::{Capability, CapabilityRights, Read, Rights, Write};
 
 use crate::layout::Kind;
 use crate::name::Name;
@@ -24,15 +24,15 @@ use crate::name::Name;
 pub enum Dir {}
 
 impl CapabilityRights for Dir {
-    const MASK: Rights = Rights::READ;
+    const MASK: Rights = Rights::READ_WRITE;
 }
 
-/// The rights an open file carries. A volume is read-only, so reading is all.
+/// The rights an open file carries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum File {}
 
 impl CapabilityRights for File {
-    const MASK: Rights = Rights::READ;
+    const MASK: Rights = Rights::READ_WRITE;
 }
 
 /// An open handle of either kind.
@@ -70,6 +70,12 @@ pub enum FsOp {
     Entry { dir: Capability<Dir>, index: u32 },
     /// Reads `file` at `offset` into a registered buffer.
     Read { file: Capability<File>, buffer: BufferOperation<Write>, offset: u64 },
+    /// Creates an empty object inside `dir`.
+    Create { dir: Capability<Dir>, name: Name, kind: Kind },
+    /// Writes a registered buffer into `file` at `offset`.
+    Write { file: Capability<File>, buffer: BufferOperation<Read>, offset: u64 },
+    /// Makes every earlier create and write durable.
+    Sync,
     /// Asks what a handle refers to.
     Stat(Handle),
     /// Drops a handle, freeing its slot.
@@ -98,6 +104,10 @@ pub enum FsDone {
     Entry { name: Name, stat: Stat },
     /// How many bytes landed in the buffer; short only at the end of a file.
     Read(usize),
+    /// How many bytes were appended to the mutation log.
+    Written(usize),
+    /// The durable generation after a sync.
+    Synced(u64),
     /// What a handle refers to.
     Stat(Stat),
     /// The handle is gone.
