@@ -258,9 +258,9 @@ fn read<D: Device>(device: &mut D, block: &mut [u8; BLOCK], index: u64) -> Resul
 
 #[cfg(all(test, feature = "format"))]
 mod tests {
-    use molt_block::Loopback;
+    use molt_block::{BlockError, Fault, Line, Loopback, Write};
 
-    use super::Volume;
+    use super::{SECTORS, SUPERS, Volume};
     use crate::crc::crc32c;
     use crate::format::{Tree, build};
     use crate::layout::{Area, BLOCK, Kind, Super};
@@ -274,7 +274,7 @@ mod tests {
         build(&tree, 1).expect("image that fits")
     }
 
-    fn mount<'a>(bytes: &'a [u8], block: &'a mut [u8; BLOCK]) -> Volume<'a, Loopback<'a>> {
+    fn mount<'a>(bytes: &'a [u8], block: &'a mut [u8; BLOCK]) -> Volume<'a, Loopback<&'a [u8]>> {
         Volume::mount(Loopback::new(bytes).expect("whole sectors"), block).expect("live volume")
     }
 
@@ -443,5 +443,88 @@ mod tests {
         let mut tree = Tree::new();
 
         assert_eq!(tree.file(&"a".repeat(MAX_NAME + 1), alloc::vec![]), Err(FsError::Name));
+    }
+
+    // Rewrites the older superblock copy at generation `next` — the write half of
+    // a checkpoint, before it is flushed.
+    fn stage<D: Write>(device: &mut D, next: u64) -> Result<(), BlockError> {
+        let mut block = [0u8; BLOCK];
+        let (mut newest, mut newest_copy) = (None::<Super>, 0);
+        for copy in 0..SUPERS {
+            device.read(copy * SECTORS, &mut block)?;
+            if let Ok(parsed) = Super::parse(&block)
+                && newest.is_none_or(|best| parsed.generation > best.generation)
+            {
+                newest = Some(parsed);
+                newest_copy = copy;
+            }
+        }
+        let mut superblock = newest.expect("a valid copy to build on");
+        superblock.generation = next;
+        let mut fresh = [0u8; BLOCK];
+        superblock.encode(&mut fresh);
+        device.write((SUPERS - 1 - newest_copy) * SECTORS, &fresh)
+    }
+
+    // A whole checkpoint: stage the older copy, then flush to swing onto it.
+    fn checkpoint<D: Write>(device: &mut D, next: u64) -> Result<(), BlockError> {
+        stage(device, next)?;
+        device.flush()
+    }
+
+    #[test]
+    fn generation_swings_only_after_flush() {
+        let mut disk = image();
+        {
+            let mut cache = [Line::EMPTY; SECTORS as usize];
+            let mut device =
+                Fault::new(Loopback::new(&mut disk[..]).expect("whole sectors"), &mut cache);
+            stage(&mut device, 2).expect("stage older copy");
+            device.crash();
+        }
+
+        let mut buffer = [0u8; BLOCK];
+        assert_eq!(
+            mount(&disk, &mut buffer).generation(),
+            1,
+            "an unflushed stage swung the generation"
+        );
+    }
+
+    #[test]
+    fn flushed_checkpoint_swings_generation() {
+        let mut disk = image();
+        {
+            let mut cache = [Line::EMPTY; SECTORS as usize];
+            let mut device =
+                Fault::new(Loopback::new(&mut disk[..]).expect("whole sectors"), &mut cache);
+            checkpoint(&mut device, 2).expect("checkpoint");
+        }
+
+        let mut buffer = [0u8; BLOCK];
+        assert_eq!(mount(&disk, &mut buffer).generation(), 2, "a flushed checkpoint did not swing");
+    }
+
+    #[test]
+    fn checkpoint_mounts_after_power_cut_at_every_sector() {
+        let base = image();
+        for cut in 0..=SECTORS {
+            let mut disk = base.clone();
+            {
+                let mut cache = [Line::EMPTY; SECTORS as usize];
+                let mut device =
+                    Fault::new(Loopback::new(&mut disk[..]).expect("whole sectors"), &mut cache);
+                device.cut_after(cut);
+                let _ = checkpoint(&mut device, 2);
+            }
+
+            let mut buffer = [0u8; BLOCK];
+            let mut volume = mount(&disk, &mut buffer);
+            assert!(
+                matches!(volume.generation(), 1 | 2),
+                "cut {cut} mounted an impossible generation"
+            );
+            volume.object(volume.root()).expect("root survived the cut");
+        }
     }
 }
