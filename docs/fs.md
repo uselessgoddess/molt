@@ -1,12 +1,12 @@
 # MoltFS
 
-Status: Stage 3 writable filesystem, July 2026.
+Status: Stage 3 COW B-tree filesystem, July 2026.
 
 How the read-only Stage 2.4 image became a writable, crash-consistent
-filesystem; what comes from bcachefs; why the runtime format is a bounded log
-rather than a free-space bitmap; and how capabilities, block durability, and
-power-loss tests fit together. This is the record for `molt-block`, `molt-fs`,
-and `molt-shell`.
+filesystem; how the bounded journal and copy-on-write metadata tree divide the
+work; what comes from bcachefs; and how capabilities, block durability, caching,
+and power-loss tests fit together. This is the record for `molt-block`,
+`molt-fs`, and `molt-shell`.
 
 ## What this stage has to answer
 
@@ -53,9 +53,8 @@ adds the log banks around it.
 
 ## Taking from bcachefs rather than btrfs
 
-The brief was btrfs's ideas without btrfs's legacy, leaning bcachefs. The three
-things worth taking are the same three in both, and they arrive here in the
-cheapest form that is still the real thing.
+The brief was btrfs's ideas without btrfs's legacy, leaning bcachefs. The ideas
+arrive here in the cheapest form that is still the real thing.
 
 **Checksums that cover data, not just metadata.** Every data block carries a
 crc32c in a region of its own, and every metadata region carries one in the
@@ -73,6 +72,21 @@ seeking across the volume — the Stage 4 item this leaves room for.
 
 **A generation in the superblock, and a checkpoint that swings it.** Below.
 
+**Filesystem state as typed B-tree keys.** bcachefs treats the filesystem as a
+database: metadata records are keys in a small set of B-trees, and its journal
+records key updates which replay inserts back into those trees. MoltFS uses one
+tree with three key spaces:
+
+- `Object(id)` maps to current kind, entry count, and file size;
+- `Dirent(parent, name)` maps a directory leaf name to an object id;
+- `Write(object, cursor)` maps a file update to its journal payload.
+
+This is the same useful boundary at smaller scale: namespace and object queries
+are tree lookups rather than mutation-log scans, while file payloads remain in
+the bounded log until extent allocation and compaction arrive. See bcachefs's
+[architecture overview](https://bcachefs.org/) and
+[transaction design](https://bcachefs.org/Transactions/).
+
 **Extents, not block pointers.** A file is a run of `(logical, blocks, block)`
 records, sorted by logical block and binary-searched. Contiguous data costs one
 record however long it is, a logical block no extent covers is a hole that reads
@@ -83,14 +97,6 @@ thrown away.
 
 What was deliberately *not* taken:
 
-- **A B-tree, yet.** bcachefs is a B-tree of everything and btrfs is a forest of
-  them, and both are right for a filesystem that mutates. A read-only image is
-  written once, sorted, and never inserted into, so the same asymptotics come
-  from a sorted array with a binary search over it — ten block reads for a
-  thousand-name directory — in about a fiftieth of the code. A mutable B-tree
-  is a Stage 4 item, when compaction and scale make insertion load-bearing. The
-  format does not fight it: entries and extents are already sorted by the key a
-  tree would use.
 - **Reflinks, snapshots, subvolumes.** All three need reference-counted general
   allocation. The room they will take is a superblock field and a region, both
   of which the layout has space for.
@@ -116,6 +122,7 @@ block 1   superblock copy 1
           names     the byte arena every entry's name points into
           sums      one crc32c per data block
           data      the blocks extents address
+          tree      fixed arena of checksummed 4096-byte COW nodes
           log 0     active, previous, or free checkpoint bank
           log 1     active, previous, or free checkpoint bank
           log 2     active, previous, or free checkpoint bank
@@ -129,12 +136,12 @@ usable from a kernel that has no heap: mounting costs one `[u8; 4096]` the
 caller supplies.
 
 **The superblock** carries a magic, version, block size, generation, volume
-length, root object id, data geometry, log-bank capacity, and six region
-descriptors — each an offset, length, and crc32c. The sixth descriptor names
-the complete mutation log for that checkpoint. Its own checksum is checked
-before any field is trusted. `Super::check` also proves the selected log lies
-at exactly one of three bank boundaries and that base metadata, data, and log
-banks do not overlap.
+length, root object id, data geometry, tree arena and root, log-bank capacity,
+and six region descriptors — each an offset, length, and crc32c. The sixth
+descriptor names the complete mutation log for that checkpoint. Its own
+checksum is checked before any field is trusted. `Super::check` also proves the
+tree root lies inside its arena, the selected log lies at exactly one of three
+bank boundaries, and base metadata, data, tree, and log banks do not overlap.
 
 **An object** is a kind, a start index, a count, and a size. For a directory the
 range is into the entries region and the size is zero; for a file the range is
@@ -149,9 +156,9 @@ reads one block per probe regardless of name length; `name_len` is a `u16` on
 disk, and `MAX_NAME` — 255 — bounds only the copy a lookup makes onto the stack
 and the inline `Name` a ring carries, not the stored form.
 
-## Writable overlay
+## Writable tree and payload log
 
-The base image remains immutable. `Journal` replays two typed records over it:
+The base image remains immutable. `Journal` appends two typed payload records:
 
 - `Create(object, parent, kind, name)` allocates the next object id and adds one
   directory entry.
@@ -163,14 +170,36 @@ tear only the record being appended, never an earlier record. The active
 superblock carries the exact log length and its crc32c, so padding and
 uncommitted tail bytes are invisible.
 
-This stage does not add a free-space map or object bitmap. They solve arbitrary
-block allocation and reclamation; this stage writes only a bounded log whose
-three fixed banks are its complete allocation policy, and object ids are
-monotonic in that log. A bitmap here would duplicate those two facts without
-making create, write, recovery, or testing stronger. `build_with_log` lets an
-image choose bank capacity, and `FsError::Full` reports the finite bound
-explicitly. Compaction into new B-tree leaves is the point where general
-free-space and object-allocation structures become load-bearing.
+Each mutation also inserts its current state into the metadata B+ tree. A node
+is one checksummed 4096-byte block. Leaves hold typed keys and values; internal
+nodes hold separator keys and child blocks. Insertion keeps a fixed
+root-to-leaf path, writes a replacement path, splits full nodes, and returns a
+new root. It never overwrites a node reachable from either durable
+superblock. `Journal::sync` publishes that root only after the nodes and log
+have passed a durability barrier.
+
+The tree API is deliberately small: exact lookup, ordered successor, insert,
+and transaction root. Filesystem code builds object, directory, and write keys
+on top rather than teaching the tree about files. The path and split buffers
+are fixed-size, so the kernel still needs no RAM allocator.
+
+The tree arena has a bounded tracing allocator. Starting a transaction marks
+nodes reachable from the active and previous roots; every other arena block is
+reclaimable. Replaced paths created in the same transaction are released
+immediately. This keeps both crash fallbacks intact while allowing old
+generations to be reused without fsck. `build_with_capacity` selects tree and
+log capacity, and `FsError::Full` reports either finite bound explicitly.
+
+## Metadata cache
+
+`MetadataTree` owns four parsed-node slots, about 16 KiB, and uses a bounded
+second-chance policy inspired by
+[SIEVE](https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo).
+A hit sets one visited bit and does not move the node. The eviction hand clears
+visited candidates and replaces the first unvisited one. This is useful here
+because it has constant metadata, no linked allocation, and makes repeated
+root and directory probes device-read free. `Journal::tree_stats` exposes hit,
+miss, and eviction counters for tests and diagnostics.
 
 ## Crash consistency
 
@@ -187,13 +216,14 @@ three log banks:
 2. one named by the previous superblock;
 3. one safe target for the next transaction.
 
-The first mutation copies the active log into the free bank and appends there.
-`Sync` uses one deterministic, synchronous sequence:
+The first mutation copies the active log into the free bank, appends there, and
+writes new COW nodes into unprotected arena blocks. `Sync` uses one
+deterministic, synchronous sequence:
 
-1. finish all target-bank sector writes;
+1. finish all target-bank and COW-node writes;
 2. issue device `flush`;
 3. write the older superblock copy with generation + 1, target bank, length,
-   and checksum;
+   checksum, and new tree root;
 4. issue device `flush` again.
 
 The first flush makes every byte the new superblock will name durable. The
@@ -202,17 +232,20 @@ superblocks and their banks intact; losing power after it leaves a complete
 new checkpoint. Mount parses both copies in generation order and verifies each
 selected log. If the newest copy parses but its log checksum fails, mount
 continues to the previous copy instead of treating a generation number as
-proof.
+proof. It applies the same rule to the tree: every reachable node checksum,
+level, child address, and generation is verified before the checkpoint can win.
 
 There is deliberately one outstanding block request at a time. That makes
 ordering observable and deterministic; barriers separate durability epochs,
 while the queue cannot reorder requests within one. `molt-block::Fault` models
 volatile controller cache separately from stable storage. The crash test starts
-from generation 2, rotates into the third bank, and cuts power before every one
-of its six device actions: log copy, create, write, log flush, superblock write,
-and superblock flush. Every interrupted run remounts generation 2; the first
-uninterrupted run remounts generation 3 with all bytes. That test is the
-recovery algorithm, not a simulation around it.
+from generation 2, rotates into the third bank, and cuts power before every
+record, tree-node, flush, and superblock action until a full checkpoint
+succeeds. Every interrupted run remounts generation 2; the first uninterrupted
+run remounts generation 3 with all bytes. Separate tests corrupt the newest log
+and newest tree root and require fallback, and cycle hundreds of checkpoints to
+prove arena reclamation. Those tests are the recovery algorithm, not a
+simulation around it.
 
 ## Schemes: no, and here is the line
 
@@ -567,20 +600,19 @@ prose but not in the types.
 
 ## Version and growth path
 
-Writable layout is version 2. Unlike the earlier `MAX_NAME` change, adding a
-log descriptor, bank capacity, and reserved banks changes bytes and geometry
-an old reader interprets. There is no published standard yet, but that is a
-reason to keep migration policy small, not to label incompatible layouts with
-the same version. Version 1 images are rejected rather than guessed at; `xtask
-mkfs` rebuilds development images as version 2.
+Writable COW layout is version 3. Adding the tree arena and root changes bytes
+and geometry an older reader interprets. There is no published standard yet,
+but that is a reason to keep migration policy small, not to label incompatible
+layouts with the same version. Version 1 and 2 images are rejected rather than
+guessed at; `xtask mkfs` rebuilds development images as version 3.
 
 - **Stage 3, cells.** `Fs` becomes a supervised cell when there is more than one
   client and restart means remount. `revoke_owner` is the piece that has to
   work then, and it already covers write authority.
-- **Stage 4, scale.** Objects and extents become B-tree leaves keyed the way
-  they are already sorted; log compaction introduces free-space and object
-  allocation maps; sums become a scrub work list; block layer gains its ring,
-  cache, and readahead behind the same traits.
+- **Stage 4, scale.** File payloads compact from the journal into extent keys;
+  reference counts and bucket generations generalize the bounded tree arena;
+  sums become a scrub work list; block layer gains its ring, data cache, and
+  readahead behind the same traits.
 - **Stage 5, storage for cells.** A signed cell image is a file with a signature
   region, and the loader is a client of this protocol — which is the argument
   for the protocol being pleasant to write against, since a loader is the next

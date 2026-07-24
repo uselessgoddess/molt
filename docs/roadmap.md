@@ -204,11 +204,12 @@ Both are argued in `docs/fs.md`.
 - [ ] capability delegation and audit events
 
 Writable filesystem includes sector writes, required virtio flush support,
-three rotating checkpoint-log banks, deterministic log/flush/superblock/flush
-ordering, `Create`/`Write`/`Sync` capability operations, and fault injection
-that cuts power before every checkpoint action. Mount always selects a complete
-old or new generation and never depends on fsck. `MOLT_FS_WRITE_OK` proves the
-same path through QEMU's virtio-blk device.
+three rotating checkpoint-log banks, a checksummed copy-on-write metadata
+B-tree with bounded node caching and generation reclamation, deterministic
+tree/log/flush/root-swing/flush ordering, `Create`/`Write`/`Sync` capability
+operations, and fault injection that cuts power before every checkpoint action.
+Mount always selects a complete old or new generation and never depends on
+fsck. `MOLT_FS_WRITE_OK` proves the same path through QEMU's virtio-blk device.
 
 ## Stage 4 — SMP, hardware breadth, and performance
 
