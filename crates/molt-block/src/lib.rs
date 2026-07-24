@@ -1,10 +1,10 @@
 //! Sector storage, described independently of the bus it hangs off.
 //!
-//! [`Device`] is the whole contract a filesystem needs: how many sectors exist
-//! and how to read some of them. `molt-virtio` implements it over a virtqueue,
-//! [`Loopback`] implements it over bytes already in memory, and a future NVMe or
-//! SD driver implements it over whatever it likes — none of which the
-//! filesystem above has to know.
+//! [`Device`] is the read contract a filesystem needs — how many sectors exist
+//! and how to read some — and [`Write`] adds the durable side: sector writes and
+//! the flush that orders them. `molt-virtio` implements both over a virtqueue,
+//! [`Loopback`] implements them over bytes already in memory, and [`Fault`]
+//! wraps a writable device in a volatile cache a test can cut power to.
 
 #![no_std]
 
@@ -12,10 +12,14 @@
 extern crate std;
 
 mod device;
+mod fault;
 mod loopback;
+mod write;
 
 pub use crate::device::{Device, bounds};
+pub use crate::fault::{Fault, Line};
 pub use crate::loopback::Loopback;
+pub use crate::write::Write;
 
 /// A sector is 512 bytes, the unit every device address is counted in.
 pub const SECTOR: usize = 512;
