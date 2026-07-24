@@ -7,7 +7,7 @@
 
 use core::cmp::Ordering;
 
-use molt_block::{Device, SECTOR};
+use molt_block::{Device, SECTOR, Writable};
 
 use crate::FsError;
 use crate::crc::{Crc, crc32c};
@@ -26,6 +26,8 @@ pub struct Volume<'buf, D> {
     block: &'buf mut [u8; BLOCK],
     cached: Option<u64>,
     superblock: Super,
+    active_copy: u64,
+    previous_log: Option<u64>,
 }
 
 impl<'buf, D: Device> Volume<'buf, D> {
@@ -36,26 +38,45 @@ impl<'buf, D: Device> Volume<'buf, D> {
     /// corrupt volume fails at mount rather than at the first lookup that
     /// happens to touch the damaged block.
     pub fn mount(mut device: D, block: &'buf mut [u8; BLOCK]) -> Result<Self, FsError> {
-        let mut newest: Option<Super> = None;
+        let mut copies = [None; SUPERS as usize];
+        let mut last_error = FsError::Magic;
         for copy in 0..SUPERS {
-            if read(&mut device, block, copy).is_err() {
+            read(&mut device, block, copy)?;
+            match Super::parse(block) {
+                Ok(parsed) => copies[copy as usize] = Some(parsed),
+                Err(error) => last_error = error,
+            }
+        }
+
+        let mut rejected = [false; SUPERS as usize];
+        for _ in 0..SUPERS {
+            let Some((active_copy, superblock)) = copies
+                .iter()
+                .enumerate()
+                .filter(|(copy, _)| !rejected[*copy])
+                .filter_map(|(copy, parsed)| parsed.map(|parsed| (copy as u64, parsed)))
+                .max_by_key(|(copy, parsed)| (parsed.generation, core::cmp::Reverse(*copy)))
+            else {
                 break;
+            };
+            rejected[active_copy as usize] = true;
+            if superblock.blocks.saturating_mul(SECTORS) > device.sectors() {
+                last_error = FsError::Corrupt;
+                continue;
             }
-            if let Ok(parsed) = Super::parse(block)
-                && newest.is_none_or(|best| parsed.generation > best.generation)
-            {
-                newest = Some(parsed);
+            if let Err(error) = verify_checkpoint(&mut device, block, superblock) {
+                last_error = error;
+                continue;
             }
-        }
 
-        let superblock = newest.ok_or(FsError::Magic)?;
-        if superblock.blocks.saturating_mul(SECTORS) > device.sectors() {
-            return Err(FsError::Corrupt);
+            let previous_log = copies
+                .iter()
+                .enumerate()
+                .find(|(copy, _)| *copy != active_copy as usize)
+                .and_then(|(_, parsed)| parsed.map(|parsed| parsed.region(Area::Log).at));
+            return Ok(Self { device, block, cached: None, superblock, active_copy, previous_log });
         }
-
-        let mut volume = Self { device, block, cached: None, superblock };
-        volume.verify()?;
-        Ok(volume)
+        Err(last_error)
     }
 
     /// The object id of the root directory.
@@ -66,6 +87,25 @@ impl<'buf, D: Device> Volume<'buf, D> {
     /// The generation the mounted checkpoint carries.
     pub const fn generation(&self) -> u64 {
         self.superblock.generation
+    }
+
+    pub(crate) const fn checkpoint(&self) -> Super {
+        self.superblock
+    }
+
+    pub(crate) const fn active_copy(&self) -> u64 {
+        self.active_copy
+    }
+
+    pub(crate) const fn previous_log(&self) -> Option<u64> {
+        self.previous_log
+    }
+
+    pub(crate) fn commit(&mut self, copy: u64, checkpoint: Super) {
+        self.previous_log = Some(self.superblock.region(Area::Log).at);
+        self.superblock = checkpoint;
+        self.active_copy = copy;
+        self.cached = None;
     }
 
     /// Reads one object record.
@@ -217,7 +257,7 @@ impl<'buf, D: Device> Volume<'buf, D> {
     }
 
     /// Reads a block, or hands back the one already in the buffer.
-    fn block(&mut self, index: u64) -> Result<&[u8; BLOCK], FsError> {
+    pub(crate) fn block(&mut self, index: u64) -> Result<&[u8; BLOCK], FsError> {
         if index >= self.superblock.blocks {
             return Err(FsError::Corrupt);
         }
@@ -229,31 +269,111 @@ impl<'buf, D: Device> Volume<'buf, D> {
         }
         Ok(self.block)
     }
+}
 
-    /// Checks every metadata region against the superblock's checksums.
-    fn verify(&mut self) -> Result<(), FsError> {
-        for area in Area::ALL {
-            let region = self.superblock.region(area);
-            let mut crc = Crc::new();
-            let mut left = region.bytes;
-            let mut index = region.at;
-            while left > 0 {
-                let take = left.min(BLOCK as u64) as usize;
-                crc.update(&self.block(index)?[..take]);
-                left -= take as u64;
-                index += 1;
-            }
-            if crc.finish() != region.crc {
-                return Err(FsError::Checksum);
-            }
+impl<D: Writable> Volume<'_, D> {
+    pub(crate) fn copy_aligned(
+        &mut self,
+        source: u64,
+        target: u64,
+        bytes: u64,
+    ) -> Result<(), FsError> {
+        if bytes % SECTOR as u64 != 0 {
+            return Err(FsError::Corrupt);
         }
+        let mut done = 0;
+        while done < bytes {
+            let take = (bytes - done).min(BLOCK as u64) as usize;
+            let source_sector = source
+                .checked_mul(SECTORS)
+                .and_then(|sector| sector.checked_add(done / SECTOR as u64))
+                .ok_or(FsError::Corrupt)?;
+            self.device.read(source_sector, &mut self.block[..take]).map_err(FsError::Device)?;
+            let target_sector = target
+                .checked_mul(SECTORS)
+                .and_then(|sector| sector.checked_add(done / SECTOR as u64))
+                .ok_or(FsError::Corrupt)?;
+            self.device.write(target_sector, &self.block[..take]).map_err(FsError::Device)?;
+            done += take as u64;
+        }
+        self.cached = None;
         Ok(())
+    }
+
+    pub(crate) fn write_aligned(
+        &mut self,
+        block: u64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), FsError> {
+        if offset % SECTOR as u64 != 0 || bytes.len() % SECTOR != 0 {
+            return Err(FsError::Corrupt);
+        }
+        let sector = block
+            .checked_mul(SECTORS)
+            .and_then(|sector| sector.checked_add(offset / SECTOR as u64))
+            .ok_or(FsError::Corrupt)?;
+        self.device.write(sector, bytes).map_err(FsError::Device)?;
+        self.cached = None;
+        Ok(())
+    }
+
+    pub(crate) fn checksum(&mut self, block: u64, bytes: u64) -> Result<u32, FsError> {
+        let mut crc = Crc::new();
+        let mut left = bytes;
+        let mut index = block;
+        while left > 0 {
+            let take = left.min(BLOCK as u64) as usize;
+            crc.update(&self.block(index)?[..take]);
+            left -= take as u64;
+            index += 1;
+        }
+        Ok(crc.finish())
+    }
+
+    pub(crate) fn write_checkpoint(&mut self, copy: u64, value: Super) -> Result<(), FsError> {
+        if copy >= SUPERS {
+            return Err(FsError::Corrupt);
+        }
+        self.block.fill(0);
+        value.encode(self.block);
+        self.device.write(copy * SECTORS, &self.block[..SECTOR]).map_err(FsError::Device)?;
+        self.cached = None;
+        Ok(())
+    }
+
+    pub(crate) fn flush(&mut self) -> Result<(), FsError> {
+        self.device.flush().map_err(FsError::Device)
     }
 }
 
 fn read<D: Device>(device: &mut D, block: &mut [u8; BLOCK], index: u64) -> Result<(), FsError> {
     let sector = index.checked_mul(SECTORS).ok_or(FsError::Corrupt)?;
     device.read(sector, block.as_mut_slice()).map_err(FsError::Device)
+}
+
+fn verify_checkpoint<D: Device>(
+    device: &mut D,
+    block: &mut [u8; BLOCK],
+    superblock: Super,
+) -> Result<(), FsError> {
+    for area in Area::ALL {
+        let region = superblock.region(area);
+        let mut crc = Crc::new();
+        let mut left = region.bytes;
+        let mut index = region.at;
+        while left > 0 {
+            let take = left.min(BLOCK as u64) as usize;
+            read(device, block, index)?;
+            crc.update(&block[..take]);
+            left -= take as u64;
+            index += 1;
+        }
+        if crc.finish() != region.crc {
+            return Err(FsError::Checksum);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(all(test, feature = "format"))]

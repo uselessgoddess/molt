@@ -1,11 +1,12 @@
-# MoltROFS
+# MoltFS
 
-Status: Stage 2.4 decision record, July 2026.
+Status: Stage 3 writable filesystem, July 2026.
 
-Why the first filesystem is read-only, what its five regions are for, which
-ideas were taken from bcachefs, Redox, and btrfs and which were left, whether
-schemes belong under a cytokernel, and whether a driver is a cell. Written as
-the record for `molt-block`, `molt-fs`, and `molt-shell`.
+How the read-only Stage 2.4 image became a writable, crash-consistent
+filesystem; what comes from bcachefs; why the runtime format is a bounded log
+rather than a free-space bitmap; and how capabilities, block durability, and
+power-loss tests fit together. This is the record for `molt-block`, `molt-fs`,
+and `molt-shell`.
 
 ## What this stage has to answer
 
@@ -22,10 +23,9 @@ questions before writing a byte of format:
    the kernel, and no `open(2)`. It has rings and capabilities, so the protocol
    has to be built out of those and be pleasant enough that nobody wants a
    shortcut around it.
-3. **What survives a crash.** A read-only volume cannot be torn by its own
-   writes, but it *is* written — by `xtask mkfs` today and by Stage 3's
-   checkpoint later — and the recovery rule has to exist in version 1 or it
-   never will.
+3. **What survives a crash.** Stage 2.4 established dual superblocks; Stage 3
+   has to turn that shape into a real ordered checkpoint and prove every power
+   cut.
 4. **Where the driver ends and the filesystem begins.** Stage 2.3 shipped
    `molt-virtio` with a `read` method on it. If a filesystem is written against
    that method, the second storage driver is a rewrite of the filesystem.
@@ -45,13 +45,11 @@ the reader first means the write path arrives with something to be correct
 *about*, and it means Stage 2.4 ships something that works instead of something
 that half-works in two directions.
 
-The cost of the choice is real and bounded: `molt-fs` carries no allocator, no
-journal, no free-space map, and no write path. What it does carry — and this is
-the part chosen deliberately — is every structure the writable successor needs
-to exist on disk from version 1: a generation-stamped superblock kept in two
-copies, a checksum over every metadata region, a crc32c per data block, and
-extents rather than block pointers. A version 2 that adds a checkpoint tree
-adds regions; it does not reinterpret the ones already there.
+The cost was real and bounded: Stage 2.4 carried no allocator, log, free-space
+map, or write path. It did establish the structures its successor needed:
+dual generation-stamped superblocks, checksummed metadata, crc32c per data
+block, and extents rather than block pointers. Stage 3 preserves that base and
+adds the log banks around it.
 
 ## Taking from bcachefs rather than btrfs
 
@@ -63,7 +61,7 @@ cheapest form that is still the real thing.
 crc32c in a region of its own, and every metadata region carries one in the
 superblock. This is bcachefs's position — checksums are not optional and not a
 mount flag — and it is why [`Volume::mount`](../crates/molt-fs/src/volume.rs)
-verifies all five regions before the first lookup rather than discovering
+verifies all six regions before the first lookup rather than discovering
 corruption at whatever block a directory search happens to land on. A volume
 that mounts is a volume whose metadata is intact, which is a much stronger
 statement than "the superblock parsed".
@@ -89,22 +87,22 @@ What was deliberately *not* taken:
   them, and both are right for a filesystem that mutates. A read-only image is
   written once, sorted, and never inserted into, so the same asymptotics come
   from a sorted array with a binary search over it — ten block reads for a
-  thousand-name directory — in about a fiftieth of the code. The B-tree is a
-  Stage 4 item because Stage 4 is where insertion exists. The format does not
-  fight it: entries and extents are already sorted by the key a tree would use,
-  so a tree is a new region and a new object field, not a new format.
-- **Reflinks, snapshots, subvolumes.** All three need refcounts, which need a
-  writer. The room they will take is a superblock field and a region, both of
-  which the layout has space for.
+  thousand-name directory — in about a fiftieth of the code. A mutable B-tree
+  is a Stage 4 item, when compaction and scale make insertion load-bearing. The
+  format does not fight it: entries and extents are already sorted by the key a
+  tree would use.
+- **Reflinks, snapshots, subvolumes.** All three need reference-counted general
+  allocation. The room they will take is a superblock field and a region, both
+  of which the layout has space for.
 - **Inodes as a namespace.** There is no `stat` on a number, no hard links, and
   no `.`/`..`. An object is reached by having opened it; see below.
 - **btrfs's on-disk anything.** The item/key/leaf machinery, the chunk tree, and
   the backref format are solutions to problems Molt does not have yet, and each
   one is a compatibility obligation from the moment an image exists.
 
-## The format
+## The base format
 
-Five regions, one superblock, all little-endian, everything block-addressed.
+Six regions, two superblocks, all little-endian, everything block-addressed.
 [`layout.rs`](../crates/molt-fs/src/layout.rs) is the definition; both the
 reader and `xtask mkfs` compile against it, so there is no second copy of the
 format to drift.
@@ -118,6 +116,9 @@ block 1   superblock copy 1
           names     the byte arena every entry's name points into
           sums      one crc32c per data block
           data      the blocks extents address
+          log 0     active, previous, or free checkpoint bank
+          log 1     active, previous, or free checkpoint bank
+          log 2     active, previous, or free checkpoint bank
 ```
 
 Blocks are 4096 bytes. Every record size divides the block size, so no record
@@ -127,15 +128,13 @@ That constant is the reason `Volume` can be `no_std`, allocation-free, and
 usable from a kernel that has no heap: mounting costs one `[u8; 4096]` the
 caller supplies.
 
-**The superblock** carries a magic, a version, the block size, a generation, the
-volume length, the root object id, where data starts and how long it is, and the
-five region descriptors — each an offset, a length, and a crc32c over the
-region's contents. Its own checksum is checked before any field is read, so a
-torn write is rejected at the checksum rather than by whatever the region
-offsets would otherwise have pointed at. `Super::check` then refuses a
-structurally impossible volume: a region starting inside the superblock copies,
-a region running past the end, a sums region whose length disagrees with the
-data block count, or metadata and data regions whose occupied blocks overlap.
+**The superblock** carries a magic, version, block size, generation, volume
+length, root object id, data geometry, log-bank capacity, and six region
+descriptors — each an offset, length, and crc32c. The sixth descriptor names
+the complete mutation log for that checkpoint. Its own checksum is checked
+before any field is trusted. `Super::check` also proves the selected log lies
+at exactly one of three bank boundaries and that base metadata, data, and log
+banks do not overlap.
 
 **An object** is a kind, a start index, a count, and a size. For a directory the
 range is into the entries region and the size is zero; for a file the range is
@@ -150,40 +149,70 @@ reads one block per probe regardless of name length; `name_len` is a `u16` on
 disk, and `MAX_NAME` — 255 — bounds only the copy a lookup makes onto the stack
 and the inline `Name` a ring carries, not the stored form.
 
+## Writable overlay
+
+The base image remains immutable. `Journal` replays two typed records over it:
+
+- `Create(object, parent, kind, name)` allocates the next object id and adds one
+  directory entry.
+- `Write(object, offset, bytes)` overlays file data. Later records win, and a
+  write beyond end creates a zero-filled hole.
+
+Records start on 512-byte sector boundaries. One sector write can therefore
+tear only the record being appended, never an earlier record. The active
+superblock carries the exact log length and its crc32c, so padding and
+uncommitted tail bytes are invisible.
+
+This stage does not add a free-space map or object bitmap. They solve arbitrary
+block allocation and reclamation; this stage writes only a bounded log whose
+three fixed banks are its complete allocation policy, and object ids are
+monotonic in that log. A bitmap here would duplicate those two facts without
+making create, write, recovery, or testing stronger. `build_with_log` lets an
+image choose bank capacity, and `FsError::Full` reports the finite bound
+explicitly. Compaction into new B-tree leaves is the point where general
+free-space and object-allocation structures become load-bearing.
+
 ## Crash consistency
 
-Nothing here writes to a mounted volume, so the property to preserve is narrower
-than Stage 3's and worth stating exactly: **a volume is always mountable at some
-checkpoint, whatever moment power is lost.**
+The invariant is exact: **after power loss, mount returns the complete old
+generation or the complete new generation, never a mixture, and needs no
+fsck.**
 
-The mechanism is two superblock copies and a generation. A checkpoint writes
-every region and every data block first, then overwrites the *older* superblock
-copy with the new one, and that overwrite is the instant the new state becomes
-the volume's state. `Volume::mount` reads both copies, discards any that fails
-its magic, checksum, version, or structure check, and takes the newest of what
-is left. So:
+Two superblocks are not enough by themselves. If a new transaction overwrote
+the previous generation's log while the active generation still depended on
+it, a crash before the new superblock would destroy the fallback. MoltFS keeps
+three log banks:
 
-- Power lost while regions are being written: neither superblock mentions them,
-  and the volume mounts at the previous generation.
-- Power lost mid-superblock: that copy fails its checksum and is discarded, and
-  the other copy — the previous checkpoint — is intact by construction, because
-  the copy being overwritten is always the older one.
-- Power lost after the superblock lands: the new generation is the newest that
-  verifies, which is the definition of the checkpoint having happened.
+1. one named by the active superblock;
+2. one named by the previous superblock;
+3. one safe target for the next transaction.
 
-There is no fsck, and that is a design position rather than an omission: the
-things fsck repairs are the things a checkpoint discipline prevents. There is
-also no `fsync`, no barrier, and no flush issued anywhere, because nothing in
-this stage writes to a device at all — `xtask mkfs` builds an image in memory
-and hands it to the host's filesystem. The moment Stage 3 writes to a virtio
-device, the checkpoint above needs `VIRTIO_F_FLUSH` between "regions written"
-and "superblock written", and that ordering is exactly the thing
-[`docs/virtio.md`](virtio.md) records as deliberately absent. The rule survives
-the transition; only the flush is new.
+The first mutation copies the active log into the free bank and appends there.
+`Sync` uses one deterministic, synchronous sequence:
 
-What this does not defend against is a device that reorders across the whole
-write. That is what the flush is for, and it does not exist yet because the
-writer does not either.
+1. finish all target-bank sector writes;
+2. issue device `flush`;
+3. write the older superblock copy with generation + 1, target bank, length,
+   and checksum;
+4. issue device `flush` again.
+
+The first flush makes every byte the new superblock will name durable. The
+second is the commit point. Losing power before it leaves both old
+superblocks and their banks intact; losing power after it leaves a complete
+new checkpoint. Mount parses both copies in generation order and verifies each
+selected log. If the newest copy parses but its log checksum fails, mount
+continues to the previous copy instead of treating a generation number as
+proof.
+
+There is deliberately one outstanding block request at a time. That makes
+ordering observable and deterministic; barriers separate durability epochs,
+while the queue cannot reorder requests within one. `molt-block::Fault` models
+volatile controller cache separately from stable storage. The crash test starts
+from generation 2, rotates into the third bank, and cuts power before every one
+of its six device actions: log copy, create, write, log flush, superblock write,
+and superblock flush. Every interrupted run remounts generation 2; the first
+uninterrupted run remounts generation 3 with all bytes. That test is the
+recovery algorithm, not a simulation around it.
 
 ## Schemes: no, and here is the line
 
@@ -266,10 +295,9 @@ executor to await *on*, and this stage has one task and a `drive` loop. Worse,
 it would be a ring whose only client is synchronous — `Volume` reads one block
 and immediately needs it — so the ring would be a queue of depth one with an
 await around it. The interesting version of that ring is the one with
-readahead, concurrent extent fetches, and a cache behind it, and all three want
-the writable filesystem's structure. Stage 3 gets `BlockOp`; Stage 2.4 gets the
-trait below, which is what makes Stage 3's version a substitution rather than a
-rewrite.
+readahead, concurrent extent fetches, and a cache behind it. That later scale
+stage gets `BlockOp`; direct traits keep this stage synchronous and make that
+change a substitution rather than a rewrite.
 
 **Naming.** No type here is called `FsCell` or `VirtioCell`. The module supplies
 the context, as [the style guide](style.md) says: `molt_fs::Fs`,
@@ -285,20 +313,25 @@ only way to read a sector, so a filesystem written against it would have
 inherited the virtqueue, and a loopback device or an NVMe driver would have
 meant a second read path in the filesystem.
 
-`molt-block` is the split. It is one trait and one implementation:
+`molt-block` is the split. Reads and durable mutation are separate contracts:
 
 ```rust
 pub trait Device {
     fn sectors(&self) -> u64;
     fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError>;
 }
+
+pub trait Writable: Device {
+    fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), BlockError>;
+    fn flush(&mut self) -> Result<(), BlockError>;
+}
 ```
 
-That is the entire contract a filesystem needs, and everything about how a
-device is reached — BARs, virtqueues, DMA arenas, interrupt vectors — stays
-below it. `molt_virtio::Block` implements it over a virtqueue,
-`molt_block::Loopback` implements it over bytes already in memory, and a future
-NVMe driver implements it over whatever it likes.
+`Volume` needs only `Device`; `Journal` and `Fs` require `Writable`. A
+read-only loopback remains useful and rejects attempted mutation with
+`BlockError::ReadOnly`, while a mutable loopback and fault-injection device
+implement the durable side. Everything about BARs, virtqueues, DMA arenas, and
+interrupt vectors stays below these traits.
 
 Three details in that signature are decisions:
 
@@ -315,6 +348,10 @@ Three details in that signature are decisions:
   smoke has to reset the same virtio device afterwards, so it lends the driver
   instead of giving it away. One blanket impl covers both, and the reset stays
   the driver owner's business.
+- **`flush` is the persistence boundary.** `write` promises later reads through
+  the same device see bytes; only a successful `flush` promises those bytes
+  survive power loss. The filesystem never infers durability from request
+  completion.
 
 `Loopback` is what makes the filesystem testable on the host: `molt-fs`'s entire
 suite mounts real images out of `Vec<u8>` with no QEMU, no device, and nothing
@@ -329,18 +366,21 @@ pub enum FsOp {
     Open { dir: Capability<Dir>, name: Name },
     Entry { dir: Capability<Dir>, index: u32 },
     Read { file: Capability<File>, buffer: BufferOperation<Write>, offset: u64 },
+    Create { dir: Capability<Dir>, name: Name, kind: Kind },
+    Write { file: Capability<File>, buffer: BufferOperation<Read>, offset: u64 },
+    Sync,
     Stat(Handle),
     Close(Handle),
 }
 ```
 
-Five operations, and the shape of each one is the argument.
+Eight operations, and the shape of each one is the argument.
 
-**Nothing carries data.** A read names a registered buffer, and only the
-registry — which the supervisor owns — can turn that name into memory. The
-driver writes into the client's buffer and neither side ever holds the other's
-pointer. This is the same discipline `molt-arch::dma` applies to a device, one
-layer up, and it is why `FsOp` is `Copy` and small enough to sit in a ring slot.
+**Nothing carries data.** A read names a buffer with `Write` authority; a write
+names one with `Read` authority. Only the supervisor-owned registry turns
+either into memory, so neither side passes a pointer. This is the same
+discipline `molt-arch::dma` applies to a device, one layer up, and it keeps
+`FsOp` `Copy` and small enough for a ring slot.
 
 **`Capability<Dir>` and `Capability<File>` are different types.** Not a flag on
 one handle: distinct rights markers, so `Read { file: ... }` cannot be written
@@ -349,6 +389,13 @@ The kind check that a POSIX filesystem does at runtime with `EISDIR` mostly
 happens at compile time here, and `FsError::Kind` exists for the case the client
 genuinely does not know yet — it opened a name and got back whichever kind was
 there.
+
+**Open handles carry `Rights::READ_WRITE`.** `Create` requires a directory
+handle, `Write` requires a file handle, and revocation invalidates both rights
+by advancing one capability generation. A stale file capability therefore
+cannot write after its owner restarts. `Sync` returns the generation that is
+durable when it completes; without pending mutations it is a barrier and keeps
+the current generation.
 
 **The root handle comes from nowhere, and off the ring.** Every other handle is
 opened from a directory somebody already holds; the first cannot be, so there is
@@ -424,8 +471,9 @@ line editor away and needs a serial `read` before it is worth writing.
 
 ## What this stage does not do
 
-- **No writes.** No allocator, no free-space map, no journal, no `fsync`, no
-  rename. Stage 3.
+- **No rename, unlink, or compaction.** Create, sparse write, replay, and sync
+  are complete; reclaiming log space and changing namespace links arrive with
+  the B-tree/free-space stage.
 - **No B-tree, no snapshots, no reflinks, no compression, no encryption.** Stage
   4, and each one needs the writer first.
 - **No cache.** `Volume` keeps the last block it read and nothing else. A
@@ -444,22 +492,21 @@ line editor away and needs a serial `read` before it is worth writing.
 ## How it is tested
 
 Everything with arithmetic in it is a host test over a real image, because
-`Loopback` made that possible: the format round-trips through the builder and
-the reader, a torn superblock is refused, a foreign block is refused, a future
-version is refused by version rather than by checksum, a region past the end of
-the volume is refused, and a damaged region fails at mount rather than at first
-use. Reads cover the boundary cases that a hand-written offset loop gets wrong —
-across a block boundary, from a hole in a sparse file, at the end of a file, and
-past it.
+`Loopback` made that possible: format round-trips through builder and reader, a
+torn superblock is refused, a foreign block is refused, a future version is
+refused by version rather than checksum, a region past volume end is refused,
+and a damaged region fails at mount rather than first use. Reads cover block
+boundaries, sparse holes, file end, and writes that overlay immutable data and
+extend it through a hole.
 
 A checksum-valid but impossible extent is still refused: physical block
 arithmetic is checked before a data read, so a malformed address cannot wrap
 into another region or panic the reader.
 
-The service tests cover the protocol rather than the format: an open walks from
-the root handle, a read lands in a registered buffer and nowhere else, a closed
-handle goes stale, a revoked owner loses every handle at once, and a table with
-no free slot refuses rather than overwrites. A full completion queue also
+Service tests cover protocol rather than format: create/write/sync survives a
+remount, dynamic `Stat` sees new size, a read lands only in its registered
+buffer, and a revoked owner cannot write through a stale file handle. A full
+handle table refuses rather than overwrites, and a full completion queue
 preserves the next result until the client makes room.
 
 The shell tests run scripts against a mounted image and compare what was
@@ -470,14 +517,12 @@ that does not exist naming itself.
 
 `cargo xtask mkfs <tree> <image>` writes a directory tree out as a mountable
 image, and the smoke disk is one of those rather than a signed pattern — the
-`disk/` tree in the repository, laid out at smoke time. That is what makes one
-artifact prove the whole path: the block driver reads sector zero and finds
-`MOLTROFS`, the filesystem mounts the same bytes, and the shell's `cat
-hello.txt` prints what the host file contains. The x86_64 boot smoke requires
-`MOLT_FS_OK:`, the shell's own `molt> cat hello.txt` and `hello, molt` lines,
-and `MOLT_SHELL_OK:` on the serial line. An xtask test lays out the same tree
-and mounts it back on the host, so the image is checked even where QEMU is not
-installed.
+`disk/` tree in the repository, laid out at smoke time. The block driver reads
+sector zero, the filesystem mounts, creates `runtime.txt`, writes and syncs it
+through virtio, reads it back, then the shell prints the original host file.
+The x86_64 smoke requires `MOLT_FS_WRITE_OK:` in addition to mount and shell
+markers. An xtask test performs the same write, drops the mount, remounts, and
+checks the durable bytes on the host.
 
 ## Debts closed before the write path
 
@@ -520,25 +565,22 @@ call it, and `Fs::seal` makes it one-shot for the mount's life. The protocol
 section above is the full argument; the debt was that the asymmetry existed in
 prose but not in the types.
 
-## Growth path
+## Version and growth path
 
-The format's version is 1 and the reader refuses anything else, which is the
-right starting posture: a version that is checked from the first image is a
-version that can be relied on later.
+Writable layout is version 2. Unlike the earlier `MAX_NAME` change, adding a
+log descriptor, bank capacity, and reserved banks changes bytes and geometry
+an old reader interprets. There is no published standard yet, but that is a
+reason to keep migration policy small, not to label incompatible layouts with
+the same version. Version 1 images are rejected rather than guessed at; `xtask
+mkfs` rebuilds development images as version 2.
 
-- **Stage 3, writable.** Regions gain a free-space map and an object bitmap; the
-  superblock gains a pointer to a log. The checkpoint rule stays exactly as it
-  is, with a device flush between the regions and the superblock. `FsOp` gains
-  `Write`, `Create`, `Rename`, and `Sync`, and `Capability<File>` gains
-  `Rights::WRITE` — which the type already models and this stage simply never
-  hands out.
 - **Stage 3, cells.** `Fs` becomes a supervised cell when there is more than one
-  client and a restart means a remount. `revoke_owner` is the piece that has to
-  work then, and it works now.
+  client and restart means remount. `revoke_owner` is the piece that has to
+  work then, and it already covers write authority.
 - **Stage 4, scale.** Objects and extents become B-tree leaves keyed the way
-  they are already sorted; the sums region becomes a scrub's work list; the
-  block layer gains its ring, a cache, and readahead behind the same `Device`
-  trait.
+  they are already sorted; log compaction introduces free-space and object
+  allocation maps; sums become a scrub work list; block layer gains its ring,
+  cache, and readahead behind the same traits.
 - **Stage 5, storage for cells.** A signed cell image is a file with a signature
   region, and the loader is a client of this protocol — which is the argument
   for the protocol being pleasant to write against, since a loader is the next
