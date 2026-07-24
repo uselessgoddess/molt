@@ -44,7 +44,7 @@ mod field {
 const REGION_BYTES: usize = 24;
 
 /// The longest name a directory entry may carry.
-pub const MAX_NAME: usize = 64;
+pub const MAX_NAME: usize = 255;
 
 pub const OBJECT_BYTES: usize = 32;
 pub const EXTENT_BYTES: usize = 16;

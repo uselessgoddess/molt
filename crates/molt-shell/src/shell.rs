@@ -29,14 +29,13 @@ pub struct Shell<'ring, 'registry, 'buffer, const R: usize, const N: usize> {
 impl<'ring, 'registry, 'buffer, const R: usize, const N: usize>
     Shell<'ring, 'registry, 'buffer, R, N>
 {
-    /// Takes the root handle the shell starts from.
-    pub async fn open(
-        mut session: Session<'ring, 'registry, 'buffer, R, N>,
-    ) -> Result<Self, ShellError> {
-        let Some(Handle::Dir(root)) = session.request(FsOp::Root).await?.handle() else {
-            return Err(ShellError::Protocol);
-        };
-        Ok(Self { session, root })
+    /// Takes the session and the root handle the shell starts from.
+    ///
+    /// The root is handed in, not requested: the shell holds exactly the
+    /// authority init chose to delegate and has no operation that would widen
+    /// it.
+    pub fn new(session: Session<'ring, 'registry, 'buffer, R, N>, root: Capability<Dir>) -> Self {
+        Self { session, root }
     }
 
     /// Runs every line of `text`, echoing each one behind a prompt.
@@ -251,11 +250,12 @@ mod tests {
         let buffers = RefCell::new(registry);
         let (client, mut driver) = ring.split();
 
+        let root = fs.root(OWNER).expect("root handle");
         let session = Session::new(client, &buffers, scratch, WINDOW).expect("registered scratch");
         let mut out = Capture::new();
         drive(
             async {
-                let mut shell = Shell::open(session).await?;
+                let mut shell = Shell::new(session, root);
                 shell.script(script, &mut out).await
             },
             || {

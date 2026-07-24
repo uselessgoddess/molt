@@ -35,6 +35,15 @@ pub fn smoke<P: Platform>(platform: &mut P, device: impl Device) {
     };
     report!(platform, "MOLT_FS_OK: generation {}", fs.generation());
 
+    let root = match fs.root(OWNER) {
+        Ok(root) => root,
+        Err(error) => {
+            report!(platform, "MOLT_FS_FAILED: {error:?}");
+            return;
+        }
+    };
+    fs.seal();
+
     let mut bytes = [0u8; WINDOW];
     let mut registry = BufferRegistry::<1>::new();
     let scratch = registry.register_read_write(OWNER, &mut bytes).expect("free buffer slot");
@@ -49,7 +58,7 @@ pub fn smoke<P: Platform>(platform: &mut P, device: impl Device) {
         let mut out = Serial(platform.serial());
         drive(
             async {
-                let mut shell = Shell::open(session).await?;
+                let mut shell = Shell::new(session, root);
                 shell.script(SCRIPT, &mut out).await
             },
             || {

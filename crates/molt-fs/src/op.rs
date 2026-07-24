@@ -61,10 +61,9 @@ impl Handle {
 }
 
 /// One filesystem operation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FsOp {
-    /// Takes a handle to the root directory.
-    Root,
     /// Opens `name` inside `dir`, whichever kind it turns out to be.
     Open { dir: Capability<Dir>, name: Name },
     /// Reads `dir`'s entry at `index`, in name order.
@@ -90,6 +89,7 @@ pub struct Stat {
 }
 
 /// What an operation produced.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FsDone {
     /// A handle to what was opened.
@@ -113,3 +113,11 @@ impl FsDone {
         }
     }
 }
+
+// A ring slot is copied by value on submission and again on completion, so its
+// size is a per-operation cost. `Name`, at [`MAX_NAME`](crate::MAX_NAME) + 1
+// bytes, dominates both messages; the bound leaves room for a header without
+// letting either grow to something a stack-built ring would feel.
+const _: () = assert!(core::mem::size_of::<FsOp>() <= 512);
+const _: () = assert!(core::mem::size_of::<FsDone>() <= 512);
+const _: () = assert!(crate::MAX_NAME <= u8::MAX as usize);

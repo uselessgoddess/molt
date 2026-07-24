@@ -146,8 +146,9 @@ simplicity budget.
 
 **An entry** is a `(name_at, name_len, object)` triple pointing into the name
 arena. Names are out of line so an entry stays 16 bytes and a directory search
-reads one block per probe regardless of name length; `MAX_NAME` is 64 bytes,
-which bounds the copy a lookup makes onto the stack.
+reads one block per probe regardless of name length; `name_len` is a `u16` on
+disk, and `MAX_NAME` — 255 — bounds only the copy a lookup makes onto the stack
+and the inline `Name` a ring carries, not the stored form.
 
 ## Crash consistency
 
@@ -210,7 +211,7 @@ malformed names, and a place where two subsystems disagree about normalization,
 all of which are Linux's `path_lookup` in miniature.
 
 So there are **no paths in `FsOp`**. `Open` takes a `Capability<Dir>` and a
-single `Name` — a leaf, checked to be non-empty, at most 64 bytes, and free of
+single `Name` — a leaf, checked to be non-empty, at most 255 bytes, and free of
 separators. Walking is done by the client, one hop at a time, and each hop
 returns a handle. A cell holding a capability to one subdirectory cannot address
 anything outside it, which is what a chroot does elsewhere and what the type
@@ -325,7 +326,6 @@ trait did.
 
 ```rust
 pub enum FsOp {
-    Root,
     Open { dir: Capability<Dir>, name: Name },
     Entry { dir: Capability<Dir>, index: u32 },
     Read { file: Capability<File>, buffer: BufferOperation<Write>, offset: u64 },
@@ -334,7 +334,7 @@ pub enum FsOp {
 }
 ```
 
-Six operations, and the shape of each one is the argument.
+Five operations, and the shape of each one is the argument.
 
 **Nothing carries data.** A read names a registered buffer, and only the
 registry — which the supervisor owns — can turn that name into memory. The
@@ -350,10 +350,15 @@ happens at compile time here, and `FsError::Kind` exists for the case the client
 genuinely does not know yet — it opened a name and got back whichever kind was
 there.
 
-**`Root` is the one handle that comes from nowhere.** Every other handle is
-opened from a directory somebody already holds. That single asymmetry is where a
-namespace would otherwise be, and it is why the shell's first line of work is
-`FsOp::Root` and everything after it is a hop.
+**The root handle comes from nowhere, and off the ring.** Every other handle is
+opened from a directory somebody already holds; the first cannot be, so there is
+no `FsOp` for it. `Fs::root` mints it, and only code holding the mounted `Fs` —
+init — can call that. Init hands each first holder its root and then calls
+`Fs::seal`, after which the grant is gone for the mount's life and a later
+caller gets `FsError::Sealed`. That single asymmetry is where a namespace would
+otherwise be: authority to reach the tree enters the system once, from the one
+place that already has all of it, rather than being mintable by anything that
+can submit an operation.
 
 **A listing carries `Stat`.** `FsDone::Entry` returns the name *and* the kind,
 size, and entry count, because the volume already read the object record to
@@ -473,6 +478,47 @@ hello.txt` prints what the host file contains. The x86_64 boot smoke requires
 and `MOLT_SHELL_OK:` on the serial line. An xtask test lays out the same tree
 and mounts it back on the host, so the image is checked even where QEMU is not
 installed.
+
+## Debts closed before the write path
+
+Stage 3 is the writable filesystem, and three things were cheaper to settle
+while the format still has no long-lived images than after. None is a write
+feature; each is a decision the write path would otherwise inherit wrong.
+
+**`MAX_NAME` is 255, and inline.** The read-only stage shipped it at 64, which
+was enough for a boot image and wrong for a filesystem: 255 is the limit every
+mainstream filesystem settled on, and the largest a one-byte inline length can
+hold. Fixing it now costs nothing on disk — names live out of line under a
+`u16` length, so a wider reader bound reinterprets no stored byte and does not
+move the version. What it does widen is the inline [`Name`](../crates/molt-fs/src/name.rs)
+a ring carries, to 256 bytes, and with it every ring slot: `FsOp` and `FsDone`
+reach 272 bytes each. The alternative considered was a `Cow`-shaped name —
+inline for short leaves, a registered-buffer reference for long ones — and it
+was rejected. It puts a resolver on the hottest path, `Open` and `Entry`, to
+save bytes on a message that is already `Copy` and already fits a stack ring
+with room to spare; the ceremony of registering a buffer for a path is exactly
+what the inline name exists to avoid, and 256 bytes is a bound a kernel stack
+does not feel. The version stays 1: the encoding did not change, only the
+reader's tolerance for it.
+
+**A ring slot's size is asserted, not assumed.** `op.rs` carries
+`const _: () = assert!(size_of::<FsOp>() <= 512)` and the same for `FsDone`, so
+raising `MAX_NAME` again — or adding a variant that carries something large —
+fails the build rather than quietly growing a message every submission and
+completion copies by value. 512 is where a message stops being a thing to pass
+on the stack without thinking about it; the current 272 leaves the headroom on
+purpose. The `large_enum_variant` lint fires alongside, because only the
+name-carrying variant is big, and it is allowed with the same reasoning the
+assert records: the imbalance is the inline name, and boxing it needs an
+allocator this layer refuses.
+
+**Root enters once and the door shuts.** The read-only stage let any client
+submit `FsOp::Root` and receive a root handle, which made the one piece of
+ambient authority in the design mintable by anyone on the ring. It is now off
+the ring entirely: `Fs::root` is the only grant, only init holds the `Fs` to
+call it, and `Fs::seal` makes it one-shot for the mount's life. The protocol
+section above is the full argument; the debt was that the asymmetry existed in
+prose but not in the types.
 
 ## Growth path
 
