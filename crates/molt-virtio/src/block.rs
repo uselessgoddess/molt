@@ -83,10 +83,10 @@ impl<'slots, 'w> Block<'slots, 'w> {
     /// Brings a device up over its `common`, `notify`, and `device` windows,
     /// allocating every ring and buffer from `arena`.
     ///
-    /// Runs the modern handshake, negotiates only `VIRTIO_F_VERSION_1` (the
-    /// driver needs no block feature to read), and programs queue zero. A device
-    /// that offers no usable queue, or rejects the feature set, is refused
-    /// rather than left half-initialized.
+    /// Runs the modern handshake, refuses read-only devices, requires durable
+    /// flush support, and programs queue zero. A device that offers no usable
+    /// queue, or rejects the feature set, is refused rather than left
+    /// half-initialized.
     pub fn start(
         common: Mmio<'w>,
         notify: Mmio<'w>,
@@ -151,10 +151,11 @@ impl<'slots, 'w> Block<'slots, 'w> {
 
     /// Runs one request and waits for its status byte.
     ///
-    /// Submits the three-descriptor read chain, kicks the device, and polls its
-    /// completion. A device that does not answer within `TIMEOUT_SPINS` has
-    /// its request cancelled — the slot stays reserved until the device returns
-    /// it — and the read fails with [`VirtioError::Timeout`].
+    /// Submits a read, write, or two-descriptor flush chain, kicks the device,
+    /// and polls its completion. A device that does not answer within
+    /// `TIMEOUT_SPINS` has its request cancelled — the slot stays reserved
+    /// until the device returns it — and the command fails with
+    /// [`VirtioError::Timeout`].
     fn command(
         &mut self,
         request: u32,
