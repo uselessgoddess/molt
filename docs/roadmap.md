@@ -198,7 +198,7 @@ Both are argued in `docs/fs.md`.
 
 ## Stage 3 — Services and networking
 
-- [ ] writable filesystem and crash-consistency tests
+- [x] writable filesystem and crash-consistency tests
 - [ ] VirtIO network, Ethernet, ARP, IPv4, UDP, then TCP
 - [ ] a typed scheme/resource namespace inspired by Redox
 - [ ] capability delegation and audit events

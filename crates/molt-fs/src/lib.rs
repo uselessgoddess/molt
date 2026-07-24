@@ -1,18 +1,22 @@
-//! MoltROFS, a read-only filesystem sitting on any [`molt_block::Device`].
+//! MoltROFS, a filesystem sitting on any [`molt_block::Device`].
 //!
-//! An image is written once by `xtask mkfs` and never modified, so the crate
-//! carries no allocator, no journal, and no write path. What it does carry is
-//! the parts a writable successor needs: a generation-stamped superblock kept
-//! in two copies, a checksum over every metadata region, and a crc32c over
-//! every data block. A checkpoint that overwrites the older copy and only then
-//! becomes the newer one is the whole of crash consistency here — a torn write
-//! leaves the previous checkpoint intact, and [`Volume::mount`] takes the
-//! newest copy that verifies.
+//! The kernel reads a boot image and never changes it, so its half of the crate
+//! carries no allocator and no write path. What it does carry is the parts a
+//! writer needs: a generation-stamped superblock kept in two copies, a checksum
+//! over every metadata region, and a crc32c over every data block. A checkpoint
+//! that overwrites the older copy and only then becomes the newer one is the
+//! whole of crash consistency here — a torn write leaves the previous checkpoint
+//! intact, and [`Volume::mount`] takes the newest copy that verifies.
 //!
-//! [`Volume`] is the reader, needing one block of buffer and nothing else.
-//! [`Fs`] wraps it in the ring protocol every other cell talks: typed [`FsOp`]
-//! submissions in, [`FsDone`] completions out, with directories and files named
-//! by capability rather than by path.
+//! [`Volume`] is the reader, needing one block of buffer and nothing else. The
+//! writer is the `format` half: [`Store`] holds a tree in memory and lays it out
+//! as a whole-image checkpoint over a [`molt_block::Disk`], the writable side of
+//! `Device`. Both are [`Backend`]s, so one [`Fs`] serves either — read-only
+//! reads with writes refused, or the full write path.
+//!
+//! [`Fs`] wraps a backend in the ring protocol every other cell talks: typed
+//! [`FsOp`] submissions in, [`FsDone`] completions out, with directories and
+//! files named by capability rather than by path.
 //!
 //! See `docs/fs.md` for the format and the decisions behind it.
 
@@ -36,11 +40,15 @@ mod volume;
 
 #[cfg(feature = "format")]
 pub mod format;
+#[cfg(feature = "format")]
+mod store;
 
 pub use crate::layout::{BLOCK, Kind, MAGIC, MAX_NAME, Object, SUPERS, VERSION};
 pub use crate::name::Name;
 pub use crate::op::{Dir, File, FsDone, FsOp, Handle, Stat};
-pub use crate::service::Fs;
+pub use crate::service::{Backend, Fs};
+#[cfg(feature = "format")]
+pub use crate::store::Store;
 pub use crate::volume::Volume;
 
 /// Why a filesystem operation failed.
@@ -60,6 +68,12 @@ pub enum FsError {
     Name,
     /// A directory operation on a file, or the reverse.
     Kind,
+    /// A name a directory already holds.
+    Exists,
+    /// A checkpoint larger than the arena that has to hold it.
+    Full,
+    /// A write aimed at a volume that only reads.
+    ReadOnly,
     /// An offset past the end of what it addresses.
     Range,
     /// The device below refused the read.

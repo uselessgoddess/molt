@@ -16,6 +16,8 @@ use crate::layout::{
     SUPERS, Super, u32_at,
 };
 use crate::name::Name;
+use crate::op::Stat;
+use crate::service::{Backend, stat};
 
 /// Sectors per block.
 const SECTORS: u64 = (BLOCK / SECTOR) as u64;
@@ -31,31 +33,37 @@ pub struct Volume<'buf, D> {
 impl<'buf, D: Device> Volume<'buf, D> {
     /// Mounts `device`, using `block` as its only buffer.
     ///
-    /// Takes the newest superblock copy that verifies, then checks every
-    /// metadata region against the checksum the superblock records, so a
-    /// corrupt volume fails at mount rather than at the first lookup that
-    /// happens to touch the damaged block.
+    /// Tries the superblock copies newest generation first and takes the first
+    /// that both parses and passes a checksum over every metadata region it
+    /// names. A crash mid-checkpoint can leave the older copy pointing into an
+    /// arena the interrupted write half-filled, so a copy that parses is not
+    /// yet trusted — the fallback steps down a generation until one verifies,
+    /// and a corrupt volume fails at mount rather than at the first lookup.
     pub fn mount(mut device: D, block: &'buf mut [u8; BLOCK]) -> Result<Self, FsError> {
-        let mut newest: Option<Super> = None;
-        for copy in 0..SUPERS {
-            if read(&mut device, block, copy).is_err() {
+        let mut supers = [None; SUPERS as usize];
+        for (copy, slot) in supers.iter_mut().enumerate() {
+            if read(&mut device, block, copy as u64).is_err() {
                 break;
             }
-            if let Ok(parsed) = Super::parse(block)
-                && newest.is_none_or(|best| parsed.generation > best.generation)
-            {
-                newest = Some(parsed);
+            *slot = Super::parse(block).ok();
+        }
+
+        let mut volume = Self { device, block, cached: None, superblock: Super::default() };
+        let mut failure = FsError::Magic;
+        while let Some((copy, superblock)) = newest(&supers) {
+            supers[copy] = None;
+            if superblock.blocks.saturating_mul(SECTORS) > volume.device.sectors() {
+                failure = FsError::Corrupt;
+                continue;
+            }
+            volume.superblock = superblock;
+            volume.cached = None;
+            match volume.verify() {
+                Ok(()) => return Ok(volume),
+                Err(error) => failure = error,
             }
         }
-
-        let superblock = newest.ok_or(FsError::Magic)?;
-        if superblock.blocks.saturating_mul(SECTORS) > device.sectors() {
-            return Err(FsError::Corrupt);
-        }
-
-        let mut volume = Self { device, block, cached: None, superblock };
-        volume.verify()?;
-        Ok(volume)
+        Err(failure)
     }
 
     /// The object id of the root directory.
@@ -251,6 +259,51 @@ impl<'buf, D: Device> Volume<'buf, D> {
     }
 }
 
+/// A read-only volume serves the read half of [`Backend`] and refuses the
+/// write half, so an [`Fs`](crate::Fs) over it answers writes with
+/// [`FsError::ReadOnly`] — every id it names is an object record index.
+impl<D: Device> Backend for Volume<'_, D> {
+    fn root(&self) -> u32 {
+        Volume::root(self)
+    }
+
+    fn generation(&self) -> u64 {
+        Volume::generation(self)
+    }
+
+    fn kind(&mut self, id: u32) -> Result<Kind, FsError> {
+        Ok(self.object(id)?.kind)
+    }
+
+    fn stat(&mut self, id: u32) -> Result<Stat, FsError> {
+        Ok(stat(&self.object(id)?))
+    }
+
+    fn lookup(&mut self, dir: u32, name: &[u8]) -> Result<u32, FsError> {
+        let dir = self.object(dir)?;
+        Volume::lookup(self, &dir, name)
+    }
+
+    fn entry(&mut self, dir: u32, index: u32) -> Result<(Name, u32), FsError> {
+        let dir = self.object(dir)?;
+        Volume::entry(self, &dir, index)
+    }
+
+    fn read(&mut self, file: u32, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        let file = self.object(file)?;
+        Volume::read(self, &file, offset, buf)
+    }
+}
+
+/// The highest-generation copy still in play, and which slot holds it.
+fn newest(supers: &[Option<Super>]) -> Option<(usize, Super)> {
+    supers
+        .iter()
+        .enumerate()
+        .filter_map(|(copy, slot)| slot.map(|superblock| (copy, superblock)))
+        .max_by_key(|(_, superblock)| superblock.generation)
+}
+
 fn read<D: Device>(device: &mut D, block: &mut [u8; BLOCK], index: u64) -> Result<(), FsError> {
     let sector = index.checked_mul(SECTORS).ok_or(FsError::Corrupt)?;
     device.read(sector, block.as_mut_slice()).map_err(FsError::Device)
@@ -274,7 +327,7 @@ mod tests {
         build(&tree, 1).expect("image that fits")
     }
 
-    fn mount<'a>(bytes: &'a [u8], block: &'a mut [u8; BLOCK]) -> Volume<'a, Loopback<'a>> {
+    fn mount<'a>(bytes: &'a [u8], block: &'a mut [u8; BLOCK]) -> Volume<'a, Loopback<&'a [u8]>> {
         Volume::mount(Loopback::new(bytes).expect("whole sectors"), block).expect("live volume")
     }
 

@@ -424,8 +424,12 @@ line editor away and needs a serial `read` before it is worth writing.
 
 ## What this stage does not do
 
-- **No writes.** No allocator, no free-space map, no journal, no `fsync`, no
-  rename. Stage 3.
+- **No writes, in the kernel.** The kernel reads a boot image and never changes
+  it, so it carries no allocator and no write path. The writer is the crate's
+  `format` half, exercised on a host — see the write path below.
+- **No free-space map, no rename.** The writer rebuilds the whole image each
+  checkpoint rather than allocating in place, so neither is needed yet. Both wait
+  for an image that outgrows memory.
 - **No B-tree, no snapshots, no reflinks, no compression, no encryption.** Stage
   4, and each one needs the writer first.
 - **No cache.** `Volume` keeps the last block it read and nothing else. A
@@ -520,18 +524,94 @@ call it, and `Fs::seal` makes it one-shot for the mount's life. The protocol
 section above is the full argument; the debt was that the asymmetry existed in
 prose but not in the types.
 
+## The write path
+
+Stage 3 is the writer, and it did not land the way the growth notes below
+predicted. Those notes assumed the read path's on-disk structure was the thing
+to extend — a free-space map, an object bitmap, a log the superblock points at.
+The cheaper truth is that the reader's format is already a whole-image
+checkpoint, and a writer that rebuilds the whole image is both simpler and
+provably consistent for the sizes this stage serves. The free-space map is the
+thing you need when an image outgrows memory; until it does, allocating a fresh
+image each checkpoint has no fragmentation to manage and no allocator bitmap to
+keep honest. It is deferred, not forgotten, and the growth notes carry the
+version it belongs to.
+
+**The writer lives beside the reader, not inside it.** The kernel has no
+allocator and reads a boot image it never changes, so the write path is the
+crate's `format` half — the same half that already held [`mkfs`](../xtask/src/main.rs).
+[`Store`](../crates/molt-fs/src/store.rs) holds the whole tree in a flat arena of
+nodes, one stable id each, so a handle a client is holding survives every
+mutation around it — a create that shifts a directory's entries, a write that
+grows a file. [`Store::sync`] walks that arena into an [`Image`](../crates/molt-fs/src/format.rs)
+through the exact builder `mkfs` uses, which is why the writer needs no second
+encoder and the version stays 1: the bytes a `Store` lays down and the bytes
+`mkfs` lays down are produced by the same code, and the reader cannot tell them
+apart.
+
+**`Device` reads; `Disk` writes.** The read-only stage had every backing behind
+one [`Device`](../crates/molt-block/src/lib.rs) trait. Splitting the write half
+into a [`Disk`](../crates/molt-block/src/disk.rs) — `write`, `flush`, on top of
+`Device` — is what lets a read-only medium stay read-only in the types: a boot
+ROM is a `Device` and cannot be handed to a checkpoint, while [`Loopback`](../crates/molt-block/src/loopback.rs)
+and the fault-injecting [`Fault`](../crates/molt-block/src/fault.rs) are `Disk`s
+and can. The reader still asks only for `Device`, so nothing on the mount path
+gained a capability it does not use.
+
+**The checkpoint is double-buffered copy-on-write.** The volume carries the two
+superblock copies the reader already tolerated and two data arenas of equal
+size. A checkpoint writes the whole image into the arena that is *not* live,
+flushes, and only then writes the superblock into the copy that pairs with it,
+and flushes again — so the live checkpoint is never the one a write touches, and
+a power cut at any point leaves the previous checkpoint whole. Parity is
+`generation % 2` and flips each time, so successive syncs alternate arenas
+rather than racing one. The generation the volume reports rises only after the
+final flush returns; an uncommitted create or write moves nothing on disk. Mount
+is unchanged from the reader: newest generation that both parses and verifies,
+stepping down a copy if the newest is torn. There is no fsck because there is
+nothing to repair — a torn write is a checkpoint that never became live.
+
+**One `Fs` serves both, over a `Backend`.** Rather than fork the ring service,
+the service takes any [`Backend`](../crates/molt-fs/src/service.rs): the read
+methods every backing has, and `create`/`write`/`sync` that default to
+[`FsError::ReadOnly`](../crates/molt-fs/src/lib.rs). A `Volume` takes the default
+and refuses writes; a `Store` overrides all three. The capability table holds
+the stable id, not a resolved record, and re-resolves it each operation — because
+a `Store`'s records move under a mutation while the id does not, and a table that
+cached a record would hand back a stale one after the create that displaced it.
+`FsOp` gains `Create`, `Write`, and `Sync`; `Capability<Dir>` and
+`Capability<File>` carry `Rights::READ_WRITE`, and the backend, not the
+capability, is what decides whether the medium underneath takes the write.
+`Rename` did not ship — it is a directory-pair mutation with its own atomicity
+question, and nothing this stage tests needs it.
+
+Everything with arithmetic in it is a host test, the same posture the reader
+took. A written file reads back, a create over a held name is refused, entries
+stay sorted through out-of-order creates, a write past the end zero-fills the
+hole, and a sync survives a remount through a fresh `Volume`. Crash consistency
+is tested by counting the disk operations a real sync performs and then cutting
+power at each one over a fault-injecting `Disk`: every budget mounts either the
+old volume or the new one and never a torn in-between, and a deliberately torn
+newer superblock falls back to the older copy rather than to nothing. The
+service tests carry the protocol the same way — create then write then read back,
+a create over a name refused, a sync made durable across a remount, a read-only
+backend refusing all three writes, and a revoked owner losing a created handle
+with the rest.
+
 ## Growth path
 
 The format's version is 1 and the reader refuses anything else, which is the
 right starting posture: a version that is checked from the first image is a
 version that can be relied on later.
 
-- **Stage 3, writable.** Regions gain a free-space map and an object bitmap; the
-  superblock gains a pointer to a log. The checkpoint rule stays exactly as it
-  is, with a device flush between the regions and the superblock. `FsOp` gains
-  `Write`, `Create`, `Rename`, and `Sync`, and `Capability<File>` gains
-  `Rights::WRITE` — which the type already models and this stage simply never
-  hands out.
+- **Stage 3, writable.** Shipped — see the write path above. It kept the
+  checkpoint rule and the version, and deferred the free-space map to the point
+  where an image outgrows the memory a whole-image rebuild needs.
+- **When images outgrow memory.** The arena gains a free-space map and the
+  checkpoint writes only the blocks a mutation touched, at which point the log
+  the earlier notes imagined becomes the thing that names them. `Rename` lands
+  here too, with the directory-pair atomicity a whole-image checkpoint gave for
+  free and an in-place writer has to earn.
 - **Stage 3, cells.** `Fs` becomes a supervised cell when there is more than one
   client and a restart means a remount. `revoke_owner` is the piece that has to
   work then, and it works now.
