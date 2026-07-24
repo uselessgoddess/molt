@@ -12,9 +12,11 @@
 extern crate std;
 
 mod device;
+mod fault;
 mod loopback;
 
-pub use crate::device::{Device, bounds};
+pub use crate::device::{Device, Writable, bounds};
+pub use crate::fault::Fault;
 pub use crate::loopback::Loopback;
 
 /// A sector is 512 bytes, the unit every device address is counted in.
@@ -31,4 +33,8 @@ pub enum BlockError {
     Device,
     /// The device did not answer within the driver's budget.
     Timeout,
+    /// The device is deliberately read-only.
+    ReadOnly,
+    /// A fault-injection device cut power at this operation.
+    PowerLoss,
 }
