@@ -65,7 +65,7 @@ mod tests {
     }
 
     #[test]
-    fn backwards_bus_range_is_refused() {
+    fn backwards_bus_range_refused() {
         assert_eq!(ConfigSpace::new(0xb000_0000, 0, 4, 1), Err(Error::Range));
     }
 }

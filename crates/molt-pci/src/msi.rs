@@ -308,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn the_msix_capability_reports_its_table() {
+    fn msix_capability_reports_table() {
         let mut space = Space::new();
         space.function(0, 0).header(0x1af4, 0x1041).msix(0x40, 4, 1, 0x2000);
         let function = function(&mut space);
@@ -322,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_writes_the_platform_message_verbatim() {
+    fn routing_writes_message_verbatim() {
         let mut space = Space::new();
         space.function(0, 0).header(0x1af4, 0x1041).msix(0x40, 2, 0, 0);
         let mut entries = [0u8; 32];
@@ -341,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn a_vector_the_device_does_not_have_is_refused() {
+    fn unknown_vector_refused() {
         let mut space = Space::new();
         space.function(0, 0).header(0x1af4, 0x1041).msix(0x40, 2, 0, 0);
         let mut entries = [0u8; 32];
@@ -355,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn a_table_window_too_small_is_refused() {
+    fn small_table_window_refused() {
         let mut space = Space::new();
         space.function(0, 0).header(0x1af4, 0x1041).msix(0x40, 4, 0, 0);
         let mut entries = [0u8; 32];
@@ -367,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn msi_is_programmed_with_the_message_and_enabled() {
+    fn msi_programmed_and_enabled() {
         let mut space = Space::new();
         space.function(0, 0).header(0x1234, 0x11e8).msi(0x40, true);
         let mut function = function(&mut space);
@@ -386,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_device_refuses_a_wide_message() {
+    fn narrow_device_refuses_wide_message() {
         let mut space = Space::new();
         space.function(0, 0).header(0x1234, 0x11e8).msi(0x40, false);
         let mut function = function(&mut space);
@@ -398,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn msix_is_preferred_over_msi() {
+    fn msix_preferred_over_msi() {
         let mut space = Space::new();
         space.function(0, 0).header(0x1af4, 0x1041).msi(0x40, true).msix(0x60, 1, 0, 0);
         let function = function(&mut space);

@@ -254,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_function_is_not_an_error() {
+    fn absent_function_is_not_error() {
         let mut space = Space::new();
 
         let function = Function::probe(space.config(0, 0), address()).expect("a legal read");
@@ -263,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn a_header_reports_what_the_device_wrote() {
+    fn header_reports_device_writes() {
         let mut space = Space::new();
         space.function(0, 0).header(0x1af4, 0x1000).class(0x02, 0x00, 0x00);
         let window = space.window();
@@ -277,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn the_command_register_is_written_whole() {
+    fn command_register_written_whole() {
         let mut space = Space::new();
         space.function(0, 0).header(0x1234, 0x0001);
         let mut function =
@@ -292,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_are_walked_in_order() {
+    fn capabilities_walked_in_order() {
         let mut space = Space::new();
         space
             .function(0, 0)
@@ -315,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn a_function_without_a_capability_list_reports_none() {
+    fn function_without_capabilities_reports_none() {
         let mut space = Space::new();
         space.function(0, 0).header(0x1234, 0x0001);
         let function =
@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn a_looping_capability_list_is_refused() {
+    fn looping_capability_list_refused() {
         let mut space = Space::new();
         // Two capabilities that point at each other: a device can describe this
         // and a walk that trusts it never returns.
@@ -347,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn a_capability_inside_the_header_is_refused() {
+    fn capability_inside_header_refused() {
         let mut space = Space::new();
         space.function(0, 0).header(0x1234, 0x0001).capability(0x40, 0x05, 0x10);
         let function =

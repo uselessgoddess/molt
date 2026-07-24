@@ -39,7 +39,7 @@ mod tests {
     use super::SbiError;
 
     #[test]
-    fn success_is_not_an_error() {
+    fn success_is_not_error() {
         assert_eq!(SbiError::from_code(0), None);
     }
 
@@ -50,7 +50,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_codes_keep_their_value() {
+    fn unknown_codes_keep_value() {
         assert_eq!(SbiError::from_code(-42), Some(SbiError::Other(-42)),);
     }
 }

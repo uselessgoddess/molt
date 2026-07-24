@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn arrival_before_the_wait_is_not_lost() {
+    fn arrival_before_wait_not_lost() {
         let slab = InterruptSlab::<2>::new();
         let token = slab.bind(0).expect("a free line");
 

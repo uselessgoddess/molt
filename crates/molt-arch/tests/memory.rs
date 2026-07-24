@@ -61,7 +61,7 @@ fn usable_ranges_are_aligned_inward() {
 }
 
 #[test]
-fn usable_ranges_start_above_the_floor() {
+fn usable_ranges_start_above_floor() {
     let map = TestMap([
         MemoryRegion::new(0, 0x9000, MemoryRegionKind::Usable),
         MemoryRegion::new(0x9000, 0xa000, MemoryRegionKind::Reserved),
@@ -154,7 +154,7 @@ fn pool_hands_out_reserved_frames_once() {
 }
 
 #[test]
-fn pool_over_map_reports_what_it_got() {
+fn pool_over_map_reports_actual() {
     let map = TestMap([
         MemoryRegion::new(0, 0x1000, MemoryRegionKind::Reserved),
         MemoryRegion::new(0x4000, 0x5000, MemoryRegionKind::Usable),

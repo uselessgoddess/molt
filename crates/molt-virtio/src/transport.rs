@@ -231,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_refuses_a_device_missing_a_structure() {
+    fn probe_refuses_device_missing_structure() {
         let mut config = Config::present();
         config.cap(0x40, 1, 4, 0x0000, 0x1000).cap(0x50, 2, 4, 0x3000, 0x0100);
 

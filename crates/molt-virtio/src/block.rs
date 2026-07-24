@@ -182,7 +182,7 @@ mod tests {
     use crate::VirtioError;
 
     #[test]
-    fn deep_device_queue_capped_at_drivers_maximum() {
+    fn device_queue_capped_at_driver_max() {
         let size = clamp_queue(256).expect("a power-of-two queue");
 
         assert_eq!(size, super::queue::MAX_SIZE, "the driver hosted more than it can");

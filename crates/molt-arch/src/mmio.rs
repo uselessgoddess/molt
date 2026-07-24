@@ -175,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn write_reaches_the_register() {
+    fn write_reaches_register() {
         let mut registers = [0u8; 16];
         let mmio = window(&mut registers);
 
@@ -185,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn access_past_the_end_is_refused() {
+    fn access_past_end_refused() {
         let mut registers = [0u8; 16];
         let mmio = window(&mut registers);
 
@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn misaligned_access_is_refused() {
+    fn misaligned_access_refused() {
         let mut registers = [0u8; 16];
         let mmio = window(&mut registers);
 
@@ -216,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn subwindow_cannot_escape_its_parent() {
+    fn subwindow_cannot_escape_parent() {
         let mut registers = [0u8; 16];
         let mmio = window(&mut registers);
 

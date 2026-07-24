@@ -352,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn arena_refuses_region_past_its_span() {
+    fn arena_refuses_region_past_span() {
         let regions = [usable(0x10_0000, 0x10_0000 + 2 * FRAME_SIZE)];
         let map = Map(&regions);
         let mut allocator = FrameAllocator::new(&map);
