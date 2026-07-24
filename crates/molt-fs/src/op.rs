@@ -11,7 +11,7 @@
 //! writes into the client's buffer without either side handing out a pointer.
 
 use molt_core::buffer::BufferOperation;
-use molt_core::capability::{Capability, CapabilityRights, Rights, Write};
+use molt_core::capability::{Capability, CapabilityRights, Read, Rights, Write};
 
 use crate::layout::Kind;
 use crate::name::Name;
@@ -19,20 +19,23 @@ use crate::name::Name;
 /// The rights an open directory carries.
 ///
 /// A directory is a distinct type from a file so an operation that only makes
-/// sense on one cannot be written for the other.
+/// sense on one cannot be written for the other. It carries write because a
+/// create mutates the directory that holds the new name; a read-only backend
+/// refuses the write itself, with [`FsError::ReadOnly`](crate::FsError).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Dir {}
 
 impl CapabilityRights for Dir {
-    const MASK: Rights = Rights::READ;
+    const MASK: Rights = Rights::READ_WRITE;
 }
 
-/// The rights an open file carries. A volume is read-only, so reading is all.
+/// The rights an open file carries. A file handle both reads and writes; the
+/// backend decides whether the medium under it will take the write.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum File {}
 
 impl CapabilityRights for File {
-    const MASK: Rights = Rights::READ;
+    const MASK: Rights = Rights::READ_WRITE;
 }
 
 /// An open handle of either kind.
@@ -70,6 +73,13 @@ pub enum FsOp {
     Entry { dir: Capability<Dir>, index: u32 },
     /// Reads `file` at `offset` into a registered buffer.
     Read { file: Capability<File>, buffer: BufferOperation<Write>, offset: u64 },
+    /// Creates `name` of `kind` inside `dir`, handing back a handle to it.
+    Create { dir: Capability<Dir>, name: Name, kind: Kind },
+    /// Writes a registered buffer into `file` at `offset`, extending it if need
+    /// be. The bytes reach the disk only once a [`FsOp::Sync`] checkpoints them.
+    Write { file: Capability<File>, buffer: BufferOperation<Read>, offset: u64 },
+    /// Commits everything written since the last sync as a durable checkpoint.
+    Sync,
     /// Asks what a handle refers to.
     Stat(Handle),
     /// Drops a handle, freeing its slot.
@@ -98,6 +108,12 @@ pub enum FsDone {
     Entry { name: Name, stat: Stat },
     /// How many bytes landed in the buffer; short only at the end of a file.
     Read(usize),
+    /// A handle to what was created.
+    Created(Handle),
+    /// How many bytes the write took, always the whole buffer.
+    Wrote(usize),
+    /// Everything written before it is now durable.
+    Synced,
     /// What a handle refers to.
     Stat(Stat),
     /// The handle is gone.
@@ -105,10 +121,10 @@ pub enum FsDone {
 }
 
 impl FsDone {
-    /// The handle an open produced, if this is what an open produced.
+    /// The handle an open or a create produced, if one did.
     pub const fn handle(self) -> Option<Handle> {
         match self {
-            Self::Opened(handle) => Some(handle),
+            Self::Opened(handle) | Self::Created(handle) => Some(handle),
             _ => None,
         }
     }

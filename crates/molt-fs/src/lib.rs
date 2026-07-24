@@ -42,7 +42,7 @@ mod store;
 pub use crate::layout::{BLOCK, Kind, MAGIC, MAX_NAME, Object, SUPERS, VERSION};
 pub use crate::name::Name;
 pub use crate::op::{Dir, File, FsDone, FsOp, Handle, Stat};
-pub use crate::service::Fs;
+pub use crate::service::{Backend, Fs};
 #[cfg(feature = "format")]
 pub use crate::store::Store;
 pub use crate::volume::Volume;

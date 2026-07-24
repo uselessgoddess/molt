@@ -16,6 +16,8 @@ use crate::layout::{
     SUPERS, Super, u32_at,
 };
 use crate::name::Name;
+use crate::op::Stat;
+use crate::service::{Backend, stat};
 
 /// Sectors per block.
 const SECTORS: u64 = (BLOCK / SECTOR) as u64;
@@ -254,6 +256,42 @@ impl<'buf, D: Device> Volume<'buf, D> {
             }
         }
         Ok(())
+    }
+}
+
+/// A read-only volume serves the read half of [`Backend`] and refuses the
+/// write half, so an [`Fs`](crate::Fs) over it answers writes with
+/// [`FsError::ReadOnly`] — every id it names is an object record index.
+impl<D: Device> Backend for Volume<'_, D> {
+    fn root(&self) -> u32 {
+        Volume::root(self)
+    }
+
+    fn generation(&self) -> u64 {
+        Volume::generation(self)
+    }
+
+    fn kind(&mut self, id: u32) -> Result<Kind, FsError> {
+        Ok(self.object(id)?.kind)
+    }
+
+    fn stat(&mut self, id: u32) -> Result<Stat, FsError> {
+        Ok(stat(&self.object(id)?))
+    }
+
+    fn lookup(&mut self, dir: u32, name: &[u8]) -> Result<u32, FsError> {
+        let dir = self.object(dir)?;
+        Volume::lookup(self, &dir, name)
+    }
+
+    fn entry(&mut self, dir: u32, index: u32) -> Result<(Name, u32), FsError> {
+        let dir = self.object(dir)?;
+        Volume::entry(self, &dir, index)
+    }
+
+    fn read(&mut self, file: u32, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        let file = self.object(file)?;
+        Volume::read(self, &file, offset, buf)
     }
 }
 

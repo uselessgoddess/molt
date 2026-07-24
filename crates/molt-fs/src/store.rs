@@ -24,6 +24,7 @@ use crate::format::Image;
 use crate::layout::{BLOCK, Kind, SUPERS};
 use crate::name::Name;
 use crate::op::Stat;
+use crate::service::Backend;
 
 /// Sectors per block.
 const SECTORS: u64 = (BLOCK / SECTOR) as u64;
@@ -235,6 +236,51 @@ impl<D: Disk> Store<D> {
 
         self.generation = generation;
         Ok(())
+    }
+}
+
+/// A store serves the whole of [`Backend`]: the read half like a volume, and
+/// the write half for real, so an [`Fs`](crate::Fs) over it takes creates,
+/// writes, and syncs where one over a [`Volume`](crate::Volume) refuses them.
+impl<D: Disk> Backend for Store<D> {
+    fn root(&self) -> u32 {
+        Store::root(self)
+    }
+
+    fn generation(&self) -> u64 {
+        Store::generation(self)
+    }
+
+    fn kind(&mut self, id: u32) -> Result<Kind, FsError> {
+        Store::kind(self, id)
+    }
+
+    fn stat(&mut self, id: u32) -> Result<Stat, FsError> {
+        Store::stat(self, id)
+    }
+
+    fn lookup(&mut self, dir: u32, name: &[u8]) -> Result<u32, FsError> {
+        Store::lookup(self, dir, name)
+    }
+
+    fn entry(&mut self, dir: u32, index: u32) -> Result<(Name, u32), FsError> {
+        Store::entry(self, dir, index)
+    }
+
+    fn read(&mut self, file: u32, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        Store::read(self, file, offset, buf)
+    }
+
+    fn create(&mut self, dir: u32, name: Name, kind: Kind) -> Result<u32, FsError> {
+        Store::create(self, dir, name, kind)
+    }
+
+    fn write(&mut self, file: u32, offset: u64, bytes: &[u8]) -> Result<usize, FsError> {
+        Store::write(self, file, offset, bytes)
+    }
+
+    fn sync(&mut self) -> Result<(), FsError> {
+        Store::sync(self)
     }
 }
 
