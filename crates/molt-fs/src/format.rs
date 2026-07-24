@@ -68,11 +68,23 @@ impl Tree {
 pub fn build(tree: &Tree, generation: u64) -> Result<Vec<u8>, FsError> {
     let mut image = Image::default();
     let root = image.dir(tree)?;
-    image.finish(root, generation)
+    let (superblock, arena) = image.compose(root, generation, SUPERS)?;
+
+    let mut bytes = vec![0; superblock.blocks as usize * BLOCK];
+    bytes[SUPERS as usize * BLOCK..][..arena.len()].copy_from_slice(&arena);
+    for copy in 0..SUPERS {
+        superblock.encode(&mut bytes[copy as usize * BLOCK..]);
+    }
+    Ok(bytes)
 }
 
+/// Accumulates the regions of an image, wherever its nodes come from.
+///
+/// [`build`] fills it from a [`Tree`]; a writable store fills it from its own
+/// nodes. Both hand it to [`Image::compose`], which places the regions from a
+/// given base block and hands back the superblock and the arena beneath it.
 #[derive(Default)]
-struct Image {
+pub(crate) struct Image {
     objects: Vec<Object>,
     extents: Vec<Extent>,
     entries: Vec<Entry>,
@@ -115,7 +127,7 @@ impl Image {
     ///
     /// An all-zero block is left out entirely: it becomes a hole the reader
     /// fills in, which is what keeps a sparse file from costing its length.
-    fn file(&mut self, bytes: &[u8]) -> Result<u32, FsError> {
+    pub(crate) fn file(&mut self, bytes: &[u8]) -> Result<u32, FsError> {
         let start = index(self.extents.len())?;
         let mut count = 0;
         for (logical, chunk) in bytes.chunks(BLOCK).enumerate() {
@@ -144,6 +156,25 @@ impl Image {
         Ok(id)
     }
 
+    /// Lays out a directory over already-laid-out children, sorted by name.
+    ///
+    /// The caller supplies `(name, object)` pairs in name order — a reader
+    /// binary searches them — and holds every child's id, so the directory is
+    /// written last with its entries contiguous.
+    pub(crate) fn push_dir(&mut self, children: &[(Name, u32)]) -> Result<u32, FsError> {
+        let start = index(self.entries.len())?;
+        for (name, object) in children {
+            let name_at = index(self.names.len())?;
+            self.names.extend_from_slice(name.as_bytes());
+            self.entries.push(Entry { name_at, name_len: name.len() as u16, object: *object });
+        }
+
+        let id = self.reserve()?;
+        self.objects[id as usize] =
+            Object { kind: Kind::Dir, start, count: index(children.len())?, size: 0 };
+        Ok(id)
+    }
+
     /// Takes the next object id, to be filled in once its contents are laid out.
     fn reserve(&mut self) -> Result<u32, FsError> {
         let id = index(self.objects.len())?;
@@ -151,8 +182,15 @@ impl Image {
         Ok(id)
     }
 
-    /// Places the regions, checksums them, and writes both superblock copies.
-    fn finish(mut self, root: u32, generation: u64) -> Result<Vec<u8>, FsError> {
+    /// Places the regions from `base`, checksums them, and returns the
+    /// superblock and the arena of blocks `[base, superblock.blocks)` beneath
+    /// it — everything the superblock names, ready to write in one run.
+    pub(crate) fn compose(
+        mut self,
+        root: u32,
+        generation: u64,
+        base: u64,
+    ) -> Result<(Super, Vec<u8>), FsError> {
         let data_blocks = (self.data.len() / BLOCK) as u64;
         let sizes = [
             self.objects.len() * OBJECT_BYTES,
@@ -163,7 +201,7 @@ impl Image {
         ];
 
         let mut superblock = Super { generation, root, data_blocks, ..Super::default() };
-        let mut at = SUPERS;
+        let mut at = base;
         for (area, bytes) in Area::ALL.into_iter().zip(sizes) {
             let region = Region { at, bytes: bytes as u64, crc: 0 };
             superblock.set_region(area, region);
@@ -190,20 +228,18 @@ impl Image {
             sums,
         ];
 
-        let mut image = vec![0; superblock.blocks as usize * BLOCK];
+        let mut arena = vec![0; (superblock.blocks - base) as usize * BLOCK];
         for (area, bytes) in Area::ALL.into_iter().zip(regions) {
             let mut region = superblock.region(area);
             region.crc = crc32c(&bytes);
             superblock.set_region(area, region);
-            let at = region.at as usize * BLOCK;
-            image[at..at + bytes.len()].copy_from_slice(&bytes);
+            let at = (region.at - base) as usize * BLOCK;
+            arena[at..at + bytes.len()].copy_from_slice(&bytes);
         }
-        image[superblock.data_at as usize * BLOCK..][..self.data.len()].copy_from_slice(&self.data);
+        let at = (superblock.data_at - base) as usize * BLOCK;
+        arena[at..at + self.data.len()].copy_from_slice(&self.data);
 
-        for copy in 0..SUPERS {
-            superblock.encode(&mut image[copy as usize * BLOCK..]);
-        }
-        Ok(image)
+        Ok((superblock, arena))
     }
 }
 

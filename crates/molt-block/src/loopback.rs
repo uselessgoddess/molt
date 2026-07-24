@@ -9,6 +9,7 @@ use crate::{BlockError, Device, Disk, SECTOR, bounds};
 /// hardware. The backing is whatever holds the bytes — a borrowed `&[u8]` for
 /// a read-only image, an owned `Vec<u8>` or `&mut [u8]` for one a checkpoint
 /// writes — so `molt-block` still needs no allocator of its own.
+#[derive(Clone)]
 pub struct Loopback<B> {
     image: B,
 }

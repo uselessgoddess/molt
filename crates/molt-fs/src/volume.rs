@@ -31,31 +31,37 @@ pub struct Volume<'buf, D> {
 impl<'buf, D: Device> Volume<'buf, D> {
     /// Mounts `device`, using `block` as its only buffer.
     ///
-    /// Takes the newest superblock copy that verifies, then checks every
-    /// metadata region against the checksum the superblock records, so a
-    /// corrupt volume fails at mount rather than at the first lookup that
-    /// happens to touch the damaged block.
+    /// Tries the superblock copies newest generation first and takes the first
+    /// that both parses and passes a checksum over every metadata region it
+    /// names. A crash mid-checkpoint can leave the older copy pointing into an
+    /// arena the interrupted write half-filled, so a copy that parses is not
+    /// yet trusted — the fallback steps down a generation until one verifies,
+    /// and a corrupt volume fails at mount rather than at the first lookup.
     pub fn mount(mut device: D, block: &'buf mut [u8; BLOCK]) -> Result<Self, FsError> {
-        let mut newest: Option<Super> = None;
-        for copy in 0..SUPERS {
-            if read(&mut device, block, copy).is_err() {
+        let mut supers = [None; SUPERS as usize];
+        for (copy, slot) in supers.iter_mut().enumerate() {
+            if read(&mut device, block, copy as u64).is_err() {
                 break;
             }
-            if let Ok(parsed) = Super::parse(block)
-                && newest.is_none_or(|best| parsed.generation > best.generation)
-            {
-                newest = Some(parsed);
+            *slot = Super::parse(block).ok();
+        }
+
+        let mut volume = Self { device, block, cached: None, superblock: Super::default() };
+        let mut failure = FsError::Magic;
+        while let Some((copy, superblock)) = newest(&supers) {
+            supers[copy] = None;
+            if superblock.blocks.saturating_mul(SECTORS) > volume.device.sectors() {
+                failure = FsError::Corrupt;
+                continue;
+            }
+            volume.superblock = superblock;
+            volume.cached = None;
+            match volume.verify() {
+                Ok(()) => return Ok(volume),
+                Err(error) => failure = error,
             }
         }
-
-        let superblock = newest.ok_or(FsError::Magic)?;
-        if superblock.blocks.saturating_mul(SECTORS) > device.sectors() {
-            return Err(FsError::Corrupt);
-        }
-
-        let mut volume = Self { device, block, cached: None, superblock };
-        volume.verify()?;
-        Ok(volume)
+        Err(failure)
     }
 
     /// The object id of the root directory.
@@ -249,6 +255,15 @@ impl<'buf, D: Device> Volume<'buf, D> {
         }
         Ok(())
     }
+}
+
+/// The highest-generation copy still in play, and which slot holds it.
+fn newest(supers: &[Option<Super>]) -> Option<(usize, Super)> {
+    supers
+        .iter()
+        .enumerate()
+        .filter_map(|(copy, slot)| slot.map(|superblock| (copy, superblock)))
+        .max_by_key(|(_, superblock)| superblock.generation)
 }
 
 fn read<D: Device>(device: &mut D, block: &mut [u8; BLOCK], index: u64) -> Result<(), FsError> {

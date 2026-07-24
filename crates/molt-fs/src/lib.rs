@@ -36,11 +36,15 @@ mod volume;
 
 #[cfg(feature = "format")]
 pub mod format;
+#[cfg(feature = "format")]
+mod store;
 
 pub use crate::layout::{BLOCK, Kind, MAGIC, MAX_NAME, Object, SUPERS, VERSION};
 pub use crate::name::Name;
 pub use crate::op::{Dir, File, FsDone, FsOp, Handle, Stat};
 pub use crate::service::Fs;
+#[cfg(feature = "format")]
+pub use crate::store::Store;
 pub use crate::volume::Volume;
 
 /// Why a filesystem operation failed.
@@ -60,6 +64,12 @@ pub enum FsError {
     Name,
     /// A directory operation on a file, or the reverse.
     Kind,
+    /// A name a directory already holds.
+    Exists,
+    /// A checkpoint larger than the arena that has to hold it.
+    Full,
+    /// A write aimed at a volume that only reads.
+    ReadOnly,
     /// An offset past the end of what it addresses.
     Range,
     /// The device below refused the read.
