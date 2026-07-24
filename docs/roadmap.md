@@ -163,9 +163,9 @@ driver, so the RISC-V smoke enumerates and stops.
       ring the kernel owns and the reset returns its frames
 - [x] `docs/virtio.md`
 
-The read path is the whole path this stage builds. Stage 2.4's filesystem is
-read-only, so the write side — a `VIRTIO_BLK_T_OUT` chain and the flush that
-orders it — is deliberately absent rather than stubbed; see `docs/virtio.md`.
+This stage originally built only the read path needed by Stage 2.4. Stage 3
+extends the same queue with `VIRTIO_BLK_T_OUT` and durable flush; see
+`docs/virtio.md`.
 
 ### Stage 2.4 — Something to run
 
@@ -198,10 +198,18 @@ Both are argued in `docs/fs.md`.
 
 ## Stage 3 — Services and networking
 
-- [ ] writable filesystem and crash-consistency tests
+- [x] writable filesystem and crash-consistency tests
 - [ ] VirtIO network, Ethernet, ARP, IPv4, UDP, then TCP
 - [ ] a typed scheme/resource namespace inspired by Redox
 - [ ] capability delegation and audit events
+
+Writable filesystem includes sector writes, required virtio flush support,
+three rotating checkpoint-log banks, a checksummed copy-on-write metadata
+B-tree with bounded node caching and generation reclamation, deterministic
+tree/log/flush/root-swing/flush ordering, `Create`/`Write`/`Sync` capability
+operations, and fault injection that cuts power before every checkpoint action.
+Mount always selects a complete old or new generation and never depends on
+fsck. `MOLT_FS_WRITE_OK` proves the same path through QEMU's virtio-blk device.
 
 ## Stage 4 — SMP, hardware breadth, and performance
 

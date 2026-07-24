@@ -1,0 +1,4357 @@
+diff --git a/crates/molt-block/src/device.rs b/crates/molt-block/src/device.rs
+index 99dcde1..3150d2f 100644
+--- a/crates/molt-block/src/device.rs
++++ b/crates/molt-block/src/device.rs
+@@ -19,6 +19,19 @@ pub trait Device {
+     fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError>;
+ }
+ 
++/// Sector-addressed storage that can make writes durable.
++///
++/// [`write`](Self::write) only promises that later reads through the same
++/// device observe the bytes. [`flush`](Self::flush) is the persistence
++/// boundary: when it returns, every earlier write must survive power loss.
++pub trait Writable: Device {
++    /// Writes consecutive sectors from `buf` starting at `sector`.
++    fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), BlockError>;
++
++    /// Makes every preceding write durable before returning.
++    fn flush(&mut self) -> Result<(), BlockError>;
++}
++
+ impl<D: Device + ?Sized> Device for &mut D {
+     fn sectors(&self) -> u64 {
+         (**self).sectors()
+@@ -29,6 +42,16 @@ impl<D: Device + ?Sized> Device for &mut D {
+     }
+ }
+ 
++impl<D: Writable + ?Sized> Writable for &mut D {
++    fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), BlockError> {
++        (**self).write(sector, buf)
++    }
++
++    fn flush(&mut self) -> Result<(), BlockError> {
++        (**self).flush()
++    }
++}
++
+ /// Checks `buf` against the device geometry, returning the sectors it spans.
+ pub fn bounds(sectors: u64, sector: u64, buf: &[u8]) -> Result<u64, BlockError> {
+     if buf.len() % SECTOR != 0 {
+diff --git a/crates/molt-block/src/fault.rs b/crates/molt-block/src/fault.rs
+new file mode 100644
+index 0000000..c37957e
+--- /dev/null
++++ b/crates/molt-block/src/fault.rs
+@@ -0,0 +1,121 @@
++//! Volatile memory storage with deterministic power-loss injection.
++
++use crate::{BlockError, Device, SECTOR, Writable, bounds};
++
++/// Storage that keeps writes volatile until flush and can cut power at one
++/// device action.
++///
++/// `stable` models bytes that survive a crash; `volatile` models a controller
++/// cache. A write changes only `volatile`, while a successful flush copies the
++/// full cache to `stable`. [`cut_after`](Self::cut_after) makes the operation
++/// after that many successful writes or flushes fail with
++/// [`BlockError::PowerLoss`].
++pub struct Fault<'a> {
++    stable: &'a mut [u8],
++    volatile: &'a mut [u8],
++    cut: Option<u64>,
++    steps: u64,
++    failed: bool,
++}
++
++impl<'a> Fault<'a> {
++    /// Starts with `volatile` equal to `stable`.
++    pub fn new(stable: &'a mut [u8], volatile: &'a mut [u8]) -> Result<Self, BlockError> {
++        if stable.len() != volatile.len() || stable.len() % SECTOR != 0 {
++            return Err(BlockError::Unaligned);
++        }
++        volatile.copy_from_slice(stable);
++        Ok(Self { stable, volatile, cut: None, steps: 0, failed: false })
++    }
++
++    /// Cuts power before the action after `steps` successful actions.
++    pub fn cut_after(mut self, steps: u64) -> Self {
++        self.cut = Some(steps);
++        self
++    }
++
++    /// How many writes and flushes completed.
++    pub const fn steps(&self) -> u64 {
++        self.steps
++    }
++
++    fn action(&mut self) -> Result<(), BlockError> {
++        if self.failed || self.cut == Some(self.steps) {
++            self.failed = true;
++            return Err(BlockError::PowerLoss);
++        }
++        self.steps += 1;
++        Ok(())
++    }
++}
++
++impl Device for Fault<'_> {
++    fn sectors(&self) -> u64 {
++        (self.volatile.len() / SECTOR) as u64
++    }
++
++    fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
++        bounds(self.sectors(), sector, buf)?;
++        let at = sector as usize * SECTOR;
++        buf.copy_from_slice(&self.volatile[at..at + buf.len()]);
++        Ok(())
++    }
++}
++
++impl Writable for Fault<'_> {
++    fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), BlockError> {
++        bounds(self.sectors(), sector, buf)?;
++        self.action()?;
++        let at = sector as usize * SECTOR;
++        self.volatile[at..at + buf.len()].copy_from_slice(buf);
++        Ok(())
++    }
++
++    fn flush(&mut self) -> Result<(), BlockError> {
++        self.action()?;
++        self.stable.copy_from_slice(self.volatile);
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::Fault;
++    use crate::{BlockError, SECTOR, Writable};
++
++    #[test]
++    fn unflushed_write_is_not_durable() {
++        let mut stable = [0u8; SECTOR];
++        let mut volatile = [0u8; SECTOR];
++        {
++            let mut device = Fault::new(&mut stable, &mut volatile).expect("matching storage");
++            device.write(0, &[0xa5; SECTOR]).expect("volatile write");
++        }
++
++        assert_eq!(stable, [0; SECTOR]);
++    }
++
++    #[test]
++    fn flush_makes_write_durable() {
++        let mut stable = [0u8; SECTOR];
++        let mut volatile = [0u8; SECTOR];
++        {
++            let mut device = Fault::new(&mut stable, &mut volatile).expect("matching storage");
++            device.write(0, &[0xa5; SECTOR]).expect("volatile write");
++            device.flush().expect("durable write");
++        }
++
++        assert_eq!(stable, [0xa5; SECTOR]);
++    }
++
++    #[test]
++    fn cut_refuses_selected_action() {
++        let mut stable = [0u8; SECTOR];
++        let mut volatile = [0u8; SECTOR];
++        let mut device =
++            Fault::new(&mut stable, &mut volatile).expect("matching storage").cut_after(1);
++
++        assert_eq!(device.write(0, &[1; SECTOR]), Ok(()));
++        assert_eq!(device.flush(), Err(BlockError::PowerLoss));
++    }
++}
+diff --git a/crates/molt-block/src/lib.rs b/crates/molt-block/src/lib.rs
+index 0079234..0eb5e89 100644
+--- a/crates/molt-block/src/lib.rs
++++ b/crates/molt-block/src/lib.rs
+@@ -1,10 +1,9 @@
+ //! Sector storage, described independently of the bus it hangs off.
+ //!
+-//! [`Device`] is the whole contract a filesystem needs: how many sectors exist
+-//! and how to read some of them. `molt-virtio` implements it over a virtqueue,
+-//! [`Loopback`] implements it over bytes already in memory, and a future NVMe or
+-//! SD driver implements it over whatever it likes — none of which the
+-//! filesystem above has to know.
++//! [`Device`] is the read contract; [`Writable`] adds sector writes and a
++//! durability boundary. `molt-virtio` implements them over a virtqueue,
++//! [`Loopback`] over bytes already in memory, and a future NVMe or SD driver
++//! over whatever it likes — none of which the filesystem above has to know.
+ 
+ #![no_std]
+ 
+@@ -12,9 +11,11 @@
+ extern crate std;
+ 
+ mod device;
++mod fault;
+ mod loopback;
+ 
+-pub use crate::device::{Device, bounds};
++pub use crate::device::{Device, Writable, bounds};
++pub use crate::fault::Fault;
+ pub use crate::loopback::Loopback;
+ 
+ /// A sector is 512 bytes, the unit every device address is counted in.
+@@ -31,4 +32,8 @@ pub enum BlockError {
+     Device,
+     /// The device did not answer within the driver's budget.
+     Timeout,
++    /// The device is deliberately read-only.
++    ReadOnly,
++    /// A fault-injection device cut power at this operation.
++    PowerLoss,
+ }
+diff --git a/crates/molt-block/src/loopback.rs b/crates/molt-block/src/loopback.rs
+index a853c3a..5b4eabe 100644
+--- a/crates/molt-block/src/loopback.rs
++++ b/crates/molt-block/src/loopback.rs
+@@ -1,6 +1,6 @@
+ //! A device backed by bytes that are already in memory.
+ 
+-use crate::{BlockError, Device, SECTOR, bounds};
++use crate::{BlockError, Device, SECTOR, Writable, bounds};
+ 
+ /// Storage read straight out of an image the caller holds.
+ ///
+@@ -8,7 +8,28 @@ use crate::{BlockError, Device, SECTOR, bounds};
+ /// image from: the same [`Device`] the virtio driver offers, with none of the
+ /// hardware. It borrows rather than owns, so `molt-block` needs no allocator.
+ pub struct Loopback<'i> {
+-    image: &'i [u8],
++    image: Image<'i>,
++}
++
++enum Image<'i> {
++    ReadOnly(&'i [u8]),
++    Writable(&'i mut [u8]),
++}
++
++impl Image<'_> {
++    fn bytes(&self) -> &[u8] {
++        match self {
++            Self::ReadOnly(bytes) => bytes,
++            Self::Writable(bytes) => bytes,
++        }
++    }
++
++    fn bytes_mut(&mut self) -> Result<&mut [u8], BlockError> {
++        match self {
++            Self::ReadOnly(_) => Err(BlockError::ReadOnly),
++            Self::Writable(bytes) => Ok(bytes),
++        }
++    }
+ }
+ 
+ impl<'i> Loopback<'i> {
+@@ -17,19 +38,40 @@ impl<'i> Loopback<'i> {
+         if image.len() % SECTOR != 0 {
+             return Err(BlockError::Unaligned);
+         }
+-        Ok(Self { image })
++        Ok(Self { image: Image::ReadOnly(image) })
++    }
++
++    /// Wraps mutable storage, which must be a whole number of sectors.
++    pub fn writable(image: &'i mut [u8]) -> Result<Self, BlockError> {
++        if image.len() % SECTOR != 0 {
++            return Err(BlockError::Unaligned);
++        }
++        Ok(Self { image: Image::Writable(image) })
+     }
+ }
+ 
+ impl Device for Loopback<'_> {
+     fn sectors(&self) -> u64 {
+-        (self.image.len() / SECTOR) as u64
++        (self.image.bytes().len() / SECTOR) as u64
+     }
+ 
+     fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+         bounds(self.sectors(), sector, buf)?;
+         let at = sector as usize * SECTOR;
+-        buf.copy_from_slice(&self.image[at..at + buf.len()]);
++        buf.copy_from_slice(&self.image.bytes()[at..at + buf.len()]);
++        Ok(())
++    }
++}
++
++impl Writable for Loopback<'_> {
++    fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), BlockError> {
++        bounds(self.sectors(), sector, buf)?;
++        let at = sector as usize * SECTOR;
++        self.image.bytes_mut()?[at..at + buf.len()].copy_from_slice(buf);
++        Ok(())
++    }
++
++    fn flush(&mut self) -> Result<(), BlockError> {
+         Ok(())
+     }
+ }
+@@ -37,7 +79,7 @@ impl Device for Loopback<'_> {
+ #[cfg(test)]
+ mod tests {
+     use super::Loopback;
+-    use crate::{BlockError, Device, SECTOR};
++    use crate::{BlockError, Device, SECTOR, Writable};
+ 
+     #[test]
+     fn sector_reads_back_what_image_holds() {
+@@ -85,4 +127,18 @@ mod tests {
+     fn partial_image_refused() {
+         assert!(matches!(Loopback::new(&[0; SECTOR + 1]), Err(BlockError::Unaligned)));
+     }
++
++    #[test]
++    fn sector_write_survives_flush() {
++        let mut image = [0u8; 2 * SECTOR];
++        let written = [0xa5; SECTOR];
++        let mut device = Loopback::writable(&mut image).expect("whole sectors");
++
++        device.write(1, &written).expect("writable sector");
++        device.flush().expect("durable write");
++        let mut read = [0u8; SECTOR];
++        device.read(1, &mut read).expect("same sector");
++
++        assert_eq!(read, written);
++    }
+ }
+diff --git a/crates/molt-fs/src/btree.rs b/crates/molt-fs/src/btree.rs
+new file mode 100644
+index 0000000..295f444
+--- /dev/null
++++ b/crates/molt-fs/src/btree.rs
+@@ -0,0 +1,921 @@
++//! Fixed-memory copy-on-write metadata tree.
++//!
++//! Leaves hold typed filesystem keys and internal nodes hold separators. Every
++//! mutation writes a new root-to-leaf path; only a later superblock swing makes
++//! that root durable. Nodes are checksummed independently, so mount can reject
++//! a torn tree and fall back to the older checkpoint.
++
++use core::cmp::Ordering;
++
++use molt_block::{Device, Writable};
++
++use crate::crc::crc32c;
++use crate::layout::{BLOCK, Kind, MAX_NAME, MAX_TREE_BLOCKS, Object, Super};
++use crate::{FsError, Name, Volume};
++
++const MAGIC: [u8; 8] = *b"MOLTBTR3";
++const HEADER: usize = 64;
++const KEY_BYTES: usize = 272;
++const VALUE_BYTES: usize = 32;
++const CAPACITY: usize = 12;
++const MAX_HEIGHT: usize = 8;
++const CACHE_SLOTS: usize = 4;
++const WORDS: usize = MAX_TREE_BLOCKS as usize / 64;
++
++const OBJECT: u8 = 1;
++const DIRENT: u8 = 2;
++const WRITE: u8 = 3;
++
++/// Activity counters for the bounded metadata-node cache.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub struct CacheStats {
++    /// Node lookups served without device I/O.
++    pub hits: u64,
++    /// Node lookups that fetched and parsed a block.
++    pub misses: u64,
++    /// Valid nodes replaced after the cache filled.
++    pub evictions: u64,
++}
++
++/// Shape and cache activity of the current metadata tree.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub struct TreeStats {
++    /// Physical block of the pending or durable root, zero for an empty tree.
++    pub root: u64,
++    /// Root-to-leaf levels, zero for an empty tree.
++    pub height: u8,
++    /// Nodes reachable from `root`.
++    pub nodes: u32,
++    /// Cache counters at the time of the walk.
++    pub cache: CacheStats,
++}
++
++#[derive(Clone, Copy, Eq, PartialEq)]
++pub(crate) struct Key {
++    bytes: [u8; KEY_BYTES],
++}
++
++impl Key {
++    pub fn object(object: u32) -> Self {
++        let mut key = Self::default();
++        key.bytes[0] = OBJECT;
++        key.bytes[1..5].copy_from_slice(&object.to_le_bytes());
++        key
++    }
++
++    pub fn dirent(parent: u32, name: &Name) -> Self {
++        let mut key = Self::dirent_start(parent);
++        key.bytes[5] = name.len() as u8;
++        key.bytes[6..6 + name.len()].copy_from_slice(name.as_bytes());
++        key
++    }
++
++    pub fn dirent_start(parent: u32) -> Self {
++        let mut key = Self::default();
++        key.bytes[0] = DIRENT;
++        key.bytes[1..5].copy_from_slice(&parent.to_le_bytes());
++        key
++    }
++
++    pub fn write(object: u32, cursor: u64) -> Self {
++        let mut key = Self::default();
++        key.bytes[0] = WRITE;
++        key.bytes[1..5].copy_from_slice(&object.to_le_bytes());
++        key.bytes[8..16].copy_from_slice(&cursor.to_le_bytes());
++        key
++    }
++
++    pub fn write_start(object: u32) -> Self {
++        Self::write(object, 0)
++    }
++
++    fn tag(self) -> u8 {
++        self.bytes[0]
++    }
++
++    fn object_id(self) -> u32 {
++        u32::from_le_bytes(self.bytes[1..5].try_into().expect("fixed key field"))
++    }
++
++    pub fn is_dirent(self, parent: u32) -> bool {
++        self.tag() == DIRENT && self.object_id() == parent
++    }
++
++    pub fn is_write(self, object: u32) -> bool {
++        self.tag() == WRITE && self.object_id() == object
++    }
++
++    pub fn cursor(self) -> u64 {
++        u64::from_le_bytes(self.bytes[8..16].try_into().expect("fixed key field"))
++    }
++
++    pub fn name(self) -> Result<Name, FsError> {
++        if self.tag() != DIRENT {
++            return Err(FsError::Corrupt);
++        }
++        let len = self.bytes[5] as usize;
++        Name::new(&self.bytes[6..6 + len]).map_err(|_| FsError::Corrupt)
++    }
++
++    fn check(self) -> Result<(), FsError> {
++        match self.tag() {
++            OBJECT if self.bytes[5..].iter().all(|byte| *byte == 0) => Ok(()),
++            DIRENT => {
++                let len = self.bytes[5] as usize;
++                if len == 0 || len > MAX_NAME || self.bytes[6 + len..].iter().any(|byte| *byte != 0)
++                {
++                    return Err(FsError::Corrupt);
++                }
++                self.name().map(|_| ())
++            }
++            WRITE
++                if self.bytes[5..8].iter().all(|byte| *byte == 0)
++                    && self.bytes[16..].iter().all(|byte| *byte == 0) =>
++            {
++                Ok(())
++            }
++            _ => Err(FsError::Corrupt),
++        }
++    }
++
++    fn cmp_dirent(&self, other: &Self) -> Ordering {
++        self.object_id().cmp(&other.object_id()).then_with(|| {
++            let left = self.bytes[5] as usize;
++            let right = other.bytes[5] as usize;
++            self.bytes[6..6 + left].cmp(&other.bytes[6..6 + right])
++        })
++    }
++}
++
++impl Default for Key {
++    fn default() -> Self {
++        Self { bytes: [0; KEY_BYTES] }
++    }
++}
++
++impl Ord for Key {
++    fn cmp(&self, other: &Self) -> Ordering {
++        self.tag().cmp(&other.tag()).then_with(|| match self.tag() {
++            OBJECT => self.object_id().cmp(&other.object_id()),
++            DIRENT => self.cmp_dirent(other),
++            WRITE => self
++                .object_id()
++                .cmp(&other.object_id())
++                .then_with(|| self.cursor().cmp(&other.cursor())),
++            _ => self.bytes.cmp(&other.bytes),
++        })
++    }
++}
++
++impl PartialOrd for Key {
++    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
++        Some(self.cmp(other))
++    }
++}
++
++#[derive(Clone, Copy, Default)]
++pub(crate) struct Value {
++    bytes: [u8; VALUE_BYTES],
++}
++
++impl Value {
++    pub fn object(object: Object) -> Self {
++        let mut value = Self::default();
++        value.bytes[0] = object.kind.byte();
++        value.bytes[4..8].copy_from_slice(&object.count.to_le_bytes());
++        value.bytes[8..16].copy_from_slice(&object.size.to_le_bytes());
++        value
++    }
++
++    pub fn dirent(object: u32) -> Self {
++        let mut value = Self::default();
++        value.bytes[..4].copy_from_slice(&object.to_le_bytes());
++        value
++    }
++
++    pub fn write(offset: u64, bytes: u32) -> Self {
++        let mut value = Self::default();
++        value.bytes[..8].copy_from_slice(&offset.to_le_bytes());
++        value.bytes[8..12].copy_from_slice(&bytes.to_le_bytes());
++        value
++    }
++
++    pub fn as_object(self) -> Result<Object, FsError> {
++        let kind = match self.bytes[0] {
++            0 => Kind::Dir,
++            1 => Kind::File,
++            _ => return Err(FsError::Corrupt),
++        };
++        Ok(Object {
++            kind,
++            start: 0,
++            count: u32::from_le_bytes(self.bytes[4..8].try_into().expect("fixed value field")),
++            size: u64::from_le_bytes(self.bytes[8..16].try_into().expect("fixed value field")),
++        })
++    }
++
++    pub fn as_dirent(self) -> u32 {
++        u32::from_le_bytes(self.bytes[..4].try_into().expect("fixed value field"))
++    }
++
++    pub fn as_write(self) -> (u64, u32) {
++        (
++            u64::from_le_bytes(self.bytes[..8].try_into().expect("fixed value field")),
++            u32::from_le_bytes(self.bytes[8..12].try_into().expect("fixed value field")),
++        )
++    }
++}
++
++#[derive(Clone, Copy)]
++struct Node {
++    level: u8,
++    len: u8,
++    generation: u64,
++    keys: [Key; CAPACITY],
++    values: [Value; CAPACITY],
++    children: [u64; CAPACITY + 1],
++}
++
++impl Node {
++    const EMPTY: Self = Self {
++        level: 0,
++        len: 0,
++        generation: 0,
++        keys: [Key { bytes: [0; KEY_BYTES] }; CAPACITY],
++        values: [Value { bytes: [0; VALUE_BYTES] }; CAPACITY],
++        children: [0; CAPACITY + 1],
++    };
++
++    fn leaf(generation: u64) -> Self {
++        Self { generation, ..Self::EMPTY }
++    }
++
++    fn lower(&self, key: Key) -> usize {
++        let mut low = 0;
++        let mut high = self.len as usize;
++        while low < high {
++            let middle = low + (high - low) / 2;
++            if self.keys[middle] < key {
++                low = middle + 1;
++            } else {
++                high = middle;
++            }
++        }
++        low
++    }
++
++    fn upper(&self, key: Key) -> usize {
++        let mut low = 0;
++        let mut high = self.len as usize;
++        while low < high {
++            let middle = low + (high - low) / 2;
++            if self.keys[middle] <= key {
++                low = middle + 1;
++            } else {
++                high = middle;
++            }
++        }
++        low
++    }
++
++    fn parse(block: &[u8; BLOCK]) -> Result<Self, FsError> {
++        if block[..MAGIC.len()] != MAGIC || u32_at(block, 8) != 3 {
++            return Err(FsError::Corrupt);
++        }
++        if node_crc(block) != u32_at(block, 32) {
++            return Err(FsError::Checksum);
++        }
++        let level = block[12];
++        let len = block[13] as usize;
++        if level as usize >= MAX_HEIGHT || len == 0 || len > CAPACITY {
++            return Err(FsError::Corrupt);
++        }
++        let mut node = Self { level, len: len as u8, generation: u64_at(block, 16), ..Self::EMPTY };
++        for at in 0..len {
++            let start = HEADER + at * KEY_BYTES;
++            node.keys[at].bytes.copy_from_slice(&block[start..start + KEY_BYTES]);
++            node.keys[at].check()?;
++            if at > 0 && node.keys[at - 1] >= node.keys[at] {
++                return Err(FsError::Corrupt);
++            }
++        }
++        let values = HEADER + CAPACITY * KEY_BYTES;
++        if level == 0 {
++            for at in 0..len {
++                let start = values + at * VALUE_BYTES;
++                node.values[at].bytes.copy_from_slice(&block[start..start + VALUE_BYTES]);
++            }
++        } else {
++            for at in 0..=len {
++                node.children[at] = u64_at(block, values + at * 8);
++                if node.children[at] == 0 {
++                    return Err(FsError::Corrupt);
++                }
++            }
++        }
++        Ok(node)
++    }
++
++    fn encode(self, block: &mut [u8; BLOCK]) {
++        block.fill(0);
++        block[..MAGIC.len()].copy_from_slice(&MAGIC);
++        block[8..12].copy_from_slice(&3u32.to_le_bytes());
++        block[12] = self.level;
++        block[13] = self.len;
++        block[16..24].copy_from_slice(&self.generation.to_le_bytes());
++        for at in 0..self.len as usize {
++            let start = HEADER + at * KEY_BYTES;
++            block[start..start + KEY_BYTES].copy_from_slice(&self.keys[at].bytes);
++        }
++        let values = HEADER + CAPACITY * KEY_BYTES;
++        if self.level == 0 {
++            for at in 0..self.len as usize {
++                let start = values + at * VALUE_BYTES;
++                block[start..start + VALUE_BYTES].copy_from_slice(&self.values[at].bytes);
++            }
++        } else {
++            for at in 0..=self.len as usize {
++                block[values + at * 8..values + at * 8 + 8]
++                    .copy_from_slice(&self.children[at].to_le_bytes());
++            }
++        }
++        let checksum = node_crc(block);
++        block[32..36].copy_from_slice(&checksum.to_le_bytes());
++    }
++}
++
++#[derive(Clone, Copy)]
++struct CacheEntry {
++    valid: bool,
++    visited: bool,
++    block: u64,
++    node: Node,
++}
++
++impl CacheEntry {
++    const EMPTY: Self = Self { valid: false, visited: false, block: 0, node: Node::EMPTY };
++}
++
++struct Cache {
++    entries: [CacheEntry; CACHE_SLOTS],
++    hand: usize,
++    stats: CacheStats,
++}
++
++impl Cache {
++    const fn new() -> Self {
++        Self {
++            entries: [CacheEntry::EMPTY; CACHE_SLOTS],
++            hand: 0,
++            stats: CacheStats { hits: 0, misses: 0, evictions: 0 },
++        }
++    }
++
++    fn get(&mut self, block: u64) -> Option<Node> {
++        for entry in &mut self.entries {
++            if entry.valid && entry.block == block {
++                entry.visited = true;
++                self.stats.hits += 1;
++                return Some(entry.node);
++            }
++        }
++        self.stats.misses += 1;
++        None
++    }
++
++    fn put(&mut self, block: u64, node: Node) {
++        if let Some(entry) =
++            self.entries.iter_mut().find(|entry| entry.valid && entry.block == block)
++        {
++            entry.node = node;
++            entry.visited = true;
++            return;
++        }
++        if let Some(at) = self.entries.iter().position(|entry| !entry.valid) {
++            self.entries[at] = CacheEntry { valid: true, visited: false, block, node };
++            return;
++        }
++
++        // SIEVE's useful core: hits only set a bit, while eviction's hand
++        // clears visited candidates and lazily promotes them past this round.
++        loop {
++            let at = self.hand;
++            self.hand = (self.hand + 1) % CACHE_SLOTS;
++            if self.entries[at].visited {
++                self.entries[at].visited = false;
++                continue;
++            }
++            self.entries[at] = CacheEntry { valid: true, visited: false, block, node };
++            self.stats.evictions += 1;
++            return;
++        }
++    }
++}
++
++#[derive(Clone, Copy)]
++struct Branch {
++    left: u64,
++    separator: Option<Key>,
++    right: Option<u64>,
++}
++
++/// The mutable state of one unpublished tree generation.
++#[derive(Clone, Copy)]
++pub(crate) struct TreeTransaction {
++    pub root: u64,
++    generation: u64,
++    tree_at: u64,
++    protected: [u64; WORDS],
++    used: [u64; WORDS],
++}
++
++/// One bounded node cache shared by lookups and tree mutations.
++pub(crate) struct MetadataTree {
++    cache: Cache,
++}
++
++impl MetadataTree {
++    pub const fn new() -> Self {
++        Self { cache: Cache::new() }
++    }
++
++    pub fn begin<D: Writable>(
++        &mut self,
++        volume: &mut Volume<'_, D>,
++    ) -> Result<TreeTransaction, FsError> {
++        let checkpoint = volume.checkpoint();
++        let mut transaction = TreeTransaction {
++            root: checkpoint.tree_root,
++            generation: checkpoint.generation.checked_add(1).ok_or(FsError::Full)?,
++            tree_at: checkpoint.tree_at,
++            protected: [0; WORDS],
++            used: [0; WORDS],
++        };
++        self.mark(volume, checkpoint.tree_root, &mut transaction.protected)?;
++        if let Some(root) = volume.previous_tree() {
++            self.mark(volume, root, &mut transaction.protected)?;
++        }
++        transaction.used = transaction.protected;
++        Ok(transaction)
++    }
++
++    pub fn get<D: Device>(
++        &mut self,
++        volume: &mut Volume<'_, D>,
++        root: u64,
++        key: Key,
++    ) -> Result<Option<Value>, FsError> {
++        if root == 0 {
++            return Ok(None);
++        }
++        let mut at = root;
++        loop {
++            let node = self.read(volume, at)?;
++            if node.level == 0 {
++                let index = node.lower(key);
++                if index < node.len as usize && node.keys[index] == key {
++                    return Ok(Some(node.values[index]));
++                }
++                return Ok(None);
++            }
++            at = node.children[node.upper(key)];
++        }
++    }
++
++    pub fn next<D: Device>(
++        &mut self,
++        volume: &mut Volume<'_, D>,
++        root: u64,
++        key: Key,
++        inclusive: bool,
++    ) -> Result<Option<(Key, Value)>, FsError> {
++        if root == 0 {
++            return Ok(None);
++        }
++        let mut path_blocks = [0; MAX_HEIGHT];
++        let mut path_children = [0usize; MAX_HEIGHT];
++        let mut depth = 0;
++        let mut at = root;
++        loop {
++            let node = self.read(volume, at)?;
++            if node.level == 0 {
++                let index = if inclusive { node.lower(key) } else { node.upper(key) };
++                if index < node.len as usize {
++                    return Ok(Some((node.keys[index], node.values[index])));
++                }
++                break;
++            }
++            if depth >= MAX_HEIGHT {
++                return Err(FsError::Corrupt);
++            }
++            let child = node.upper(key);
++            path_blocks[depth] = at;
++            path_children[depth] = child;
++            depth += 1;
++            at = node.children[child];
++        }
++
++        while depth > 0 {
++            depth -= 1;
++            let parent = self.read(volume, path_blocks[depth])?;
++            let child = path_children[depth];
++            if child >= parent.len as usize {
++                continue;
++            }
++            at = parent.children[child + 1];
++            loop {
++                let node = self.read(volume, at)?;
++                if node.level == 0 {
++                    return Ok((node.len > 0).then_some((node.keys[0], node.values[0])));
++                }
++                at = node.children[0];
++            }
++        }
++        Ok(None)
++    }
++
++    pub fn insert<D: Writable>(
++        &mut self,
++        volume: &mut Volume<'_, D>,
++        transaction: &mut TreeTransaction,
++        key: Key,
++        value: Value,
++    ) -> Result<(), FsError> {
++        if transaction.root == 0 {
++            let mut leaf = Node::leaf(transaction.generation);
++            leaf.keys[0] = key;
++            leaf.values[0] = value;
++            leaf.len = 1;
++            transaction.root = self.write_new(volume, transaction, leaf)?;
++            return Ok(());
++        }
++
++        let mut path_blocks = [0; MAX_HEIGHT];
++        let mut path_children = [0usize; MAX_HEIGHT];
++        let mut depth = 0;
++        let mut leaf_at = transaction.root;
++        let leaf = loop {
++            let node = self.read(volume, leaf_at)?;
++            if node.level == 0 {
++                break node;
++            }
++            if depth >= MAX_HEIGHT - 1 {
++                return Err(FsError::Full);
++            }
++            let child = node.upper(key);
++            path_blocks[depth] = leaf_at;
++            path_children[depth] = child;
++            depth += 1;
++            leaf_at = node.children[child];
++        };
++
++        let mut branch = self.insert_leaf(volume, transaction, leaf, key, value)?;
++        self.release(transaction, leaf_at);
++
++        while depth > 0 {
++            depth -= 1;
++            let parent_at = path_blocks[depth];
++            let parent = self.read(volume, parent_at)?;
++            let child = path_children[depth];
++            branch = self.rewrite_parent(volume, transaction, parent, child, branch)?;
++            self.release(transaction, parent_at);
++        }
++
++        transaction.root = if let (Some(separator), Some(right)) = (branch.separator, branch.right)
++        {
++            let child = self.read(volume, branch.left)?;
++            let mut root =
++                Node { level: child.level + 1, generation: transaction.generation, ..Node::EMPTY };
++            root.len = 1;
++            root.keys[0] = separator;
++            root.children[0] = branch.left;
++            root.children[1] = right;
++            self.write_new(volume, transaction, root)?
++        } else {
++            branch.left
++        };
++        Ok(())
++    }
++
++    pub fn stats<D: Device>(
++        &mut self,
++        volume: &mut Volume<'_, D>,
++        root: u64,
++    ) -> Result<TreeStats, FsError> {
++        if root == 0 {
++            return Ok(TreeStats { cache: self.cache.stats, ..TreeStats::default() });
++        }
++        let root_node = self.read(volume, root)?;
++        let mut stack = [0; MAX_TREE_BLOCKS as usize];
++        stack[0] = root;
++        let mut depth = 1;
++        let mut nodes = 0u32;
++        while depth > 0 {
++            depth -= 1;
++            let node = self.read(volume, stack[depth])?;
++            nodes = nodes.checked_add(1).ok_or(FsError::Corrupt)?;
++            if node.level > 0 {
++                for &child in &node.children[..=node.len as usize] {
++                    if depth >= stack.len() {
++                        return Err(FsError::Corrupt);
++                    }
++                    stack[depth] = child;
++                    depth += 1;
++                }
++            }
++        }
++        Ok(TreeStats { root, height: root_node.level + 1, nodes, cache: self.cache.stats })
++    }
++
++    fn insert_leaf<D: Writable>(
++        &mut self,
++        volume: &mut Volume<'_, D>,
++        transaction: &mut TreeTransaction,
++        leaf: Node,
++        key: Key,
++        value: Value,
++    ) -> Result<Branch, FsError> {
++        let index = leaf.lower(key);
++        if index < leaf.len as usize && leaf.keys[index] == key {
++            let mut node = leaf;
++            node.generation = transaction.generation;
++            node.values[index] = value;
++            return Ok(Branch {
++                left: self.write_new(volume, transaction, node)?,
++                separator: None,
++                right: None,
++            });
++        }
++
++        let total = leaf.len as usize + 1;
++        let mut keys = [Key::default(); CAPACITY + 1];
++        let mut values = [Value::default(); CAPACITY + 1];
++        keys[..index].copy_from_slice(&leaf.keys[..index]);
++        values[..index].copy_from_slice(&leaf.values[..index]);
++        keys[index] = key;
++        values[index] = value;
++        let len = leaf.len as usize;
++        keys[index + 1..=len].copy_from_slice(&leaf.keys[index..len]);
++        values[index + 1..=len].copy_from_slice(&leaf.values[index..len]);
++        if total <= CAPACITY {
++            let mut node = Node::leaf(transaction.generation);
++            node.len = total as u8;
++            node.keys[..total].copy_from_slice(&keys[..total]);
++            node.values[..total].copy_from_slice(&values[..total]);
++            return Ok(Branch {
++                left: self.write_new(volume, transaction, node)?,
++                separator: None,
++                right: None,
++            });
++        }
++
++        let middle = total / 2;
++        let mut left = Node::leaf(transaction.generation);
++        left.len = middle as u8;
++        left.keys[..middle].copy_from_slice(&keys[..middle]);
++        left.values[..middle].copy_from_slice(&values[..middle]);
++        let right_len = total - middle;
++        let mut right = Node::leaf(transaction.generation);
++        right.len = right_len as u8;
++        right.keys[..right_len].copy_from_slice(&keys[middle..total]);
++        right.values[..right_len].copy_from_slice(&values[middle..total]);
++        let separator = right.keys[0];
++        let left_at = self.write_new(volume, transaction, left)?;
++        let right_at = self.write_new(volume, transaction, right)?;
++        Ok(Branch { left: left_at, separator: Some(separator), right: Some(right_at) })
++    }
++
++    fn rewrite_parent<D: Writable>(
++        &mut self,
++        volume: &mut Volume<'_, D>,
++        transaction: &mut TreeTransaction,
++        parent: Node,
++        child: usize,
++        branch: Branch,
++    ) -> Result<Branch, FsError> {
++        let Some(separator) = branch.separator else {
++            let mut node = parent;
++            node.generation = transaction.generation;
++            node.children[child] = branch.left;
++            return Ok(Branch {
++                left: self.write_new(volume, transaction, node)?,
++                separator: None,
++                right: None,
++            });
++        };
++        let right = branch.right.ok_or(FsError::Corrupt)?;
++        let total = parent.len as usize + 1;
++        let mut keys = [Key::default(); CAPACITY + 1];
++        let mut children = [0u64; CAPACITY + 2];
++        keys[..child].copy_from_slice(&parent.keys[..child]);
++        keys[child] = separator;
++        keys[child + 1..total].copy_from_slice(&parent.keys[child..parent.len as usize]);
++        children[..=child].copy_from_slice(&parent.children[..=child]);
++        children[child] = branch.left;
++        children[child + 1] = right;
++        children[child + 2..=total]
++            .copy_from_slice(&parent.children[child + 1..=parent.len as usize]);
++
++        if total <= CAPACITY {
++            let mut node =
++                Node { level: parent.level, generation: transaction.generation, ..Node::EMPTY };
++            node.len = total as u8;
++            node.keys[..total].copy_from_slice(&keys[..total]);
++            node.children[..=total].copy_from_slice(&children[..=total]);
++            return Ok(Branch {
++                left: self.write_new(volume, transaction, node)?,
++                separator: None,
++                right: None,
++            });
++        }
++
++        let middle = total / 2;
++        let mut left_node =
++            Node { level: parent.level, generation: transaction.generation, ..Node::EMPTY };
++        left_node.len = middle as u8;
++        left_node.keys[..middle].copy_from_slice(&keys[..middle]);
++        left_node.children[..=middle].copy_from_slice(&children[..=middle]);
++        let right_len = total - middle - 1;
++        let mut right_node =
++            Node { level: parent.level, generation: transaction.generation, ..Node::EMPTY };
++        right_node.len = right_len as u8;
++        right_node.keys[..right_len].copy_from_slice(&keys[middle + 1..total]);
++        right_node.children[..=right_len].copy_from_slice(&children[middle + 1..=total]);
++        let left_at = self.write_new(volume, transaction, left_node)?;
++        let right_at = self.write_new(volume, transaction, right_node)?;
++        Ok(Branch { left: left_at, separator: Some(keys[middle]), right: Some(right_at) })
++    }
++
++    fn read<D: Device>(&mut self, volume: &mut Volume<'_, D>, at: u64) -> Result<Node, FsError> {
++        check_block(volume.checkpoint(), at)?;
++        if let Some(node) = self.cache.get(at) {
++            return Ok(node);
++        }
++        let node = Node::parse(volume.block(at)?)?;
++        self.cache.put(at, node);
++        Ok(node)
++    }
++
++    fn write_new<D: Writable>(
++        &mut self,
++        volume: &mut Volume<'_, D>,
++        transaction: &mut TreeTransaction,
++        node: Node,
++    ) -> Result<u64, FsError> {
++        let checkpoint = volume.checkpoint();
++        let mut found = None;
++        for offset in 0..checkpoint.tree_blocks {
++            if !bit(transaction.used, offset) {
++                found = Some(offset);
++                break;
++            }
++        }
++        let offset = found.ok_or(FsError::Full)?;
++        set(&mut transaction.used, offset);
++        let at = checkpoint.tree_at + u64::from(offset);
++        let mut block = [0; BLOCK];
++        node.encode(&mut block);
++        volume.write_tree_block(at, &block)?;
++        self.cache.put(at, node);
++        Ok(at)
++    }
++
++    fn release(&mut self, transaction: &mut TreeTransaction, at: u64) {
++        let Some(relative) = at.checked_sub(transaction.tree_at) else {
++            return;
++        };
++        let Ok(offset) = u32::try_from(relative) else {
++            return;
++        };
++        if offset < MAX_TREE_BLOCKS
++            && !bit(transaction.protected, offset)
++            && bit(transaction.used, offset)
++        {
++            clear(&mut transaction.used, offset);
++        }
++    }
++
++    fn mark<D: Device>(
++        &mut self,
++        volume: &mut Volume<'_, D>,
++        root: u64,
++        bits: &mut [u64; WORDS],
++    ) -> Result<(), FsError> {
++        if root == 0 {
++            return Ok(());
++        }
++        let checkpoint = volume.checkpoint();
++        let mut stack = [0; MAX_TREE_BLOCKS as usize];
++        stack[0] = root;
++        let mut depth = 1;
++        while depth > 0 {
++            depth -= 1;
++            let at = stack[depth];
++            let offset = tree_offset(checkpoint, at)?;
++            if bit(*bits, offset) {
++                continue;
++            }
++            set(bits, offset);
++            let node = self.read(volume, at)?;
++            if node.level > 0 {
++                for &child in &node.children[..=node.len as usize] {
++                    if depth >= stack.len() {
++                        return Err(FsError::Corrupt);
++                    }
++                    stack[depth] = child;
++                    depth += 1;
++                }
++            }
++        }
++        Ok(())
++    }
++}
++
++/// Checks every reachable node before a superblock can become the mounted one.
++pub(crate) fn verify<D: Device>(
++    device: &mut D,
++    scratch: &mut [u8; BLOCK],
++    checkpoint: Super,
++) -> Result<(), FsError> {
++    if checkpoint.tree_root == 0 {
++        return Ok(());
++    }
++    let mut used = [0; WORDS];
++    let mut stack = [(0u64, 0xffu8); MAX_TREE_BLOCKS as usize];
++    stack[0] = (checkpoint.tree_root, 0xff);
++    let mut depth = 1;
++    while depth > 0 {
++        depth -= 1;
++        let (at, expected) = stack[depth];
++        let offset = tree_offset(checkpoint, at)?;
++        if bit(used, offset) {
++            return Err(FsError::Corrupt);
++        }
++        set(&mut used, offset);
++        volume_read(device, scratch, at)?;
++        let node = Node::parse(scratch)?;
++        if node.generation > checkpoint.generation
++            || (at == checkpoint.tree_root && node.generation != checkpoint.generation)
++        {
++            return Err(FsError::Corrupt);
++        }
++        if expected != 0xff && node.level != expected {
++            return Err(FsError::Corrupt);
++        }
++        if node.level > 0 {
++            for &child in &node.children[..=node.len as usize] {
++                if depth >= stack.len() {
++                    return Err(FsError::Corrupt);
++                }
++                stack[depth] = (child, node.level - 1);
++                depth += 1;
++            }
++        }
++    }
++    Ok(())
++}
++
++fn check_block(checkpoint: Super, at: u64) -> Result<(), FsError> {
++    tree_offset(checkpoint, at).map(|_| ())
++}
++
++fn tree_offset(checkpoint: Super, at: u64) -> Result<u32, FsError> {
++    let offset = at.checked_sub(checkpoint.tree_at).ok_or(FsError::Corrupt)?;
++    if offset >= u64::from(checkpoint.tree_blocks) {
++        return Err(FsError::Corrupt);
++    }
++    u32::try_from(offset).map_err(|_| FsError::Corrupt)
++}
++
++fn bit(bits: [u64; WORDS], at: u32) -> bool {
++    bits[at as usize / 64] & (1 << (at % 64)) != 0
++}
++
++fn set(bits: &mut [u64; WORDS], at: u32) {
++    bits[at as usize / 64] |= 1 << (at % 64);
++}
++
++fn clear(bits: &mut [u64; WORDS], at: u32) {
++    bits[at as usize / 64] &= !(1 << (at % 64));
++}
++
++fn node_crc(block: &[u8; BLOCK]) -> u32 {
++    let mut copy = *block;
++    copy[32..36].fill(0);
++    crc32c(&copy)
++}
++
++fn u32_at(bytes: &[u8], at: usize) -> u32 {
++    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("fixed node field"))
++}
++
++fn u64_at(bytes: &[u8], at: usize) -> u64 {
++    u64::from_le_bytes(bytes[at..at + 8].try_into().expect("fixed node field"))
++}
++
++fn volume_read<D: Device>(device: &mut D, block: &mut [u8; BLOCK], at: u64) -> Result<(), FsError> {
++    let sectors = (BLOCK / molt_block::SECTOR) as u64;
++    device.read(at.checked_mul(sectors).ok_or(FsError::Corrupt)?, block).map_err(FsError::Device)
++}
++
++const _: () = assert!(HEADER + CAPACITY * KEY_BYTES + (CAPACITY + 1) * VALUE_BYTES <= BLOCK);
+diff --git a/crates/molt-fs/src/format.rs b/crates/molt-fs/src/format.rs
+index 11ffd78..59b5e21 100644
+--- a/crates/molt-fs/src/format.rs
++++ b/crates/molt-fs/src/format.rs
+@@ -11,8 +11,8 @@ use alloc::vec::Vec;
+ use crate::FsError;
+ use crate::crc::crc32c;
+ use crate::layout::{
+-    Area, BLOCK, ENTRY_BYTES, EXTENT_BYTES, Entry, Extent, Kind, OBJECT_BYTES, Object, Region,
+-    SUPERS, Super,
++    Area, BLOCK, DEFAULT_LOG_BLOCKS, DEFAULT_TREE_BLOCKS, ENTRY_BYTES, EXTENT_BYTES, Entry, Extent,
++    Kind, OBJECT_BYTES, Object, Region, SUPERS, Super,
+ };
+ use crate::name::Name;
+ 
+@@ -66,9 +66,27 @@ impl Tree {
+ 
+ /// Lays `tree` out as a mountable image stamped with `generation`.
+ pub fn build(tree: &Tree, generation: u64) -> Result<Vec<u8>, FsError> {
++    build_with_log(tree, generation, DEFAULT_LOG_BLOCKS)
++}
++
++/// Lays `tree` out with `log_blocks` in each of three rotating log banks.
++pub fn build_with_log(tree: &Tree, generation: u64, log_blocks: u32) -> Result<Vec<u8>, FsError> {
++    build_with_capacity(tree, generation, log_blocks, DEFAULT_TREE_BLOCKS)
++}
++
++/// Lays `tree` out with explicit log and COW metadata capacity.
++pub fn build_with_capacity(
++    tree: &Tree,
++    generation: u64,
++    log_blocks: u32,
++    tree_blocks: u32,
++) -> Result<Vec<u8>, FsError> {
++    if log_blocks == 0 || tree_blocks == 0 || tree_blocks > crate::layout::MAX_TREE_BLOCKS {
++        return Err(FsError::Range);
++    }
+     let mut image = Image::default();
+     let root = image.dir(tree)?;
+-    image.finish(root, generation)
++    image.finish(root, generation, log_blocks, tree_blocks)
+ }
+ 
+ #[derive(Default)]
+@@ -152,7 +170,13 @@ impl Image {
+     }
+ 
+     /// Places the regions, checksums them, and writes both superblock copies.
+-    fn finish(mut self, root: u32, generation: u64) -> Result<Vec<u8>, FsError> {
++    fn finish(
++        mut self,
++        root: u32,
++        generation: u64,
++        log_blocks: u32,
++        tree_blocks: u32,
++    ) -> Result<Vec<u8>, FsError> {
+         let data_blocks = (self.data.len() / BLOCK) as u64;
+         let sizes = [
+             self.objects.len() * OBJECT_BYTES,
+@@ -162,15 +186,22 @@ impl Image {
+             data_blocks as usize * 4,
+         ];
+ 
+-        let mut superblock = Super { generation, root, data_blocks, ..Super::default() };
++        let mut superblock =
++            Super { generation, root, data_blocks, log_blocks, tree_blocks, ..Super::default() };
+         let mut at = SUPERS;
+-        for (area, bytes) in Area::ALL.into_iter().zip(sizes) {
++        for (area, bytes) in Area::BASE.into_iter().zip(sizes) {
+             let region = Region { at, bytes: bytes as u64, crc: 0 };
+             superblock.set_region(area, region);
+             at += region.blocks();
+         }
+         superblock.data_at = at;
+-        superblock.blocks = at + data_blocks;
++        superblock.tree_at = at.checked_add(data_blocks).ok_or(FsError::Range)?;
++        let log_at =
++            superblock.tree_at.checked_add(u64::from(tree_blocks)).ok_or(FsError::Range)?;
++        let log_span =
++            u64::from(log_blocks).checked_mul(crate::layout::LOG_BANKS).ok_or(FsError::Range)?;
++        superblock.blocks = log_at.checked_add(log_span).ok_or(FsError::Range)?;
++        superblock.set_region(Area::Log, Region { at: log_at, bytes: 0, crc: crc32c(&[]) });
+ 
+         // Extents were addressed from the start of the data region.
+         for extent in &mut self.extents {
+@@ -191,7 +222,7 @@ impl Image {
+         ];
+ 
+         let mut image = vec![0; superblock.blocks as usize * BLOCK];
+-        for (area, bytes) in Area::ALL.into_iter().zip(regions) {
++        for (area, bytes) in Area::BASE.into_iter().zip(regions) {
+             let mut region = superblock.region(area);
+             region.crc = crc32c(&bytes);
+             superblock.set_region(area, region);
+@@ -223,9 +254,9 @@ fn index(value: usize) -> Result<u32, FsError> {
+ mod tests {
+     use alloc::vec;
+ 
+-    use super::{Tree, build};
++    use super::{Tree, build, build_with_capacity};
+     use crate::FsError;
+-    use crate::layout::{BLOCK, Super};
++    use crate::layout::{BLOCK, MAX_TREE_BLOCKS, Super};
+ 
+     #[test]
+     fn empty_tree_still_mounts_as_volume() {
+@@ -234,6 +265,7 @@ mod tests {
+ 
+         assert_eq!(superblock.generation, 1);
+         assert_eq!(superblock.data_blocks, 0);
++        assert_eq!(superblock.tree_blocks, MAX_TREE_BLOCKS);
+     }
+ 
+     #[test]
+@@ -263,6 +295,15 @@ mod tests {
+         assert_eq!(Super::parse(&image).expect("superblock").data_blocks, 0);
+     }
+ 
++    #[test]
++    fn invalid_tree_capacity_refused() {
++        assert_eq!(build_with_capacity(&Tree::new(), 1, 1, 0), Err(FsError::Range));
++        assert_eq!(
++            build_with_capacity(&Tree::new(), 1, 1, MAX_TREE_BLOCKS + 1),
++            Err(FsError::Range)
++        );
++    }
++
+     #[test]
+     fn directory_reopens_instead_of_duplicating() {
+         let mut tree = Tree::new();
+diff --git a/crates/molt-fs/src/journal.rs b/crates/molt-fs/src/journal.rs
+new file mode 100644
+index 0000000..68c8670
+--- /dev/null
++++ b/crates/molt-fs/src/journal.rs
+@@ -0,0 +1,715 @@
++//! Writable view of an immutable image plus its COW tree and payload log.
++//!
++//! A transaction copies the active log into a third bank, appends typed records,
++//! and path-copies metadata nodes. [`Journal::sync`] flushes those writes before
++//! it publishes their log and tree root, then flushes the superblock. Blocks
++//! reachable from the newest and previous checkpoints are never overwritten.
++
++use molt_block::{SECTOR, Writable};
++
++use crate::btree::{Key, MetadataTree, TreeStats, TreeTransaction, Value};
++use crate::layout::{Area, BLOCK, Kind, OBJECT_BYTES, Object, Region};
++use crate::log::{ALIGN, HEADER, Record};
++use crate::{FsError, Name, Volume};
++
++#[derive(Clone, Copy)]
++struct Transaction {
++    at: u64,
++    bytes: u64,
++    tree: TreeTransaction,
++}
++
++/// A mounted writable filesystem.
++pub struct Journal<'buf, D> {
++    volume: Volume<'buf, D>,
++    transaction: Option<Transaction>,
++    tree: MetadataTree,
++    base_objects: u32,
++    next_object: u32,
++}
++
++impl<'buf, D: Writable> Journal<'buf, D> {
++    /// Mounts the newest valid checkpoint and replays its mutation log.
++    pub fn mount(device: D, block: &'buf mut [u8; BLOCK]) -> Result<Self, FsError> {
++        let volume = Volume::mount(device, block)?;
++        let object_bytes = volume.checkpoint().region(Area::Objects).bytes;
++        if object_bytes % OBJECT_BYTES as u64 != 0 {
++            return Err(FsError::Corrupt);
++        }
++        let base_objects =
++            u32::try_from(object_bytes / OBJECT_BYTES as u64).map_err(|_| FsError::Corrupt)?;
++        let mut journal = Self {
++            volume,
++            transaction: None,
++            tree: MetadataTree::new(),
++            base_objects,
++            next_object: base_objects,
++        };
++        journal.validate_log()?;
++        Ok(journal)
++    }
++
++    /// The object id of the root directory.
++    pub const fn root(&self) -> u32 {
++        self.volume.root()
++    }
++
++    /// The generation of the active durable checkpoint.
++    pub const fn generation(&self) -> u64 {
++        self.volume.generation()
++    }
++
++    /// Returns the current COW tree shape and cache counters.
++    pub fn tree_stats(&mut self) -> Result<TreeStats, FsError> {
++        let root = self.tree_root();
++        self.tree.stats(&mut self.volume, root)
++    }
++
++    /// Returns the current object state after replaying every mutation.
++    pub fn object(&mut self, id: u32) -> Result<Object, FsError> {
++        if id >= self.next_object {
++            return Err(FsError::Missing);
++        }
++        let root = self.tree_root();
++        if let Some(value) = self.tree.get(&mut self.volume, root, Key::object(id))? {
++            return value.as_object();
++        }
++        if id < self.base_objects {
++            return self.volume.object(id);
++        }
++        Err(FsError::Corrupt)
++    }
++
++    /// Finds `name` in a directory, including objects created since mkfs.
++    pub fn lookup(&mut self, dir: u32, name: &Name) -> Result<u32, FsError> {
++        let object = self.object(dir)?;
++        if object.kind != Kind::Dir {
++            return Err(FsError::Kind);
++        }
++        if dir < self.base_objects {
++            let base = self.volume.object(dir)?;
++            match self.volume.lookup(&base, name.as_bytes()) {
++                Ok(object) => return Ok(object),
++                Err(FsError::Missing) => {}
++                Err(error) => return Err(error),
++            }
++        }
++
++        let root = self.tree_root();
++        if let Some(value) = self.tree.get(&mut self.volume, root, Key::dirent(dir, name))? {
++            return Ok(value.as_dirent());
++        }
++        Err(FsError::Missing)
++    }
++
++    /// Reads `index` in bytewise name order.
++    pub fn entry(&mut self, dir: u32, index: u32) -> Result<(Name, u32), FsError> {
++        let object = self.object(dir)?;
++        if object.kind != Kind::Dir {
++            return Err(FsError::Kind);
++        }
++        if index >= object.count {
++            return Err(FsError::Missing);
++        }
++        let base = if dir < self.base_objects { Some(self.volume.object(dir)?) } else { None };
++        let mut previous = None;
++        let mut selected = None;
++
++        for _ in 0..=index {
++            let mut candidate = None;
++            if let Some(base) = base {
++                for at in 0..base.count {
++                    let (name, object) = self.volume.entry(&base, at)?;
++                    choose(&mut candidate, previous, name, object);
++                }
++            }
++            let root = self.tree_root();
++            let key = match previous {
++                Some(name) => Key::dirent(dir, &name),
++                None => Key::dirent_start(dir),
++            };
++            if let Some((key, value)) =
++                self.tree.next(&mut self.volume, root, key, previous.is_none())?
++                && key.is_dirent(dir)
++            {
++                choose(&mut candidate, previous, key.name()?, value.as_dirent());
++            }
++            selected = candidate;
++            previous = Some(selected.ok_or(FsError::Corrupt)?.0);
++        }
++        selected.ok_or(FsError::Corrupt)
++    }
++
++    /// Reads the current file contents, overlaying later writes over earlier
++    /// ones and the immutable image.
++    pub fn read(&mut self, file: u32, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
++        let object = self.object(file)?;
++        if object.kind != Kind::File {
++            return Err(FsError::Kind);
++        }
++        if offset > object.size {
++            return Err(FsError::Range);
++        }
++        let want = (object.size - offset).min(buf.len() as u64) as usize;
++        buf[..want].fill(0);
++
++        if file < self.base_objects {
++            let base = self.volume.object(file)?;
++            if offset <= base.size {
++                let take = (base.size - offset).min(want as u64) as usize;
++                self.volume.read(&base, offset, &mut buf[..take])?;
++            }
++        }
++
++        let read_end = offset.checked_add(want as u64).ok_or(FsError::Corrupt)?;
++        let root = self.tree_root();
++        let mut key = Key::write_start(file);
++        let mut inclusive = true;
++        while let Some((found, value)) = self.tree.next(&mut self.volume, root, key, inclusive)? {
++            if !found.is_write(file) {
++                break;
++            }
++            let (written_at, bytes) = value.as_write();
++            let cursor = found.cursor();
++            let written_end = written_at.checked_add(u64::from(bytes)).ok_or(FsError::Corrupt)?;
++            let start = offset.max(written_at);
++            let end = read_end.min(written_end);
++            if start < end {
++                let target = (start - offset) as usize;
++                self.copy_payload(
++                    cursor,
++                    start - written_at,
++                    &mut buf[target..target + (end - start) as usize],
++                )?;
++            }
++            key = found;
++            inclusive = false;
++        }
++        Ok(want)
++    }
++
++    /// Creates and opens one empty object below `parent`.
++    pub fn create(&mut self, parent: u32, name: Name, kind: Kind) -> Result<u32, FsError> {
++        let mut parent_object = self.object(parent)?;
++        if parent_object.kind != Kind::Dir {
++            return Err(FsError::Kind);
++        }
++        match self.lookup(parent, &name) {
++            Ok(_) => return Err(FsError::Exists),
++            Err(FsError::Missing) => {}
++            Err(error) => return Err(error),
++        }
++        let object = self.next_object;
++        let next = object.checked_add(1).ok_or(FsError::Full)?;
++        parent_object.count = parent_object.count.checked_add(1).ok_or(FsError::Full)?;
++        let before = self.begin()?;
++        if let Err(error) = self
++            .append(Record::create(object, parent, kind, name), name.as_bytes())
++            .and_then(|_| self.index(Key::object(parent), Value::object(parent_object)))
++            .and_then(|_| {
++                self.index(
++                    Key::object(object),
++                    Value::object(Object { kind, start: 0, count: 0, size: 0 }),
++                )
++            })
++            .and_then(|_| self.index(Key::dirent(parent, &name), Value::dirent(object)))
++        {
++            self.transaction = Some(before);
++            return Err(error);
++        }
++        self.next_object = next;
++        Ok(object)
++    }
++
++    /// Appends a file write and returns the number of accepted bytes.
++    pub fn write(&mut self, file: u32, offset: u64, bytes: &[u8]) -> Result<usize, FsError> {
++        let mut object = self.object(file)?;
++        if object.kind != Kind::File {
++            return Err(FsError::Kind);
++        }
++        offset.checked_add(bytes.len() as u64).ok_or(FsError::Range)?;
++        if bytes.is_empty() {
++            return Ok(0);
++        }
++        let record = Record::write(file, offset, bytes.len())?;
++        let before = self.begin()?;
++        let cursor = match self.append(record, bytes) {
++            Ok(cursor) => cursor,
++            Err(error) => {
++                self.transaction = Some(before);
++                return Err(error);
++            }
++        };
++        object.size = object.size.max(offset + bytes.len() as u64);
++        if let Err(error) = self.index(Key::object(file), Value::object(object)).and_then(|_| {
++            self.index(Key::write(file, cursor), Value::write(offset, bytes.len() as u32))
++        }) {
++            self.transaction = Some(before);
++            return Err(error);
++        }
++        Ok(bytes.len())
++    }
++
++    /// Makes every pending record durable and publishes a new generation.
++    pub fn sync(&mut self) -> Result<u64, FsError> {
++        let Some(transaction) = self.transaction else {
++            self.volume.flush()?;
++            return Ok(self.volume.generation());
++        };
++
++        let crc = self.volume.checksum(transaction.at, transaction.bytes)?;
++        let mut checkpoint = self.volume.checkpoint();
++        checkpoint.generation = checkpoint.generation.checked_add(1).ok_or(FsError::Full)?;
++        checkpoint.tree_root = transaction.tree.root;
++        checkpoint
++            .set_region(Area::Log, Region { at: transaction.at, bytes: transaction.bytes, crc });
++        let copy = 1 - self.volume.active_copy();
++
++        // The log must survive before any durable superblock is allowed to
++        // name it. The second flush is the commit point.
++        self.volume.flush()?;
++        self.volume.write_checkpoint(copy, checkpoint)?;
++        self.volume.flush()?;
++        self.volume.commit(copy, checkpoint);
++        self.transaction = None;
++        Ok(checkpoint.generation)
++    }
++
++    fn validate_log(&mut self) -> Result<(), FsError> {
++        let mut next = self.base_objects;
++        let mut cursor = 0;
++        while cursor < self.log_region().bytes {
++            let record = self.record(cursor)?;
++            match record {
++                Record::Create { object, parent, .. } => {
++                    if object != next || parent >= next {
++                        return Err(FsError::Corrupt);
++                    }
++                    let name = self.record_name(cursor, record).map_err(|_| FsError::Corrupt)?;
++                    if self.kind_before(parent, cursor)? != Kind::Dir
++                        || self.name_exists_before(parent, &name, cursor)?
++                    {
++                        return Err(FsError::Corrupt);
++                    }
++                    next = next.checked_add(1).ok_or(FsError::Corrupt)?;
++                }
++                Record::Write { object, offset, bytes } => {
++                    if object >= next
++                        || self.kind_before(object, cursor)? != Kind::File
++                        || offset.checked_add(u64::from(bytes)).is_none()
++                    {
++                        return Err(FsError::Corrupt);
++                    }
++                }
++            }
++            cursor = cursor
++                .checked_add(record.span().map_err(|_| FsError::Corrupt)?)
++                .ok_or(FsError::Corrupt)?;
++        }
++        if cursor != self.log_region().bytes {
++            return Err(FsError::Corrupt);
++        }
++        self.next_object = next;
++        self.validate_index()
++    }
++
++    fn validate_index(&mut self) -> Result<(), FsError> {
++        let region = self.log_region();
++        let root = self.tree_root();
++        if region.bytes > 0 && root == 0 {
++            return Err(FsError::Corrupt);
++        }
++        let mut cursor = 0;
++        while cursor < region.bytes {
++            let record = self.record(cursor)?;
++            match record {
++                Record::Create { object, parent, kind, .. } => {
++                    let name = self.record_name(cursor, record)?;
++                    let state = self
++                        .tree
++                        .get(&mut self.volume, root, Key::object(object))?
++                        .ok_or(FsError::Corrupt)?
++                        .as_object()?;
++                    let linked = self
++                        .tree
++                        .get(&mut self.volume, root, Key::dirent(parent, &name))?
++                        .ok_or(FsError::Corrupt)?
++                        .as_dirent();
++                    if state.kind != kind || linked != object {
++                        return Err(FsError::Corrupt);
++                    }
++                }
++                Record::Write { object, offset, bytes } => {
++                    let indexed = self
++                        .tree
++                        .get(&mut self.volume, root, Key::write(object, cursor))?
++                        .ok_or(FsError::Corrupt)?
++                        .as_write();
++                    if indexed != (offset, bytes) {
++                        return Err(FsError::Corrupt);
++                    }
++                }
++            }
++            cursor += record.span().map_err(|_| FsError::Corrupt)?;
++        }
++        Ok(())
++    }
++
++    fn kind_before(&mut self, object: u32, limit: u64) -> Result<Kind, FsError> {
++        if object < self.base_objects {
++            return Ok(self.volume.object(object)?.kind);
++        }
++        let mut cursor = 0;
++        while cursor < limit {
++            let record = self.record(cursor)?;
++            if let Record::Create { object: created, kind, .. } = record
++                && created == object
++            {
++                return Ok(kind);
++            }
++            cursor += record.span().map_err(|_| FsError::Corrupt)?;
++        }
++        Err(FsError::Corrupt)
++    }
++
++    fn name_exists_before(
++        &mut self,
++        parent: u32,
++        name: &Name,
++        limit: u64,
++    ) -> Result<bool, FsError> {
++        if parent < self.base_objects {
++            let base = self.volume.object(parent)?;
++            match self.volume.lookup(&base, name.as_bytes()) {
++                Ok(_) => return Ok(true),
++                Err(FsError::Missing) => {}
++                Err(error) => return Err(error),
++            }
++        }
++        let mut cursor = 0;
++        while cursor < limit {
++            let record = self.record(cursor)?;
++            if let Record::Create { parent: held, .. } = record
++                && held == parent
++                && self.record_name(cursor, record)? == *name
++            {
++                return Ok(true);
++            }
++            cursor += record.span().map_err(|_| FsError::Corrupt)?;
++        }
++        Ok(false)
++    }
++
++    fn begin(&mut self) -> Result<Transaction, FsError> {
++        if let Some(transaction) = self.transaction {
++            return Ok(transaction);
++        }
++        let checkpoint = self.volume.checkpoint();
++        let active = checkpoint.region(Area::Log);
++        let target = (0..crate::layout::LOG_BANKS)
++            .filter_map(|bank| checkpoint.log_bank(bank).ok())
++            .find(|at| *at != active.at && Some(*at) != self.volume.previous_log())
++            .ok_or(FsError::Corrupt)?;
++        let tree = self.tree.begin(&mut self.volume)?;
++        self.volume.copy_aligned(active.at, target, active.bytes)?;
++        let transaction = Transaction { at: target, bytes: active.bytes, tree };
++        self.transaction = Some(transaction);
++        Ok(transaction)
++    }
++
++    fn append(&mut self, record: Record, payload: &[u8]) -> Result<u64, FsError> {
++        if payload.len() != record.payload() as usize {
++            return Err(FsError::Corrupt);
++        }
++        let transaction = self.begin()?;
++        let cursor = transaction.bytes;
++        let span = record.span()?;
++        let end = transaction.bytes.checked_add(span).ok_or(FsError::Full)?;
++        let capacity = u64::from(self.volume.checkpoint().log_blocks)
++            .checked_mul(BLOCK as u64)
++            .ok_or(FsError::Corrupt)?;
++        if end > capacity {
++            return Err(FsError::Full);
++        }
++
++        let mut header = [0; HEADER];
++        record.encode(&mut header);
++        let mut written = 0;
++        while written < span {
++            let mut sector = [0u8; SECTOR];
++            if written == 0 {
++                sector[..HEADER].copy_from_slice(&header);
++            }
++            let sector_end = written + SECTOR as u64;
++            let payload_start = HEADER as u64;
++            let payload_end = payload_start + payload.len() as u64;
++            let start = written.max(payload_start);
++            let end = sector_end.min(payload_end);
++            if start < end {
++                let source = (start - payload_start) as usize;
++                let target = (start - written) as usize;
++                sector[target..target + (end - start) as usize]
++                    .copy_from_slice(&payload[source..source + (end - start) as usize]);
++            }
++            self.volume.write_aligned(transaction.at, transaction.bytes + written, &sector)?;
++            written += ALIGN;
++        }
++        self.transaction = Some(Transaction { bytes: end, ..transaction });
++        Ok(cursor)
++    }
++
++    fn index(&mut self, key: Key, value: Value) -> Result<(), FsError> {
++        let mut transaction = self.transaction.ok_or(FsError::Corrupt)?;
++        self.tree.insert(&mut self.volume, &mut transaction.tree, key, value)?;
++        self.transaction = Some(transaction);
++        Ok(())
++    }
++
++    fn tree_root(&self) -> u64 {
++        self.transaction
++            .map_or(self.volume.checkpoint().tree_root, |transaction| transaction.tree.root)
++    }
++
++    fn log_region(&self) -> Region {
++        match self.transaction {
++            Some(transaction) => Region { at: transaction.at, bytes: transaction.bytes, crc: 0 },
++            None => self.volume.checkpoint().region(Area::Log),
++        }
++    }
++
++    fn record(&mut self, cursor: u64) -> Result<Record, FsError> {
++        let log = self.log_region();
++        if cursor % ALIGN != 0
++            || cursor.checked_add(HEADER as u64).ok_or(FsError::Corrupt)? > log.bytes
++        {
++            return Err(FsError::Corrupt);
++        }
++        let within = (cursor % BLOCK as u64) as usize;
++        let block = self.volume.block(log.at + cursor / BLOCK as u64)?;
++        let record = Record::parse(&block[within..within + HEADER])?;
++        let end = cursor
++            .checked_add(record.span().map_err(|_| FsError::Corrupt)?)
++            .ok_or(FsError::Corrupt)?;
++        if end > log.bytes {
++            return Err(FsError::Corrupt);
++        }
++        Ok(record)
++    }
++
++    fn record_name(&mut self, cursor: u64, record: Record) -> Result<Name, FsError> {
++        let Record::Create { name_len, .. } = record else {
++            return Err(FsError::Corrupt);
++        };
++        let mut bytes = [0; crate::MAX_NAME];
++        self.copy_payload(cursor, 0, &mut bytes[..name_len as usize])?;
++        Name::new(&bytes[..name_len as usize])
++    }
++
++    fn copy_payload(
++        &mut self,
++        cursor: u64,
++        payload_offset: u64,
++        target: &mut [u8],
++    ) -> Result<(), FsError> {
++        let log = self.log_region();
++        let mut source = cursor
++            .checked_add(HEADER as u64)
++            .and_then(|at| at.checked_add(payload_offset))
++            .ok_or(FsError::Corrupt)?;
++        let end = source.checked_add(target.len() as u64).ok_or(FsError::Corrupt)?;
++        if end > log.bytes {
++            return Err(FsError::Corrupt);
++        }
++        let mut done = 0;
++        while done < target.len() {
++            let within = (source % BLOCK as u64) as usize;
++            let take = (target.len() - done).min(BLOCK - within);
++            let block = self.volume.block(log.at + source / BLOCK as u64)?;
++            target[done..done + take].copy_from_slice(&block[within..within + take]);
++            done += take;
++            source += take as u64;
++        }
++        Ok(())
++    }
++}
++
++fn choose(candidate: &mut Option<(Name, u32)>, previous: Option<Name>, name: Name, object: u32) {
++    if previous.is_some_and(|previous| name.as_bytes() <= previous.as_bytes()) {
++        return;
++    }
++    if candidate.is_none_or(|(held, _)| name.as_bytes() < held.as_bytes()) {
++        *candidate = Some((name, object));
++    }
++}
++
++const _: () = assert!(ALIGN == SECTOR as u64);
++const _: () = assert!(BLOCK % SECTOR == 0);
++
++#[cfg(all(test, feature = "format"))]
++mod tests {
++    use molt_block::{BlockError, Fault, Loopback};
++
++    use super::Journal;
++    use crate::format::{Tree, build};
++    use crate::{BLOCK, FsError, Kind, Name};
++
++    fn name(text: &str) -> Name {
++        Name::try_from(text).expect("legal name")
++    }
++
++    fn image() -> alloc::vec::Vec<u8> {
++        let mut tree = Tree::new();
++        tree.file("base", b"immutable".to_vec()).expect("legal name");
++        build(&tree, 1).expect("image")
++    }
++
++    fn commit_file(bytes: &mut [u8], file: &str, contents: &[u8]) -> u64 {
++        let mut block = [0; BLOCK];
++        let mut journal =
++            Journal::mount(Loopback::writable(bytes).expect("writable image"), &mut block)
++                .expect("mount");
++        let object = journal.create(journal.root(), name(file), Kind::File).expect("create");
++        journal.write(object, 0, contents).expect("write");
++        journal.sync().expect("sync")
++    }
++
++    fn assert_checkpoint(bytes: &[u8], generation: u64) {
++        let mut block = [0; BLOCK];
++        let mut journal =
++            Journal::mount(Loopback::new(bytes).expect("image"), &mut block).expect("mount");
++        assert_eq!(journal.generation(), generation);
++
++        let first = journal.lookup(journal.root(), &name("first")).expect("first survives");
++        let mut contents = [0; 8];
++        assert_eq!(journal.read(first, 0, &mut contents), Ok(5));
++        assert_eq!(&contents[..5], b"first");
++
++        match generation {
++            2 => assert_eq!(journal.lookup(journal.root(), &name("second")), Err(FsError::Missing)),
++            3 => {
++                let second =
++                    journal.lookup(journal.root(), &name("second")).expect("second committed");
++                assert_eq!(journal.read(second, 0, &mut contents), Ok(6));
++                assert_eq!(&contents[..6], b"second");
++            }
++            _ => panic!("unexpected generation {generation}"),
++        }
++    }
++
++    #[test]
++    fn power_loss_at_every_checkpoint_action_mounts_old_or_new_generation() {
++        let mut baseline = image();
++        assert_eq!(commit_file(&mut baseline, "first", b"first"), 2);
++
++        let mut first_success = None;
++        for cut in 0..64 {
++            let mut stable = baseline.clone();
++            let mut volatile = alloc::vec![0; stable.len()];
++            let outcome = {
++                let device = Fault::new(&mut stable, &mut volatile)
++                    .expect("matching storage")
++                    .cut_after(cut);
++                let mut block = [0; BLOCK];
++                let mut journal =
++                    Journal::mount(device, &mut block).expect("old checkpoint mounts");
++                (|| {
++                    let object = journal.create(journal.root(), name("second"), Kind::File)?;
++                    journal.write(object, 0, b"second")?;
++                    journal.sync()
++                })()
++            };
++
++            match outcome {
++                Ok(3) => {
++                    assert_checkpoint(&stable, 3);
++                    first_success = Some(cut);
++                    break;
++                }
++                Err(FsError::Device(BlockError::PowerLoss)) => {
++                    assert_checkpoint(&stable, 2);
++                }
++                other => panic!("cut {cut} produced {other:?}"),
++            }
++        }
++
++        assert_eq!(
++            first_success,
++            Some(11),
++            "copy, records, COW paths, log/tree flush, root swing, checkpoint flush"
++        );
++    }
++
++    #[test]
++    fn newest_checkpoint_with_bad_log_falls_back_to_previous_generation() {
++        let mut bytes = image();
++        assert_eq!(commit_file(&mut bytes, "first", b"first"), 2);
++
++        let active = crate::layout::Super::parse(&bytes[BLOCK..2 * BLOCK]).expect("generation two");
++        let log = active.region(crate::layout::Area::Log);
++        bytes[log.at as usize * BLOCK] ^= 1;
++
++        let mut block = [0; BLOCK];
++        let mut journal =
++            Journal::mount(Loopback::new(&bytes).expect("image"), &mut block).expect("fallback");
++
++        assert_eq!(journal.generation(), 1);
++        assert_eq!(journal.lookup(journal.root(), &name("first")), Err(FsError::Missing));
++    }
++
++    #[test]
++    fn newest_checkpoint_with_bad_tree_falls_back() {
++        let mut bytes = image();
++        assert_eq!(commit_file(&mut bytes, "first", b"first"), 2);
++        assert_eq!(commit_file(&mut bytes, "second", b"second"), 3);
++
++        let left = crate::layout::Super::parse(&bytes[..BLOCK]).expect("left checkpoint");
++        let right =
++            crate::layout::Super::parse(&bytes[BLOCK..2 * BLOCK]).expect("right checkpoint");
++        let active = if left.generation > right.generation { left } else { right };
++        bytes[active.tree_root as usize * BLOCK] ^= 1;
++
++        assert_checkpoint(&bytes, 2);
++    }
++
++    #[test]
++    fn tree_arena_reuses_old_generations() {
++        let mut bytes = image();
++        {
++            let mut block = [0; BLOCK];
++            let mut journal =
++                Journal::mount(Loopback::writable(&mut bytes).expect("image"), &mut block)
++                    .expect("mount");
++            let file = journal.create(journal.root(), name("rolling"), Kind::File).expect("create");
++            for byte in 0..200u8 {
++                journal.write(file, 0, &[byte]).expect("write");
++                journal.sync().expect("checkpoint");
++            }
++        }
++
++        let mut block = [0; BLOCK];
++        let mut journal =
++            Journal::mount(Loopback::new(&bytes).expect("image"), &mut block).expect("remount");
++        let file = journal.lookup(journal.root(), &name("rolling")).expect("file");
++        let mut byte = [0];
++        assert_eq!(journal.read(file, 0, &mut byte), Ok(1));
++        assert_eq!(byte, [199]);
++    }
++
++    #[test]
++    fn later_writes_overlay_base_data_and_can_extend_sparsely() {
++        let mut bytes = image();
++        let mut block = [0; BLOCK];
++        let mut journal =
++            Journal::mount(Loopback::writable(&mut bytes).expect("image"), &mut block)
++                .expect("mount");
++        let base = journal.lookup(journal.root(), &name("base")).expect("base file");
++
++        journal.write(base, 2, b"WRITE").expect("overwrite");
++        journal.write(base, 12, b"tail").expect("sparse extension");
++        let mut contents = [0xa5; 20];
++        let read = journal.read(base, 0, &mut contents).expect("overlay read");
++
++        assert_eq!(read, 16);
++        assert_eq!(&contents[..16], b"imWRITEle\0\0\0tail");
++    }
++}
+diff --git a/crates/molt-fs/src/layout.rs b/crates/molt-fs/src/layout.rs
+index 68e8833..d893a36 100644
+--- a/crates/molt-fs/src/layout.rs
++++ b/crates/molt-fs/src/layout.rs
+@@ -1,4 +1,4 @@
+-//! The on-disk shape of a volume: superblock, regions, and the three records.
++//! On-disk shape of a volume: superblocks, regions, and base records.
+ //!
+ //! Every number is little-endian and every record size divides [`BLOCK`], so no
+ //! record straddles a block boundary and a reader needs exactly one block of
+@@ -15,7 +15,7 @@ pub const BLOCK: usize = 4096;
+ pub const MAGIC: [u8; 8] = *b"MOLTROFS";
+ 
+ /// The format this crate reads.
+-pub const VERSION: u32 = 1;
++pub const VERSION: u32 = 3;
+ 
+ /// Superblock copies at the start of the volume.
+ ///
+@@ -24,7 +24,22 @@ pub const VERSION: u32 = 1;
+ pub const SUPERS: u64 = 2;
+ 
+ /// How much of block zero the superblock occupies.
+-pub const SUPER_BYTES: usize = 192;
++pub const SUPER_BYTES: usize = 244;
++
++/// Log banks kept so newest and previous checkpoints remain intact while a
++/// third bank receives the next generation.
++pub const LOG_BANKS: u64 = 3;
++
++/// Log capacity an image builder reserves unless its caller chooses another.
++#[cfg(feature = "format")]
++pub const DEFAULT_LOG_BLOCKS: u32 = 64;
++
++/// COW metadata nodes an image builder reserves by default.
++#[cfg(feature = "format")]
++pub const DEFAULT_TREE_BLOCKS: u32 = MAX_TREE_BLOCKS;
++
++/// Largest tree arena mount can track without dynamic allocation.
++pub const MAX_TREE_BLOCKS: u32 = 256;
+ 
+ /// Where each superblock field sits.
+ mod field {
+@@ -37,7 +52,11 @@ mod field {
+     pub const DATA_AT: usize = 40;
+     pub const DATA_BLOCKS: usize = 48;
+     pub const REGIONS: usize = 64;
+-    pub const CRC: usize = 188;
++    pub const LOG_BLOCKS: usize = 208;
++    pub const TREE_AT: usize = 216;
++    pub const TREE_BLOCKS: usize = 224;
++    pub const TREE_ROOT: usize = 232;
++    pub const CRC: usize = 240;
+ }
+ 
+ /// One region descriptor: where it starts, how long it is, what it hashes to.
+@@ -68,11 +87,16 @@ pub enum Area {
+     Names,
+     /// One crc32c per data block.
+     Sums,
++    /// Typed create and write records committed by the active checkpoint.
++    Log,
+ }
+ 
+ impl Area {
+-    pub const ALL: [Self; 5] =
++    #[cfg(feature = "format")]
++    pub const BASE: [Self; 5] =
+         [Self::Objects, Self::Extents, Self::Entries, Self::Names, Self::Sums];
++    pub const ALL: [Self; 6] =
++        [Self::Objects, Self::Extents, Self::Entries, Self::Names, Self::Sums, Self::Log];
+ 
+     const fn index(self) -> usize {
+         match self {
+@@ -81,6 +105,7 @@ impl Area {
+             Self::Entries => 2,
+             Self::Names => 3,
+             Self::Sums => 4,
++            Self::Log => 5,
+         }
+     }
+ }
+@@ -108,6 +133,10 @@ pub struct Super {
+     pub root: u32,
+     pub data_at: u64,
+     pub data_blocks: u64,
++    pub log_blocks: u32,
++    pub tree_at: u64,
++    pub tree_blocks: u32,
++    pub tree_root: u64,
+     pub(crate) regions: [Region; Area::ALL.len()],
+ }
+ 
+@@ -148,6 +177,10 @@ impl Super {
+             root: u32_at(block, field::ROOT),
+             data_at: u64_at(block, field::DATA_AT),
+             data_blocks: u64_at(block, field::DATA_BLOCKS),
++            log_blocks: u32_at(block, field::LOG_BLOCKS),
++            tree_at: u64_at(block, field::TREE_AT),
++            tree_blocks: u32_at(block, field::TREE_BLOCKS),
++            tree_root: u64_at(block, field::TREE_ROOT),
+             regions: [Region::default(); Area::ALL.len()],
+         };
+         for area in Area::ALL {
+@@ -167,9 +200,7 @@ impl Super {
+ 
+     /// Writes the superblock into `block`, stamping its checksum last.
+     ///
+-    /// Encoders belong to the image builder — a mounted volume only reads — so
+-    /// they compile away with the `format` feature.
+-    #[cfg(any(feature = "format", test))]
++    /// The image builder writes both initial copies; sync writes one new copy.
+     pub fn encode(&self, block: &mut [u8]) {
+         let block = &mut block[..SUPER_BYTES];
+         block.fill(0);
+@@ -181,6 +212,10 @@ impl Super {
+         put_u32(block, field::ROOT, self.root);
+         put_u64(block, field::DATA_AT, self.data_at);
+         put_u64(block, field::DATA_BLOCKS, self.data_blocks);
++        put_u32(block, field::LOG_BLOCKS, self.log_blocks);
++        put_u64(block, field::TREE_AT, self.tree_at);
++        put_u32(block, field::TREE_BLOCKS, self.tree_blocks);
++        put_u64(block, field::TREE_ROOT, self.tree_root);
+         for area in Area::ALL {
+             let region = self.region(area);
+             let at = field::REGIONS + area.index() * REGION_BYTES;
+@@ -194,8 +229,20 @@ impl Super {
+     /// Rejects a superblock whose regions do not fit the volume it describes.
+     fn check(&self) -> Result<(), FsError> {
+         let data_end = self.data_at.checked_add(self.data_blocks).ok_or(FsError::Corrupt)?;
++        let log_span = u64::from(self.log_blocks).checked_mul(LOG_BANKS).ok_or(FsError::Corrupt)?;
++        let log_start = self.blocks.checked_sub(log_span).ok_or(FsError::Corrupt)?;
++        let tree_end =
++            self.tree_at.checked_add(u64::from(self.tree_blocks)).ok_or(FsError::Corrupt)?;
+         let sum_bytes = self.data_blocks.checked_mul(4).ok_or(FsError::Corrupt)?;
+-        if self.data_at < SUPERS || data_end > self.blocks {
++        if self.log_blocks == 0
++            || self.tree_blocks == 0
++            || self.tree_blocks > MAX_TREE_BLOCKS
++            || self.data_at < SUPERS
++            || data_end > self.tree_at
++            || tree_end > log_start
++            || (self.tree_root != 0
++                && (self.tree_root < self.tree_at || self.tree_root >= tree_end))
++        {
+             return Err(FsError::Corrupt);
+         }
+         if self.region(Area::Sums).bytes != sum_bytes {
+@@ -207,7 +254,18 @@ impl Super {
+             if region.at < SUPERS || end > self.blocks {
+                 return Err(FsError::Corrupt);
+             }
+-            if overlaps(region.at, end, self.data_at, data_end) {
++            if area == Area::Log {
++                let bank_bytes =
++                    u64::from(self.log_blocks).checked_mul(BLOCK as u64).ok_or(FsError::Corrupt)?;
++                let in_bank = (0..LOG_BANKS)
++                    .any(|bank| region.at == log_start + bank * u64::from(self.log_blocks));
++                if !in_bank || region.bytes > bank_bytes {
++                    return Err(FsError::Corrupt);
++                }
++            } else if end > self.tree_at {
++                return Err(FsError::Corrupt);
++            }
++            if area != Area::Log && overlaps(region.at, end, self.data_at, data_end) {
+                 return Err(FsError::Corrupt);
+             }
+             for &other in &Area::ALL[..index] {
+@@ -220,6 +278,16 @@ impl Super {
+         }
+         Ok(())
+     }
++
++    /// First block of log bank `bank`.
++    pub fn log_bank(&self, bank: u64) -> Result<u64, FsError> {
++        if bank >= LOG_BANKS {
++            return Err(FsError::Corrupt);
++        }
++        let span = u64::from(self.log_blocks).checked_mul(LOG_BANKS).ok_or(FsError::Corrupt)?;
++        let start = self.blocks.checked_sub(span).ok_or(FsError::Corrupt)?;
++        Ok(start + bank * u64::from(self.log_blocks))
++    }
+ }
+ 
+ fn overlaps(left: u64, left_end: u64, right: u64, right_end: u64) -> bool {
+@@ -382,10 +450,13 @@ mod tests {
+     fn volume() -> Super {
+         let mut parsed = Super {
+             generation: 7,
+-            blocks: 16,
++            blocks: 32,
+             root: 0,
+-            data_at: 14,
++            data_at: 10,
+             data_blocks: 2,
++            log_blocks: 4,
++            tree_at: 12,
++            tree_blocks: 8,
+             ..Super::default()
+         };
+         for area in Area::ALL {
+@@ -393,6 +464,7 @@ mod tests {
+         }
+         parsed.set_region(Area::Objects, Region { at: 2, bytes: 32, crc: 1 });
+         parsed.set_region(Area::Sums, Region { at: 3, bytes: 8, crc: 2 });
++        parsed.set_region(Area::Log, Region { at: 20, bytes: 0, crc: 0 });
+         parsed
+     }
+ 
+@@ -436,7 +508,7 @@ mod tests {
+     fn region_past_end_refused() {
+         let mut block = [0u8; BLOCK];
+         let mut parsed = volume();
+-        parsed.set_region(Area::Objects, Region { at: 15, bytes: 2 * BLOCK as u64, crc: 0 });
++        parsed.set_region(Area::Objects, Region { at: 31, bytes: 2 * BLOCK as u64, crc: 0 });
+         parsed.encode(&mut block);
+ 
+         assert_eq!(Super::parse(&block), Err(FsError::Corrupt));
+@@ -462,6 +534,16 @@ mod tests {
+         assert_eq!(Super::parse(&block), Err(FsError::Corrupt));
+     }
+ 
++    #[test]
++    fn tree_root_outside_arena_refused() {
++        let mut block = [0u8; BLOCK];
++        let mut parsed = volume();
++        parsed.tree_root = parsed.tree_at + u64::from(parsed.tree_blocks);
++        parsed.encode(&mut block);
++
++        assert_eq!(Super::parse(&block), Err(FsError::Corrupt));
++    }
++
+     #[test]
+     fn sum_length_overflow_refused() {
+         let mut block = [0u8; BLOCK];
+diff --git a/crates/molt-fs/src/lib.rs b/crates/molt-fs/src/lib.rs
+index 71db11f..f44ca9e 100644
+--- a/crates/molt-fs/src/lib.rs
++++ b/crates/molt-fs/src/lib.rs
+@@ -1,18 +1,18 @@
+-//! MoltROFS, a read-only filesystem sitting on any [`molt_block::Device`].
++//! MoltFS, a checksummed writable filesystem over [`molt_block::Writable`].
+ //!
+-//! An image is written once by `xtask mkfs` and never modified, so the crate
+-//! carries no allocator, no journal, and no write path. What it does carry is
+-//! the parts a writable successor needs: a generation-stamped superblock kept
+-//! in two copies, a checksum over every metadata region, and a crc32c over
+-//! every data block. A checkpoint that overwrites the older copy and only then
+-//! becomes the newer one is the whole of crash consistency here — a torn write
+-//! leaves the previous checkpoint intact, and [`Volume::mount`] takes the
+-//! newest copy that verifies.
++//! `xtask mkfs` lays out immutable objects, extents, entries, names, sums, and
++//! data. Runtime metadata lives in a checksummed copy-on-write B+ tree while
++//! create and write payloads live in one of three rotating log banks. A sync
++//! flushes both before publishing their root through the older of two
++//! generation-stamped superblocks, then flushes the superblock. Power loss
++//! therefore leaves either the previous generation or the complete new
++//! generation mountable, without fsck.
+ //!
+ //! [`Volume`] is the reader, needing one block of buffer and nothing else.
+-//! [`Fs`] wraps it in the ring protocol every other cell talks: typed [`FsOp`]
+-//! submissions in, [`FsDone`] completions out, with directories and files named
+-//! by capability rather than by path.
++//! [`Journal`] adds allocation-free replay and mutation, and [`Fs`] wraps it in
++//! the ring protocol every other cell talks: typed [`FsOp`] submissions in,
++//! [`FsDone`] completions out, with directories and files named by capability
++//! rather than by path.
+ //!
+ //! See `docs/fs.md` for the format and the decisions behind it.
+ 
+@@ -27,8 +27,11 @@ use molt_block::BlockError;
+ use molt_core::buffer::BufferError;
+ use molt_core::capability::CapabilityError;
+ 
++mod btree;
+ mod crc;
++mod journal;
+ mod layout;
++mod log;
+ mod name;
+ mod op;
+ mod service;
+@@ -37,6 +40,8 @@ mod volume;
+ #[cfg(feature = "format")]
+ pub mod format;
+ 
++pub use crate::btree::{CacheStats, TreeStats};
++pub use crate::journal::Journal;
+ pub use crate::layout::{BLOCK, Kind, MAGIC, MAX_NAME, Object, SUPERS, VERSION};
+ pub use crate::name::Name;
+ pub use crate::op::{Dir, File, FsDone, FsOp, Handle, Stat};
+@@ -56,13 +61,15 @@ pub enum FsError {
+     Corrupt,
+     /// No such object, entry, or name.
+     Missing,
++    /// The name already exists in that directory.
++    Exists,
+     /// A name that is empty, overlong, or holds a separator.
+     Name,
+     /// A directory operation on a file, or the reverse.
+     Kind,
+     /// An offset past the end of what it addresses.
+     Range,
+-    /// The device below refused the read.
++    /// The device below refused an operation.
+     Device(BlockError),
+     /// A root grant asked for after the bootstrap was sealed.
+     Sealed,
+@@ -72,6 +79,8 @@ pub enum FsError {
+     Buffer(BufferError),
+     /// No free handle left in the table.
+     Handles,
++    /// The tree arena, mutation log, or object-id space is full.
++    Full,
+ }
+ 
+ impl From<BlockError> for FsError {
+diff --git a/crates/molt-fs/src/log.rs b/crates/molt-fs/src/log.rs
+new file mode 100644
+index 0000000..7665b95
+--- /dev/null
++++ b/crates/molt-fs/src/log.rs
+@@ -0,0 +1,139 @@
++//! Typed records in the append-only mutation log.
++
++use crate::layout::{Kind, MAX_NAME};
++use crate::{FsError, Name};
++
++/// Every record starts on a sector so one device write never tears two records.
++pub const ALIGN: u64 = molt_block::SECTOR as u64;
++
++/// Bytes before a record's name or file data.
++pub const HEADER: usize = 32;
++
++const MAGIC: [u8; 4] = *b"MLOG";
++const CREATE: u8 = 1;
++const WRITE: u8 = 2;
++
++/// One mutation header. Its payload follows immediately.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum Record {
++    Create { object: u32, parent: u32, kind: Kind, name_len: u16 },
++    Write { object: u32, offset: u64, bytes: u32 },
++}
++
++impl Record {
++    pub fn create(object: u32, parent: u32, kind: Kind, name: Name) -> Self {
++        Self::Create { object, parent, kind, name_len: name.len() as u16 }
++    }
++
++    pub fn write(object: u32, offset: u64, bytes: usize) -> Result<Self, FsError> {
++        Ok(Self::Write { object, offset, bytes: u32::try_from(bytes).map_err(|_| FsError::Range)? })
++    }
++
++    pub const fn payload(self) -> u32 {
++        match self {
++            Self::Create { name_len, .. } => name_len as u32,
++            Self::Write { bytes, .. } => bytes,
++        }
++    }
++
++    pub fn span(self) -> Result<u64, FsError> {
++        let bytes = (HEADER as u64).checked_add(u64::from(self.payload())).ok_or(FsError::Range)?;
++        bytes.checked_next_multiple_of(ALIGN).ok_or(FsError::Range)
++    }
++
++    pub fn encode(self, header: &mut [u8; HEADER]) {
++        header.fill(0);
++        header[..MAGIC.len()].copy_from_slice(&MAGIC);
++        match self {
++            Self::Create { object, parent, kind, name_len } => {
++                header[4] = CREATE;
++                header[5] = kind.byte();
++                put_u16(header, 6, name_len);
++                put_u32(header, 8, u32::from(name_len));
++                put_u32(header, 12, object);
++                put_u32(header, 16, parent);
++            }
++            Self::Write { object, offset, bytes } => {
++                header[4] = WRITE;
++                put_u32(header, 8, bytes);
++                put_u32(header, 12, object);
++                put_u64(header, 20, offset);
++            }
++        }
++    }
++
++    pub fn parse(header: &[u8]) -> Result<Self, FsError> {
++        let header = header.get(..HEADER).ok_or(FsError::Corrupt)?;
++        if header[..MAGIC.len()] != MAGIC {
++            return Err(FsError::Corrupt);
++        }
++        let payload = u32_at(header, 8);
++        let object = u32_at(header, 12);
++        match header[4] {
++            CREATE => {
++                let name_len = u16_at(header, 6);
++                let kind = match header[5] {
++                    0 => Kind::Dir,
++                    1 => Kind::File,
++                    _ => return Err(FsError::Corrupt),
++                };
++                if name_len == 0 || name_len as usize > MAX_NAME || payload != u32::from(name_len) {
++                    return Err(FsError::Corrupt);
++                }
++                Ok(Self::Create { object, parent: u32_at(header, 16), kind, name_len })
++            }
++            WRITE if payload != 0 => {
++                Ok(Self::Write { object, offset: u64_at(header, 20), bytes: payload })
++            }
++            _ => Err(FsError::Corrupt),
++        }
++    }
++}
++
++fn u16_at(bytes: &[u8], at: usize) -> u16 {
++    u16::from_le_bytes(bytes[at..at + 2].try_into().expect("fixed field"))
++}
++
++fn u32_at(bytes: &[u8], at: usize) -> u32 {
++    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("fixed field"))
++}
++
++fn u64_at(bytes: &[u8], at: usize) -> u64 {
++    u64::from_le_bytes(bytes[at..at + 8].try_into().expect("fixed field"))
++}
++
++fn put_u16(bytes: &mut [u8], at: usize, value: u16) {
++    bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
++}
++
++fn put_u32(bytes: &mut [u8], at: usize, value: u32) {
++    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
++}
++
++fn put_u64(bytes: &mut [u8], at: usize, value: u64) {
++    bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{HEADER, Record};
++    use crate::{Kind, Name};
++
++    #[test]
++    fn create_header_survives_round_trip() {
++        let name = Name::try_from("note").expect("legal name");
++        let record = Record::create(4, 1, Kind::File, name);
++        let mut header = [0; HEADER];
++
++        record.encode(&mut header);
++
++        assert_eq!(Record::parse(&header), Ok(record));
++    }
++
++    #[test]
++    fn write_span_covers_header_data_and_padding() {
++        let record = Record::write(3, 7, 600).expect("bounded payload");
++
++        assert_eq!(record.span(), Ok(1024));
++    }
++}
+diff --git a/crates/molt-fs/src/op.rs b/crates/molt-fs/src/op.rs
+index c9f61ed..a439121 100644
+--- a/crates/molt-fs/src/op.rs
++++ b/crates/molt-fs/src/op.rs
+@@ -6,12 +6,12 @@
+ //! subtree cannot address anything outside it, which is what a chroot is for
+ //! elsewhere and what the type is here.
+ //!
+-//! Data never travels in an operation. A read names a registered buffer, which
+-//! only the supervisor-owned registry can turn into memory, so the driver
+-//! writes into the client's buffer without either side handing out a pointer.
++//! Data never travels in an operation. Reads and writes name registered
++//! buffers, which only the supervisor-owned registry can turn into memory, so
++//! neither side hands out a pointer.
+ 
+ use molt_core::buffer::BufferOperation;
+-use molt_core::capability::{Capability, CapabilityRights, Rights, Write};
++use molt_core::capability::{Capability, CapabilityRights, Read, Rights, Write};
+ 
+ use crate::layout::Kind;
+ use crate::name::Name;
+@@ -24,15 +24,15 @@ use crate::name::Name;
+ pub enum Dir {}
+ 
+ impl CapabilityRights for Dir {
+-    const MASK: Rights = Rights::READ;
++    const MASK: Rights = Rights::READ_WRITE;
+ }
+ 
+-/// The rights an open file carries. A volume is read-only, so reading is all.
++/// The rights an open file carries.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub enum File {}
+ 
+ impl CapabilityRights for File {
+-    const MASK: Rights = Rights::READ;
++    const MASK: Rights = Rights::READ_WRITE;
+ }
+ 
+ /// An open handle of either kind.
+@@ -70,6 +70,12 @@ pub enum FsOp {
+     Entry { dir: Capability<Dir>, index: u32 },
+     /// Reads `file` at `offset` into a registered buffer.
+     Read { file: Capability<File>, buffer: BufferOperation<Write>, offset: u64 },
++    /// Creates an empty object inside `dir`.
++    Create { dir: Capability<Dir>, name: Name, kind: Kind },
++    /// Writes a registered buffer into `file` at `offset`.
++    Write { file: Capability<File>, buffer: BufferOperation<Read>, offset: u64 },
++    /// Makes every earlier create and write durable.
++    Sync,
+     /// Asks what a handle refers to.
+     Stat(Handle),
+     /// Drops a handle, freeing its slot.
+@@ -98,6 +104,10 @@ pub enum FsDone {
+     Entry { name: Name, stat: Stat },
+     /// How many bytes landed in the buffer; short only at the end of a file.
+     Read(usize),
++    /// How many bytes were appended to the mutation log.
++    Written(usize),
++    /// The durable generation after a sync.
++    Synced(u64),
+     /// What a handle refers to.
+     Stat(Stat),
+     /// The handle is gone.
+diff --git a/crates/molt-fs/src/service.rs b/crates/molt-fs/src/service.rs
+index 4a2df15..615c9ce 100644
+--- a/crates/molt-fs/src/service.rs
++++ b/crates/molt-fs/src/service.rs
+@@ -1,33 +1,38 @@
+ //! The filesystem as something other cells can talk to.
+ //!
+-//! [`Fs`] is the only holder of the [`Volume`]: everyone else names objects
++//! [`Fs`] is the only holder of the mounted volume: everyone else names objects
+ //! through a capability table it owns and reaches it over a ring. The table
+-//! caches the object record behind each handle, which a read-only volume makes
+-//! free — nothing can change under a handle once it is open.
++//! caches only an object id and kind; size and entry count are replayed when
++//! asked because writes can change them under an open handle.
+ 
+-use molt_block::Device;
++use molt_block::Writable;
+ use molt_core::buffer::BufferRegistry;
+ use molt_core::capability::{Capability, CapabilityTable, CellId};
+ use molt_core::ring::{Completion, IoDriver};
+ 
+-use crate::FsError;
+ use crate::layout::{BLOCK, Kind, Object};
+ use crate::op::{Dir, File, FsDone, FsOp, Handle, Stat};
+-use crate::volume::Volume;
++use crate::{FsError, Journal};
++
++#[derive(Clone, Copy)]
++struct OpenObject {
++    id: u32,
++    kind: Kind,
++}
+ 
+ /// A mounted volume behind a capability table.
+ pub struct Fs<'buf, D, const N: usize> {
+-    volume: Volume<'buf, D>,
+-    open: CapabilityTable<Object, N>,
++    journal: Journal<'buf, D>,
++    open: CapabilityTable<OpenObject, N>,
+     pending: Option<Completion<Result<FsDone, FsError>>>,
+     sealed: bool,
+ }
+ 
+-impl<'buf, D: Device, const N: usize> Fs<'buf, D, N> {
++impl<'buf, D: Writable, const N: usize> Fs<'buf, D, N> {
+     /// Mounts `device`, using `block` as the volume's only buffer.
+     pub fn mount(device: D, block: &'buf mut [u8; BLOCK]) -> Result<Self, FsError> {
+         Ok(Self {
+-            volume: Volume::mount(device, block)?,
++            journal: Journal::mount(device, block)?,
+             open: CapabilityTable::new(),
+             pending: None,
+             sealed: false,
+@@ -36,7 +41,7 @@ impl<'buf, D: Device, const N: usize> Fs<'buf, D, N> {
+ 
+     /// The checkpoint the mounted volume carries.
+     pub fn generation(&self) -> u64 {
+-        self.volume.generation()
++        self.journal.generation()
+     }
+ 
+     /// Hands `owner` a handle to the root directory.
+@@ -50,12 +55,14 @@ impl<'buf, D: Device, const N: usize> Fs<'buf, D, N> {
+         if self.sealed {
+             return Err(FsError::Sealed);
+         }
+-        let root = self.volume.root();
+-        let object = self.volume.object(root)?;
++        let root = self.journal.root();
++        let object = self.journal.object(root)?;
+         if object.kind != Kind::Dir {
+             return Err(FsError::Kind);
+         }
+-        self.open.insert::<Dir>(owner, object).map_err(|_| FsError::Handles)
++        self.open
++            .insert::<Dir>(owner, OpenObject { id: root, kind: object.kind })
++            .map_err(|_| FsError::Handles)
+     }
+ 
+     /// Closes the root bootstrap for good, so no later caller can grant one.
+@@ -80,20 +87,31 @@ impl<'buf, D: Device, const N: usize> Fs<'buf, D, N> {
+         match op {
+             FsOp::Open { dir, name } => {
+                 let parent = *self.open.get(dir)?;
+-                let id = self.volume.lookup(&parent, name.as_bytes())?;
+-                let object = self.volume.object(id)?;
+-                self.hold(owner, object).map(FsDone::Opened)
++                let id = self.journal.lookup(parent.id, &name)?;
++                let object = self.journal.object(id)?;
++                self.hold(owner, id, object.kind).map(FsDone::Opened)
+             }
+             FsOp::Entry { dir, index } => {
+                 let parent = *self.open.get(dir)?;
+-                let (name, object) = self.volume.entry(&parent, index)?;
+-                Ok(FsDone::Entry { name, stat: stat(&self.volume.object(object)?) })
++                let (name, object) = self.journal.entry(parent.id, index)?;
++                Ok(FsDone::Entry { name, stat: stat(&self.journal.object(object)?) })
+             }
+             FsOp::Read { file, buffer, offset } => {
+                 let object = *self.open.get(file)?;
+                 let target = buffers.resolve_write(buffer)?;
+-                self.volume.read(&object, offset, target).map(FsDone::Read)
++                self.journal.read(object.id, offset, target).map(FsDone::Read)
+             }
++            FsOp::Create { dir, name, kind } => {
++                let parent = *self.open.get(dir)?;
++                let object = self.journal.create(parent.id, name, kind)?;
++                self.hold(owner, object, kind).map(FsDone::Opened)
++            }
++            FsOp::Write { file, buffer, offset } => {
++                let object = *self.open.get(file)?;
++                let source = buffers.resolve_read(buffer)?;
++                self.journal.write(object.id, offset, source).map(FsDone::Written)
++            }
++            FsOp::Sync => self.journal.sync().map(FsDone::Synced),
+             FsOp::Stat(handle) => Ok(FsDone::Stat(stat(&self.object(handle)?))),
+             FsOp::Close(handle) => {
+                 match handle {
+@@ -144,19 +162,25 @@ impl<'buf, D: Device, const N: usize> Fs<'buf, D, N> {
+         self.open.revoke_owner(owner)
+     }
+ 
+-    fn hold(&mut self, owner: CellId, object: Object) -> Result<Handle, FsError> {
+-        match object.kind {
++    fn hold(&mut self, owner: CellId, id: u32, kind: Kind) -> Result<Handle, FsError> {
++        let object = OpenObject { id, kind };
++        match kind {
+             Kind::Dir => self.open.insert::<Dir>(owner, object).map(Handle::Dir),
+             Kind::File => self.open.insert::<File>(owner, object).map(Handle::File),
+         }
+         .map_err(|_| FsError::Handles)
+     }
+ 
+-    fn object(&self, handle: Handle) -> Result<Object, FsError> {
+-        Ok(match handle {
++    fn object(&mut self, handle: Handle) -> Result<Object, FsError> {
++        let object = match handle {
+             Handle::Dir(dir) => *self.open.get(dir)?,
+             Handle::File(file) => *self.open.get(file)?,
+-        })
++        };
++        let current = self.journal.object(object.id)?;
++        if object.kind != current.kind {
++            return Err(FsError::Corrupt);
++        }
++        Ok(current)
+     }
+ }
+ 
+@@ -237,6 +261,65 @@ mod tests {
+         assert_eq!(buffers.resolve_write(window).expect("same buffer"), b"hello, molt");
+     }
+ 
++    #[test]
++    fn create_write_sync_survives_remount() {
++        let mut bytes = image();
++        let mut source = *b"durable molt";
++        let source_len = source.len();
++        {
++            let mut block = [0u8; BLOCK];
++            let mut fs = Fs::<_, 4>::mount(Loopback::writable(&mut bytes).unwrap(), &mut block)
++                .expect("mount");
++            let mut buffers = BufferRegistry::<1>::new();
++            let buffer = buffers.register_read(OWNER, &mut source).expect("free slot");
++            let root = fs.root(OWNER).expect("root handle");
++
++            let created = fs
++                .apply(
++                    OWNER,
++                    FsOp::Create { dir: root, name: name("written.txt"), kind: Kind::File },
++                    &mut buffers,
++                )
++                .expect("create");
++            let Some(Handle::File(file)) = created.handle() else {
++                panic!("new file opened as a directory: {created:?}");
++            };
++            let write = FsOp::Write {
++                file,
++                buffer: BufferOperation::new(buffer, 0, source_len),
++                offset: 0,
++            };
++
++            assert_eq!(fs.apply(OWNER, write, &mut buffers), Ok(FsDone::Written(source_len)));
++            assert_eq!(
++                fs.apply(OWNER, FsOp::Stat(Handle::File(file)), &mut buffers),
++                Ok(FsDone::Stat(Stat { kind: Kind::File, size: source_len as u64, entries: 0 }))
++            );
++            assert_eq!(fs.apply(OWNER, FsOp::Sync, &mut buffers), Ok(FsDone::Synced(2)));
++        }
++
++        let mut block = [0u8; BLOCK];
++        let mut target = [0u8; 16];
++        let target_len = target.len();
++        let mut fs =
++            Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("remount");
++        let mut buffers = BufferRegistry::<1>::new();
++        let buffer = buffers.register_write(OWNER, &mut target).expect("free slot");
++        let root = fs.root(OWNER).expect("root handle");
++        let opened = fs
++            .apply(OWNER, FsOp::Open { dir: root, name: name("written.txt") }, &mut buffers)
++            .expect("open durable file");
++        let Some(Handle::File(file)) = opened.handle() else {
++            panic!("durable file opened as a directory: {opened:?}");
++        };
++        let read =
++            FsOp::Read { file, buffer: BufferOperation::new(buffer, 0, target_len), offset: 0 };
++
++        assert_eq!(fs.generation(), 2);
++        assert_eq!(fs.apply(OWNER, read, &mut buffers), Ok(FsDone::Read(source_len)));
++        assert_eq!(&target[..source_len], &source);
++    }
++
+     #[test]
+     fn stat_counts_entries_of_directory() {
+         let bytes = image();
+@@ -279,6 +362,37 @@ mod tests {
+         assert_eq!(fs.revoke(OWNER), 2);
+     }
+ 
++    #[test]
++    fn revoked_owner_cannot_write_through_stale_file_handle() {
++        let mut bytes = image();
++        let mut source = [0xa5; 8];
++        let source_len = source.len();
++        let mut block = [0u8; BLOCK];
++        let mut fs =
++            Fs::<_, 4>::mount(Loopback::writable(&mut bytes).unwrap(), &mut block).expect("mount");
++        let mut buffers = BufferRegistry::<1>::new();
++        let buffer = buffers.register_read(OWNER, &mut source).expect("free slot");
++        let root = fs.root(OWNER).expect("root handle");
++        let created = fs
++            .apply(
++                OWNER,
++                FsOp::Create { dir: root, name: name("revoked"), kind: Kind::File },
++                &mut buffers,
++            )
++            .expect("create");
++        let Some(Handle::File(file)) = created.handle() else {
++            panic!("new file opened as a directory: {created:?}");
++        };
++
++        assert_eq!(fs.revoke(OWNER), 2);
++        let write =
++            FsOp::Write { file, buffer: BufferOperation::new(buffer, 0, source_len), offset: 0 };
++        assert_eq!(
++            fs.apply(OWNER, write, &mut buffers),
++            Err(FsError::Handle(CapabilityError::Stale))
++        );
++    }
++
+     #[test]
+     fn handles_run_out_rather_than_overwrite() {
+         let bytes = image();
+diff --git a/crates/molt-fs/src/volume.rs b/crates/molt-fs/src/volume.rs
+index c992290..916b622 100644
+--- a/crates/molt-fs/src/volume.rs
++++ b/crates/molt-fs/src/volume.rs
+@@ -7,7 +7,7 @@
+ 
+ use core::cmp::Ordering;
+ 
+-use molt_block::{Device, SECTOR};
++use molt_block::{Device, SECTOR, Writable};
+ 
+ use crate::FsError;
+ use crate::crc::{Crc, crc32c};
+@@ -26,6 +26,9 @@ pub struct Volume<'buf, D> {
+     block: &'buf mut [u8; BLOCK],
+     cached: Option<u64>,
+     superblock: Super,
++    active_copy: u64,
++    previous_log: Option<u64>,
++    previous_tree: Option<u64>,
+ }
+ 
+ impl<'buf, D: Device> Volume<'buf, D> {
+@@ -36,26 +39,59 @@ impl<'buf, D: Device> Volume<'buf, D> {
+     /// corrupt volume fails at mount rather than at the first lookup that
+     /// happens to touch the damaged block.
+     pub fn mount(mut device: D, block: &'buf mut [u8; BLOCK]) -> Result<Self, FsError> {
+-        let mut newest: Option<Super> = None;
++        let mut copies = [None; SUPERS as usize];
++        let mut last_error = FsError::Magic;
+         for copy in 0..SUPERS {
+-            if read(&mut device, block, copy).is_err() {
++            read(&mut device, block, copy)?;
++            match Super::parse(block) {
++                Ok(parsed) => copies[copy as usize] = Some(parsed),
++                Err(error) => last_error = error,
++            }
++        }
++
++        let mut rejected = [false; SUPERS as usize];
++        for _ in 0..SUPERS {
++            let Some((active_copy, superblock)) = copies
++                .iter()
++                .enumerate()
++                .filter(|(copy, _)| !rejected[*copy])
++                .filter_map(|(copy, parsed)| parsed.map(|parsed| (copy as u64, parsed)))
++                .max_by_key(|(copy, parsed)| (parsed.generation, core::cmp::Reverse(*copy)))
++            else {
+                 break;
++            };
++            rejected[active_copy as usize] = true;
++            if superblock.blocks.saturating_mul(SECTORS) > device.sectors() {
++                last_error = FsError::Corrupt;
++                continue;
+             }
+-            if let Ok(parsed) = Super::parse(block)
+-                && newest.is_none_or(|best| parsed.generation > best.generation)
+-            {
+-                newest = Some(parsed);
++            if let Err(error) = verify_checkpoint(&mut device, block, superblock) {
++                last_error = error;
++                continue;
+             }
+-        }
+ 
+-        let superblock = newest.ok_or(FsError::Magic)?;
+-        if superblock.blocks.saturating_mul(SECTORS) > device.sectors() {
+-            return Err(FsError::Corrupt);
++            let previous = copies
++                .iter()
++                .enumerate()
++                .find(|(copy, _)| *copy != active_copy as usize)
++                .and_then(|(_, parsed)| *parsed)
++                .filter(|parsed| {
++                    parsed.blocks.saturating_mul(SECTORS) <= device.sectors()
++                        && verify_checkpoint(&mut device, block, *parsed).is_ok()
++                });
++            let previous_log = previous.map(|parsed| parsed.region(Area::Log).at);
++            let previous_tree = previous.map(|parsed| parsed.tree_root).filter(|root| *root != 0);
++            return Ok(Self {
++                device,
++                block,
++                cached: None,
++                superblock,
++                active_copy,
++                previous_log,
++                previous_tree,
++            });
+         }
+-
+-        let mut volume = Self { device, block, cached: None, superblock };
+-        volume.verify()?;
+-        Ok(volume)
++        Err(last_error)
+     }
+ 
+     /// The object id of the root directory.
+@@ -68,6 +104,30 @@ impl<'buf, D: Device> Volume<'buf, D> {
+         self.superblock.generation
+     }
+ 
++    pub(crate) const fn checkpoint(&self) -> Super {
++        self.superblock
++    }
++
++    pub(crate) const fn active_copy(&self) -> u64 {
++        self.active_copy
++    }
++
++    pub(crate) const fn previous_log(&self) -> Option<u64> {
++        self.previous_log
++    }
++
++    pub(crate) const fn previous_tree(&self) -> Option<u64> {
++        self.previous_tree
++    }
++
++    pub(crate) fn commit(&mut self, copy: u64, checkpoint: Super) {
++        self.previous_log = Some(self.superblock.region(Area::Log).at);
++        self.previous_tree = (self.superblock.tree_root != 0).then_some(self.superblock.tree_root);
++        self.superblock = checkpoint;
++        self.active_copy = copy;
++        self.cached = None;
++    }
++
+     /// Reads one object record.
+     pub fn object(&mut self, id: u32) -> Result<Object, FsError> {
+         Object::parse(self.record(Area::Objects, id as u64, OBJECT_BYTES)?)
+@@ -217,7 +277,7 @@ impl<'buf, D: Device> Volume<'buf, D> {
+     }
+ 
+     /// Reads a block, or hands back the one already in the buffer.
+-    fn block(&mut self, index: u64) -> Result<&[u8; BLOCK], FsError> {
++    pub(crate) fn block(&mut self, index: u64) -> Result<&[u8; BLOCK], FsError> {
+         if index >= self.superblock.blocks {
+             return Err(FsError::Corrupt);
+         }
+@@ -229,26 +289,97 @@ impl<'buf, D: Device> Volume<'buf, D> {
+         }
+         Ok(self.block)
+     }
++}
+ 
+-    /// Checks every metadata region against the superblock's checksums.
+-    fn verify(&mut self) -> Result<(), FsError> {
+-        for area in Area::ALL {
+-            let region = self.superblock.region(area);
+-            let mut crc = Crc::new();
+-            let mut left = region.bytes;
+-            let mut index = region.at;
+-            while left > 0 {
+-                let take = left.min(BLOCK as u64) as usize;
+-                crc.update(&self.block(index)?[..take]);
+-                left -= take as u64;
+-                index += 1;
+-            }
+-            if crc.finish() != region.crc {
+-                return Err(FsError::Checksum);
+-            }
++impl<D: Writable> Volume<'_, D> {
++    pub(crate) fn copy_aligned(
++        &mut self,
++        source: u64,
++        target: u64,
++        bytes: u64,
++    ) -> Result<(), FsError> {
++        if bytes % SECTOR as u64 != 0 {
++            return Err(FsError::Corrupt);
++        }
++        let mut done = 0;
++        while done < bytes {
++            let take = (bytes - done).min(BLOCK as u64) as usize;
++            let source_sector = source
++                .checked_mul(SECTORS)
++                .and_then(|sector| sector.checked_add(done / SECTOR as u64))
++                .ok_or(FsError::Corrupt)?;
++            self.device.read(source_sector, &mut self.block[..take]).map_err(FsError::Device)?;
++            let target_sector = target
++                .checked_mul(SECTORS)
++                .and_then(|sector| sector.checked_add(done / SECTOR as u64))
++                .ok_or(FsError::Corrupt)?;
++            self.device.write(target_sector, &self.block[..take]).map_err(FsError::Device)?;
++            done += take as u64;
+         }
++        self.cached = None;
+         Ok(())
+     }
++
++    pub(crate) fn write_aligned(
++        &mut self,
++        block: u64,
++        offset: u64,
++        bytes: &[u8],
++    ) -> Result<(), FsError> {
++        if offset % SECTOR as u64 != 0 || bytes.len() % SECTOR != 0 {
++            return Err(FsError::Corrupt);
++        }
++        let sector = block
++            .checked_mul(SECTORS)
++            .and_then(|sector| sector.checked_add(offset / SECTOR as u64))
++            .ok_or(FsError::Corrupt)?;
++        self.device.write(sector, bytes).map_err(FsError::Device)?;
++        self.cached = None;
++        Ok(())
++    }
++
++    pub(crate) fn write_tree_block(&mut self, at: u64, block: &[u8; BLOCK]) -> Result<(), FsError> {
++        let checkpoint = self.checkpoint();
++        let end = checkpoint
++            .tree_at
++            .checked_add(u64::from(checkpoint.tree_blocks))
++            .ok_or(FsError::Corrupt)?;
++        if at < checkpoint.tree_at || at >= end {
++            return Err(FsError::Corrupt);
++        }
++        let sector = at.checked_mul(SECTORS).ok_or(FsError::Corrupt)?;
++        self.device.write(sector, block).map_err(FsError::Device)?;
++        self.cached = None;
++        Ok(())
++    }
++
++    pub(crate) fn checksum(&mut self, block: u64, bytes: u64) -> Result<u32, FsError> {
++        let mut crc = Crc::new();
++        let mut left = bytes;
++        let mut index = block;
++        while left > 0 {
++            let take = left.min(BLOCK as u64) as usize;
++            crc.update(&self.block(index)?[..take]);
++            left -= take as u64;
++            index += 1;
++        }
++        Ok(crc.finish())
++    }
++
++    pub(crate) fn write_checkpoint(&mut self, copy: u64, value: Super) -> Result<(), FsError> {
++        if copy >= SUPERS {
++            return Err(FsError::Corrupt);
++        }
++        self.block.fill(0);
++        value.encode(self.block);
++        self.device.write(copy * SECTORS, &self.block[..SECTOR]).map_err(FsError::Device)?;
++        self.cached = None;
++        Ok(())
++    }
++
++    pub(crate) fn flush(&mut self) -> Result<(), FsError> {
++        self.device.flush().map_err(FsError::Device)
++    }
+ }
+ 
+ fn read<D: Device>(device: &mut D, block: &mut [u8; BLOCK], index: u64) -> Result<(), FsError> {
+@@ -256,6 +387,30 @@ fn read<D: Device>(device: &mut D, block: &mut [u8; BLOCK], index: u64) -> Resul
+     device.read(sector, block.as_mut_slice()).map_err(FsError::Device)
+ }
+ 
++fn verify_checkpoint<D: Device>(
++    device: &mut D,
++    block: &mut [u8; BLOCK],
++    superblock: Super,
++) -> Result<(), FsError> {
++    for area in Area::ALL {
++        let region = superblock.region(area);
++        let mut crc = Crc::new();
++        let mut left = region.bytes;
++        let mut index = region.at;
++        while left > 0 {
++            let take = left.min(BLOCK as u64) as usize;
++            read(device, block, index)?;
++            crc.update(&block[..take]);
++            left -= take as u64;
++            index += 1;
++        }
++        if crc.finish() != region.crc {
++            return Err(FsError::Checksum);
++        }
++    }
++    crate::btree::verify(device, block, superblock)
++}
++
+ #[cfg(all(test, feature = "format"))]
+ mod tests {
+     use molt_block::Loopback;
+diff --git a/crates/molt-fs/tests/cow_tree.rs b/crates/molt-fs/tests/cow_tree.rs
+new file mode 100644
+index 0000000..0c895e6
+--- /dev/null
++++ b/crates/molt-fs/tests/cow_tree.rs
+@@ -0,0 +1,85 @@
++use molt_block::Loopback;
++use molt_fs::format::{Tree, build};
++use molt_fs::{BLOCK, FsError, Journal, Kind, Name};
++
++fn image() -> Vec<u8> {
++    build(&Tree::new(), 1).expect("image")
++}
++
++fn name(index: usize) -> Name {
++    Name::try_from(format!("file-{index:02}").as_str()).expect("name")
++}
++
++#[test]
++fn tree_splits_and_remounts() {
++    let mut bytes = image();
++    {
++        let mut block = [0; BLOCK];
++        let mut journal = Journal::mount(Loopback::writable(&mut bytes).expect("disk"), &mut block)
++            .expect("mount");
++        for index in 0..40 {
++            journal.create(journal.root(), name(index), Kind::File).expect("create");
++        }
++        journal.sync().expect("sync");
++
++        let stats = journal.tree_stats().expect("stats");
++        assert!(stats.height >= 2, "forty keys stayed in one leaf: {stats:?}");
++        assert!(stats.nodes >= 4, "split did not create a real tree: {stats:?}");
++    }
++
++    let mut block = [0; BLOCK];
++    let mut journal =
++        Journal::mount(Loopback::new(&bytes).expect("disk"), &mut block).expect("remount");
++    for index in 0..40 {
++        assert!(journal.lookup(journal.root(), &name(index)).is_ok(), "missing key {index}");
++        assert_eq!(journal.entry(journal.root(), index as u32).expect("entry").0, name(index));
++    }
++}
++
++#[test]
++fn root_swing_hides_unsynced_tree() {
++    let mut bytes = image();
++    let stable_root;
++    {
++        let mut block = [0; BLOCK];
++        let mut journal = Journal::mount(Loopback::writable(&mut bytes).expect("disk"), &mut block)
++            .expect("mount");
++        journal.create(journal.root(), name(1), Kind::File).expect("create");
++        journal.sync().expect("sync");
++        stable_root = journal.tree_stats().expect("stats").root;
++
++        journal.create(journal.root(), name(2), Kind::File).expect("create");
++        let pending_root = journal.tree_stats().expect("stats").root;
++        assert_ne!(pending_root, stable_root, "mutation rewrote committed root");
++    }
++
++    let mut block = [0; BLOCK];
++    let mut journal =
++        Journal::mount(Loopback::new(&bytes).expect("disk"), &mut block).expect("remount");
++    assert!(journal.lookup(journal.root(), &name(1)).is_ok());
++    assert_eq!(journal.lookup(journal.root(), &name(2)), Err(FsError::Missing));
++    assert_eq!(journal.tree_stats().expect("stats").root, stable_root);
++}
++
++#[test]
++fn cache_hit_skips_device_read() {
++    let mut bytes = image();
++    {
++        let mut block = [0; BLOCK];
++        let mut journal = Journal::mount(Loopback::writable(&mut bytes).expect("disk"), &mut block)
++            .expect("mount");
++        journal.create(journal.root(), name(0), Kind::File).expect("create");
++        journal.sync().expect("sync");
++    }
++
++    let mut block = [0; BLOCK];
++    let mut journal =
++        Journal::mount(Loopback::new(&bytes).expect("disk"), &mut block).expect("remount");
++    journal.lookup(journal.root(), &name(0)).expect("first lookup");
++    let first = journal.tree_stats().expect("stats").cache;
++    journal.lookup(journal.root(), &name(0)).expect("second lookup");
++    let second = journal.tree_stats().expect("stats").cache;
++
++    assert!(second.hits > first.hits, "cached node was not hit: {first:?} -> {second:?}");
++    assert_eq!(second.misses, first.misses, "cache hit fetched another node");
++}
+diff --git a/crates/molt-virtio/src/block.rs b/crates/molt-virtio/src/block.rs
+index 1f1c5ef..86802dc 100644
+--- a/crates/molt-virtio/src/block.rs
++++ b/crates/molt-virtio/src/block.rs
+@@ -1,23 +1,20 @@
+-//! The block driver: the handshake that brings a device up, one sector read,
+-//! and the reset that reclaims its frames.
++//! The block driver: the handshake that brings a device up, sector I/O with a
++//! durable flush, and the reset that reclaims its frames.
+ //!
+-//! [`Block::start`] runs the modern initialization sequence and programs a
+-//! single queue out of an [`Arena`] of device-owned frames. [`Block::read`]
+-//! issues one read request and polls the used ring for it, giving up with
+-//! [`VirtioError::Timeout`] after a bounded spin so a wedged device cannot hang
+-//! the caller. [`Block::reset`] stops the device *before* it hands the frames
+-//! back, so no in-flight DMA can land in a reclaimed frame.
+-//!
+-//! The write path is absent by design: Stage 2.4's filesystem is read-only, so
+-//! the driver never marks a sector writable to the device or issues a flush.
++//! [`Block::start`] runs the modern initialization sequence, requires cache
++//! flush support, and programs a single queue out of an [`Arena`] of
++//! device-owned frames. Each command polls the used ring for its answer, giving
++//! up with [`VirtioError::Timeout`] after a bounded spin so a wedged device
++//! cannot hang the caller. [`Block::reset`] stops the device *before* it hands
++//! the frames back, so no in-flight DMA can land in a reclaimed frame.
+ //!
+ //! [`molt_block::Device`] is how anything above reaches this: the filesystem
+ //! reads sectors, not virtqueues, and gets the same contract from a loopback
+ //! image.
+ 
+ use molt_arch::Mmio;
+-use molt_arch::dma::{Arena, DmaError, Region};
+-use molt_block::{BlockError, Device};
++use molt_arch::dma::{Arena, Region};
++use molt_block::{BlockError, Device, Writable};
+ 
+ use crate::VirtioError;
+ use crate::config::{Common, status};
+@@ -28,6 +25,18 @@ use crate::request::{Completion, Requests};
+ /// A block read request (`VIRTIO_BLK_T_IN`).
+ const VIRTIO_BLK_T_IN: u32 = 0;
+ 
++/// A block write request (`VIRTIO_BLK_T_OUT`).
++const VIRTIO_BLK_T_OUT: u32 = 1;
++
++/// A cache flush request (`VIRTIO_BLK_T_FLUSH`).
++const VIRTIO_BLK_T_FLUSH: u32 = 4;
++
++/// The device is read-only (`VIRTIO_BLK_F_RO`).
++const VIRTIO_BLK_F_RO: u64 = 1 << 5;
++
++/// The device accepts cache flush requests (`VIRTIO_BLK_F_FLUSH`).
++const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
++
+ /// The status byte a device writes on success (`VIRTIO_BLK_S_OK`).
+ const VIRTIO_BLK_S_OK: u8 = 0;
+ 
+@@ -51,7 +60,7 @@ const CONTROL_BYTES: u64 = HEADER_LEN as u64 + 1;
+ /// The data region is one frame, which bounds a single transfer.
+ const DATA_BYTES: u64 = 4096;
+ 
+-/// The largest read the driver issues as one request.
++/// The largest transfer the driver issues as one request.
+ const TRANSFER: usize = DATA_BYTES as usize;
+ 
+ /// How long `read` polls the used ring before declaring the request timed out.
+@@ -74,10 +83,10 @@ impl<'slots, 'w> Block<'slots, 'w> {
+     /// Brings a device up over its `common`, `notify`, and `device` windows,
+     /// allocating every ring and buffer from `arena`.
+     ///
+-    /// Runs the modern handshake, negotiates only `VIRTIO_F_VERSION_1` (the
+-    /// driver needs no block feature to read), and programs queue zero. A device
+-    /// that offers no usable queue, or rejects the feature set, is refused
+-    /// rather than left half-initialized.
++    /// Runs the modern handshake, refuses read-only devices, requires durable
++    /// flush support, and programs queue zero. A device that offers no usable
++    /// queue, or rejects the feature set, is refused rather than left
++    /// half-initialized.
+     pub fn start(
+         common: Mmio<'w>,
+         notify: Mmio<'w>,
+@@ -89,7 +98,13 @@ impl<'slots, 'w> Block<'slots, 'w> {
+         common.reset()?;
+         common.add_status(status::ACKNOWLEDGE)?;
+         common.add_status(status::DRIVER)?;
+-        common.negotiate(0)?;
++        let features = common.negotiate(VIRTIO_BLK_F_RO | VIRTIO_BLK_F_FLUSH)?;
++        if features & VIRTIO_BLK_F_RO != 0 {
++            return Err(VirtioError::ReadOnly);
++        }
++        if features & VIRTIO_BLK_F_FLUSH == 0 {
++            return Err(VirtioError::Features);
++        }
+ 
+         // The capacity is only meaningful once the features are settled.
+         let capacity = capacity(&common, &device)?;
+@@ -134,29 +149,32 @@ impl<'slots, 'w> Block<'slots, 'w> {
+         self.capacity
+     }
+ 
+-    /// Reads `sector` into `buf` in one request; `buf` must fit the data region.
++    /// Runs one request and waits for its status byte.
+     ///
+-    /// Submits the three-descriptor read chain, kicks the device, and polls its
+-    /// completion. A device that does not answer within `TIMEOUT_SPINS` has
+-    /// its request cancelled — the slot stays reserved until the device returns
+-    /// it — and the read fails with [`VirtioError::Timeout`].
+-    fn transfer(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), VirtioError> {
+-        if buf.len() as u64 > self.data.len() {
+-            return Err(DmaError::Range.into());
+-        }
+-
+-        self.control.write_u32(0, VIRTIO_BLK_T_IN)?;
++    /// Submits a read, write, or two-descriptor flush chain, kicks the device,
++    /// and polls its completion. A device that does not answer within
++    /// `TIMEOUT_SPINS` has its request cancelled — the slot stays reserved
++    /// until the device returns it — and the command fails with
++    /// [`VirtioError::Timeout`].
++    fn command(
++        &mut self,
++        request: u32,
++        sector: u64,
++        data: Option<Segment>,
++    ) -> Result<(), VirtioError> {
++        self.control.write_u32(0, request)?;
+         self.control.write_u32(4, 0)?;
+         self.control.write_u64(8, sector)?;
+         // Poison the status so a device that answers without writing it is
+         // caught rather than read as success.
+         self.control.write_u8(STATUS_AT, 0xff)?;
+ 
+-        let head = self.queue.push(&[
+-            Segment::readable(self.control.physical(), HEADER_LEN),
+-            Segment::writable(self.data.physical(), buf.len() as u32),
+-            Segment::writable(self.control.physical() + STATUS_AT, 1),
+-        ])?;
++        let header = Segment::readable(self.control.physical(), HEADER_LEN);
++        let status = Segment::writable(self.control.physical() + STATUS_AT, 1);
++        let head = match data {
++            Some(data) => self.queue.push(&[header, data, status])?,
++            None => self.queue.push(&[header, status])?,
++        };
+         let token = self.requests.issue(head);
+         self.notify.signal(0, self.notify_off)?;
+ 
+@@ -166,7 +184,6 @@ impl<'slots, 'w> Block<'slots, 'w> {
+                     if self.control.read_u8(STATUS_AT)? != VIRTIO_BLK_S_OK {
+                         return Err(VirtioError::Device);
+                     }
+-                    self.data.read_into(0, buf)?;
+                     return Ok(());
+                 }
+             }
+@@ -199,10 +216,37 @@ impl Device for Block<'_, '_> {
+         molt_block::bounds(self.capacity, sector, buf)?;
+         for (index, chunk) in buf.chunks_mut(TRANSFER).enumerate() {
+             let at = sector + (index * TRANSFER / molt_block::SECTOR) as u64;
+-            self.transfer(at, chunk)?;
++            let len = u32::try_from(chunk.len()).map_err(|_| BlockError::Range)?;
++            let data = Segment::writable(self.data.physical(), len);
++            self.command(VIRTIO_BLK_T_IN, at, Some(data))?;
++            self.data
++                .read_into(0, chunk)
++                .map_err(|error| BlockError::from(VirtioError::Dma(error)))?;
++        }
++        Ok(())
++    }
++}
++
++impl Writable for Block<'_, '_> {
++    /// Splits `buf` into transfers the data region can hold, one request each.
++    fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), BlockError> {
++        molt_block::bounds(self.capacity, sector, buf)?;
++        for (index, chunk) in buf.chunks(TRANSFER).enumerate() {
++            let at = sector + (index * TRANSFER / molt_block::SECTOR) as u64;
++            self.data
++                .write_from(0, chunk)
++                .map_err(|error| BlockError::from(VirtioError::Dma(error)))?;
++            let len = u32::try_from(chunk.len()).map_err(|_| BlockError::Range)?;
++            let data = Segment::readable(self.data.physical(), len);
++            self.command(VIRTIO_BLK_T_OUT, at, Some(data))?;
+         }
+         Ok(())
+     }
++
++    fn flush(&mut self) -> Result<(), BlockError> {
++        self.command(VIRTIO_BLK_T_FLUSH, 0, None)?;
++        Ok(())
++    }
+ }
+ 
+ /// Reads the device's capacity, in sectors.
+diff --git a/crates/molt-virtio/src/lib.rs b/crates/molt-virtio/src/lib.rs
+index c670715..7ea38b5 100644
+--- a/crates/molt-virtio/src/lib.rs
++++ b/crates/molt-virtio/src/lib.rs
+@@ -5,15 +5,12 @@
+ //! initialization handshake and programs a queue; [`Queue`] is one split
+ //! virtqueue laid over [`Region`](molt_arch::dma::Region)s the device reads and
+ //! writes; [`Notify`] kicks the device; and [`Block`] ties them together to
+-//! read sectors and, on [`reset`](Block::reset), to reclaim every frame only
+-//! after the device has been told to stop.
++//! read and write sectors, flush them durably, and, on [`reset`](Block::reset),
++//! reclaim every frame only after the device has been told to stop.
+ //!
+-//! Above the driver there is only [`molt_block::Device`], which [`Block`]
+-//! implements: sectors in, sectors out, with the virtqueue invisible.
+-//!
+-//! The write path is deliberately absent. Stage 2.4's filesystem is read-only,
+-//! so the driver never issues a flush and never hands the device a writable
+-//! sector — the one operation is a read.
++//! Above the driver there are only [`molt_block::Device`] and
++//! [`molt_block::Writable`], which [`Block`] implements: sectors in, sectors
++//! out, with the virtqueue invisible.
+ 
+ #![no_std]
+ 
+@@ -52,6 +49,8 @@ pub enum VirtioError {
+     Dma(DmaError),
+     /// The device would not accept the features the driver requires.
+     Features,
++    /// The device advertises itself as read-only.
++    ReadOnly,
+     /// The device reported a size or layout the driver cannot honour.
+     Device,
+     /// The submission ring is full; the caller must drain completions first.
+@@ -83,6 +82,7 @@ impl From<VirtioError> for BlockError {
+         match error {
+             VirtioError::Timeout => Self::Timeout,
+             VirtioError::Dma(DmaError::Range) => Self::Range,
++            VirtioError::ReadOnly => Self::ReadOnly,
+             _ => Self::Device,
+         }
+     }
+diff --git a/docs/fs.md b/docs/fs.md
+index 80b01ca..82d4139 100644
+--- a/docs/fs.md
++++ b/docs/fs.md
+@@ -1,11 +1,12 @@
+-# MoltROFS
++# MoltFS
+ 
+-Status: Stage 2.4 decision record, July 2026.
++Status: Stage 3 COW B-tree filesystem, July 2026.
+ 
+-Why the first filesystem is read-only, what its five regions are for, which
+-ideas were taken from bcachefs, Redox, and btrfs and which were left, whether
+-schemes belong under a cytokernel, and whether a driver is a cell. Written as
+-the record for `molt-block`, `molt-fs`, and `molt-shell`.
++How the read-only Stage 2.4 image became a writable, crash-consistent
++filesystem; how the bounded journal and copy-on-write metadata tree divide the
++work; what comes from bcachefs; and how capabilities, block durability, caching,
++and power-loss tests fit together. This is the record for `molt-block`,
++`molt-fs`, and `molt-shell`.
+ 
+ ## What this stage has to answer
+ 
+@@ -22,10 +23,9 @@ questions before writing a byte of format:
+    the kernel, and no `open(2)`. It has rings and capabilities, so the protocol
+    has to be built out of those and be pleasant enough that nobody wants a
+    shortcut around it.
+-3. **What survives a crash.** A read-only volume cannot be torn by its own
+-   writes, but it *is* written — by `xtask mkfs` today and by Stage 3's
+-   checkpoint later — and the recovery rule has to exist in version 1 or it
+-   never will.
++3. **What survives a crash.** Stage 2.4 established dual superblocks; Stage 3
++   has to turn that shape into a real ordered checkpoint and prove every power
++   cut.
+ 4. **Where the driver ends and the filesystem begins.** Stage 2.3 shipped
+    `molt-virtio` with a `read` method on it. If a filesystem is written against
+    that method, the second storage driver is a rewrite of the filesystem.
+@@ -45,25 +45,22 @@ the reader first means the write path arrives with something to be correct
+ *about*, and it means Stage 2.4 ships something that works instead of something
+ that half-works in two directions.
+ 
+-The cost of the choice is real and bounded: `molt-fs` carries no allocator, no
+-journal, no free-space map, and no write path. What it does carry — and this is
+-the part chosen deliberately — is every structure the writable successor needs
+-to exist on disk from version 1: a generation-stamped superblock kept in two
+-copies, a checksum over every metadata region, a crc32c per data block, and
+-extents rather than block pointers. A version 2 that adds a checkpoint tree
+-adds regions; it does not reinterpret the ones already there.
++The cost was real and bounded: Stage 2.4 carried no allocator, log, free-space
++map, or write path. It did establish the structures its successor needed:
++dual generation-stamped superblocks, checksummed metadata, crc32c per data
++block, and extents rather than block pointers. Stage 3 preserves that base and
++adds the log banks around it.
+ 
+ ## Taking from bcachefs rather than btrfs
+ 
+-The brief was btrfs's ideas without btrfs's legacy, leaning bcachefs. The three
+-things worth taking are the same three in both, and they arrive here in the
+-cheapest form that is still the real thing.
++The brief was btrfs's ideas without btrfs's legacy, leaning bcachefs. The ideas
++arrive here in the cheapest form that is still the real thing.
+ 
+ **Checksums that cover data, not just metadata.** Every data block carries a
+ crc32c in a region of its own, and every metadata region carries one in the
+ superblock. This is bcachefs's position — checksums are not optional and not a
+ mount flag — and it is why [`Volume::mount`](../crates/molt-fs/src/volume.rs)
+-verifies all five regions before the first lookup rather than discovering
++verifies all six regions before the first lookup rather than discovering
+ corruption at whatever block a directory search happens to land on. A volume
+ that mounts is a volume whose metadata is intact, which is a much stronger
+ statement than "the superblock parsed".
+@@ -75,6 +72,21 @@ seeking across the volume — the Stage 4 item this leaves room for.
+ 
+ **A generation in the superblock, and a checkpoint that swings it.** Below.
+ 
++**Filesystem state as typed B-tree keys.** bcachefs treats the filesystem as a
++database: metadata records are keys in a small set of B-trees, and its journal
++records key updates which replay inserts back into those trees. MoltFS uses one
++tree with three key spaces:
++
++- `Object(id)` maps to current kind, entry count, and file size;
++- `Dirent(parent, name)` maps a directory leaf name to an object id;
++- `Write(object, cursor)` maps a file update to its journal payload.
++
++This is the same useful boundary at smaller scale: namespace and object queries
++are tree lookups rather than mutation-log scans, while file payloads remain in
++the bounded log until extent allocation and compaction arrive. See bcachefs's
++[architecture overview](https://bcachefs.org/) and
++[transaction design](https://bcachefs.org/Transactions/).
++
+ **Extents, not block pointers.** A file is a run of `(logical, blocks, block)`
+ records, sorted by logical block and binary-searched. Contiguous data costs one
+ record however long it is, a logical block no extent covers is a hole that reads
+@@ -85,26 +97,18 @@ thrown away.
+ 
+ What was deliberately *not* taken:
+ 
+-- **A B-tree, yet.** bcachefs is a B-tree of everything and btrfs is a forest of
+-  them, and both are right for a filesystem that mutates. A read-only image is
+-  written once, sorted, and never inserted into, so the same asymptotics come
+-  from a sorted array with a binary search over it — ten block reads for a
+-  thousand-name directory — in about a fiftieth of the code. The B-tree is a
+-  Stage 4 item because Stage 4 is where insertion exists. The format does not
+-  fight it: entries and extents are already sorted by the key a tree would use,
+-  so a tree is a new region and a new object field, not a new format.
+-- **Reflinks, snapshots, subvolumes.** All three need refcounts, which need a
+-  writer. The room they will take is a superblock field and a region, both of
+-  which the layout has space for.
++- **Reflinks, snapshots, subvolumes.** All three need reference-counted general
++  allocation. The room they will take is a superblock field and a region, both
++  of which the layout has space for.
+ - **Inodes as a namespace.** There is no `stat` on a number, no hard links, and
+   no `.`/`..`. An object is reached by having opened it; see below.
+ - **btrfs's on-disk anything.** The item/key/leaf machinery, the chunk tree, and
+   the backref format are solutions to problems Molt does not have yet, and each
+   one is a compatibility obligation from the moment an image exists.
+ 
+-## The format
++## The base format
+ 
+-Five regions, one superblock, all little-endian, everything block-addressed.
++Six regions, two superblocks, all little-endian, everything block-addressed.
+ [`layout.rs`](../crates/molt-fs/src/layout.rs) is the definition; both the
+ reader and `xtask mkfs` compile against it, so there is no second copy of the
+ format to drift.
+@@ -118,6 +122,10 @@ block 1   superblock copy 1
+           names     the byte arena every entry's name points into
+           sums      one crc32c per data block
+           data      the blocks extents address
++          tree      fixed arena of checksummed 4096-byte COW nodes
++          log 0     active, previous, or free checkpoint bank
++          log 1     active, previous, or free checkpoint bank
++          log 2     active, previous, or free checkpoint bank
+ ```
+ 
+ Blocks are 4096 bytes. Every record size divides the block size, so no record
+@@ -127,15 +135,13 @@ That constant is the reason `Volume` can be `no_std`, allocation-free, and
+ usable from a kernel that has no heap: mounting costs one `[u8; 4096]` the
+ caller supplies.
+ 
+-**The superblock** carries a magic, a version, the block size, a generation, the
+-volume length, the root object id, where data starts and how long it is, and the
+-five region descriptors — each an offset, a length, and a crc32c over the
+-region's contents. Its own checksum is checked before any field is read, so a
+-torn write is rejected at the checksum rather than by whatever the region
+-offsets would otherwise have pointed at. `Super::check` then refuses a
+-structurally impossible volume: a region starting inside the superblock copies,
+-a region running past the end, a sums region whose length disagrees with the
+-data block count, or metadata and data regions whose occupied blocks overlap.
++**The superblock** carries a magic, version, block size, generation, volume
++length, root object id, data geometry, tree arena and root, log-bank capacity,
++and six region descriptors — each an offset, length, and crc32c. The sixth
++descriptor names the complete mutation log for that checkpoint. Its own
++checksum is checked before any field is trusted. `Super::check` also proves the
++tree root lies inside its arena, the selected log lies at exactly one of three
++bank boundaries, and base metadata, data, tree, and log banks do not overlap.
+ 
+ **An object** is a kind, a start index, a count, and a size. For a directory the
+ range is into the entries region and the size is zero; for a file the range is
+@@ -150,40 +156,96 @@ reads one block per probe regardless of name length; `name_len` is a `u16` on
+ disk, and `MAX_NAME` — 255 — bounds only the copy a lookup makes onto the stack
+ and the inline `Name` a ring carries, not the stored form.
+ 
++## Writable tree and payload log
++
++The base image remains immutable. `Journal` appends two typed payload records:
++
++- `Create(object, parent, kind, name)` allocates the next object id and adds one
++  directory entry.
++- `Write(object, offset, bytes)` overlays file data. Later records win, and a
++  write beyond end creates a zero-filled hole.
++
++Records start on 512-byte sector boundaries. One sector write can therefore
++tear only the record being appended, never an earlier record. The active
++superblock carries the exact log length and its crc32c, so padding and
++uncommitted tail bytes are invisible.
++
++Each mutation also inserts its current state into the metadata B+ tree. A node
++is one checksummed 4096-byte block. Leaves hold typed keys and values; internal
++nodes hold separator keys and child blocks. Insertion keeps a fixed
++root-to-leaf path, writes a replacement path, splits full nodes, and returns a
++new root. It never overwrites a node reachable from either durable
++superblock. `Journal::sync` publishes that root only after the nodes and log
++have passed a durability barrier.
++
++The tree API is deliberately small: exact lookup, ordered successor, insert,
++and transaction root. Filesystem code builds object, directory, and write keys
++on top rather than teaching the tree about files. The path and split buffers
++are fixed-size, so the kernel still needs no RAM allocator.
++
++The tree arena has a bounded tracing allocator. Starting a transaction marks
++nodes reachable from the active and previous roots; every other arena block is
++reclaimable. Replaced paths created in the same transaction are released
++immediately. This keeps both crash fallbacks intact while allowing old
++generations to be reused without fsck. `build_with_capacity` selects tree and
++log capacity, and `FsError::Full` reports either finite bound explicitly.
++
++## Metadata cache
++
++`MetadataTree` owns four parsed-node slots, about 16 KiB, and uses a bounded
++second-chance policy inspired by
++[SIEVE](https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo).
++A hit sets one visited bit and does not move the node. The eviction hand clears
++visited candidates and replaces the first unvisited one. This is useful here
++because it has constant metadata, no linked allocation, and makes repeated
++root and directory probes device-read free. `Journal::tree_stats` exposes hit,
++miss, and eviction counters for tests and diagnostics.
++
+ ## Crash consistency
+ 
+-Nothing here writes to a mounted volume, so the property to preserve is narrower
+-than Stage 3's and worth stating exactly: **a volume is always mountable at some
+-checkpoint, whatever moment power is lost.**
+-
+-The mechanism is two superblock copies and a generation. A checkpoint writes
+-every region and every data block first, then overwrites the *older* superblock
+-copy with the new one, and that overwrite is the instant the new state becomes
+-the volume's state. `Volume::mount` reads both copies, discards any that fails
+-its magic, checksum, version, or structure check, and takes the newest of what
+-is left. So:
+-
+-- Power lost while regions are being written: neither superblock mentions them,
+-  and the volume mounts at the previous generation.
+-- Power lost mid-superblock: that copy fails its checksum and is discarded, and
+-  the other copy — the previous checkpoint — is intact by construction, because
+-  the copy being overwritten is always the older one.
+-- Power lost after the superblock lands: the new generation is the newest that
+-  verifies, which is the definition of the checkpoint having happened.
+-
+-There is no fsck, and that is a design position rather than an omission: the
+-things fsck repairs are the things a checkpoint discipline prevents. There is
+-also no `fsync`, no barrier, and no flush issued anywhere, because nothing in
+-this stage writes to a device at all — `xtask mkfs` builds an image in memory
+-and hands it to the host's filesystem. The moment Stage 3 writes to a virtio
+-device, the checkpoint above needs `VIRTIO_F_FLUSH` between "regions written"
+-and "superblock written", and that ordering is exactly the thing
+-[`docs/virtio.md`](virtio.md) records as deliberately absent. The rule survives
+-the transition; only the flush is new.
+-
+-What this does not defend against is a device that reorders across the whole
+-write. That is what the flush is for, and it does not exist yet because the
+-writer does not either.
++The invariant is exact: **after power loss, mount returns the complete old
++generation or the complete new generation, never a mixture, and needs no
++fsck.**
++
++Two superblocks are not enough by themselves. If a new transaction overwrote
++the previous generation's log while the active generation still depended on
++it, a crash before the new superblock would destroy the fallback. MoltFS keeps
++three log banks:
++
++1. one named by the active superblock;
++2. one named by the previous superblock;
++3. one safe target for the next transaction.
++
++The first mutation copies the active log into the free bank, appends there, and
++writes new COW nodes into unprotected arena blocks. `Sync` uses one
++deterministic, synchronous sequence:
++
++1. finish all target-bank and COW-node writes;
++2. issue device `flush`;
++3. write the older superblock copy with generation + 1, target bank, length,
++   checksum, and new tree root;
++4. issue device `flush` again.
++
++The first flush makes every byte the new superblock will name durable. The
++second is the commit point. Losing power before it leaves both old
++superblocks and their banks intact; losing power after it leaves a complete
++new checkpoint. Mount parses both copies in generation order and verifies each
++selected log. If the newest copy parses but its log checksum fails, mount
++continues to the previous copy instead of treating a generation number as
++proof. It applies the same rule to the tree: every reachable node checksum,
++level, child address, and generation is verified before the checkpoint can win.
++
++There is deliberately one outstanding block request at a time. That makes
++ordering observable and deterministic; barriers separate durability epochs,
++while the queue cannot reorder requests within one. `molt-block::Fault` models
++volatile controller cache separately from stable storage. The crash test starts
++from generation 2, rotates into the third bank, and cuts power before every
++record, tree-node, flush, and superblock action until a full checkpoint
++succeeds. Every interrupted run remounts generation 2; the first uninterrupted
++run remounts generation 3 with all bytes. Separate tests corrupt the newest log
++and newest tree root and require fallback, and cycle hundreds of checkpoints to
++prove arena reclamation. Those tests are the recovery algorithm, not a
++simulation around it.
+ 
+ ## Schemes: no, and here is the line
+ 
+@@ -266,10 +328,9 @@ executor to await *on*, and this stage has one task and a `drive` loop. Worse,
+ it would be a ring whose only client is synchronous — `Volume` reads one block
+ and immediately needs it — so the ring would be a queue of depth one with an
+ await around it. The interesting version of that ring is the one with
+-readahead, concurrent extent fetches, and a cache behind it, and all three want
+-the writable filesystem's structure. Stage 3 gets `BlockOp`; Stage 2.4 gets the
+-trait below, which is what makes Stage 3's version a substitution rather than a
+-rewrite.
++readahead, concurrent extent fetches, and a cache behind it. That later scale
++stage gets `BlockOp`; direct traits keep this stage synchronous and make that
++change a substitution rather than a rewrite.
+ 
+ **Naming.** No type here is called `FsCell` or `VirtioCell`. The module supplies
+ the context, as [the style guide](style.md) says: `molt_fs::Fs`,
+@@ -285,20 +346,25 @@ only way to read a sector, so a filesystem written against it would have
+ inherited the virtqueue, and a loopback device or an NVMe driver would have
+ meant a second read path in the filesystem.
+ 
+-`molt-block` is the split. It is one trait and one implementation:
++`molt-block` is the split. Reads and durable mutation are separate contracts:
+ 
+ ```rust
+ pub trait Device {
+     fn sectors(&self) -> u64;
+     fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError>;
+ }
++
++pub trait Writable: Device {
++    fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), BlockError>;
++    fn flush(&mut self) -> Result<(), BlockError>;
++}
+ ```
+ 
+-That is the entire contract a filesystem needs, and everything about how a
+-device is reached — BARs, virtqueues, DMA arenas, interrupt vectors — stays
+-below it. `molt_virtio::Block` implements it over a virtqueue,
+-`molt_block::Loopback` implements it over bytes already in memory, and a future
+-NVMe driver implements it over whatever it likes.
++`Volume` needs only `Device`; `Journal` and `Fs` require `Writable`. A
++read-only loopback remains useful and rejects attempted mutation with
++`BlockError::ReadOnly`, while a mutable loopback and fault-injection device
++implement the durable side. Everything about BARs, virtqueues, DMA arenas, and
++interrupt vectors stays below these traits.
+ 
+ Three details in that signature are decisions:
+ 
+@@ -315,6 +381,10 @@ Three details in that signature are decisions:
+   smoke has to reset the same virtio device afterwards, so it lends the driver
+   instead of giving it away. One blanket impl covers both, and the reset stays
+   the driver owner's business.
++- **`flush` is the persistence boundary.** `write` promises later reads through
++  the same device see bytes; only a successful `flush` promises those bytes
++  survive power loss. The filesystem never infers durability from request
++  completion.
+ 
+ `Loopback` is what makes the filesystem testable on the host: `molt-fs`'s entire
+ suite mounts real images out of `Vec<u8>` with no QEMU, no device, and nothing
+@@ -329,18 +399,21 @@ pub enum FsOp {
+     Open { dir: Capability<Dir>, name: Name },
+     Entry { dir: Capability<Dir>, index: u32 },
+     Read { file: Capability<File>, buffer: BufferOperation<Write>, offset: u64 },
++    Create { dir: Capability<Dir>, name: Name, kind: Kind },
++    Write { file: Capability<File>, buffer: BufferOperation<Read>, offset: u64 },
++    Sync,
+     Stat(Handle),
+     Close(Handle),
+ }
+ ```
+ 
+-Five operations, and the shape of each one is the argument.
++Eight operations, and the shape of each one is the argument.
+ 
+-**Nothing carries data.** A read names a registered buffer, and only the
+-registry — which the supervisor owns — can turn that name into memory. The
+-driver writes into the client's buffer and neither side ever holds the other's
+-pointer. This is the same discipline `molt-arch::dma` applies to a device, one
+-layer up, and it is why `FsOp` is `Copy` and small enough to sit in a ring slot.
++**Nothing carries data.** A read names a buffer with `Write` authority; a write
++names one with `Read` authority. Only the supervisor-owned registry turns
++either into memory, so neither side passes a pointer. This is the same
++discipline `molt-arch::dma` applies to a device, one layer up, and it keeps
++`FsOp` `Copy` and small enough for a ring slot.
+ 
+ **`Capability<Dir>` and `Capability<File>` are different types.** Not a flag on
+ one handle: distinct rights markers, so `Read { file: ... }` cannot be written
+@@ -350,6 +423,13 @@ happens at compile time here, and `FsError::Kind` exists for the case the client
+ genuinely does not know yet — it opened a name and got back whichever kind was
+ there.
+ 
++**Open handles carry `Rights::READ_WRITE`.** `Create` requires a directory
++handle, `Write` requires a file handle, and revocation invalidates both rights
++by advancing one capability generation. A stale file capability therefore
++cannot write after its owner restarts. `Sync` returns the generation that is
++durable when it completes; without pending mutations it is a barrier and keeps
++the current generation.
++
+ **The root handle comes from nowhere, and off the ring.** Every other handle is
+ opened from a directory somebody already holds; the first cannot be, so there is
+ no `FsOp` for it. `Fs::root` mints it, and only code holding the mounted `Fs` —
+@@ -424,8 +504,9 @@ line editor away and needs a serial `read` before it is worth writing.
+ 
+ ## What this stage does not do
+ 
+-- **No writes.** No allocator, no free-space map, no journal, no `fsync`, no
+-  rename. Stage 3.
++- **No rename, unlink, or compaction.** Create, sparse write, replay, and sync
++  are complete; reclaiming log space and changing namespace links arrive with
++  the B-tree/free-space stage.
+ - **No B-tree, no snapshots, no reflinks, no compression, no encryption.** Stage
+   4, and each one needs the writer first.
+ - **No cache.** `Volume` keeps the last block it read and nothing else. A
+@@ -444,22 +525,21 @@ line editor away and needs a serial `read` before it is worth writing.
+ ## How it is tested
+ 
+ Everything with arithmetic in it is a host test over a real image, because
+-`Loopback` made that possible: the format round-trips through the builder and
+-the reader, a torn superblock is refused, a foreign block is refused, a future
+-version is refused by version rather than by checksum, a region past the end of
+-the volume is refused, and a damaged region fails at mount rather than at first
+-use. Reads cover the boundary cases that a hand-written offset loop gets wrong —
+-across a block boundary, from a hole in a sparse file, at the end of a file, and
+-past it.
++`Loopback` made that possible: format round-trips through builder and reader, a
++torn superblock is refused, a foreign block is refused, a future version is
++refused by version rather than checksum, a region past volume end is refused,
++and a damaged region fails at mount rather than first use. Reads cover block
++boundaries, sparse holes, file end, and writes that overlay immutable data and
++extend it through a hole.
+ 
+ A checksum-valid but impossible extent is still refused: physical block
+ arithmetic is checked before a data read, so a malformed address cannot wrap
+ into another region or panic the reader.
+ 
+-The service tests cover the protocol rather than the format: an open walks from
+-the root handle, a read lands in a registered buffer and nowhere else, a closed
+-handle goes stale, a revoked owner loses every handle at once, and a table with
+-no free slot refuses rather than overwrites. A full completion queue also
++Service tests cover protocol rather than format: create/write/sync survives a
++remount, dynamic `Stat` sees new size, a read lands only in its registered
++buffer, and a revoked owner cannot write through a stale file handle. A full
++handle table refuses rather than overwrites, and a full completion queue
+ preserves the next result until the client makes room.
+ 
+ The shell tests run scripts against a mounted image and compare what was
+@@ -470,14 +550,12 @@ that does not exist naming itself.
+ 
+ `cargo xtask mkfs <tree> <image>` writes a directory tree out as a mountable
+ image, and the smoke disk is one of those rather than a signed pattern — the
+-`disk/` tree in the repository, laid out at smoke time. That is what makes one
+-artifact prove the whole path: the block driver reads sector zero and finds
+-`MOLTROFS`, the filesystem mounts the same bytes, and the shell's `cat
+-hello.txt` prints what the host file contains. The x86_64 boot smoke requires
+-`MOLT_FS_OK:`, the shell's own `molt> cat hello.txt` and `hello, molt` lines,
+-and `MOLT_SHELL_OK:` on the serial line. An xtask test lays out the same tree
+-and mounts it back on the host, so the image is checked even where QEMU is not
+-installed.
++`disk/` tree in the repository, laid out at smoke time. The block driver reads
++sector zero, the filesystem mounts, creates `runtime.txt`, writes and syncs it
++through virtio, reads it back, then the shell prints the original host file.
++The x86_64 smoke requires `MOLT_FS_WRITE_OK:` in addition to mount and shell
++markers. An xtask test performs the same write, drops the mount, remounts, and
++checks the durable bytes on the host.
+ 
+ ## Debts closed before the write path
+ 
+@@ -520,25 +598,21 @@ call it, and `Fs::seal` makes it one-shot for the mount's life. The protocol
+ section above is the full argument; the debt was that the asymmetry existed in
+ prose but not in the types.
+ 
+-## Growth path
++## Version and growth path
+ 
+-The format's version is 1 and the reader refuses anything else, which is the
+-right starting posture: a version that is checked from the first image is a
+-version that can be relied on later.
++Writable COW layout is version 3. Adding the tree arena and root changes bytes
++and geometry an older reader interprets. There is no published standard yet,
++but that is a reason to keep migration policy small, not to label incompatible
++layouts with the same version. Version 1 and 2 images are rejected rather than
++guessed at; `xtask mkfs` rebuilds development images as version 3.
+ 
+-- **Stage 3, writable.** Regions gain a free-space map and an object bitmap; the
+-  superblock gains a pointer to a log. The checkpoint rule stays exactly as it
+-  is, with a device flush between the regions and the superblock. `FsOp` gains
+-  `Write`, `Create`, `Rename`, and `Sync`, and `Capability<File>` gains
+-  `Rights::WRITE` — which the type already models and this stage simply never
+-  hands out.
+ - **Stage 3, cells.** `Fs` becomes a supervised cell when there is more than one
+-  client and a restart means a remount. `revoke_owner` is the piece that has to
+-  work then, and it works now.
+-- **Stage 4, scale.** Objects and extents become B-tree leaves keyed the way
+-  they are already sorted; the sums region becomes a scrub's work list; the
+-  block layer gains its ring, a cache, and readahead behind the same `Device`
+-  trait.
++  client and restart means remount. `revoke_owner` is the piece that has to
++  work then, and it already covers write authority.
++- **Stage 4, scale.** File payloads compact from the journal into extent keys;
++  reference counts and bucket generations generalize the bounded tree arena;
++  sums become a scrub work list; block layer gains its ring, data cache, and
++  readahead behind the same traits.
+ - **Stage 5, storage for cells.** A signed cell image is a file with a signature
+   region, and the loader is a client of this protocol — which is the argument
+   for the protocol being pleasant to write against, since a loader is the next
+diff --git a/docs/roadmap.md b/docs/roadmap.md
+index f39ad75..3fd8ed7 100644
+--- a/docs/roadmap.md
++++ b/docs/roadmap.md
+@@ -163,9 +163,9 @@ driver, so the RISC-V smoke enumerates and stops.
+       ring the kernel owns and the reset returns its frames
+ - [x] `docs/virtio.md`
+ 
+-The read path is the whole path this stage builds. Stage 2.4's filesystem is
+-read-only, so the write side — a `VIRTIO_BLK_T_OUT` chain and the flush that
+-orders it — is deliberately absent rather than stubbed; see `docs/virtio.md`.
++This stage originally built only the read path needed by Stage 2.4. Stage 3
++extends the same queue with `VIRTIO_BLK_T_OUT` and durable flush; see
++`docs/virtio.md`.
+ 
+ ### Stage 2.4 — Something to run
+ 
+@@ -198,11 +198,19 @@ Both are argued in `docs/fs.md`.
+ 
+ ## Stage 3 — Services and networking
+ 
+-- [ ] writable filesystem and crash-consistency tests
++- [x] writable filesystem and crash-consistency tests
+ - [ ] VirtIO network, Ethernet, ARP, IPv4, UDP, then TCP
+ - [ ] a typed scheme/resource namespace inspired by Redox
+ - [ ] capability delegation and audit events
+ 
++Writable filesystem includes sector writes, required virtio flush support,
++three rotating checkpoint-log banks, a checksummed copy-on-write metadata
++B-tree with bounded node caching and generation reclamation, deterministic
++tree/log/flush/root-swing/flush ordering, `Create`/`Write`/`Sync` capability
++operations, and fault injection that cuts power before every checkpoint action.
++Mount always selects a complete old or new generation and never depends on
++fsck. `MOLT_FS_WRITE_OK` proves the same path through QEMU's virtio-blk device.
++
+ ## Stage 4 — SMP, hardware breadth, and performance
+ 
+ - [ ] per-CPU executors and rings; explicit cross-core fan-in
+diff --git a/docs/testing.md b/docs/testing.md
+index 7b4c6da..073efe1 100644
+--- a/docs/testing.md
++++ b/docs/testing.md
+@@ -160,15 +160,15 @@ possible rather than just asserting that a capability was written. See
+ [`docs/pci.md`](pci.md).
+ 
+ **The smoke disk is a filesystem, not a pattern.** Stage 2.4 replaced the signed
+-sector the virtio smoke used to read with a real MoltROFS image: `cargo xtask
++sector the virtio smoke used to read with a real MoltFS image: `cargo xtask
+ mkfs <tree> <image>` lays a host directory tree out as a mountable volume, and
+ the smoke builds one from the `disk/` tree in the repository. One artifact then
+-proves the whole path, because the markers it produces are the same bytes seen
+-at four heights — `MOLT_BLOCK_OK` for the sector, `MOLT_FS_OK` for the mount,
+-and then the shell's own `molt> cat hello.txt` and `hello, molt` lines before
+-`MOLT_SHELL_OK`. Requiring the shell's output rather than only its marker is the
+-point: a marker says a component ran, and the echoed file says the file's
+-contents survived the driver, the format, and the ring. See
++proves the whole path, because markers expose the same bytes at five heights:
++`MOLT_BLOCK_OK` for the sector, `MOLT_FS_OK` for mount,
++`MOLT_FS_WRITE_OK` for a durable create/write/sync/read cycle, then the shell's
++own `molt> cat hello.txt` and `hello, molt` lines before `MOLT_SHELL_OK`.
++Requiring data rather than only component markers says contents survived
++driver, format, and ring. See
+ [`docs/fs.md`](fs.md).
+ 
+ Everything under those markers that can be tested without a machine is. The
+diff --git a/docs/virtio.md b/docs/virtio.md
+index 6843147..c20b1fe 100644
+--- a/docs/virtio.md
++++ b/docs/virtio.md
+@@ -4,8 +4,8 @@ Status: Stage 2.3 decision record, July 2026.
+ 
+ Why a queue is built out of frames the kernel owns rather than memory the device
+ names, where a physical address is allowed to exist, what the four request
+-semantics actually promise, and why there is no write path. Written as the
+-record for `molt-arch::dma` and the `molt-virtio` crate.
++semantics actually promise, and how Stage 3 orders writes and flushes. Written
++as the record for `molt-arch::dma` and the `molt-virtio` crate.
+ 
+ ## The shape of the problem
+ 
+@@ -140,25 +140,23 @@ modern one and has exactly one point of policy: `negotiate` always demands
+ `VIRTIO_F_VERSION_1` and refuses a device that will not offer it. There is no
+ legacy fallback. A device that clears `FEATURES_OK` after the driver writes it,
+ or that offers no modern transport, is refused rather than driven through an
+-interface with a different memory model. The block driver negotiates *no* block
+-feature bits beyond that — a bare `VIRTIO_BLK_T_IN` read needs none — so the
+-feature word it writes back is just the version bit.
++interface with a different memory model. The block driver also refuses
++`VIRTIO_BLK_F_RO` and requires `VIRTIO_BLK_F_FLUSH`. A device without a
++durability boundary cannot satisfy the filesystem checkpoint contract and is
++refused during startup.
+ 
+ `clamp_queue` caps the device's advertised queue depth at what the driver can
+ host without a heap and refuses a device that offers no queue at all. The device
+ picking a smaller queue than it advertised, or a non-power-of-two size, is a
+ `VirtioError::Device` rather than a ring laid out wrong.
+ 
+-## What this stage does not do
++## Write ordering
+ 
+-**There is no write path, and that is a decision, not a gap.** Stage 2.4's
+-filesystem is read-only, so the driver never issues `VIRTIO_BLK_T_OUT`, never
+-marks a data segment writable *by the device toward the disk*, and never issues
+-the flush that would have to order such a write against a completion. Adding a
+-half-tested write path now — with no consumer and no crash-consistency story —
+-would be code the roadmap explicitly defers to Stage 3's writable filesystem.
+-The one public operation is `read`. When there is something that writes, the
+-flush ordering and the `VIRTIO_F_FLUSH` negotiation come with it.
++`VIRTIO_BLK_T_OUT` uses a device-readable data descriptor.
++`VIRTIO_BLK_T_FLUSH` carries only request and status descriptors, with sector
++zero. `molt-block::Writable` exposes both without exposing a virtqueue. One
++outstanding request at a time keeps completion order deterministic, and MoltFS
++places explicit flushes between log data and the superblock that names it.
+ 
+ **Bus mastering is granted for this device, once, and it is not free.** The same
+ trade [`docs/pci.md`](pci.md) recorded for MSI applies with full force here: a
+@@ -189,15 +187,15 @@ What no host test can show is that a queue built from claimed frames, a device
+ brought up over a mapped BAR, and a physical address handed across the DMA
+ boundary all describe the same disk. The only proof is a sector reading back
+ correct, so the x86_64 smoke attaches a `virtio-blk-pci,disable-legacy=on`
+-function backed by a MoltROFS image `xtask mkfs` lays out from the `disk/` tree,
+-brings the device up, reads sector zero, checks it against the volume's
+-`MOLTROFS` magic, and resets. It requires `MOLT_VIRTIO_OK`, `MOLT_BLOCK_OK`, and
+-`MOLT_VIRTIO_RESET_OK` on the serial line, the last of which is the queue-reset
+-ordering proving itself: the device stopped, then the frames came back.
++function backed by a MoltFS image `xtask mkfs` lays out from the `disk/` tree,
++brings the device up, reads sector zero, commits a filesystem write, and resets.
++It requires `MOLT_VIRTIO_OK`, `MOLT_BLOCK_OK`, `MOLT_FS_WRITE_OK`, and
++`MOLT_VIRTIO_RESET_OK` on the serial line. The last marker proves queue-reset
++ordering: the device stopped, then frames came back.
+ 
+ The disk is a real filesystem rather than a signed pattern so that one artifact
+-carries the whole path: the same bytes this driver reads are what Stage 2.4's
+-filesystem mounts and its shell prints, and the markers between `MOLT_BLOCK_OK`
++carries the whole path: the same bytes this driver reads are what MoltFS writes,
++mounts, and prints through its shell, and the markers between `MOLT_BLOCK_OK`
+ and `MOLT_VIRTIO_RESET_OK` are that filesystem's. See [`docs/fs.md`](fs.md).
+ 
+ The RISC-V smoke does not run it. The `virt` board hands out no DMA frames to
+diff --git a/kernel/src/fs.rs b/kernel/src/fs.rs
+index f270fb6..147fe6b 100644
+--- a/kernel/src/fs.rs
++++ b/kernel/src/fs.rs
+@@ -1,4 +1,4 @@
+-//! Mounting the disk the block driver just proved, and reading it as a cell would.
++//! Mounting the disk, committing a write, and reading it as a cell would.
+ //!
+ //! Nothing here reaches into the volume: the shell holds one root capability
+ //! and talks over a ring, the filesystem answers on the same loop, and the only
+@@ -7,11 +7,11 @@
+ use core::cell::RefCell;
+ 
+ use molt_arch::{Platform, SerialPort, SerialWriter};
+-use molt_block::Device;
+-use molt_core::buffer::BufferRegistry;
++use molt_block::Writable;
++use molt_core::buffer::{BufferOperation, BufferRegistry};
+ use molt_core::capability::CellId;
+ use molt_core::ring::IoRing;
+-use molt_fs::{BLOCK, Fs, FsDone, FsError, FsOp};
++use molt_fs::{BLOCK, Fs, FsDone, FsError, FsOp, Handle, Kind, Name};
+ use molt_kernel::report;
+ use molt_shell::{Console, Session, Shell, drive};
+ 
+@@ -21,10 +21,11 @@ const HANDLES: usize = 4;
+ const RING: usize = 4;
+ /// Deliberately smaller than the files on the disk, so `cat` has to loop.
+ const WINDOW: usize = 64;
++const WRITTEN: &[u8] = b"written through virtio";
+ 
+ const SCRIPT: &[u8] = b"help\nls\nls docs\ncat hello.txt\nls nowhere\n";
+ 
+-pub fn smoke<P: Platform>(platform: &mut P, device: impl Device) {
++pub fn smoke<P: Platform>(platform: &mut P, device: impl Writable) {
+     let mut block = [0u8; BLOCK];
+     let mut fs = match Fs::<_, HANDLES>::mount(device, &mut block) {
+         Ok(mounted) => mounted,
+@@ -45,8 +46,47 @@ pub fn smoke<P: Platform>(platform: &mut P, device: impl Device) {
+     fs.seal();
+ 
+     let mut bytes = [0u8; WINDOW];
++    bytes[..WRITTEN.len()].copy_from_slice(WRITTEN);
+     let mut registry = BufferRegistry::<1>::new();
+     let scratch = registry.register_read_write(OWNER, &mut bytes).expect("free buffer slot");
++    let write_result = (|| {
++        let source = registry.read_capability(scratch)?;
++        let target = registry.write_capability(scratch)?;
++        let name = Name::try_from("runtime.txt")?;
++        let created =
++            fs.apply(OWNER, FsOp::Create { dir: root, name, kind: Kind::File }, &mut registry)?;
++        let Some(Handle::File(file)) = created.handle() else {
++            return Err(FsError::Kind);
++        };
++        let written = fs.apply(
++            OWNER,
++            FsOp::Write { file, buffer: BufferOperation::new(source, 0, WRITTEN.len()), offset: 0 },
++            &mut registry,
++        )?;
++        if written != FsDone::Written(WRITTEN.len()) {
++            return Err(FsError::Corrupt);
++        }
++        let generation = match fs.apply(OWNER, FsOp::Sync, &mut registry)? {
++            FsDone::Synced(generation) => generation,
++            _ => return Err(FsError::Corrupt),
++        };
++        let window = BufferOperation::new(target, 0, WRITTEN.len());
++        if fs.apply(OWNER, FsOp::Read { file, buffer: window, offset: 0 }, &mut registry)?
++            != FsDone::Read(WRITTEN.len())
++            || registry.resolve_write(window)? != WRITTEN
++        {
++            return Err(FsError::Corrupt);
++        }
++        fs.apply(OWNER, FsOp::Close(Handle::File(file)), &mut registry)?;
++        Ok(generation)
++    })();
++    match write_result {
++        Ok(generation) => report!(platform, "MOLT_FS_WRITE_OK: generation {generation}"),
++        Err(error) => {
++            report!(platform, "MOLT_FS_FAILED: {error:?}");
++            return;
++        }
++    }
+     let buffers = RefCell::new(registry);
+     let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, RING>::new();
+     let (client, mut driver) = ring.split();
+diff --git a/kernel/src/virtio.rs b/kernel/src/virtio.rs
+index 6a2524b..ae3ecfe 100644
+--- a/kernel/src/virtio.rs
++++ b/kernel/src/virtio.rs
+@@ -10,7 +10,7 @@ use molt_virtio::{Block, Transport};
+ const VIRTIO_VENDOR: u16 = 0x1af4;
+ const VIRTIO_BLOCK: u16 = 0x1042;
+ 
+-/// What a MoltROFS volume starts with, which is what `xtask` puts on the disk.
++/// What a MoltFS volume starts with, which is what `xtask` puts on the disk.
+ const SIGNATURE: [u8; 8] = molt_fs::MAGIC;
+ const DMA_FRAMES: usize = 8;
+ const BLOCK_TAG: u32 = 0xb10c;
+diff --git a/xtask/src/main.rs b/xtask/src/main.rs
+index b13af04..cd49a3b 100644
+--- a/xtask/src/main.rs
++++ b/xtask/src/main.rs
+@@ -77,7 +77,7 @@ fn usage() -> String {
+     "usage: cargo xtask <image|boot|smoke [x86_64|riscv64|all]|mkfs <tree> <image>>".into()
+ }
+ 
+-/// Writes the tree at `tree` out as a mountable MoltROFS image.
++/// Writes the tree at `tree` out as a mountable MoltFS image.
+ fn mkfs(tree: &Path, image: &Path) -> Result<(), String> {
+     let bytes = lay_out(tree)?;
+     fs::write(image, &bytes)
+@@ -158,6 +158,7 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
+             "MOLT_VIRTIO_OK:",
+             "MOLT_BLOCK_OK:",
+             "MOLT_FS_OK:",
++            "MOLT_FS_WRITE_OK:",
+             "molt> cat hello.txt",
+             "hello, molt",
+             "MOLT_SHELL_OK:",
+@@ -355,8 +356,8 @@ fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
+ 
+ /// Builds the disk the smoke test hands to QEMU.
+ ///
+-/// It is a real MoltROFS image rather than a signed pattern, so the block read
+-/// and the shell's `cat` prove the same bytes end to end.
++/// It is a real MoltFS image rather than a signed pattern, so block I/O, a
++/// durable runtime write, and the shell's `cat` prove the same disk end to end.
+ fn virtio_disk() -> Result<PathBuf, String> {
+     let root = workspace_root();
+     let image_dir = target_dir(&root).join("molt");
+@@ -443,7 +444,7 @@ mod tests {
+     use molt_block::Loopback;
+     use molt_core::buffer::{BufferOperation, BufferRegistry};
+     use molt_core::capability::CellId;
+-    use molt_fs::{BLOCK, Fs, FsDone, FsOp, Handle, Name};
++    use molt_fs::{BLOCK, Fs, FsDone, FsOp, Handle, Kind, Name};
+ 
+     use super::{DISK_TREE, lay_out, workspace_root};
+ 
+@@ -451,29 +452,86 @@ mod tests {
+     const WINDOW: usize = 64;
+ 
+     #[test]
+-    fn smoke_disk_mounts_reads() {
++    fn smoke_disk_mounts_reads_and_writes() {
+         let tree = workspace_root().join(DISK_TREE);
+-        let image = lay_out(&tree).expect("image of the smoke tree");
++        let on_disk = fs::read(tree.join("hello.txt")).expect("file the image was built from");
++        let mut image = lay_out(&tree).expect("image of the smoke tree");
++        {
++            let mut block = [0u8; BLOCK];
++            let mut fs = Fs::<_, 4>::mount(
++                Loopback::writable(&mut image).expect("whole sectors"),
++                &mut block,
++            )
++            .unwrap();
++
++            let mut bytes = [0u8; WINDOW];
++            let mut buffers = BufferRegistry::<1>::new();
++            let buffer = buffers.register_read_write(OWNER, &mut bytes).expect("free slot");
++            let target = buffers.write_capability(buffer).expect("write right");
++            let root = fs.root(OWNER).expect("root handle");
++            let name = Name::try_from("hello.txt").expect("legal name");
++            let opened =
++                fs.apply(OWNER, FsOp::Open { dir: root, name }, &mut buffers).expect("open");
++            let Some(Handle::File(file)) = opened.handle() else {
++                panic!("hello.txt opened as a directory: {opened:?}");
++            };
++
++            let window = BufferOperation::new(target, 0, WINDOW);
++            let read =
++                fs.apply(OWNER, FsOp::Read { file, buffer: window, offset: 0 }, &mut buffers);
++            assert_eq!(read, Ok(FsDone::Read(on_disk.len())));
++            assert_eq!(
++                &buffers.resolve_write(window).expect("same buffer")[..on_disk.len()],
++                &on_disk
++            );
++
++            let source = buffers.read_capability(buffer).expect("read right");
++            let created = fs
++                .apply(
++                    OWNER,
++                    FsOp::Create {
++                        dir: root,
++                        name: Name::try_from("runtime.txt").unwrap(),
++                        kind: Kind::File,
++                    },
++                    &mut buffers,
++                )
++                .expect("create");
++            let Some(Handle::File(runtime)) = created.handle() else {
++                panic!("runtime.txt opened as a directory: {created:?}");
++            };
++            let write = FsOp::Write {
++                file: runtime,
++                buffer: BufferOperation::new(source, 0, on_disk.len()),
++                offset: 0,
++            };
++            assert_eq!(fs.apply(OWNER, write, &mut buffers), Ok(FsDone::Written(on_disk.len())));
++            assert_eq!(fs.apply(OWNER, FsOp::Sync, &mut buffers), Ok(FsDone::Synced(2)));
++        }
++
+         let mut block = [0u8; BLOCK];
++        let mut bytes = [0u8; WINDOW];
+         let mut fs =
+             Fs::<_, 4>::mount(Loopback::new(&image).expect("whole sectors"), &mut block).unwrap();
+-
+-        let mut bytes = [0u8; WINDOW];
+         let mut buffers = BufferRegistry::<1>::new();
+         let buffer = buffers.register_write(OWNER, &mut bytes).expect("free slot");
+         let root = fs.root(OWNER).expect("root handle");
+-        let name = Name::try_from("hello.txt").expect("legal name");
+-        let opened = fs.apply(OWNER, FsOp::Open { dir: root, name }, &mut buffers).expect("open");
++        let opened = fs
++            .apply(
++                OWNER,
++                FsOp::Open { dir: root, name: Name::try_from("runtime.txt").unwrap() },
++                &mut buffers,
++            )
++            .expect("open durable file");
+         let Some(Handle::File(file)) = opened.handle() else {
+-            panic!("hello.txt opened as a directory: {opened:?}");
++            panic!("runtime.txt opened as a directory: {opened:?}");
+         };
+-
+         let window = BufferOperation::new(buffer, 0, WINDOW);
+-        let read = fs.apply(OWNER, FsOp::Read { file, buffer: window, offset: 0 }, &mut buffers);
+-        let on_disk = fs::read(tree.join("hello.txt")).expect("file the image was built from");
+ 
+-        assert_eq!(read, Ok(FsDone::Read(on_disk.len())));
+-        let taken = buffers.resolve_write(window).expect("same buffer");
+-        assert_eq!(&taken[..on_disk.len()], &on_disk[..]);
++        assert_eq!(
++            fs.apply(OWNER, FsOp::Read { file, buffer: window, offset: 0 }, &mut buffers),
++            Ok(FsDone::Read(on_disk.len()))
++        );
++        assert_eq!(&buffers.resolve_write(window).expect("same buffer")[..on_disk.len()], &on_disk);
+     }
+ }
