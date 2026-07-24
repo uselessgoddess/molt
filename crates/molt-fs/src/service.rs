@@ -20,6 +20,7 @@ pub struct Fs<'buf, D, const N: usize> {
     volume: Volume<'buf, D>,
     open: CapabilityTable<Object, N>,
     pending: Option<Completion<Result<FsDone, FsError>>>,
+    sealed: bool,
 }
 
 impl<'buf, D: Device, const N: usize> Fs<'buf, D, N> {
@@ -29,6 +30,7 @@ impl<'buf, D: Device, const N: usize> Fs<'buf, D, N> {
             volume: Volume::mount(device, block)?,
             open: CapabilityTable::new(),
             pending: None,
+            sealed: false,
         })
     }
 
@@ -39,15 +41,29 @@ impl<'buf, D: Device, const N: usize> Fs<'buf, D, N> {
 
     /// Hands `owner` a handle to the root directory.
     ///
-    /// This is the one handle that comes from nowhere; every other one is
-    /// opened through a directory somebody already holds.
+    /// This is the one handle that comes from nowhere: every other is opened
+    /// through a directory somebody already holds, and no [`FsOp`] mints it, so
+    /// only code with the mounted `Fs` in hand — init at bootstrap — can bless
+    /// the first holder. [`seal`](Self::seal) shuts the door afterwards, and
+    /// then this returns [`FsError::Sealed`].
     pub fn root(&mut self, owner: CellId) -> Result<Capability<Dir>, FsError> {
+        if self.sealed {
+            return Err(FsError::Sealed);
+        }
         let root = self.volume.root();
         let object = self.volume.object(root)?;
         if object.kind != Kind::Dir {
             return Err(FsError::Kind);
         }
         self.open.insert::<Dir>(owner, object).map_err(|_| FsError::Handles)
+    }
+
+    /// Closes the root bootstrap for good, so no later caller can grant one.
+    ///
+    /// One-way by design: init hands out the roots the system starts with, then
+    /// seals, and the authority to mint another is gone for the mount's life.
+    pub fn seal(&mut self) {
+        self.sealed = true;
     }
 
     /// Performs one operation, handing any new handle to `owner`.
@@ -62,7 +78,6 @@ impl<'buf, D: Device, const N: usize> Fs<'buf, D, N> {
         buffers: &mut BufferRegistry<'_, M>,
     ) -> Result<FsDone, FsError> {
         match op {
-            FsOp::Root => self.root(owner).map(|dir| FsDone::Opened(Handle::Dir(dir))),
             FsOp::Open { dir, name } => {
                 let parent = *self.open.get(dir)?;
                 let id = self.volume.lookup(&parent, name.as_bytes())?;
@@ -275,6 +290,20 @@ mod tests {
         let opened = fs.apply(OWNER, FsOp::Open { dir: root, name: name("docs") }, &mut buffers);
 
         assert_eq!(opened, Err(FsError::Handles));
+    }
+
+    #[test]
+    fn seal_refuses_later_root() {
+        let bytes = image();
+        let mut block = [0u8; BLOCK];
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("mount");
+
+        let first = fs.root(OWNER);
+        fs.seal();
+        let second = fs.root(OWNER);
+
+        assert!(first.is_ok(), "{first:?}");
+        assert_eq!(second, Err(FsError::Sealed));
     }
 
     #[test]

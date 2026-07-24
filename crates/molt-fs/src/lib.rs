@@ -64,6 +64,8 @@ pub enum FsError {
     Range,
     /// The device below refused the read.
     Device(BlockError),
+    /// A root grant asked for after the bootstrap was sealed.
+    Sealed,
     /// A handle that is unknown, stale, or short of rights.
     Handle(CapabilityError),
     /// A buffer that is unknown or does not hold the range claimed for it.

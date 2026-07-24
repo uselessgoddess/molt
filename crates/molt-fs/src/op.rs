@@ -61,10 +61,18 @@ impl Handle {
 }
 
 /// One filesystem operation.
+///
+/// There is no operation for the root directory: a capability comes only from
+/// opening it through one already held, and the first is handed off the ring at
+/// bootstrap (see [`Fs::root`](crate::Fs::root)). Nothing a client can submit
+/// mints authority the client did not already have.
+// Only `Open` carries a `Name`, so the variants differ in size — but a boxed
+// name would mean an allocator this layer refuses and a pointer crossing the
+// ring, which is exactly what the inline name exists to avoid. The `const _`
+// below pins the size the imbalance is allowed to reach.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FsOp {
-    /// Takes a handle to the root directory.
-    Root,
     /// Opens `name` inside `dir`, whichever kind it turns out to be.
     Open { dir: Capability<Dir>, name: Name },
     /// Reads `dir`'s entry at `index`, in name order.
@@ -90,6 +98,10 @@ pub struct Stat {
 }
 
 /// What an operation produced.
+// `Entry` carries a `Name` the other answers do not; the imbalance is the
+// inline name again, and boxing it would trade the ring's freedom from
+// pointers for an allocator this layer does not have.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FsDone {
     /// A handle to what was opened.
@@ -113,3 +125,10 @@ impl FsDone {
         }
     }
 }
+
+// A ring slot is copied by value on submission and again on completion, so its
+// size is a per-operation cost. `Name`, at [`MAX_NAME`](crate::MAX_NAME) + 1
+// bytes, dominates both messages; the bound leaves room for a header without
+// letting either grow to something a stack-built ring would feel.
+const _: () = assert!(core::mem::size_of::<FsOp>() <= 512);
+const _: () = assert!(core::mem::size_of::<FsDone>() <= 512);

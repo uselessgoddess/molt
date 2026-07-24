@@ -44,7 +44,15 @@ mod field {
 const REGION_BYTES: usize = 24;
 
 /// The longest name a directory entry may carry.
-pub const MAX_NAME: usize = 64;
+///
+/// 255 is the limit every mainstream filesystem settled on, and the largest a
+/// name's one-byte inline length can hold. Fixing it now, before a writable
+/// format and long-lived images exist, is free: names live out of line and
+/// carry a `u16` length on disk, so a wider bound reinterprets no stored byte
+/// and does not move [`VERSION`]. It does widen [`Name`](crate::Name) — and
+/// with it every ring slot — to 256 bytes; `op.rs` asserts the ceiling that
+/// keeps.
+pub const MAX_NAME: usize = 255;
 
 pub const OBJECT_BYTES: usize = 32;
 pub const EXTENT_BYTES: usize = 16;
