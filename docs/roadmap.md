@@ -198,7 +198,13 @@ Both are argued in `docs/fs.md`.
 
 ## Stage 3 — Services and networking
 
-- [ ] writable filesystem and crash-consistency tests
+- [x] a durable block write path — `molt-block::Write`, `Fault` power-loss
+      injection, and the virtio `VIRTIO_BLK_T_OUT`/`VIRTIO_BLK_T_FLUSH` requests
+      behind it — with crash-consistency tests that cut power at each checkpoint
+      of the filesystem's two-copy superblock discipline
+- [ ] a writable filesystem over it: object and data writes,
+      `FsOp::Write`/`Create`/`Sync`, and the free-space map a copy-on-write
+      checkpoint needs
 - [ ] VirtIO network, Ethernet, ARP, IPv4, UDP, then TCP
 - [ ] a typed scheme/resource namespace inspired by Redox
 - [ ] capability delegation and audit events

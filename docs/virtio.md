@@ -3,9 +3,9 @@
 Status: Stage 2.3 decision record, July 2026.
 
 Why a queue is built out of frames the kernel owns rather than memory the device
-names, where a physical address is allowed to exist, what the four request
-semantics actually promise, and why there is no write path. Written as the
-record for `molt-arch::dma` and the `molt-virtio` crate.
+names, where a physical address is allowed to exist, what the request semantics
+actually promise, and how the write path orders a sector against its flush.
+Written as the record for `molt-arch::dma` and the `molt-virtio` crate.
 
 ## The shape of the problem
 
@@ -140,25 +140,30 @@ modern one and has exactly one point of policy: `negotiate` always demands
 `VIRTIO_F_VERSION_1` and refuses a device that will not offer it. There is no
 legacy fallback. A device that clears `FEATURES_OK` after the driver writes it,
 or that offers no modern transport, is refused rather than driven through an
-interface with a different memory model. The block driver negotiates *no* block
-feature bits beyond that — a bare `VIRTIO_BLK_T_IN` read needs none — so the
-feature word it writes back is just the version bit.
+interface with a different memory model. On top of the version bit the block
+driver negotiates one block feature, `VIRTIO_BLK_F_FLUSH`, and only when the
+device offers it: a device with no volatile cache advertises none, and the
+driver's `flush` is a no-op against it rather than a request it has no way to
+answer.
 
 `clamp_queue` caps the device's advertised queue depth at what the driver can
 host without a heap and refuses a device that offers no queue at all. The device
 picking a smaller queue than it advertised, or a non-power-of-two size, is a
 `VirtioError::Device` rather than a ring laid out wrong.
 
-## What this stage does not do
+## The write path
 
-**There is no write path, and that is a decision, not a gap.** Stage 2.4's
-filesystem is read-only, so the driver never issues `VIRTIO_BLK_T_OUT`, never
-marks a data segment writable *by the device toward the disk*, and never issues
-the flush that would have to order such a write against a completion. Adding a
-half-tested write path now — with no consumer and no crash-consistency story —
-would be code the roadmap explicitly defers to Stage 3's writable filesystem.
-The one public operation is `read`. When there is something that writes, the
-flush ordering and the `VIRTIO_F_FLUSH` negotiation come with it.
+`write` mirrors `read`: the same three-descriptor chain with the data segment
+marked readable *by the device* instead of writable, carrying a
+`VIRTIO_BLK_T_OUT` header. A returned `write` does not mean the sector is on the
+platter — the device may hold it in a cache — so durability is `flush`'s job, a
+data-less `VIRTIO_BLK_T_FLUSH` request that returns only once every earlier
+write is durable, and a no-op on a device that offered no cache to flush. That is
+the ordering [`molt-block`](../crates/molt-block/src/write.rs)'s `Write` trait
+promises and the filesystem's two-copy checkpoint rests on: write the blocks,
+flush, then write the superblock that names them.
+
+## What this stage does not do
 
 **Bus mastering is granted for this device, once, and it is not free.** The same
 trade [`docs/pci.md`](pci.md) recorded for MSI applies with full force here: a
