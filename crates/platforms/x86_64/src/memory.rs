@@ -81,6 +81,10 @@ pub fn free_frames() -> Option<FrameCursor> {
 ///
 /// The direct map already covers every usable region, so the caller reaches the
 /// span at `offset + start` without mapping anything.
+///
+/// The move is the point and it is permanent: the frames are the caller's for
+/// good, no later claim can be handed the same ones, and a [`FrameCursor`] read
+/// before this call is stale.
 pub fn claim_ram(map: &dyn MemoryMap, count: u64) -> Result<Span, PlatformError> {
     let state = active()?;
     let mut frames = BootFrameAllocator::resume(map, state.cursor);

@@ -177,6 +177,10 @@ pub fn free_frames() -> Option<FrameCursor> {
 ///
 /// Usable RAM is identity mapped read-write at boot, so the caller reaches the
 /// span at its physical address without mapping anything.
+///
+/// The move is the point and it is permanent: the frames are the caller's for
+/// good, no later claim can be handed the same ones, and a [`FrameCursor`] read
+/// before this call is stale.
 pub fn claim_ram(boot_info: &BootInfo<'_>, count: u64) -> Result<Span, PlatformError> {
     let state = active()?;
     let mut frames = FrameAllocator::resume(boot_info.memory_map(), state.cursor);

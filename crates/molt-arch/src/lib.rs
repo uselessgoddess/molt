@@ -607,6 +607,11 @@ pub trait Platform: DeviceMapper + InterruptFabric {
     /// A driver resumes a [`FrameAllocator`] here to back DMA out of frames no
     /// live mapping claims. A platform that cannot say returns `None`, and the
     /// driver goes without.
+    ///
+    /// The cursor is a snapshot, not a reservation: a later
+    /// [`claim_ram`](Self::claim_ram) moves the platform past it, so one taken
+    /// before that call names frames somebody else now owns. Read it again
+    /// rather than keeping one.
     fn free_frames(&self) -> Option<FrameCursor> {
         None
     }
@@ -617,6 +622,11 @@ pub trait Platform: DeviceMapper + InterruptFabric {
     /// mappings end, so two callers resuming there are handed the same RAM.
     /// This moves the platform's cursor past what it returns, which is what the
     /// heap needs: it never gives its span back.
+    ///
+    /// So the span is the caller's for the life of the kernel. There is no
+    /// giving it back — no free list stands behind this, and the next consumer
+    /// of RAM starts where the cursor now is, which is only true because every
+    /// claim is recorded here rather than in the caller.
     fn claim_ram(
         &mut self,
         _boot_info: &BootInfo<'_>,

@@ -259,6 +259,30 @@ impl<'s> Arena<'s> {
     /// The caller must already have told the device to stop reaching them, as
     /// for [`reset`](Arena::reset). A region the arena did not hand out has no
     /// claim to return and is refused.
+    ///
+    /// The region is consumed, and that is the whole defence against freeing a
+    /// device frame twice: a copyable handle would let a second release hand
+    /// the same frames to the next region while the first one is still being
+    /// written by a device.
+    ///
+    /// ```compile_fail
+    /// use molt_arch::dma::{Arena, DmaError, Region};
+    ///
+    /// fn twice(arena: &mut Arena<'_>, region: Region) -> Result<(), DmaError> {
+    ///     arena.release(region)?;
+    ///     arena.release(region)
+    /// }
+    /// ```
+    ///
+    /// The same body, releasing once, compiles:
+    ///
+    /// ```
+    /// use molt_arch::dma::{Arena, DmaError, Region};
+    ///
+    /// fn once(arena: &mut Arena<'_>, region: Region) -> Result<(), DmaError> {
+    ///     arena.release(region)
+    /// }
+    /// ```
     pub fn release(&mut self, region: Region) -> Result<(), DmaError> {
         self.table.release(region.frames.ok_or(DmaError::Foreign)?)?;
         Ok(())
@@ -400,6 +424,27 @@ mod tests {
 
         assert_eq!(third.physical(), 0x10_0000);
         assert_eq!(second.physical(), 0x10_0000 + FRAME_SIZE, "live region moved");
+    }
+
+    #[test]
+    fn look_alike_of_released_region_refused() {
+        let regions = [usable(0x10_0000, 0x10_0000 + FRAME_SIZE)];
+        let map = Map(&regions);
+        let mut allocator = FrameAllocator::new(&map);
+        let mut slots = [None; 1];
+        let mut arena = Arena::claim(&mut allocator, 0, 6, &mut slots).unwrap();
+        let mut buffer = [0u8; 16];
+
+        let first = arena.region(FRAME_SIZE).unwrap();
+        let physical = first.physical();
+        arena.release(first).unwrap();
+        // The nearest thing to releasing the same region twice: only the claim
+        // a region carries frees frames, so a stand-in over the same address
+        // cannot free them a second time.
+        let twin = region(&mut buffer, physical);
+
+        assert_eq!(arena.release(twin).err(), Some(DmaError::Foreign));
+        assert!(arena.region(FRAME_SIZE).is_ok(), "the frames were freed twice over");
     }
 
     #[test]
