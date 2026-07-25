@@ -43,7 +43,7 @@ mod volume;
 pub mod format;
 
 pub use crate::btree::{CacheStats, TreeStats};
-pub use crate::cell::FsCell;
+pub use crate::cell::{FsCell, FsState};
 pub use crate::journal::Journal;
 pub use crate::layout::{BLOCK, Kind, MAGIC, MAX_NAME, Object, SUPERS, VERSION};
 pub use crate::name::Name;
@@ -84,6 +84,9 @@ pub enum FsError {
     Handles,
     /// The tree arena, mutation log, or object-id space is full.
     Full,
+    /// The service ran its restart hooks and could not remount, so there is no
+    /// filesystem behind it any more.
+    Failed,
 }
 
 impl From<BlockError> for FsError {

@@ -363,6 +363,15 @@ was not is exactly what a power cut would have taken. `generation()` counts
 restarts, `checkpoint()` reports the volume's, and the two are deliberately
 different numbers.
 
+**When the remount fails.** By then the hooks have run: handles are revoked, the
+tree is dropped, and the log is unreplayed, so there is no filesystem left to
+answer with. The cell says so rather than pretending — `state()` turns
+`FsState::Failed` and every later `fs()` and `restart()` returns
+`FsError::Failed`. Restarting again is refused on purpose: the hooks would revoke
+a second time, and whatever made the disk unreadable is still there. Recovery
+belongs to the supervisor, which drops the cell and starts one on a device that
+mounts.
+
 **Why it is not `impl Cell`.** `molt_core::cell::Cell` requires `Send + 'static`,
 a `State: Default`, and an infallible `spawn`. A mount is none of those: it owns
 a device that may carry a lifetime, and mounting is the operation that fails.
@@ -615,8 +624,10 @@ preserves the next result until the client makes room.
 
 Cell tests cover the lifecycle: a restart keeps what was synced, drops what was
 not, leaves every handle stale, runs its hooks in the documented order, and
-counts itself. Two tests hold the stack budget at 16 KiB for mount and for a
-create/sync cycle.
+counts itself. A disk that stops answering reads mid-restart proves the failed
+state: the cell reports the device error, refuses every later call, and does not
+run its hooks again even once the disk is back. Two tests hold the stack budget
+at 16 KiB for mount and for a create/sync cycle.
 
 The shell tests run scripts against a mounted image and compare what was
 printed, which is the only test that can catch a protocol that is technically

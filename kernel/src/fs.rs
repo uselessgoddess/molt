@@ -44,7 +44,13 @@ pub fn smoke<P: Platform>(platform: &mut P, device: impl Disk) {
 
 /// Runs the write cycle and the shell script against a started service.
 fn session<P: Platform, D: Disk>(platform: &mut P, service: &mut FsCell<D, HANDLES>) -> bool {
-    let fs = service.fs();
+    let fs = match service.fs() {
+        Ok(fs) => fs,
+        Err(error) => {
+            report!(platform, "MOLT_FS_FAILED: {error:?}");
+            return false;
+        }
+    };
     let root = match fs.root(OWNER) {
         Ok(root) => root,
         Err(error) => {
@@ -126,8 +132,8 @@ fn restart<P: Platform, D: Disk>(platform: &mut P, service: &mut FsCell<D, HANDL
     let found = (|| {
         service.restart(&mut Quiesced)?;
         let name = Name::try_from("runtime.txt")?;
-        let root = service.fs().root(OWNER)?;
-        let opened = service.fs().apply(OWNER, FsOp::Open { dir: root, name }, &mut registry)?;
+        let root = service.fs()?.root(OWNER)?;
+        let opened = service.fs()?.apply(OWNER, FsOp::Open { dir: root, name }, &mut registry)?;
         match opened.handle() {
             Some(Handle::File(_)) => Ok(()),
             _ => Err(FsError::Kind),
