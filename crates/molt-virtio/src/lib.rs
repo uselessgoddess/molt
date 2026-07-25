@@ -9,7 +9,7 @@
 //! reclaim every frame only after the device has been told to stop.
 //!
 //! Above the driver there are only [`molt_block::Device`] and
-//! [`molt_block::Writable`], which [`Block`] implements: sectors in, sectors
+//! [`molt_block::Disk`], which [`Block`] implements: sectors in, sectors
 //! out, with the virtqueue invisible.
 
 #![no_std]
