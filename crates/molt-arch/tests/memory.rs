@@ -1,6 +1,6 @@
 use molt_arch::{
     FrameAllocator, FramePool, ImageSection, MapPermissions, MappingError, MemoryMap, MemoryRegion,
-    MemoryRegionKind, PageProtection, UsableRange, UsableRegions,
+    MemoryRegionKind, PageProtection, RunError, UsableRange, UsableRegions,
 };
 
 struct TestMap([MemoryRegion; 3]);
@@ -165,4 +165,42 @@ fn pool_over_map_reports_what_it_got() {
     assert_eq!(pool.fill(&mut FrameAllocator::new(&map)), 1);
     assert!(pool.allocate().is_some());
     assert_eq!(pool.allocate(), None);
+}
+
+#[test]
+fn run_spans_frames_in_order() {
+    let map = TestMap([
+        MemoryRegion::new(0, 0x1000, MemoryRegionKind::Reserved),
+        MemoryRegion::new(0x4000, 0x8000, MemoryRegionKind::Usable),
+        MemoryRegion::new(0x9000, 0xa000, MemoryRegionKind::Usable),
+    ]);
+    let mut allocator = FrameAllocator::new(&map);
+
+    let span = allocator.run(3).unwrap();
+
+    assert_eq!((span.start(), span.count()), (0x4000, 3));
+    assert_eq!(allocator.allocate().map(|frame| frame.start()), Some(0x7000), "a frame was lost");
+}
+
+#[test]
+fn run_across_gap_refused() {
+    let map = TestMap([
+        MemoryRegion::new(0, 0x1000, MemoryRegionKind::Reserved),
+        MemoryRegion::new(0x4000, 0x5000, MemoryRegionKind::Usable),
+        MemoryRegion::new(0x9000, 0xb000, MemoryRegionKind::Usable),
+    ]);
+
+    assert_eq!(FrameAllocator::new(&map).run(2), Err(RunError::NotContiguous));
+}
+
+#[test]
+fn run_past_map_refused() {
+    let map = TestMap([
+        MemoryRegion::new(0, 0x1000, MemoryRegionKind::Reserved),
+        MemoryRegion::new(0x4000, 0x6000, MemoryRegionKind::Usable),
+        MemoryRegion::new(0x9000, 0xa000, MemoryRegionKind::Reserved),
+    ]);
+
+    assert_eq!(FrameAllocator::new(&map).run(3), Err(RunError::OutOfFrames));
+    assert_eq!(FrameAllocator::new(&map).run(0), Err(RunError::Empty));
 }

@@ -16,6 +16,7 @@ const DISK_TREE: &str = "disk";
 
 const BOOT_MARKERS: &[&str] = &[
     "MOLT_EXCEPTION_OK",
+    "MOLT_HEAP_OK",
     "MOLT_MAPPING_OK",
     "MOLT_WX_OK",
     "MOLT_DEVICE_WINDOW_OK",

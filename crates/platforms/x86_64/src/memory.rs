@@ -10,7 +10,7 @@ use molt_arch::audit::{Audit, Contents, Declared, Leaf, MappedRange, PageWalk};
 use molt_arch::memory::{Cache, Device, Inventory, Rights, Span};
 use molt_arch::{
     BootInfo, FrameAllocator as BootFrameAllocator, FrameCursor, MapPermissions, MappingError,
-    Mmio, PageProtection, PlatformError, UsableRegions,
+    MemoryMap, Mmio, PageProtection, PlatformError, UsableRegions,
 };
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::mapper::{MapToError, TranslateResult};
@@ -75,6 +75,18 @@ fn active() -> Result<&'static mut Space, PlatformError> {
 /// [`BootFrameAllocator`] here to back DMA out of frames no live mapping owns.
 pub fn free_frames() -> Option<FrameCursor> {
     active().ok().map(|state| state.cursor)
+}
+
+/// Hands out `count` frames of that RAM and moves the cursor past them.
+///
+/// The direct map already covers every usable region, so the caller reaches the
+/// span at `offset + start` without mapping anything.
+pub fn claim_ram(map: &dyn MemoryMap, count: u64) -> Result<Span, PlatformError> {
+    let state = active()?;
+    let mut frames = BootFrameAllocator::resume(map, state.cursor);
+    let span = frames.run(count)?;
+    state.cursor = frames.cursor();
+    Ok(span)
 }
 
 /// Builds the kernel address space and returns its local APIC window.

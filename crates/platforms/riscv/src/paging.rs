@@ -168,6 +168,23 @@ fn map_section(
         .map_err(PlatformError::Mapping)
 }
 
+/// A cursor past the RAM the boot address space is already built out of.
+pub fn free_frames() -> Option<FrameCursor> {
+    active().ok().map(|state| state.cursor)
+}
+
+/// Hands out `count` frames of that RAM and moves the cursor past them.
+///
+/// Usable RAM is identity mapped read-write at boot, so the caller reaches the
+/// span at its physical address without mapping anything.
+pub fn claim_ram(boot_info: &BootInfo<'_>, count: u64) -> Result<Span, PlatformError> {
+    let state = active()?;
+    let mut frames = FrameAllocator::resume(boot_info.memory_map(), state.cursor);
+    let span = frames.run(count)?;
+    state.cursor = frames.cursor();
+    Ok(span)
+}
+
 pub fn verify_owned_mapping(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
     let state = active()?;
     let mut frames = FrameAllocator::resume(boot_info.memory_map(), state.cursor);

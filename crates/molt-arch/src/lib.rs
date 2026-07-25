@@ -231,6 +231,17 @@ pub struct FrameAllocator<'m> {
     next: u64,
 }
 
+/// Why a run of frames was refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunError {
+    /// A request for no frames names no span.
+    Empty,
+    /// The map ran out before the run was filled.
+    OutOfFrames,
+    /// The next frame sits past a gap in the map, so the run is not one span.
+    NotContiguous,
+}
+
 /// A resumable [`FrameAllocator`] position.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameCursor {
@@ -256,6 +267,27 @@ impl<'m> FrameAllocator<'m> {
 
     pub const fn cursor(&self) -> FrameCursor {
         FrameCursor { floor: self.floor, region: self.region, next: self.next }
+    }
+
+    /// Hands out `count` frames as one span.
+    ///
+    /// The allocator walks a rising sequence inside a usable region, so a run
+    /// is contiguous until it reaches a gap in the map, which is refused rather
+    /// than papered over.
+    pub fn run(&mut self, count: u64) -> Result<memory::Span, RunError> {
+        if count == 0 {
+            return Err(RunError::Empty);
+        }
+        let first = self.allocate().ok_or(RunError::OutOfFrames)?.start();
+        let mut previous = first;
+        for _ in 1..count {
+            let frame = self.allocate().ok_or(RunError::OutOfFrames)?.start();
+            if frame != previous + FRAME_SIZE {
+                return Err(RunError::NotContiguous);
+            }
+            previous = frame;
+        }
+        memory::Span::frames(first, count).map_err(|_| RunError::OutOfFrames)
     }
 
     pub fn allocate(&mut self) -> Option<PhysicalFrame> {
@@ -495,6 +527,14 @@ pub enum PlatformError {
     Mapping(MappingError),
     Fabric(FabricError),
     MissingConfigSpace,
+    /// Free RAM could not cover a request for frames.
+    Frames(RunError),
+}
+
+impl From<RunError> for PlatformError {
+    fn from(error: RunError) -> Self {
+        Self::Frames(error)
+    }
 }
 
 impl From<MappingError> for PlatformError {
@@ -569,6 +609,20 @@ pub trait Platform: DeviceMapper + InterruptFabric {
     /// driver goes without.
     fn free_frames(&self) -> Option<FrameCursor> {
         None
+    }
+
+    /// Hands out `count` frames of that same free RAM, for keeps.
+    ///
+    /// [`free_frames`](Self::free_frames) only says where the kernel's own
+    /// mappings end, so two callers resuming there are handed the same RAM.
+    /// This moves the platform's cursor past what it returns, which is what the
+    /// heap needs: it never gives its span back.
+    fn claim_ram(
+        &mut self,
+        _boot_info: &BootInfo<'_>,
+        _count: u64,
+    ) -> Result<memory::Span, PlatformError> {
+        Err(PlatformError::Unsupported)
     }
 
     fn terminate(&mut self, status: ExitStatus) -> !;

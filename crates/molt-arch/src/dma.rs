@@ -8,7 +8,7 @@
 //! reclaims as a whole once the device has been told to stop.
 
 use crate::memory::{Error as MemoryError, FrameTable, Frames, Owner, Span};
-use crate::{FRAME_SIZE, FrameAllocator};
+use crate::{FRAME_SIZE, FrameAllocator, RunError};
 
 /// Why a DMA request was refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +32,16 @@ pub enum DmaError {
 impl From<MemoryError> for DmaError {
     fn from(error: MemoryError) -> Self {
         Self::Frames(error)
+    }
+}
+
+impl From<RunError> for DmaError {
+    fn from(error: RunError) -> Self {
+        match error {
+            RunError::Empty => Self::Empty,
+            RunError::OutOfFrames => Self::OutOfFrames,
+            RunError::NotContiguous => Self::NotContiguous,
+        }
     }
 }
 
@@ -209,24 +219,10 @@ impl<'s> Arena<'s> {
         tag: u32,
         slots: &'s mut [Option<Owner>],
     ) -> Result<Self, DmaError> {
-        let count = slots.len() as u64;
-        if count == 0 {
-            return Err(DmaError::Empty);
-        }
-        let first = allocator.allocate().ok_or(DmaError::OutOfFrames)?.start();
-        let mut previous = first;
-        for _ in 1..count {
-            let frame = allocator.allocate().ok_or(DmaError::OutOfFrames)?.start();
-            if frame != previous + FRAME_SIZE {
-                return Err(DmaError::NotContiguous);
-            }
-            previous = frame;
-        }
-
-        let span = Span::frames(first, count)?;
+        let span = allocator.run(slots.len() as u64)?;
         let mut table = FrameTable::over(span, slots)?;
         let frames = table.claim(span, Owner::Device(tag))?;
-        Ok(Self { table, frames, offset, next: first })
+        Ok(Self { table, frames, offset, next: span.start() })
     }
 
     /// The device span this arena owns.

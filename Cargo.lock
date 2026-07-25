@@ -523,6 +523,7 @@ dependencies = [
 name = "molt-kernel"
 version = "0.1.0"
 dependencies = [
+ "molt-alloc",
  "molt-arch",
  "molt-block",
  "molt-core",
