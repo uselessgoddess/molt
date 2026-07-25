@@ -11,7 +11,6 @@
 //! in a scratch node. What is left on the stack of a mutation is one path of
 //! block numbers.
 
-use alloc::alloc::{Layout, alloc_zeroed, handle_alloc_error};
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
@@ -22,7 +21,8 @@ use molt_block::{Device, Disk};
 use crate::bitmap::Bitmap;
 use crate::crc::Crc;
 use crate::layout::{BLOCK, Kind, MAX_NAME, Object, Super, buffer};
-use crate::{FsError, Name, Volume};
+use crate::mem::{Unique, Zeroed};
+use crate::{FsError, Name, Volume, mem};
 
 const MAGIC: [u8; 8] = *b"MOLTBTR3";
 const HEADER: usize = 64;
@@ -248,46 +248,40 @@ struct Node {
     children: [u64; CAPACITY + 1],
 }
 
+// SAFETY: every field is an integer or an array of them, so all-zero bytes are
+// an empty leaf of generation zero.
+unsafe impl Zeroed for Node {}
+
 impl Node {
     /// An empty node, allocated zeroed.
     ///
-    /// Every field is an integer or an array of them, so all-zero is already a
-    /// valid empty leaf. Zeroing the allocation directly is what keeps the node
-    /// off the stack that `Box::new` would build it on first.
-    fn empty() -> Box<Self> {
-        let layout = Layout::new::<Self>();
-        // SAFETY: `Node` is a non-zero-sized aggregate of integers, so the
-        // layout is non-zero and its zeroed bytes are an initialized `Node`;
-        // the pointer comes from the global allocator and is boxed once.
-        unsafe {
-            let node = alloc_zeroed(layout).cast::<Self>();
-            if node.is_null() {
-                handle_alloc_error(layout);
-            }
-            Box::from_raw(node)
-        }
+    /// Zeroing the allocation directly is what keeps the node off the stack
+    /// that `Rc::new` would build it on first, and a heap with no four
+    /// kilobytes left says so rather than aborting the kernel.
+    fn empty() -> Result<Unique<Self>, FsError> {
+        Unique::zeroed()
     }
 
-    fn leaf(generation: u64) -> Box<Self> {
-        let mut node = Self::empty();
+    fn leaf(generation: u64) -> Result<Unique<Self>, FsError> {
+        let mut node = Self::empty()?;
         node.generation = generation;
-        node
+        Ok(node)
     }
 
-    fn inner(level: u8, generation: u64) -> Box<Self> {
-        let mut node = Self::leaf(generation);
+    fn inner(level: u8, generation: u64) -> Result<Unique<Self>, FsError> {
+        let mut node = Self::leaf(generation)?;
         node.level = level;
-        node
+        Ok(node)
     }
 
     /// A heap copy of a cached node, ready to be rewritten in place.
-    fn copy(&self) -> Box<Self> {
-        let mut node = Self::inner(self.level, self.generation);
+    fn copy(&self) -> Result<Unique<Self>, FsError> {
+        let mut node = Self::inner(self.level, self.generation)?;
         node.len = self.len;
         node.keys.copy_from_slice(&self.keys);
         node.values.copy_from_slice(&self.values);
         node.children.copy_from_slice(&self.children);
-        node
+        Ok(node)
     }
 
     fn lower(&self, key: &Key) -> usize {
@@ -313,7 +307,7 @@ impl Node {
         low
     }
 
-    fn parse(block: &[u8; BLOCK]) -> Result<Box<Self>, FsError> {
+    fn parse(block: &[u8; BLOCK]) -> Result<Unique<Self>, FsError> {
         if block[..MAGIC.len()] != MAGIC || u32_at(block, 8) != 3 {
             return Err(FsError::Corrupt);
         }
@@ -325,7 +319,7 @@ impl Node {
         if level as usize >= MAX_HEIGHT || len == 0 || len > CAPACITY {
             return Err(FsError::Corrupt);
         }
-        let mut node = Self::inner(level, u64_at(block, 16));
+        let mut node = Self::inner(level, u64_at(block, 16))?;
         node.len = len as u8;
         for at in 0..len {
             let start = HEADER + at * KEY_BYTES;
@@ -398,12 +392,12 @@ struct Cache {
 }
 
 impl Cache {
-    fn new() -> Self {
-        Self {
-            entries: Vec::with_capacity(CACHE_SLOTS),
-            hand: 0,
-            stats: CacheStats { hits: 0, misses: 0, evictions: 0 },
-        }
+    fn new() -> Result<Self, FsError> {
+        // Room for every slot up front: the cache never grows past this, so a
+        // heap short of it is better refused at mount than mid-transaction.
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(CACHE_SLOTS)?;
+        Ok(Self { entries, hand: 0, stats: CacheStats { hits: 0, misses: 0, evictions: 0 } })
     }
 
     fn get(&mut self, block: u64) -> Option<Rc<Node>> {
@@ -456,7 +450,6 @@ enum Branch {
 }
 
 /// The mutable state of one unpublished tree generation.
-#[derive(Clone)]
 pub(crate) struct TreeTransaction {
     pub root: u64,
     generation: u64,
@@ -474,9 +467,16 @@ pub(crate) struct MetadataTree {
     scratch: Box<[u8; BLOCK]>,
 }
 
+impl TreeTransaction {
+    /// A copy of the transaction, if the heap has room for its two maps.
+    pub fn try_clone(&self) -> Result<Self, FsError> {
+        Ok(Self { protected: self.protected.try_clone()?, used: self.used.try_clone()?, ..*self })
+    }
+}
+
 impl MetadataTree {
-    pub fn new() -> Self {
-        Self { cache: Cache::new(), scratch: buffer() }
+    pub fn new() -> Result<Self, FsError> {
+        Ok(Self { cache: Cache::new()?, scratch: buffer()? })
     }
 
     pub fn begin<D: Disk>(&mut self, volume: &mut Volume<D>) -> Result<TreeTransaction, FsError> {
@@ -485,14 +485,14 @@ impl MetadataTree {
             root: checkpoint.tree_root,
             generation: checkpoint.generation.checked_add(1).ok_or(FsError::Full)?,
             tree_at: checkpoint.tree_at,
-            protected: Bitmap::new(checkpoint.tree_blocks),
-            used: Bitmap::new(checkpoint.tree_blocks),
+            protected: Bitmap::new(checkpoint.tree_blocks)?,
+            used: Bitmap::new(checkpoint.tree_blocks)?,
         };
         self.mark(volume, checkpoint.tree_root, &mut transaction.protected)?;
         if let Some(root) = volume.previous_tree() {
             self.mark(volume, root, &mut transaction.protected)?;
         }
-        transaction.used = transaction.protected.clone();
+        transaction.used = transaction.protected.try_clone()?;
         Ok(transaction)
     }
 
@@ -571,7 +571,7 @@ impl MetadataTree {
         value: Value,
     ) -> Result<(), FsError> {
         if transaction.root == 0 {
-            let mut leaf = Node::leaf(transaction.generation);
+            let mut leaf = Node::leaf(transaction.generation)?;
             leaf.keys[0] = *key;
             leaf.values[0] = value;
             leaf.len = 1;
@@ -610,7 +610,7 @@ impl MetadataTree {
             Branch::One(at) => at,
             Branch::Split { left, separator, right } => {
                 let level = self.read(volume, left)?.level + 1;
-                let mut root = Node::inner(level, transaction.generation);
+                let mut root = Node::inner(level, transaction.generation)?;
                 root.len = 1;
                 root.keys[0] = *separator;
                 root.children[0] = left;
@@ -632,7 +632,7 @@ impl MetadataTree {
         let blocks = volume.checkpoint().tree_blocks as usize;
         let height = self.read(volume, root)?.level + 1;
         let mut pending = Vec::new();
-        pending.push(root);
+        mem::push(&mut pending, root)?;
         let mut nodes = 0u32;
         while let Some(at) = pending.pop() {
             let node = self.read(volume, at)?;
@@ -643,7 +643,7 @@ impl MetadataTree {
                 if pending.len() + node.len as usize + 1 > blocks {
                     return Err(FsError::Corrupt);
                 }
-                pending.extend_from_slice(&node.children[..=node.len as usize]);
+                mem::extend(&mut pending, &node.children[..=node.len as usize])?;
             }
         }
         Ok(TreeStats { root, height, nodes, cache: self.cache.stats })
@@ -659,7 +659,7 @@ impl MetadataTree {
     ) -> Result<Branch, FsError> {
         let index = leaf.lower(key);
         if index < leaf.len as usize && leaf.keys[index] == *key {
-            let mut node = leaf.copy();
+            let mut node = leaf.copy()?;
             node.generation = transaction.generation;
             node.values[index] = value;
             return Ok(Branch::One(self.write_new(volume, transaction, node)?));
@@ -684,17 +684,17 @@ impl MetadataTree {
         };
 
         if total <= CAPACITY {
-            let mut node = Node::leaf(transaction.generation);
+            let mut node = Node::leaf(transaction.generation)?;
             fill(&mut node, 0, total);
             return Ok(Branch::One(self.write_new(volume, transaction, node)?));
         }
 
         let middle = total / 2;
-        let mut left = Node::leaf(transaction.generation);
+        let mut left = Node::leaf(transaction.generation)?;
         fill(&mut left, 0, middle);
-        let mut right = Node::leaf(transaction.generation);
+        let mut right = Node::leaf(transaction.generation)?;
         fill(&mut right, middle, total);
-        let separator = Box::new(right.keys[0]);
+        let separator = Box::try_new(right.keys[0])?;
         let left_at = self.write_new(volume, transaction, left)?;
         let right_at = self.write_new(volume, transaction, right)?;
         Ok(Branch::Split { left: left_at, separator, right: right_at })
@@ -710,7 +710,7 @@ impl MetadataTree {
     ) -> Result<Branch, FsError> {
         let (left, separator, right) = match branch {
             Branch::One(at) => {
-                let mut node = parent.copy();
+                let mut node = parent.copy()?;
                 node.generation = transaction.generation;
                 node.children[child] = at;
                 return Ok(Branch::One(self.write_new(volume, transaction, node)?));
@@ -743,18 +743,18 @@ impl MetadataTree {
         };
 
         if total <= CAPACITY {
-            let mut node = Node::inner(parent.level, transaction.generation);
+            let mut node = Node::inner(parent.level, transaction.generation)?;
             fill(&mut node, 0, total);
             return Ok(Branch::One(self.write_new(volume, transaction, node)?));
         }
 
         // The middle key rises to the parent instead of staying in either half.
         let middle = total / 2;
-        let mut left_node = Node::inner(parent.level, transaction.generation);
+        let mut left_node = Node::inner(parent.level, transaction.generation)?;
         fill(&mut left_node, 0, middle);
-        let mut right_node = Node::inner(parent.level, transaction.generation);
+        let mut right_node = Node::inner(parent.level, transaction.generation)?;
         fill(&mut right_node, middle + 1, total);
-        let rising = Box::new(*key_at(middle));
+        let rising = Box::try_new(*key_at(middle))?;
         let left_at = self.write_new(volume, transaction, left_node)?;
         let right_at = self.write_new(volume, transaction, right_node)?;
         Ok(Branch::Split { left: left_at, separator: rising, right: right_at })
@@ -765,7 +765,7 @@ impl MetadataTree {
         if let Some(node) = self.cache.get(at) {
             return Ok(node);
         }
-        let node = Rc::from(Node::parse(volume.block(at)?)?);
+        let node = Node::parse(volume.block(at)?)?.shared();
         self.cache.put(at, Rc::clone(&node));
         Ok(node)
     }
@@ -774,7 +774,7 @@ impl MetadataTree {
         &mut self,
         volume: &mut Volume<D>,
         transaction: &mut TreeTransaction,
-        node: Box<Node>,
+        node: Unique<Node>,
     ) -> Result<u64, FsError> {
         let checkpoint = volume.checkpoint();
         let offset = transaction.used.first_clear().ok_or(FsError::Full)?;
@@ -782,7 +782,7 @@ impl MetadataTree {
         let at = checkpoint.tree_at + u64::from(offset);
         node.encode(&mut self.scratch);
         volume.write_tree_block(at, &self.scratch)?;
-        self.cache.put(at, Rc::from(node));
+        self.cache.put(at, node.shared());
         Ok(at)
     }
 
@@ -811,7 +811,7 @@ impl MetadataTree {
         }
         let checkpoint = volume.checkpoint();
         let mut pending = Vec::new();
-        pending.push(root);
+        mem::push(&mut pending, root)?;
         while let Some(at) = pending.pop() {
             let offset = tree_offset(&checkpoint, at)?;
             if bits.get(offset) {
@@ -823,7 +823,7 @@ impl MetadataTree {
                 if pending.len() + node.len as usize + 1 > checkpoint.tree_blocks as usize {
                     return Err(FsError::Corrupt);
                 }
-                pending.extend_from_slice(&node.children[..=node.len as usize]);
+                mem::extend(&mut pending, &node.children[..=node.len as usize])?;
             }
         }
         Ok(())
@@ -867,10 +867,10 @@ pub(crate) fn verify<D: Device>(
     if checkpoint.tree_root == 0 {
         return Ok(());
     }
-    let mut used = Bitmap::new(checkpoint.tree_blocks);
+    let mut used = Bitmap::new(checkpoint.tree_blocks)?;
     let mut pending = Vec::new();
     // No level is expected of the root; every child is expected one below it.
-    pending.push((checkpoint.tree_root, None));
+    mem::push(&mut pending, (checkpoint.tree_root, None))?;
     while let Some((at, expected)) = pending.pop() {
         let offset = tree_offset(checkpoint, at)?;
         if used.get(offset) {
@@ -892,7 +892,7 @@ pub(crate) fn verify<D: Device>(
                 return Err(FsError::Corrupt);
             }
             for &child in &node.children[..=node.len as usize] {
-                pending.push((child, Some(node.level - 1)));
+                mem::push(&mut pending, (child, Some(node.level - 1)))?;
             }
         }
     }

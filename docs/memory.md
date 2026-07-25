@@ -195,10 +195,16 @@ donation instead of failing the boot — what was donated is still a heap. The
 frames are `Owner::Kernel` and never come back; the free list inside recycles
 them for the life of the kernel. `MOLT_HEAP_OK` reports the bytes it took.
 
-Two limits are worth stating rather than discovering. Allocation failure is a
-panic through `handle_alloc_error`, because stable Rust has no fallible `Box`;
-what keeps it theoretical is that every consumer is bounded (the metadata cache
-is sixteen nodes, a path is eight block numbers). And the heap is global and not
+A heap that runs out says so. `Heap::allocate` returns `None` and `Global`
+hands back a null pointer, which is what `Box::try_new` and friends turn into an
+`AllocError`; the filesystem asks that way and answers `FsError::Memory`, so an
+exhausted heap costs a request rather than the machine. `Box::new` and `vec!`
+still end in `handle_alloc_error` and still panic — the fallible form is a
+choice each caller makes, and `molt-fs` is the caller that made it. What keeps
+even that rare is that every consumer is bounded: the metadata cache is sixteen
+nodes, a path is eight block numbers.
+
+One limit is worth stating rather than discovering. The heap is global and not
 `Sync`-clever — `Global` is a spinlock over one `Heap` — so Stage 4's SMP work
 either shards it or replaces it, and that is a change with one consumer.
 

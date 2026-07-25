@@ -14,11 +14,17 @@ use crate::{FsError, Name, Volume};
 
 /// The unpublished half of a checkpoint: where the new log bank is, how far it
 /// has been filled, and the tree generation indexing it.
-#[derive(Clone)]
 struct Transaction {
     at: u64,
     bytes: u64,
     tree: TreeTransaction,
+}
+
+impl Transaction {
+    /// A copy to roll back to, if the heap has room for the tree's arena maps.
+    fn try_clone(&self) -> Result<Self, FsError> {
+        Ok(Self { tree: self.tree.try_clone()?, ..*self })
+    }
 }
 
 /// A mounted writable filesystem.
@@ -36,7 +42,7 @@ impl<D: Disk> Journal<D> {
         let mut journal = Self {
             volume: Volume::mount(device)?,
             transaction: None,
-            tree: MetadataTree::new(),
+            tree: MetadataTree::new()?,
             base_objects: 0,
             next_object: 0,
         };
@@ -51,7 +57,7 @@ impl<D: Disk> Journal<D> {
     pub fn remount(&mut self) -> Result<(), FsError> {
         self.volume.remount()?;
         self.transaction = None;
-        self.tree = MetadataTree::new();
+        self.tree = MetadataTree::new()?;
         self.replay()
     }
 
@@ -493,7 +499,7 @@ impl<D: Disk> Journal<D> {
     /// until the next generation reuses them.
     fn snapshot(&mut self) -> Result<Transaction, FsError> {
         self.begin()?;
-        self.transaction.clone().ok_or(FsError::Corrupt)
+        self.transaction.as_ref().ok_or(FsError::Corrupt)?.try_clone()
     }
 
     /// The open transaction, or [`FsError::Corrupt`] if there is none.

@@ -6,10 +6,9 @@
 //! rather than the 24 its fields need.
 
 use alloc::boxed::Box;
-use alloc::vec;
 
-use crate::FsError;
 use crate::crc::crc32c;
+use crate::{FsError, mem};
 
 /// The unit everything on a volume is addressed in.
 pub const BLOCK: usize = 4096;
@@ -18,8 +17,8 @@ pub const BLOCK: usize = 4096;
 ///
 /// Whoever needs one needs it for as long as they live, and none of them is
 /// small enough to be a local.
-pub(crate) fn buffer() -> Box<[u8; BLOCK]> {
-    vec![0; BLOCK].into_boxed_slice().try_into().expect("BLOCK bytes")
+pub(crate) fn buffer() -> Result<Box<[u8; BLOCK]>, FsError> {
+    mem::zeroed()
 }
 
 /// The signature a volume opens with.

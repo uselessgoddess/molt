@@ -240,7 +240,7 @@ pass with room: in a debug build `Journal::mount` spends 10 264 bytes, a create
 back on the stack, which is the only way this property stays true.
 `experiments/stack_probe.rs` prints the same measurement phase by phase.
 
-What moved: nodes are `Box<Node>` and cached as `Rc<Node>`; the mutation path is
+What moved: nodes are built on the heap and cached as `Rc<Node>`; the mutation path is
 a `Vec` of block numbers rather than of nodes, so descending costs 8 bytes a
 level; the split scratch is one boxed block owned by the tree; the free-space
 bitmap is a `Vec<u64>` sized from the arena; and `Volume` owns its 4 KiB block
@@ -249,13 +249,29 @@ from `Volume`, `Journal`, and `Fs`. The kernel donates 4 MiB of claimed frames t
 `molt-alloc` at boot, which is where all of that now lives.
 
 The trade is honest rather than free: a bounded array cannot fail, and a heap
-can. `FsError::Full` still reports the arena and log bounds, but an exhausted
-heap goes through `handle_alloc_error` and panics, because Rust's stable
-allocation APIs have no fallible form and `try_reserve` covers only the
-collections. Bounding the filesystem's demand is what keeps that theoretical:
-the cache is sixteen nodes, a path is `MAX_HEIGHT` block numbers, and a mutation
-allocates a replacement path, not a tree. Fallible allocation is a Stage 4 item
-and it belongs to `molt-alloc`, not here.
+can. `FsError::Full` still reports the arena and log bounds, and an exhausted
+heap is `FsError::Memory` next to it — a filesystem that already answers errors
+has no business taking the machine down over one node it could not get.
+`crates/molt-fs/src/mem.rs` is where that mapping lives: `Box::try_new_zeroed`,
+`Rc::try_new_zeroed`, and `try_reserve` behind names the call sites use, so no
+allocation in the crate reaches `handle_alloc_error`. `mkfs` is the exception
+and stays infallible — it runs on a host, behind a feature the kernel does not
+enable.
+
+`Rc::try_new_zeroed` rather than a `Box` converted afterwards, because a node is
+built field by field and shared only once it reaches the cache: converting would
+allocate the four kilobytes twice, and `Rc::try_new(node)` would build it on the
+stack the budget above measures. `mem::Unique` is the window while the handle is
+still the only one — it derefs mutably through `Rc::get_mut` and gives itself up
+with `shared()`.
+
+Bounding the filesystem's demand is still what keeps refusal rare: the cache is
+sixteen nodes reserved at mount, a path is `MAX_HEIGHT` block numbers, and a
+mutation allocates a replacement path, not a tree. `crates/molt-fs/tests/memory.rs`
+is the proof it is handled rather than merely typed — it replaces the global
+allocator with one that refuses large allocations on the calling thread, and
+shows a mount answering `FsError::Memory` and a refused create rolling back to
+its snapshot while the journal keeps taking work.
 
 ## Crash consistency
 

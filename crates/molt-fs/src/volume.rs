@@ -36,7 +36,7 @@ pub struct Volume<D> {
 impl<D: Device> Volume<D> {
     /// Mounts `device` at the newest checkpoint that verifies.
     pub fn mount(mut device: D) -> Result<Self, FsError> {
-        let mut block = buffer();
+        let mut block = buffer()?;
         let checkpoint = survey(&mut device, &mut block)?;
         Ok(Self {
             device,

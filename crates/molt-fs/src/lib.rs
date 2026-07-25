@@ -18,10 +18,14 @@
 //! See `docs/fs.md` for the format and the decisions behind it.
 
 #![no_std]
+#![feature(allocator_api)]
 
 extern crate alloc;
 #[cfg(test)]
 extern crate std;
+
+use alloc::alloc::AllocError;
+use alloc::collections::TryReserveError;
 
 use molt_block::BlockError;
 use molt_core::buffer::BufferError;
@@ -34,6 +38,7 @@ mod crc;
 mod journal;
 mod layout;
 mod log;
+mod mem;
 mod name;
 mod op;
 mod service;
@@ -87,6 +92,20 @@ pub enum FsError {
     /// The service ran its restart hooks and could not remount, so there is no
     /// filesystem behind it any more.
     Failed,
+    /// The heap refused memory the operation needed.
+    Memory,
+}
+
+impl From<AllocError> for FsError {
+    fn from(_: AllocError) -> Self {
+        Self::Memory
+    }
+}
+
+impl From<TryReserveError> for FsError {
+    fn from(_: TryReserveError) -> Self {
+        Self::Memory
+    }
 }
 
 impl From<BlockError> for FsError {

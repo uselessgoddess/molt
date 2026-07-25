@@ -6,10 +6,11 @@
 //! stack would then have to carry twice per transaction.
 
 use alloc::boxed::Box;
-use alloc::vec;
+
+use crate::{FsError, mem};
 
 /// Bits addressed by index. Indices past the end read false and write nowhere.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub(crate) struct Bitmap {
     words: Box<[u64]>,
     bits: u32,
@@ -17,8 +18,15 @@ pub(crate) struct Bitmap {
 
 impl Bitmap {
     /// Zeroed map with room for `bits` indices.
-    pub fn new(bits: u32) -> Self {
-        Self { words: vec![0; bits.div_ceil(64) as usize].into_boxed_slice(), bits }
+    pub fn new(bits: u32) -> Result<Self, FsError> {
+        Ok(Self { words: mem::zeroed_slice(bits.div_ceil(64) as usize)?, bits })
+    }
+
+    /// A copy of the map, if the heap has room for a second one.
+    pub fn try_clone(&self) -> Result<Self, FsError> {
+        let mut words = mem::zeroed_slice(self.words.len())?;
+        words.copy_from_slice(&self.words);
+        Ok(Self { words, bits: self.bits })
     }
 
     pub fn get(&self, at: u32) -> bool {
@@ -56,29 +64,32 @@ const fn mask(at: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::Bitmap;
+    use crate::FsError;
 
     #[test]
-    fn set_bit_reads_back() {
-        let mut bits = Bitmap::new(100);
+    fn set_bit_reads_back() -> Result<(), FsError> {
+        let mut bits = Bitmap::new(100)?;
         bits.set(70);
 
         assert!(bits.get(70));
         assert!(!bits.get(69), "neighbour was set too");
+        Ok(())
     }
 
     #[test]
-    fn first_clear_skips_full_words() {
-        let mut bits = Bitmap::new(130);
+    fn first_clear_skips_full_words() -> Result<(), FsError> {
+        let mut bits = Bitmap::new(130)?;
         for at in 0..65 {
             bits.set(at);
         }
 
         assert_eq!(bits.first_clear(), Some(65));
+        Ok(())
     }
 
     #[test]
-    fn cleared_bit_is_reused() {
-        let mut bits = Bitmap::new(8);
+    fn cleared_bit_is_reused() -> Result<(), FsError> {
+        let mut bits = Bitmap::new(8)?;
         for at in 0..8 {
             bits.set(at);
         }
@@ -87,11 +98,12 @@ mod tests {
         bits.clear(3);
 
         assert_eq!(bits.first_clear(), Some(3));
+        Ok(())
     }
 
     #[test]
-    fn tail_past_end_stays_unusable() {
-        let mut bits = Bitmap::new(3);
+    fn tail_past_end_stays_unusable() -> Result<(), FsError> {
+        let mut bits = Bitmap::new(3)?;
         for at in 0..3 {
             bits.set(at);
         }
@@ -99,5 +111,6 @@ mod tests {
 
         assert_eq!(bits.first_clear(), None, "map handed out index it does not hold");
         assert!(!bits.get(9));
+        Ok(())
     }
 }

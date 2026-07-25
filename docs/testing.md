@@ -197,6 +197,15 @@ frame the compiler considers dead, which is exactly what Miri is right to
 object to, so it is `cfg(not(miri))` and the safe API around it carries the
 Miri coverage instead. See [the stack budget](fs.md#the-stack-budget).
 
+The heap has the same shape of problem: `molt-fs` returns `FsError::Memory`
+instead of panicking, and nothing exercises that path on a host with gigabytes
+free. `crates/molt-fs/tests/memory.rs` is a separate binary because it installs
+a `#[global_allocator]` that refuses allocations of a kilobyte or more — block
+buffers and tree nodes, not the harness's own — and only on the thread that
+asked for the refusal, so the tests still run in parallel. It shows a mount
+answering the error and a create rolling back to its snapshot with the journal
+still usable afterwards, which is the part a type signature cannot claim.
+
 ## Conventions
 
 Test naming and shape are in [the style guide](style.md). Two rules matter more
