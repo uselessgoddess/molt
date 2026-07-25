@@ -459,17 +459,15 @@ mod tests {
         let on_disk = fs::read(tree.join("hello.txt")).expect("file the image was built from");
         let mut image = lay_out(&tree).expect("image of the smoke tree");
         {
-            let mut fs =
-                Fs::<_, 4>::mount(Loopback::writable(&mut image).expect("whole sectors")).unwrap();
+            let mut fs = Fs::<_, 4>::mount(Loopback::writable(&mut image).unwrap()).unwrap();
 
             let mut bytes = [0u8; WINDOW];
             let mut buffers = BufferRegistry::<1>::new();
-            let buffer = buffers.register_read_write(OWNER, &mut bytes).expect("free slot");
-            let target = buffers.write_capability(buffer).expect("write right");
-            let root = fs.root(OWNER).expect("root handle");
-            let name = Name::try_from("hello.txt").expect("legal name");
-            let opened =
-                fs.apply(OWNER, FsOp::Open { dir: root, name }, &mut buffers).expect("open");
+            let buffer = buffers.register_read_write(OWNER, &mut bytes).unwrap();
+            let target = buffers.write_capability(buffer).unwrap();
+            let root = fs.root(OWNER).unwrap();
+            let name = Name::try_from("hello.txt").unwrap();
+            let opened = fs.apply(OWNER, FsOp::Open { dir: root, name }, &mut buffers).unwrap();
             let Some(Handle::File(file)) = opened.handle() else {
                 panic!("hello.txt opened as a directory: {opened:?}");
             };
@@ -478,12 +476,9 @@ mod tests {
             let read =
                 fs.apply(OWNER, FsOp::Read { file, buffer: window, offset: 0 }, &mut buffers);
             assert_eq!(read, Ok(FsDone::Read(on_disk.len())));
-            assert_eq!(
-                &buffers.resolve_write(window).expect("same buffer")[..on_disk.len()],
-                &on_disk
-            );
+            assert_eq!(&buffers.resolve_write(window).unwrap()[..on_disk.len()], &on_disk);
 
-            let source = buffers.read_capability(buffer).expect("read right");
+            let source = buffers.read_capability(buffer).unwrap();
             let created = fs
                 .apply(
                     OWNER,
@@ -494,7 +489,7 @@ mod tests {
                     },
                     &mut buffers,
                 )
-                .expect("create");
+                .unwrap();
             let Some(Handle::File(runtime)) = created.handle() else {
                 panic!("runtime.txt opened as a directory: {created:?}");
             };
@@ -507,17 +502,17 @@ mod tests {
             assert_eq!(fs.apply(OWNER, FsOp::Sync, &mut buffers), Ok(FsDone::Synced(2)));
         }
         let mut bytes = [0u8; WINDOW];
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&image).expect("whole sectors")).unwrap();
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&image).unwrap()).unwrap();
         let mut buffers = BufferRegistry::<1>::new();
-        let buffer = buffers.register_write(OWNER, &mut bytes).expect("free slot");
-        let root = fs.root(OWNER).expect("root handle");
+        let buffer = buffers.register_write(OWNER, &mut bytes).unwrap();
+        let root = fs.root(OWNER).unwrap();
         let opened = fs
             .apply(
                 OWNER,
                 FsOp::Open { dir: root, name: Name::try_from("runtime.txt").unwrap() },
                 &mut buffers,
             )
-            .expect("open durable file");
+            .unwrap();
         let Some(Handle::File(file)) = opened.handle() else {
             panic!("runtime.txt opened as a directory: {opened:?}");
         };
@@ -527,6 +522,6 @@ mod tests {
             fs.apply(OWNER, FsOp::Read { file, buffer: window, offset: 0 }, &mut buffers),
             Ok(FsDone::Read(on_disk.len()))
         );
-        assert_eq!(&buffers.resolve_write(window).expect("same buffer")[..on_disk.len()], &on_disk);
+        assert_eq!(&buffers.resolve_write(window).unwrap()[..on_disk.len()], &on_disk);
     }
 }

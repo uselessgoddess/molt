@@ -220,8 +220,11 @@ a test now holds mount and commit under 16 KiB each. A driver that could only
 return DMA frames by resetting its queue grew per-region release. And `FsCell`
 makes the filesystem a service with a lifecycle rather than a library every
 caller links: it mounts once, answers on a ring, and restarts at the last
-durable checkpoint with every handle from the old epoch revoked. See
-[`docs/memory.md`](memory.md) and [`docs/fs.md`](fs.md).
+durable checkpoint with every handle from the old epoch revoked. Being the first
+real cell, it is also what `Cell` was measured against and rewritten for —
+fallible `spawn`, restart in place through the supervisor's hooks, the message
+pair moved out to `Handler`, and no thread bounds on a service that owns a
+borrowed device. See [`docs/memory.md`](memory.md) and [`docs/fs.md`](fs.md).
 
 Asynchronous I/O below the ring is deliberately not on this list. `Volume` and
 `Journal` still call the block device and block; making them `await` a
@@ -241,7 +244,10 @@ The heap and the filesystem are both single-threaded today — one global
 spinlock over the free list, `Rc` and `&mut` inside the tree — and that is what
 this stage has to answer for. Neither shape is an obstacle: a service reached
 only by ring is already the unit a core owns, so the sharding happens under the
-lock and around the cell, not through the filesystem's types.
+lock and around the cell, not through the filesystem's types. `Send` and
+`'static` belong to this stage for the same reason — they are demands of moving
+a cell between cores, so they go on whatever does the moving, where the code
+that needs them can say so.
 
 ## Stage 5 — Evolution experiments
 

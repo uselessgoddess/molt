@@ -231,9 +231,9 @@ mod tests {
 
     fn image() -> Vec<u8> {
         let mut tree = Tree::new();
-        tree.file("hello.txt", b"hello, molt".to_vec()).expect("legal name");
-        tree.file("note.txt", b"one\ntwo\n".to_vec()).expect("legal name");
-        tree.dir("docs").expect("legal name").file("readme", b"read me\n".to_vec()).unwrap();
+        tree.file("hello.txt", b"hello, molt".to_vec()).unwrap();
+        tree.file("note.txt", b"one\ntwo\n".to_vec()).unwrap();
+        tree.dir("docs").unwrap().file("readme", b"read me\n".to_vec()).unwrap();
         build(&tree, 1).expect("image that fits")
     }
 
@@ -243,14 +243,14 @@ mod tests {
         let mut scratch = [0u8; WINDOW];
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
 
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).expect("mount");
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap();
         let mut registry = BufferRegistry::<1>::new();
-        let scratch = registry.register_read_write(OWNER, &mut scratch).expect("free slot");
+        let scratch = registry.register_read_write(OWNER, &mut scratch).unwrap();
         let buffers = RefCell::new(registry);
         let (client, mut driver) = ring.split();
 
-        let root = fs.root(OWNER).expect("root handle");
-        let session = Session::new(client, &buffers, scratch, WINDOW).expect("registered scratch");
+        let root = fs.root(OWNER).unwrap();
+        let session = Session::new(client, &buffers, scratch, WINDOW).unwrap();
         let mut out = Capture::new();
         drive(
             async {
@@ -268,7 +268,7 @@ mod tests {
     /// What `run` prints for `line` alone, without prompt or echo.
     fn output(line: &str) -> String {
         let echoed = std::format!("molt> {line}\n");
-        run(line.as_bytes()).strip_prefix(&echoed).expect("echoed line").into()
+        run(line.as_bytes()).strip_prefix(&echoed).unwrap().into()
     }
 
     #[test]
