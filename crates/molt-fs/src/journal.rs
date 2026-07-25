@@ -12,7 +12,9 @@ use crate::layout::{Area, BLOCK, Kind, OBJECT_BYTES, Object, Region};
 use crate::log::{ALIGN, HEADER, Record};
 use crate::{FsError, Name, Volume};
 
-#[derive(Clone, Copy)]
+/// The unpublished half of a checkpoint: where the new log bank is, how far it
+/// has been filled, and the tree generation indexing it.
+#[derive(Clone)]
 struct Transaction {
     at: u64,
     bytes: u64,
@@ -71,7 +73,7 @@ impl<'buf, D: Disk> Journal<'buf, D> {
             return Err(FsError::Missing);
         }
         let root = self.tree_root();
-        if let Some(value) = self.tree.get(&mut self.volume, root, Key::object(id))? {
+        if let Some(value) = self.tree.get(&mut self.volume, root, &Key::object(id))? {
             return value.as_object();
         }
         if id < self.base_objects {
@@ -96,7 +98,7 @@ impl<'buf, D: Disk> Journal<'buf, D> {
         }
 
         let root = self.tree_root();
-        if let Some(value) = self.tree.get(&mut self.volume, root, Key::dirent(dir, name))? {
+        if let Some(value) = self.tree.get(&mut self.volume, root, &Key::dirent(dir, name))? {
             return Ok(value.as_dirent());
         }
         Err(FsError::Missing)
@@ -129,7 +131,7 @@ impl<'buf, D: Disk> Journal<'buf, D> {
                 None => Key::dirent_start(dir),
             };
             if let Some((key, value)) =
-                self.tree.next(&mut self.volume, root, key, previous.is_none())?
+                self.tree.next(&mut self.volume, root, &key, previous.is_none())?
                 && key.is_dirent(dir)
             {
                 choose(&mut candidate, previous, key.name()?, value.as_dirent());
@@ -165,7 +167,7 @@ impl<'buf, D: Disk> Journal<'buf, D> {
         let root = self.tree_root();
         let mut key = Key::write_start(file);
         let mut inclusive = true;
-        while let Some((found, value)) = self.tree.next(&mut self.volume, root, key, inclusive)? {
+        while let Some((found, value)) = self.tree.next(&mut self.volume, root, &key, inclusive)? {
             if !found.is_write(file) {
                 break;
             }
@@ -202,7 +204,7 @@ impl<'buf, D: Disk> Journal<'buf, D> {
         let object = self.next_object;
         let next = object.checked_add(1).ok_or(FsError::Full)?;
         parent_object.count = parent_object.count.checked_add(1).ok_or(FsError::Full)?;
-        let before = self.begin()?;
+        let before = self.snapshot()?;
         if let Err(error) = self
             .append(Record::create(object, parent, kind, name), name.as_bytes())
             .and_then(|_| self.index(Key::object(parent), Value::object(parent_object)))
@@ -232,7 +234,7 @@ impl<'buf, D: Disk> Journal<'buf, D> {
             return Ok(0);
         }
         let record = Record::write(file, offset, bytes.len())?;
-        let before = self.begin()?;
+        let before = self.snapshot()?;
         let cursor = match self.append(record, bytes) {
             Ok(cursor) => cursor,
             Err(error) => {
@@ -252,17 +254,17 @@ impl<'buf, D: Disk> Journal<'buf, D> {
 
     /// Makes every pending record durable and publishes a new generation.
     pub fn sync(&mut self) -> Result<u64, FsError> {
-        let Some(transaction) = self.transaction else {
+        let Some(transaction) = self.transaction.as_ref() else {
             self.volume.flush()?;
             return Ok(self.volume.generation());
         };
+        let (at, bytes, root) = (transaction.at, transaction.bytes, transaction.tree.root);
 
-        let crc = self.volume.checksum(transaction.at, transaction.bytes)?;
+        let crc = self.volume.checksum(at, bytes)?;
         let mut checkpoint = self.volume.checkpoint();
         checkpoint.generation = checkpoint.generation.checked_add(1).ok_or(FsError::Full)?;
-        checkpoint.tree_root = transaction.tree.root;
-        checkpoint
-            .set_region(Area::Log, Region { at: transaction.at, bytes: transaction.bytes, crc });
+        checkpoint.tree_root = root;
+        checkpoint.set_region(Area::Log, Region { at, bytes, crc });
         let copy = 1 - self.volume.active_copy();
 
         // The log must survive before any durable superblock is allowed to
@@ -327,12 +329,12 @@ impl<'buf, D: Disk> Journal<'buf, D> {
                     let name = self.record_name(cursor, record)?;
                     let state = self
                         .tree
-                        .get(&mut self.volume, root, Key::object(object))?
+                        .get(&mut self.volume, root, &Key::object(object))?
                         .ok_or(FsError::Corrupt)?
                         .as_object()?;
                     let linked = self
                         .tree
-                        .get(&mut self.volume, root, Key::dirent(parent, &name))?
+                        .get(&mut self.volume, root, &Key::dirent(parent, &name))?
                         .ok_or(FsError::Corrupt)?
                         .as_dirent();
                     if state.kind != kind || linked != object {
@@ -342,7 +344,7 @@ impl<'buf, D: Disk> Journal<'buf, D> {
                 Record::Write { object, offset, bytes } => {
                     let indexed = self
                         .tree
-                        .get(&mut self.volume, root, Key::write(object, cursor))?
+                        .get(&mut self.volume, root, &Key::write(object, cursor))?
                         .ok_or(FsError::Corrupt)?
                         .as_write();
                     if indexed != (offset, bytes) {
@@ -400,9 +402,10 @@ impl<'buf, D: Disk> Journal<'buf, D> {
         Ok(false)
     }
 
-    fn begin(&mut self) -> Result<Transaction, FsError> {
-        if let Some(transaction) = self.transaction {
-            return Ok(transaction);
+    /// Opens a transaction unless one is already open.
+    fn begin(&mut self) -> Result<(), FsError> {
+        if self.transaction.is_some() {
+            return Ok(());
         }
         let checkpoint = self.volume.checkpoint();
         let active = checkpoint.region(Area::Log);
@@ -412,19 +415,18 @@ impl<'buf, D: Disk> Journal<'buf, D> {
             .ok_or(FsError::Corrupt)?;
         let tree = self.tree.begin(&mut self.volume)?;
         self.volume.copy_aligned(active.at, target, active.bytes)?;
-        let transaction = Transaction { at: target, bytes: active.bytes, tree };
-        self.transaction = Some(transaction);
-        Ok(transaction)
+        self.transaction = Some(Transaction { at: target, bytes: active.bytes, tree });
+        Ok(())
     }
 
     fn append(&mut self, record: Record, payload: &[u8]) -> Result<u64, FsError> {
         if payload.len() != record.payload() as usize {
             return Err(FsError::Corrupt);
         }
-        let transaction = self.begin()?;
-        let cursor = transaction.bytes;
+        self.begin()?;
+        let (at, cursor) = self.bank()?;
         let span = record.span()?;
-        let end = transaction.bytes.checked_add(span).ok_or(FsError::Full)?;
+        let end = cursor.checked_add(span).ok_or(FsError::Full)?;
         let capacity = u64::from(self.volume.checkpoint().log_blocks)
             .checked_mul(BLOCK as u64)
             .ok_or(FsError::Corrupt)?;
@@ -451,27 +453,52 @@ impl<'buf, D: Disk> Journal<'buf, D> {
                 sector[target..target + (end - start) as usize]
                     .copy_from_slice(&payload[source..source + (end - start) as usize]);
             }
-            self.volume.write_aligned(transaction.at, transaction.bytes + written, &sector)?;
+            self.volume.write_aligned(at, cursor + written, &sector)?;
             written += ALIGN;
         }
-        self.transaction = Some(Transaction { bytes: end, ..transaction });
+        self.open()?.bytes = end;
         Ok(cursor)
     }
 
     fn index(&mut self, key: Key, value: Value) -> Result<(), FsError> {
-        let mut transaction = self.transaction.ok_or(FsError::Corrupt)?;
-        self.tree.insert(&mut self.volume, &mut transaction.tree, key, value)?;
+        // Taken out and put back: the tree needs the volume the journal owns,
+        // and a failed insert still leaves a transaction its caller rolls back.
+        let mut transaction = self.transaction.take().ok_or(FsError::Corrupt)?;
+        let inserted = self.tree.insert(&mut self.volume, &mut transaction.tree, &key, value);
         self.transaction = Some(transaction);
-        Ok(())
+        inserted
+    }
+
+    /// Opens a transaction and copies it aside for rollback.
+    ///
+    /// A mutation is several appends and inserts; if a later one fails, the
+    /// caller puts this copy back so the transaction keeps only what it had
+    /// before. Blocks the abandoned half wrote stay unreferenced in the arena
+    /// until the next generation reuses them.
+    fn snapshot(&mut self) -> Result<Transaction, FsError> {
+        self.begin()?;
+        self.transaction.clone().ok_or(FsError::Corrupt)
+    }
+
+    /// The open transaction, or [`FsError::Corrupt`] if there is none.
+    fn open(&mut self) -> Result<&mut Transaction, FsError> {
+        self.transaction.as_mut().ok_or(FsError::Corrupt)
+    }
+
+    /// Where the pending log bank sits and how far it is filled.
+    fn bank(&self) -> Result<(u64, u64), FsError> {
+        let transaction = self.transaction.as_ref().ok_or(FsError::Corrupt)?;
+        Ok((transaction.at, transaction.bytes))
     }
 
     fn tree_root(&self) -> u64 {
         self.transaction
+            .as_ref()
             .map_or(self.volume.checkpoint().tree_root, |transaction| transaction.tree.root)
     }
 
     fn log_region(&self) -> Region {
-        match self.transaction {
+        match self.transaction.as_ref() {
             Some(transaction) => Region { at: transaction.at, bytes: transaction.bytes, crc: 0 },
             None => self.volume.checkpoint().region(Area::Log),
         }

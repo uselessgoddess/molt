@@ -1,4 +1,4 @@
-//! MoltFS, a checksummed writable filesystem over [`molt_block::Writable`].
+//! MoltFS, a checksummed writable filesystem over [`molt_block::Disk`].
 //!
 //! `xtask mkfs` lays out immutable objects, extents, entries, names, sums, and
 //! data. Runtime metadata lives in a checksummed copy-on-write B+ tree while
@@ -9,16 +9,16 @@
 //! generation mountable, without fsck.
 //!
 //! [`Volume`] is the reader, needing one block of buffer and nothing else.
-//! [`Journal`] adds allocation-free replay and mutation, and [`Fs`] wraps it in
-//! the ring protocol every other cell talks: typed [`FsOp`] submissions in,
-//! [`FsDone`] completions out, with directories and files named by capability
-//! rather than by path.
+//! [`Journal`] adds replay and mutation, and [`Fs`] wraps it in the ring
+//! protocol every other cell talks: typed [`FsOp`] submissions in, [`FsDone`]
+//! completions out, with directories and files named by capability rather than
+//! by path. Metadata nodes and the arena bitmap live on the heap, so a mutation
+//! costs its caller a path of block numbers rather than kilobytes of frame.
 //!
 //! See `docs/fs.md` for the format and the decisions behind it.
 
 #![no_std]
 
-#[cfg(feature = "format")]
 extern crate alloc;
 #[cfg(test)]
 extern crate std;
@@ -27,6 +27,7 @@ use molt_block::BlockError;
 use molt_core::buffer::BufferError;
 use molt_core::capability::CapabilityError;
 
+mod bitmap;
 mod btree;
 mod crc;
 mod journal;

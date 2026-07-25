@@ -2,8 +2,7 @@
 //!
 //! It lives beside the reader rather than in `xtask` so both halves share one
 //! definition of the layout and a test can round-trip through them. Nothing in
-//! the kernel needs it, so it hides behind the `format` feature and is the only
-//! part of the crate that allocates.
+//! the kernel needs it, so it hides behind the `format` feature.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -256,7 +255,7 @@ mod tests {
 
     use super::{Tree, build, build_with_capacity};
     use crate::FsError;
-    use crate::layout::{BLOCK, MAX_TREE_BLOCKS, Super};
+    use crate::layout::{BLOCK, DEFAULT_TREE_BLOCKS, MAX_TREE_BLOCKS, Super};
 
     #[test]
     fn empty_tree_still_mounts_as_volume() {
@@ -265,7 +264,7 @@ mod tests {
 
         assert_eq!(superblock.generation, 1);
         assert_eq!(superblock.data_blocks, 0);
-        assert_eq!(superblock.tree_blocks, MAX_TREE_BLOCKS);
+        assert_eq!(superblock.tree_blocks, DEFAULT_TREE_BLOCKS);
     }
 
     #[test]

@@ -49,36 +49,40 @@ impl<'buf, D: Device> Volume<'buf, D> {
             }
         }
 
+        // Newest generation first, each candidate dropped if it fails to
+        // verify. Loops rather than iterator chains: every frame of one carries
+        // a superblock, and mount runs on whatever stack its caller has.
         let mut rejected = [false; SUPERS as usize];
         for _ in 0..SUPERS {
-            let Some((active_copy, superblock)) = copies
-                .iter()
-                .enumerate()
-                .filter(|(copy, _)| !rejected[*copy])
-                .filter_map(|(copy, parsed)| parsed.map(|parsed| (copy as u64, parsed)))
-                .max_by_key(|(copy, parsed)| (parsed.generation, core::cmp::Reverse(*copy)))
-            else {
+            let Some(active_copy) = newest(&copies, &rejected) else {
                 break;
             };
-            rejected[active_copy as usize] = true;
+            rejected[active_copy] = true;
+            let Some(superblock) = copies[active_copy] else {
+                break;
+            };
             if superblock.blocks.saturating_mul(SECTORS) > device.sectors() {
                 last_error = FsError::Corrupt;
                 continue;
             }
-            if let Err(error) = verify_checkpoint(&mut device, block, superblock) {
+            if let Err(error) = verify_checkpoint(&mut device, block, &superblock) {
                 last_error = error;
                 continue;
             }
 
-            let previous = copies
-                .iter()
-                .enumerate()
-                .find(|(copy, _)| *copy != active_copy as usize)
-                .and_then(|(_, parsed)| *parsed)
-                .filter(|parsed| {
-                    parsed.blocks.saturating_mul(SECTORS) <= device.sectors()
-                        && verify_checkpoint(&mut device, block, *parsed).is_ok()
-                });
+            let mut previous = None;
+            for (copy, parsed) in copies.iter().enumerate() {
+                if copy == active_copy {
+                    continue;
+                }
+                if let Some(parsed) = parsed
+                    && parsed.blocks.saturating_mul(SECTORS) <= device.sectors()
+                    && verify_checkpoint(&mut device, block, parsed).is_ok()
+                {
+                    previous = Some(*parsed);
+                    break;
+                }
+            }
             let previous_log = previous.map(|parsed| parsed.region(Area::Log).at);
             let previous_tree = previous.map(|parsed| parsed.tree_root).filter(|root| *root != 0);
             return Ok(Self {
@@ -86,7 +90,7 @@ impl<'buf, D: Device> Volume<'buf, D> {
                 block,
                 cached: None,
                 superblock,
-                active_copy,
+                active_copy: active_copy as u64,
                 previous_log,
                 previous_tree,
             });
@@ -387,10 +391,24 @@ fn read<D: Device>(device: &mut D, block: &mut [u8; BLOCK], index: u64) -> Resul
     device.read(sector, block.as_mut_slice()).map_err(FsError::Device)
 }
 
+/// The copy holding the newest generation, ties going to the lower copy.
+fn newest(copies: &[Option<Super>], rejected: &[bool]) -> Option<usize> {
+    let mut best: Option<(usize, u64)> = None;
+    for (copy, parsed) in copies.iter().enumerate() {
+        if let Some(parsed) = parsed
+            && !rejected[copy]
+            && best.is_none_or(|(_, generation)| parsed.generation > generation)
+        {
+            best = Some((copy, parsed.generation));
+        }
+    }
+    best.map(|(copy, _)| copy)
+}
+
 fn verify_checkpoint<D: Device>(
     device: &mut D,
     block: &mut [u8; BLOCK],
-    superblock: Super,
+    superblock: &Super,
 ) -> Result<(), FsError> {
     for area in Area::ALL {
         let region = superblock.region(area);
