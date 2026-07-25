@@ -138,9 +138,12 @@ fn verify_frame_ownership(span: Span) {
 fn verify_heap<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let bytes = heap::init(boot_info, platform).expect("RAM for the kernel heap");
 
-    let probe = Box::new([0x4du8; 64]);
+    // `black_box` keeps the release build from eliding a box it can prove is
+    // never read: the accounting it drives is the whole point of the probe.
+    let probe = core::hint::black_box(Box::new([0x4du8; 64]));
     assert!(heap::used() >= probe.len(), "a live box left the heap empty");
-    drop(probe);
+    assert!(probe.iter().all(|&byte| byte == 0x4d), "the heap handed back other bytes");
+    drop(core::hint::black_box(probe));
     assert_eq!(heap::used(), 0, "a dropped box left the heap holding bytes");
 
     report!(platform, "MOLT_HEAP_OK: {bytes} bytes");
