@@ -4,8 +4,10 @@
 //! A driver hands the device physical addresses and touches the same bytes
 //! through a CPU pointer. [`Region`] carries the pair, so a public operation
 //! never passes a raw physical address around, and [`Arena`] hands regions out
-//! of one span of [`Owner::Device`] frames it
-//! reclaims as a whole once the device has been told to stop.
+//! of one span of [`Owner::Device`] frames: one at a time through
+//! [`region`](Arena::region), back one at a time through
+//! [`release`](Arena::release), and all at once through [`reset`](Arena::reset)
+//! once the device has been told to stop.
 
 use crate::memory::{Error as MemoryError, FrameTable, Frames, Owner, Span};
 use crate::{FRAME_SIZE, FrameAllocator, RunError};
@@ -23,8 +25,10 @@ pub enum DmaError {
     NotContiguous,
     /// The allocator ran out before the arena's span was filled.
     OutOfFrames,
-    /// The arena has no room left for a region of this size.
+    /// The arena has no free run left for a region of this size.
     OutOfSpace,
+    /// The region was not handed out by the arena asked to take it back.
+    Foreign,
     /// The frame table refused the claim or release.
     Frames(MemoryError),
 }
@@ -58,6 +62,7 @@ pub struct Region {
     cpu: *mut u8,
     physical: u64,
     len: u64,
+    frames: Option<Frames>,
 }
 
 // SAFETY: `Region` is a unique handle to a range of frames
@@ -66,13 +71,16 @@ unsafe impl Send for Region {}
 impl Region {
     /// Wraps `len` bytes reachable at `cpu` and physically at `physical`.
     ///
+    /// The frames are the caller's, not an arena's, so no arena will take them
+    /// back.
+    ///
     /// # Safety
     ///
     /// `cpu` must be the live, write-back direct-map address of the `len` bytes
     /// at `physical`; those frames must be uniquely owned for the region's
     /// lifetime, and no second region may cover any part of the same range.
     pub const unsafe fn new(cpu: *mut u8, physical: u64, len: u64) -> Self {
-        Self { cpu, physical, len }
+        Self { cpu, physical, len, frames: None }
     }
 
     /// The physical address a device is given to reach these bytes.
@@ -191,19 +199,17 @@ impl Region {
     }
 }
 
-/// One span of device-owned frames, handed out as [`Region`]s and reclaimed
-/// whole.
+/// One span of device-owned frames, handed out as [`Region`]s and taken back.
 ///
-/// The arena claims a bounded, contiguous span as a single
-/// [`Owner::Device`] [`Frames`] token, then
-/// bump-allocates frame-granular regions out of it. It is reclaimed by
-/// [`reset`](Arena::reset), which the caller invokes only after the device has
-/// been told to stop touching the frames.
+/// The arena reserves a bounded, contiguous span and then tracks it a frame at
+/// a time: each region claims the lowest free run long enough to hold it as
+/// [`Owner::Device`], and releasing a region frees that run for the next one. A
+/// driver that reprograms a queue therefore reuses its frames instead of
+/// running the span down.
 pub struct Arena<'s> {
     table: FrameTable<'s>,
-    frames: Frames,
     offset: u64,
-    next: u64,
+    tag: u32,
 }
 
 impl<'s> Arena<'s> {
@@ -220,17 +226,16 @@ impl<'s> Arena<'s> {
         slots: &'s mut [Option<Owner>],
     ) -> Result<Self, DmaError> {
         let span = allocator.run(slots.len() as u64)?;
-        let mut table = FrameTable::over(span, slots)?;
-        let frames = table.claim(span, Owner::Device(tag))?;
-        Ok(Self { table, frames, offset, next: span.start() })
+        let table = FrameTable::over(span, slots)?;
+        Ok(Self { table, offset, tag })
     }
 
     /// The device span this arena owns.
     pub fn span(&self) -> Span {
-        self.frames.span()
+        self.table.base()
     }
 
-    /// Bump-allocates a region of `bytes`, backed by whole frames.
+    /// Claims a region of `bytes`, backed by whole frames.
     ///
     /// The region reports the exact `bytes` asked for, so its accessors stay
     /// tightly bounded, while the frames behind it belong to no other region.
@@ -239,28 +244,32 @@ impl<'s> Arena<'s> {
             return Err(DmaError::Empty);
         }
         let step = crate::align_up(bytes, FRAME_SIZE).ok_or(DmaError::OutOfSpace)?;
-        let physical = self.next;
-        let end = physical.checked_add(step).ok_or(DmaError::OutOfSpace)?;
-        if end > self.frames.span().end() {
-            return Err(DmaError::OutOfSpace);
-        }
-        self.next = end;
+        let span = self.table.vacant(step / FRAME_SIZE).ok_or(DmaError::OutOfSpace)?;
+        let frames = self.table.claim(span, Owner::Device(self.tag))?;
 
-        let cpu = (self.offset + physical) as *mut u8;
-        // SAFETY: `physical` names whole frames inside the span this arena
-        // claimed as `Owner::Device`, `offset` is their live write-back direct
-        // map, the bump cursor never re-issues a frame, and `bytes <= step`.
-        Ok(unsafe { Region::new(cpu, physical, bytes) })
+        let cpu = (self.offset + span.start()) as *mut u8;
+        // `Region::new`'s contract, met with the claim kept inside: the table
+        // holds these whole frames for this arena until the region comes back,
+        // `offset` is their live write-back direct map, and `bytes` fits them.
+        Ok(Region { cpu, physical: span.start(), len: bytes, frames: Some(frames) })
     }
 
-    /// Releases the whole span back to its frame table.
+    /// Takes one region's frames back, for the next region to use.
+    ///
+    /// The caller must already have told the device to stop reaching them, as
+    /// for [`reset`](Arena::reset). A region the arena did not hand out has no
+    /// claim to return and is refused.
+    pub fn release(&mut self, region: Region) -> Result<(), DmaError> {
+        self.table.release(region.frames.ok_or(DmaError::Foreign)?)?;
+        Ok(())
+    }
+
+    /// Releases the whole span, regions still outstanding included.
     ///
     /// The caller must already have told the device to stop, so no in-flight
     /// DMA can land in a frame after it is reclaimed.
-    pub fn reset(self) -> Result<(), DmaError> {
-        let Self { mut table, frames, .. } = self;
-        table.release(frames)?;
-        Ok(())
+    pub fn reset(mut self) {
+        self.table.evict(Owner::Device(self.tag));
     }
 }
 
@@ -375,15 +384,51 @@ mod tests {
     }
 
     #[test]
+    fn released_region_frames_come_back() {
+        let regions = [usable(0x10_0000, 0x10_0000 + 3 * FRAME_SIZE)];
+        let map = Map(&regions);
+        let mut allocator = FrameAllocator::new(&map);
+        let mut slots = [None; 3];
+        let mut arena = Arena::claim(&mut allocator, 0, 4, &mut slots).expect("three free frames");
+
+        let first = arena.region(FRAME_SIZE).expect("room for one frame");
+        let second = arena.region(2 * FRAME_SIZE).expect("room for two more");
+        assert_eq!(arena.region(FRAME_SIZE).err(), Some(DmaError::OutOfSpace));
+        arena.release(first).expect("a region this arena handed out");
+
+        let third = arena.region(FRAME_SIZE).expect("the frame just released");
+
+        assert_eq!(third.physical(), 0x10_0000);
+        assert_eq!(second.physical(), 0x10_0000 + FRAME_SIZE, "a live region moved");
+    }
+
+    #[test]
+    fn foreign_region_refused() {
+        let regions = [usable(0x10_0000, 0x10_0000 + FRAME_SIZE)];
+        let map = Map(&regions);
+        let mut allocator = FrameAllocator::new(&map);
+        let mut slots = [None; 1];
+        let mut arena = Arena::claim(&mut allocator, 0, 5, &mut slots).expect("one free frame");
+        let mut buffer = [0u8; 16];
+
+        let borrowed = region(&mut buffer, 0x10_0000);
+
+        assert_eq!(arena.release(borrowed).err(), Some(DmaError::Foreign));
+        assert!(arena.region(FRAME_SIZE).is_ok(), "the arena lost a frame it still holds");
+    }
+
+    #[test]
     fn reset_returns_span_to_table() {
         let regions = [usable(0x10_0000, 0x10_0000 + 4 * FRAME_SIZE)];
         let map = Map(&regions);
         let mut allocator = FrameAllocator::new(&map);
         let mut slots = [None; 4];
-        let arena = Arena::claim(&mut allocator, 0, 2, &mut slots).expect("four free frames");
+        let mut arena = Arena::claim(&mut allocator, 0, 2, &mut slots).expect("four free frames");
+        let outstanding = arena.region(FRAME_SIZE).expect("room for one frame");
 
-        arena.reset().expect("the span this arena claimed");
+        arena.reset();
 
+        assert_eq!(outstanding.physical(), 0x10_0000);
         assert!(slots.iter().all(Option::is_none), "reset left frames claimed");
     }
 }

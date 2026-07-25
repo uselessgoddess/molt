@@ -248,6 +248,33 @@ impl<'s> FrameTable<'s> {
         Ok(())
     }
 
+    /// Lowest run of `count` frames no one holds.
+    pub fn vacant(&self, count: u64) -> Option<Span> {
+        let mut run = 0;
+        for (index, slot) in self.slots.iter().take(self.base.count() as usize).enumerate() {
+            run = if slot.is_some() { 0 } else { run + 1 };
+            if run == count {
+                let first = index as u64 + 1 - count;
+                return Span::frames(self.base.start + first * FRAME_SIZE, count).ok();
+            }
+        }
+        None
+    }
+
+    /// Releases every frame `owner` holds and reports how many there were.
+    ///
+    /// Tearing an owner down as a whole outlives its tokens: a [`Frames`] of an
+    /// evicted owner names frames the table may since have given to someone
+    /// else, so the caller drops those tokens rather than releasing them.
+    pub fn evict(&mut self, owner: Owner) -> u64 {
+        let mut released = 0;
+        for slot in self.slots.iter_mut().filter(|slot| **slot == Some(owner)) {
+            *slot = None;
+            released += 1;
+        }
+        released
+    }
+
     /// The owner of the frame containing `address`, if it has one.
     pub fn owner(&self, address: u64) -> Result<Option<Owner>, Error> {
         if !self.base.contains(address) {

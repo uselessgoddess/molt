@@ -199,9 +199,12 @@ impl<'slots, 'window> Block<'slots, 'window> {
     /// The reset comes first so the device stops touching the rings and buffers
     /// before the frames behind them return to the table.
     pub fn reset(self) -> Result<(), VirtioError> {
-        let Self { mut common, arena, .. } = self;
+        let Self { mut common, queue, control, data, mut arena, .. } = self;
         common.reset()?;
-        arena.reset()?;
+        for region in queue.regions().into_iter().chain([control, data]) {
+            arena.release(region)?;
+        }
+        arena.reset();
         Ok(())
     }
 }
