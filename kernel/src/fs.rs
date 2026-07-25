@@ -11,7 +11,7 @@ use molt_block::Disk;
 use molt_core::buffer::{BufferOperation, BufferRegistry};
 use molt_core::capability::CellId;
 use molt_core::ring::IoRing;
-use molt_fs::{BLOCK, Fs, FsDone, FsError, FsOp, Handle, Kind, Name};
+use molt_fs::{Fs, FsDone, FsError, FsOp, Handle, Kind, Name};
 use molt_kernel::report;
 use molt_shell::{Console, Session, Shell, drive};
 
@@ -26,8 +26,7 @@ const WRITTEN: &[u8] = b"written through virtio";
 const SCRIPT: &[u8] = b"help\nls\nls docs\ncat hello.txt\nls nowhere\n";
 
 pub fn smoke<P: Platform>(platform: &mut P, device: impl Disk) {
-    let mut block = [0u8; BLOCK];
-    let mut fs = match Fs::<_, HANDLES>::mount(device, &mut block) {
+    let mut fs = match Fs::<_, HANDLES>::mount(device) {
         Ok(mounted) => mounted,
         Err(error) => {
             report!(platform, "MOLT_FS_FAILED: {error:?}");

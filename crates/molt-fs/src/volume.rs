@@ -1,10 +1,12 @@
 //! Reading a mounted volume through one block of buffer.
 //!
 //! Every lookup and every read goes through [`Volume::block`], which holds the
-//! last block it read. There is no page cache and no allocation: a binary
-//! search over a directory re-reads a block only when it moves to another one,
-//! and a data block costs a second read for the checksum that covers it.
+//! last block it read. There is no page cache: a binary search over a directory
+//! re-reads a block only when it moves to another one, and a data block costs a
+//! second read for the checksum that covers it. The buffer belongs to the
+//! volume, since a block is far too much to ask of a caller's frame.
 
+use alloc::boxed::Box;
 use core::cmp::Ordering;
 
 use molt_block::{Device, Disk, SECTOR};
@@ -13,7 +15,7 @@ use crate::FsError;
 use crate::crc::{Crc, crc32c};
 use crate::layout::{
     Area, BLOCK, ENTRY_BYTES, EXTENT_BYTES, Entry, Extent, Kind, MAX_NAME, OBJECT_BYTES, Object,
-    SUPERS, Super, u32_at,
+    SUPERS, Super, buffer, u32_at,
 };
 use crate::name::Name;
 
@@ -21,9 +23,9 @@ use crate::name::Name;
 const SECTORS: u64 = (BLOCK / SECTOR) as u64;
 
 /// A mounted, read-only volume.
-pub struct Volume<'buf, D> {
+pub struct Volume<D> {
     device: D,
-    block: &'buf mut [u8; BLOCK],
+    block: Box<[u8; BLOCK]>,
     cached: Option<u64>,
     superblock: Super,
     active_copy: u64,
@@ -31,14 +33,16 @@ pub struct Volume<'buf, D> {
     previous_tree: Option<u64>,
 }
 
-impl<'buf, D: Device> Volume<'buf, D> {
-    /// Mounts `device`, using `block` as its only buffer.
+impl<D: Device> Volume<D> {
+    /// Mounts `device`.
     ///
     /// Takes the newest superblock copy that verifies, then checks every
     /// metadata region against the checksum the superblock records, so a
     /// corrupt volume fails at mount rather than at the first lookup that
     /// happens to touch the damaged block.
-    pub fn mount(mut device: D, block: &'buf mut [u8; BLOCK]) -> Result<Self, FsError> {
+    pub fn mount(mut device: D) -> Result<Self, FsError> {
+        let mut owned = buffer();
+        let block = &mut *owned;
         let mut copies = [None; SUPERS as usize];
         let mut last_error = FsError::Magic;
         for copy in 0..SUPERS {
@@ -87,7 +91,7 @@ impl<'buf, D: Device> Volume<'buf, D> {
             let previous_tree = previous.map(|parsed| parsed.tree_root).filter(|root| *root != 0);
             return Ok(Self {
                 device,
-                block,
+                block: owned,
                 cached: None,
                 superblock,
                 active_copy: active_copy as u64,
@@ -288,14 +292,14 @@ impl<'buf, D: Device> Volume<'buf, D> {
         if self.cached != Some(index) {
             // The buffer holds a partial block until the read lands.
             self.cached = None;
-            read(&mut self.device, self.block, index)?;
+            read(&mut self.device, &mut self.block, index)?;
             self.cached = Some(index);
         }
-        Ok(self.block)
+        Ok(&self.block)
     }
 }
 
-impl<D: Disk> Volume<'_, D> {
+impl<D: Disk> Volume<D> {
     pub(crate) fn copy_aligned(
         &mut self,
         source: u64,
@@ -375,7 +379,7 @@ impl<D: Disk> Volume<'_, D> {
             return Err(FsError::Corrupt);
         }
         self.block.fill(0);
-        value.encode(self.block);
+        value.encode(&mut self.block[..]);
         self.device.write(copy * SECTORS, &self.block[..SECTOR]).map_err(FsError::Device)?;
         self.cached = None;
         Ok(())
@@ -447,15 +451,14 @@ mod tests {
         build(&tree, 1).expect("image that fits")
     }
 
-    fn mount<'a>(bytes: &'a [u8], block: &'a mut [u8; BLOCK]) -> Volume<'a, Loopback<'a>> {
-        Volume::mount(Loopback::new(bytes).expect("whole sectors"), block).expect("live volume")
+    fn mount(bytes: &[u8]) -> Volume<Loopback<'_>> {
+        Volume::mount(Loopback::new(bytes).expect("whole sectors")).expect("live volume")
     }
 
     #[test]
     fn file_reads_back_what_was_written() {
         let bytes = image();
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
+        let mut volume = mount(&bytes);
 
         let root = volume.object(volume.root()).expect("root object");
         let id = volume.lookup(&root, b"hello.txt").expect("name in the root");
@@ -469,8 +472,7 @@ mod tests {
     #[test]
     fn read_crossing_blocks_stays_contiguous() {
         let bytes = image();
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
+        let mut volume = mount(&bytes);
 
         let root = volume.object(volume.root()).expect("root object");
         let id = volume.lookup(&root, b"big.bin").expect("name in the root");
@@ -485,8 +487,7 @@ mod tests {
     #[test]
     fn short_read_stops_at_end_of_file() {
         let bytes = image();
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
+        let mut volume = mount(&bytes);
 
         let root = volume.object(volume.root()).expect("root object");
         let id = volume.lookup(&root, b"hello.txt").expect("name in the root");
@@ -498,8 +499,7 @@ mod tests {
     #[test]
     fn missing_name_reported() {
         let bytes = image();
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
+        let mut volume = mount(&bytes);
 
         let root = volume.object(volume.root()).expect("root object");
 
@@ -509,8 +509,7 @@ mod tests {
     #[test]
     fn entries_come_back_sorted() {
         let bytes = image();
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
+        let mut volume = mount(&bytes);
 
         let root = volume.object(volume.root()).expect("root object");
         let first = volume.entry(&root, 0).expect("entry").0;
@@ -523,8 +522,7 @@ mod tests {
     #[test]
     fn nested_directory_reachable() {
         let bytes = image();
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
+        let mut volume = mount(&bytes);
 
         let root = volume.object(volume.root()).expect("root object");
         let docs = volume.lookup(&root, b"docs").expect("subdirectory");
@@ -537,8 +535,7 @@ mod tests {
     #[test]
     fn entry_past_end_reported() {
         let bytes = image();
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
+        let mut volume = mount(&bytes);
 
         let root = volume.object(volume.root()).expect("root object");
 
@@ -550,9 +547,7 @@ mod tests {
         let mut bytes = image();
         let data = super::Super::parse(&bytes[..BLOCK]).expect("superblock").data_at;
         bytes[data as usize * BLOCK] ^= 0xff;
-
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
+        let mut volume = mount(&bytes);
         let root = volume.object(volume.root()).expect("root object");
         let id = volume.lookup(&root, b"big.bin").expect("name in the root");
         let file = volume.object(id).expect("file object");
@@ -572,9 +567,7 @@ mod tests {
         for copy in 0..super::SUPERS {
             superblock.encode(&mut bytes[copy as usize * BLOCK..]);
         }
-
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
+        let mut volume = mount(&bytes);
         let root = volume.object(volume.root()).expect("root object");
         let id = volume.lookup(&root, b"big.bin").expect("name in the root");
         let file = volume.object(id).expect("file object");
@@ -588,12 +581,10 @@ mod tests {
         let superblock = super::Super::parse(&bytes[..BLOCK]).expect("superblock");
         let at = superblock.region(Area::Objects).at as usize * BLOCK;
         bytes[at] ^= 0xff;
-
-        let mut buffer = [0u8; BLOCK];
         let device = Loopback::new(&bytes).expect("whole sectors");
 
         assert_eq!(
-            Volume::mount(device, &mut buffer).err(),
+            Volume::mount(device).err(),
             Some(FsError::Checksum),
             "a damaged object region mounted"
         );
@@ -603,9 +594,7 @@ mod tests {
     fn torn_superblock_falls_back_to_older_copy() {
         let mut bytes = image();
         bytes[0] ^= 0xff;
-
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
+        let mut volume = mount(&bytes);
         let root = volume.object(volume.root()).expect("root object");
 
         assert!(volume.lookup(&root, b"hello.txt").is_ok(), "the older copy did not serve");

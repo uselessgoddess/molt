@@ -22,18 +22,18 @@ struct Transaction {
 }
 
 /// A mounted writable filesystem.
-pub struct Journal<'buf, D> {
-    volume: Volume<'buf, D>,
+pub struct Journal<D> {
+    volume: Volume<D>,
     transaction: Option<Transaction>,
     tree: MetadataTree,
     base_objects: u32,
     next_object: u32,
 }
 
-impl<'buf, D: Disk> Journal<'buf, D> {
+impl<D: Disk> Journal<D> {
     /// Mounts the newest valid checkpoint and replays its mutation log.
-    pub fn mount(device: D, block: &'buf mut [u8; BLOCK]) -> Result<Self, FsError> {
-        let volume = Volume::mount(device, block)?;
+    pub fn mount(device: D) -> Result<Self, FsError> {
+        let volume = Volume::mount(device)?;
         let object_bytes = volume.checkpoint().region(Area::Objects).bytes;
         if object_bytes % OBJECT_BYTES as u64 != 0 {
             return Err(FsError::Corrupt);
@@ -591,19 +591,15 @@ mod tests {
     }
 
     fn commit_file(bytes: &mut [u8], file: &str, contents: &[u8]) -> u64 {
-        let mut block = [0; BLOCK];
         let mut journal =
-            Journal::mount(Loopback::writable(bytes).expect("writable image"), &mut block)
-                .expect("mount");
+            Journal::mount(Loopback::writable(bytes).expect("writable image")).expect("mount");
         let object = journal.create(journal.root(), name(file), Kind::File).expect("create");
         journal.write(object, 0, contents).expect("write");
         journal.sync().expect("sync")
     }
 
     fn assert_checkpoint(bytes: &[u8], generation: u64) {
-        let mut block = [0; BLOCK];
-        let mut journal =
-            Journal::mount(Loopback::new(bytes).expect("image"), &mut block).expect("mount");
+        let mut journal = Journal::mount(Loopback::new(bytes).expect("image")).expect("mount");
         assert_eq!(journal.generation(), generation);
 
         let first = journal.lookup(journal.root(), &name("first")).expect("first survives");
@@ -636,9 +632,7 @@ mod tests {
                 let device = Fault::new(&mut stable, &mut volatile)
                     .expect("matching storage")
                     .cut_after(cut);
-                let mut block = [0; BLOCK];
-                let mut journal =
-                    Journal::mount(device, &mut block).expect("old checkpoint mounts");
+                let mut journal = Journal::mount(device).expect("old checkpoint mounts");
                 (|| {
                     let object = journal.create(journal.root(), name("second"), Kind::File)?;
                     journal.write(object, 0, b"second")?;
@@ -674,10 +668,7 @@ mod tests {
         let active = crate::layout::Super::parse(&bytes[BLOCK..2 * BLOCK]).expect("generation two");
         let log = active.region(crate::layout::Area::Log);
         bytes[log.at as usize * BLOCK] ^= 1;
-
-        let mut block = [0; BLOCK];
-        let mut journal =
-            Journal::mount(Loopback::new(&bytes).expect("image"), &mut block).expect("fallback");
+        let mut journal = Journal::mount(Loopback::new(&bytes).expect("image")).expect("fallback");
 
         assert_eq!(journal.generation(), 1);
         assert_eq!(journal.lookup(journal.root(), &name("first")), Err(FsError::Missing));
@@ -702,20 +693,15 @@ mod tests {
     fn tree_arena_reuses_old_generations() {
         let mut bytes = image();
         {
-            let mut block = [0; BLOCK];
             let mut journal =
-                Journal::mount(Loopback::writable(&mut bytes).expect("image"), &mut block)
-                    .expect("mount");
+                Journal::mount(Loopback::writable(&mut bytes).expect("image")).expect("mount");
             let file = journal.create(journal.root(), name("rolling"), Kind::File).expect("create");
             for byte in 0..200u8 {
                 journal.write(file, 0, &[byte]).expect("write");
                 journal.sync().expect("checkpoint");
             }
         }
-
-        let mut block = [0; BLOCK];
-        let mut journal =
-            Journal::mount(Loopback::new(&bytes).expect("image"), &mut block).expect("remount");
+        let mut journal = Journal::mount(Loopback::new(&bytes).expect("image")).expect("remount");
         let file = journal.lookup(journal.root(), &name("rolling")).expect("file");
         let mut byte = [0];
         assert_eq!(journal.read(file, 0, &mut byte), Ok(1));
@@ -725,10 +711,8 @@ mod tests {
     #[test]
     fn later_writes_overlay_base_data_and_can_extend_sparsely() {
         let mut bytes = image();
-        let mut block = [0; BLOCK];
         let mut journal =
-            Journal::mount(Loopback::writable(&mut bytes).expect("image"), &mut block)
-                .expect("mount");
+            Journal::mount(Loopback::writable(&mut bytes).expect("image")).expect("mount");
         let base = journal.lookup(journal.root(), &name("base")).expect("base file");
 
         journal.write(base, 2, b"WRITE").expect("overwrite");

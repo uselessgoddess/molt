@@ -14,7 +14,7 @@ use std::hint::black_box;
 
 use molt_block::Loopback;
 use molt_fs::format::{self, Tree};
-use molt_fs::{BLOCK, FsError, Journal, Kind, Name, Volume};
+use molt_fs::{FsError, Journal, Kind, Name, Volume};
 
 const WINDOW: usize = 96 * 1024;
 const MARK: u8 = 0xa5;
@@ -51,17 +51,16 @@ fn probe() -> Result<(), FsError> {
     let mut bytes = image();
 
     let base = paint();
-    let volume = Volume::mount(Loopback::new(&bytes)?, &mut [0; BLOCK]).is_ok();
+    let volume = Volume::mount(Loopback::new(&bytes)?).is_ok();
     report("Volume::mount", depth(base));
     assert!(volume);
 
     let base = paint();
-    let mounted = Journal::mount(Loopback::new(&bytes)?, &mut [0; BLOCK]).is_ok();
+    let mounted = Journal::mount(Loopback::new(&bytes)?).is_ok();
     report("Journal::mount", depth(base));
     assert!(mounted);
 
-    let mut block = [0; BLOCK];
-    let mut journal = Journal::mount(Loopback::writable(&mut bytes)?, &mut block)?;
+    let mut journal = Journal::mount(Loopback::writable(&mut bytes)?)?;
 
     let base = paint();
     journal.create(journal.root(), name(0), Kind::File)?;

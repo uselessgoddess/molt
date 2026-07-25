@@ -445,7 +445,7 @@ mod tests {
     use molt_block::Loopback;
     use molt_core::buffer::{BufferOperation, BufferRegistry};
     use molt_core::capability::CellId;
-    use molt_fs::{BLOCK, Fs, FsDone, FsOp, Handle, Kind, Name};
+    use molt_fs::{Fs, FsDone, FsOp, Handle, Kind, Name};
 
     use super::{DISK_TREE, lay_out, workspace_root};
 
@@ -458,12 +458,8 @@ mod tests {
         let on_disk = fs::read(tree.join("hello.txt")).expect("file the image was built from");
         let mut image = lay_out(&tree).expect("image of the smoke tree");
         {
-            let mut block = [0u8; BLOCK];
-            let mut fs = Fs::<_, 4>::mount(
-                Loopback::writable(&mut image).expect("whole sectors"),
-                &mut block,
-            )
-            .unwrap();
+            let mut fs =
+                Fs::<_, 4>::mount(Loopback::writable(&mut image).expect("whole sectors")).unwrap();
 
             let mut bytes = [0u8; WINDOW];
             let mut buffers = BufferRegistry::<1>::new();
@@ -509,11 +505,8 @@ mod tests {
             assert_eq!(fs.apply(OWNER, write, &mut buffers), Ok(FsDone::Written(on_disk.len())));
             assert_eq!(fs.apply(OWNER, FsOp::Sync, &mut buffers), Ok(FsDone::Synced(2)));
         }
-
-        let mut block = [0u8; BLOCK];
         let mut bytes = [0u8; WINDOW];
-        let mut fs =
-            Fs::<_, 4>::mount(Loopback::new(&image).expect("whole sectors"), &mut block).unwrap();
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&image).expect("whole sectors")).unwrap();
         let mut buffers = BufferRegistry::<1>::new();
         let buffer = buffers.register_write(OWNER, &mut bytes).expect("free slot");
         let root = fs.root(OWNER).expect("root handle");

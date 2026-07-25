@@ -11,7 +11,7 @@ use std::hint::black_box;
 
 use molt_block::Loopback;
 use molt_fs::format::{self, Tree};
-use molt_fs::{BLOCK, FsError, Journal, Kind, Name};
+use molt_fs::{FsError, Journal, Kind, Name};
 
 /// Painted window, and what one call may spend of it.
 const WINDOW: usize = 96 * 1024;
@@ -50,7 +50,7 @@ fn mount_fits_kernel_stack() -> Result<(), FsError> {
     let bytes = image();
 
     let base = paint();
-    let mounted = Journal::mount(Loopback::new(&bytes)?, &mut [0; BLOCK]).is_ok();
+    let mounted = Journal::mount(Loopback::new(&bytes)?).is_ok();
     let spent = depth(base);
 
     assert!(mounted, "image did not mount");
@@ -61,8 +61,7 @@ fn mount_fits_kernel_stack() -> Result<(), FsError> {
 #[test]
 fn commit_fits_kernel_stack() -> Result<(), FsError> {
     let mut bytes = image();
-    let mut block = [0; BLOCK];
-    let mut journal = Journal::mount(Loopback::writable(&mut bytes)?, &mut block)?;
+    let mut journal = Journal::mount(Loopback::writable(&mut bytes)?)?;
     // A tree deep enough that one more key rewrites a root-to-leaf path.
     for index in 0..40 {
         journal.create(journal.root(), name(index), Kind::File)?;

@@ -10,7 +10,7 @@ use molt_core::buffer::BufferRegistry;
 use molt_core::capability::{Capability, CapabilityTable, CellId};
 use molt_core::ring::{Completion, IoDriver};
 
-use crate::layout::{BLOCK, Kind, Object};
+use crate::layout::{Kind, Object};
 use crate::op::{Dir, File, FsDone, FsOp, Handle, Stat};
 use crate::{FsError, Journal};
 
@@ -21,18 +21,18 @@ struct OpenObject {
 }
 
 /// A mounted volume behind a capability table.
-pub struct Fs<'buf, D, const N: usize> {
-    journal: Journal<'buf, D>,
+pub struct Fs<D, const N: usize> {
+    journal: Journal<D>,
     open: CapabilityTable<OpenObject, N>,
     pending: Option<Completion<Result<FsDone, FsError>>>,
     sealed: bool,
 }
 
-impl<'buf, D: Disk, const N: usize> Fs<'buf, D, N> {
+impl<D: Disk, const N: usize> Fs<D, N> {
     /// Mounts `device`, using `block` as the volume's only buffer.
-    pub fn mount(device: D, block: &'buf mut [u8; BLOCK]) -> Result<Self, FsError> {
+    pub fn mount(device: D) -> Result<Self, FsError> {
         Ok(Self {
-            journal: Journal::mount(device, block)?,
+            journal: Journal::mount(device)?,
             open: CapabilityTable::new(),
             pending: None,
             sealed: false,
@@ -201,7 +201,7 @@ mod tests {
 
     use super::Fs;
     use crate::format::{Tree, build};
-    use crate::layout::{BLOCK, Kind};
+    use crate::layout::Kind;
     use crate::op::{FsDone, FsOp, Handle, Stat};
     use crate::{FsError, Name};
 
@@ -221,8 +221,7 @@ mod tests {
     #[test]
     fn open_walks_from_root_handle() {
         let bytes = image();
-        let mut block = [0u8; BLOCK];
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("mount");
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).expect("mount");
         let mut buffers = BufferRegistry::<1>::new();
 
         let root = fs.root(OWNER).expect("root handle");
@@ -241,9 +240,8 @@ mod tests {
     #[test]
     fn read_lands_in_registered_buffer() {
         let bytes = image();
-        let mut block = [0u8; BLOCK];
         let mut target = [0u8; 32];
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("mount");
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).expect("mount");
         let mut buffers = BufferRegistry::<1>::new();
         let buffer = buffers.register_write(OWNER, &mut target).expect("free slot");
 
@@ -267,9 +265,7 @@ mod tests {
         let mut source = *b"durable molt";
         let source_len = source.len();
         {
-            let mut block = [0u8; BLOCK];
-            let mut fs = Fs::<_, 4>::mount(Loopback::writable(&mut bytes).unwrap(), &mut block)
-                .expect("mount");
+            let mut fs = Fs::<_, 4>::mount(Loopback::writable(&mut bytes).unwrap()).expect("mount");
             let mut buffers = BufferRegistry::<1>::new();
             let buffer = buffers.register_read(OWNER, &mut source).expect("free slot");
             let root = fs.root(OWNER).expect("root handle");
@@ -297,12 +293,9 @@ mod tests {
             );
             assert_eq!(fs.apply(OWNER, FsOp::Sync, &mut buffers), Ok(FsDone::Synced(2)));
         }
-
-        let mut block = [0u8; BLOCK];
         let mut target = [0u8; 16];
         let target_len = target.len();
-        let mut fs =
-            Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("remount");
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).expect("remount");
         let mut buffers = BufferRegistry::<1>::new();
         let buffer = buffers.register_write(OWNER, &mut target).expect("free slot");
         let root = fs.root(OWNER).expect("root handle");
@@ -323,8 +316,7 @@ mod tests {
     #[test]
     fn stat_counts_entries_of_directory() {
         let bytes = image();
-        let mut block = [0u8; BLOCK];
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("mount");
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).expect("mount");
         let mut buffers = BufferRegistry::<1>::new();
 
         let root = fs.root(OWNER).expect("root handle");
@@ -336,8 +328,7 @@ mod tests {
     #[test]
     fn closed_handle_goes_stale() {
         let bytes = image();
-        let mut block = [0u8; BLOCK];
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("mount");
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).expect("mount");
         let mut buffers = BufferRegistry::<1>::new();
 
         let root = fs.root(OWNER).expect("root handle");
@@ -351,8 +342,7 @@ mod tests {
     #[test]
     fn revoked_owner_loses_every_handle() {
         let bytes = image();
-        let mut block = [0u8; BLOCK];
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("mount");
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).expect("mount");
         let mut buffers = BufferRegistry::<1>::new();
 
         let root = fs.root(OWNER).expect("root handle");
@@ -367,9 +357,7 @@ mod tests {
         let mut bytes = image();
         let mut source = [0xa5; 8];
         let source_len = source.len();
-        let mut block = [0u8; BLOCK];
-        let mut fs =
-            Fs::<_, 4>::mount(Loopback::writable(&mut bytes).unwrap(), &mut block).expect("mount");
+        let mut fs = Fs::<_, 4>::mount(Loopback::writable(&mut bytes).unwrap()).expect("mount");
         let mut buffers = BufferRegistry::<1>::new();
         let buffer = buffers.register_read(OWNER, &mut source).expect("free slot");
         let root = fs.root(OWNER).expect("root handle");
@@ -396,8 +384,7 @@ mod tests {
     #[test]
     fn handles_run_out_rather_than_overwrite() {
         let bytes = image();
-        let mut block = [0u8; BLOCK];
-        let mut fs = Fs::<_, 1>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("mount");
+        let mut fs = Fs::<_, 1>::mount(Loopback::new(&bytes).unwrap()).expect("mount");
         let mut buffers = BufferRegistry::<1>::new();
 
         let root = fs.root(OWNER).expect("root handle");
@@ -409,8 +396,7 @@ mod tests {
     #[test]
     fn seal_refuses_later_root() {
         let bytes = image();
-        let mut block = [0u8; BLOCK];
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("mount");
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).expect("mount");
 
         let first = fs.root(OWNER);
         fs.seal();
@@ -423,8 +409,7 @@ mod tests {
     #[test]
     fn ring_answers_in_order_submitted() {
         let bytes = image();
-        let mut block = [0u8; BLOCK];
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("mount");
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).expect("mount");
         let mut buffers = BufferRegistry::<1>::new();
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
         let (mut client, mut driver) = ring.split();
@@ -459,8 +444,7 @@ mod tests {
     #[test]
     fn full_completion_queue_preserves_next_result() {
         let bytes = image();
-        let mut block = [0u8; BLOCK];
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("mount");
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).expect("mount");
         let mut buffers = BufferRegistry::<1>::new();
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 1>::new();
         let (mut client, mut driver) = ring.split();

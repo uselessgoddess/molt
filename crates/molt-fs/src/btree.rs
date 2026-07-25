@@ -479,10 +479,7 @@ impl MetadataTree {
         Self { cache: Cache::new(), scratch: buffer() }
     }
 
-    pub fn begin<D: Disk>(
-        &mut self,
-        volume: &mut Volume<'_, D>,
-    ) -> Result<TreeTransaction, FsError> {
+    pub fn begin<D: Disk>(&mut self, volume: &mut Volume<D>) -> Result<TreeTransaction, FsError> {
         let checkpoint = volume.checkpoint();
         let mut transaction = TreeTransaction {
             root: checkpoint.tree_root,
@@ -501,7 +498,7 @@ impl MetadataTree {
 
     pub fn get<D: Device>(
         &mut self,
-        volume: &mut Volume<'_, D>,
+        volume: &mut Volume<D>,
         root: u64,
         key: &Key,
     ) -> Result<Option<Value>, FsError> {
@@ -525,7 +522,7 @@ impl MetadataTree {
 
     pub fn next<D: Device>(
         &mut self,
-        volume: &mut Volume<'_, D>,
+        volume: &mut Volume<D>,
         root: u64,
         key: &Key,
         inclusive: bool,
@@ -568,7 +565,7 @@ impl MetadataTree {
 
     pub fn insert<D: Disk>(
         &mut self,
-        volume: &mut Volume<'_, D>,
+        volume: &mut Volume<D>,
         transaction: &mut TreeTransaction,
         key: &Key,
         value: Value,
@@ -626,7 +623,7 @@ impl MetadataTree {
 
     pub fn stats<D: Device>(
         &mut self,
-        volume: &mut Volume<'_, D>,
+        volume: &mut Volume<D>,
         root: u64,
     ) -> Result<TreeStats, FsError> {
         if root == 0 {
@@ -654,7 +651,7 @@ impl MetadataTree {
 
     fn insert_leaf<D: Disk>(
         &mut self,
-        volume: &mut Volume<'_, D>,
+        volume: &mut Volume<D>,
         transaction: &mut TreeTransaction,
         leaf: &Node,
         key: &Key,
@@ -705,7 +702,7 @@ impl MetadataTree {
 
     fn rewrite_parent<D: Disk>(
         &mut self,
-        volume: &mut Volume<'_, D>,
+        volume: &mut Volume<D>,
         transaction: &mut TreeTransaction,
         parent: &Node,
         child: usize,
@@ -763,11 +760,7 @@ impl MetadataTree {
         Ok(Branch::Split { left: left_at, separator: rising, right: right_at })
     }
 
-    fn read<D: Device>(
-        &mut self,
-        volume: &mut Volume<'_, D>,
-        at: u64,
-    ) -> Result<Rc<Node>, FsError> {
+    fn read<D: Device>(&mut self, volume: &mut Volume<D>, at: u64) -> Result<Rc<Node>, FsError> {
         check_block(&volume.checkpoint(), at)?;
         if let Some(node) = self.cache.get(at) {
             return Ok(node);
@@ -779,7 +772,7 @@ impl MetadataTree {
 
     fn write_new<D: Disk>(
         &mut self,
-        volume: &mut Volume<'_, D>,
+        volume: &mut Volume<D>,
         transaction: &mut TreeTransaction,
         node: Box<Node>,
     ) -> Result<u64, FsError> {
@@ -809,7 +802,7 @@ impl MetadataTree {
 
     fn mark<D: Device>(
         &mut self,
-        volume: &mut Volume<'_, D>,
+        volume: &mut Volume<D>,
         root: u64,
         bits: &mut Bitmap,
     ) -> Result<(), FsError> {
