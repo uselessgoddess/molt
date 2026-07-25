@@ -1,7 +1,8 @@
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::thread;
 
-use molt_core::cell::{Cell, Supervisor};
+use molt_core::cell::{Cell, Handler, Quiesced, Supervisor};
 use molt_core::executor::{Executor, SpawnError};
 
 #[test]
@@ -42,35 +43,42 @@ fn poll_race_keeps_wake() {
     assert_eq!(executor.next_ready(), None);
 }
 
-#[derive(Default)]
-struct State(u32);
-
-struct Worker(State);
+struct Worker(u32);
 
 impl Cell for Worker {
-    type Message = u32;
-    type Reply = u32;
-    type State = State;
+    type Error = Infallible;
+    type State = u32;
 
-    fn spawn(state: State) -> Self {
-        Self(state)
+    fn spawn(start: u32) -> Result<Self, Infallible> {
+        Ok(Self(start))
     }
 
+    fn restart(&mut self) -> Result<(), Infallible> {
+        self.0 = 0;
+        Ok(())
+    }
+}
+
+impl Handler for Worker {
+    type Message = u32;
+    type Reply = u32;
+
     fn handle(&mut self, value: u32) -> u32 {
-        self.0.0 += value;
-        self.0.0
+        self.0 += value;
+        self.0
     }
 }
 
 #[test]
-fn restart_keeps_task() {
+fn restart_keeps_task() -> Result<(), Infallible> {
     let executor = Executor::<1>::new();
     let task = executor.register().unwrap();
-    let mut cell = Supervisor::<Worker>::new(State(4));
+    let mut cell = Supervisor::<Worker>::new(4)?;
 
-    cell.restart_default();
+    cell.restart(&mut Quiesced)?;
     executor.wake(task);
 
     assert_eq!(cell.call(2), 2);
     assert_eq!(executor.next_ready(), Some(task));
+    Ok(())
 }
