@@ -131,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn write_span_covers_header_data_and_padding() {
+    fn write_span_covers_padding() {
         let record = Record::write(3, 7, 600).unwrap();
 
         assert_eq!(record.span(), Ok(1024));

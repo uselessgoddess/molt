@@ -1,10 +1,12 @@
 //! Reading a mounted volume through one block of buffer.
 //!
 //! Every lookup and every read goes through [`Volume::block`], which holds the
-//! last block it read. There is no page cache and no allocation: a binary
-//! search over a directory re-reads a block only when it moves to another one,
-//! and a data block costs a second read for the checksum that covers it.
+//! last block it read. There is no page cache: a binary search over a directory
+//! re-reads a block only when it moves to another one, and a data block costs a
+//! second read for the checksum that covers it. The buffer belongs to the
+//! volume, since a block is far too much to ask of a caller's frame.
 
+use alloc::boxed::Box;
 use core::cmp::Ordering;
 
 use molt_block::{Device, Disk, SECTOR};
@@ -13,7 +15,7 @@ use crate::FsError;
 use crate::crc::{Crc, crc32c};
 use crate::layout::{
     Area, BLOCK, ENTRY_BYTES, EXTENT_BYTES, Entry, Extent, Kind, MAX_NAME, OBJECT_BYTES, Object,
-    SUPERS, Super, u32_at,
+    SUPERS, Super, buffer, u32_at,
 };
 use crate::name::Name;
 
@@ -21,9 +23,9 @@ use crate::name::Name;
 const SECTORS: u64 = (BLOCK / SECTOR) as u64;
 
 /// A mounted, read-only volume.
-pub struct Volume<'buf, D> {
+pub struct Volume<D> {
     device: D,
-    block: &'buf mut [u8; BLOCK],
+    block: Box<[u8; BLOCK]>,
     cached: Option<u64>,
     superblock: Super,
     active_copy: u64,
@@ -31,67 +33,35 @@ pub struct Volume<'buf, D> {
     previous_tree: Option<u64>,
 }
 
-impl<'buf, D: Device> Volume<'buf, D> {
-    /// Mounts `device`, using `block` as its only buffer.
+impl<D: Device> Volume<D> {
+    /// Mounts `device` at the newest checkpoint that verifies.
+    pub fn mount(mut device: D) -> Result<Self, FsError> {
+        let mut block = buffer()?;
+        let checkpoint = survey(&mut device, &mut block)?;
+        Ok(Self {
+            device,
+            block,
+            cached: None,
+            superblock: checkpoint.superblock,
+            active_copy: checkpoint.active_copy,
+            previous_log: checkpoint.previous_log,
+            previous_tree: checkpoint.previous_tree,
+        })
+    }
+
+    /// Re-reads the volume as a fresh mount would.
     ///
-    /// Takes the newest superblock copy that verifies, then checks every
-    /// metadata region against the checksum the superblock records, so a
-    /// corrupt volume fails at mount rather than at the first lookup that
-    /// happens to touch the damaged block.
-    pub fn mount(mut device: D, block: &'buf mut [u8; BLOCK]) -> Result<Self, FsError> {
-        let mut copies = [None; SUPERS as usize];
-        let mut last_error = FsError::Magic;
-        for copy in 0..SUPERS {
-            read(&mut device, block, copy)?;
-            match Super::parse(block) {
-                Ok(parsed) => copies[copy as usize] = Some(parsed),
-                Err(error) => last_error = error,
-            }
-        }
-
-        let mut rejected = [false; SUPERS as usize];
-        for _ in 0..SUPERS {
-            let Some((active_copy, superblock)) = copies
-                .iter()
-                .enumerate()
-                .filter(|(copy, _)| !rejected[*copy])
-                .filter_map(|(copy, parsed)| parsed.map(|parsed| (copy as u64, parsed)))
-                .max_by_key(|(copy, parsed)| (parsed.generation, core::cmp::Reverse(*copy)))
-            else {
-                break;
-            };
-            rejected[active_copy as usize] = true;
-            if superblock.blocks.saturating_mul(SECTORS) > device.sectors() {
-                last_error = FsError::Corrupt;
-                continue;
-            }
-            if let Err(error) = verify_checkpoint(&mut device, block, superblock) {
-                last_error = error;
-                continue;
-            }
-
-            let previous = copies
-                .iter()
-                .enumerate()
-                .find(|(copy, _)| *copy != active_copy as usize)
-                .and_then(|(_, parsed)| *parsed)
-                .filter(|parsed| {
-                    parsed.blocks.saturating_mul(SECTORS) <= device.sectors()
-                        && verify_checkpoint(&mut device, block, *parsed).is_ok()
-                });
-            let previous_log = previous.map(|parsed| parsed.region(Area::Log).at);
-            let previous_tree = previous.map(|parsed| parsed.tree_root).filter(|root| *root != 0);
-            return Ok(Self {
-                device,
-                block,
-                cached: None,
-                superblock,
-                active_copy,
-                previous_log,
-                previous_tree,
-            });
-        }
-        Err(last_error)
+    /// Everything the mount held about the disk is dropped for what the disk
+    /// now says, so a service restarting on top of this volume comes back at
+    /// the last checkpoint that was made durable.
+    pub fn remount(&mut self) -> Result<(), FsError> {
+        let checkpoint = survey(&mut self.device, &mut self.block)?;
+        self.cached = None;
+        self.superblock = checkpoint.superblock;
+        self.active_copy = checkpoint.active_copy;
+        self.previous_log = checkpoint.previous_log;
+        self.previous_tree = checkpoint.previous_tree;
+        Ok(())
     }
 
     /// The object id of the root directory.
@@ -284,14 +254,14 @@ impl<'buf, D: Device> Volume<'buf, D> {
         if self.cached != Some(index) {
             // The buffer holds a partial block until the read lands.
             self.cached = None;
-            read(&mut self.device, self.block, index)?;
+            read(&mut self.device, &mut self.block, index)?;
             self.cached = Some(index);
         }
-        Ok(self.block)
+        Ok(&self.block)
     }
 }
 
-impl<D: Disk> Volume<'_, D> {
+impl<D: Disk> Volume<D> {
     pub(crate) fn copy_aligned(
         &mut self,
         source: u64,
@@ -371,7 +341,7 @@ impl<D: Disk> Volume<'_, D> {
             return Err(FsError::Corrupt);
         }
         self.block.fill(0);
-        value.encode(self.block);
+        value.encode(&mut self.block[..]);
         self.device.write(copy * SECTORS, &self.block[..SECTOR]).map_err(FsError::Device)?;
         self.cached = None;
         Ok(())
@@ -382,15 +352,97 @@ impl<D: Disk> Volume<'_, D> {
     }
 }
 
+/// Which checkpoint a mount settled on, and what the one before it held.
+struct Checkpoint {
+    superblock: Super,
+    active_copy: u64,
+    previous_log: Option<u64>,
+    previous_tree: Option<u64>,
+}
+
+/// Takes the newest superblock copy that verifies.
+///
+/// Every metadata region is checked against the checksum the superblock
+/// records, so a corrupt volume fails here rather than at the first lookup that
+/// happens to touch the damaged block.
+fn survey<D: Device>(device: &mut D, block: &mut [u8; BLOCK]) -> Result<Checkpoint, FsError> {
+    let mut copies = [None; SUPERS as usize];
+    let mut last_error = FsError::Magic;
+    for copy in 0..SUPERS {
+        read(device, block, copy)?;
+        match Super::parse(block) {
+            Ok(parsed) => copies[copy as usize] = Some(parsed),
+            Err(error) => last_error = error,
+        }
+    }
+
+    // Newest generation first, each candidate dropped if it fails to verify.
+    // Loops rather than iterator chains: every frame of one carries a
+    // superblock, and mount runs on whatever stack its caller has.
+    let mut rejected = [false; SUPERS as usize];
+    for _ in 0..SUPERS {
+        let Some(active_copy) = newest(&copies, &rejected) else {
+            break;
+        };
+        rejected[active_copy] = true;
+        let Some(superblock) = copies[active_copy] else {
+            break;
+        };
+        if superblock.blocks.saturating_mul(SECTORS) > device.sectors() {
+            last_error = FsError::Corrupt;
+            continue;
+        }
+        if let Err(error) = verify_checkpoint(device, block, &superblock) {
+            last_error = error;
+            continue;
+        }
+
+        let mut previous = None;
+        for (copy, parsed) in copies.iter().enumerate() {
+            if copy == active_copy {
+                continue;
+            }
+            if let Some(parsed) = parsed
+                && parsed.blocks.saturating_mul(SECTORS) <= device.sectors()
+                && verify_checkpoint(device, block, parsed).is_ok()
+            {
+                previous = Some(*parsed);
+                break;
+            }
+        }
+        return Ok(Checkpoint {
+            superblock,
+            active_copy: active_copy as u64,
+            previous_log: previous.map(|parsed| parsed.region(Area::Log).at),
+            previous_tree: previous.map(|parsed| parsed.tree_root).filter(|root| *root != 0),
+        });
+    }
+    Err(last_error)
+}
+
 fn read<D: Device>(device: &mut D, block: &mut [u8; BLOCK], index: u64) -> Result<(), FsError> {
     let sector = index.checked_mul(SECTORS).ok_or(FsError::Corrupt)?;
     device.read(sector, block.as_mut_slice()).map_err(FsError::Device)
 }
 
+/// The copy holding the newest generation, ties going to the lower copy.
+fn newest(copies: &[Option<Super>], rejected: &[bool]) -> Option<usize> {
+    let mut best: Option<(usize, u64)> = None;
+    for (copy, parsed) in copies.iter().enumerate() {
+        if let Some(parsed) = parsed
+            && !rejected[copy]
+            && best.is_none_or(|(_, generation)| parsed.generation > generation)
+        {
+            best = Some((copy, parsed.generation));
+        }
+    }
+    best.map(|(copy, _)| copy)
+}
+
 fn verify_checkpoint<D: Device>(
     device: &mut D,
     block: &mut [u8; BLOCK],
-    superblock: Super,
+    superblock: &Super,
 ) -> Result<(), FsError> {
     for area in Area::ALL {
         let region = superblock.region(area);
@@ -423,129 +475,128 @@ mod tests {
 
     fn image() -> alloc::vec::Vec<u8> {
         let mut tree = Tree::new();
-        tree.file("hello.txt", b"hello, molt".to_vec()).expect("legal name");
-        tree.file("big.bin", alloc::vec![0xa5; 3 * BLOCK + 7]).expect("legal name");
-        tree.dir("docs").expect("legal name").file("readme", b"read me".to_vec()).unwrap();
-        build(&tree, 1).expect("image that fits")
+        tree.file("hello.txt", b"hello, molt".to_vec()).unwrap();
+        tree.file("big.bin", alloc::vec![0xa5; 3 * BLOCK + 7]).unwrap();
+        tree.dir("docs").unwrap().file("readme", b"read me".to_vec()).unwrap();
+        build(&tree, 1).unwrap()
     }
 
-    fn mount<'a>(bytes: &'a [u8], block: &'a mut [u8; BLOCK]) -> Volume<'a, Loopback<'a>> {
-        Volume::mount(Loopback::new(bytes).expect("whole sectors"), block).expect("live volume")
+    fn mount(bytes: &[u8]) -> Volume<Loopback<'_>> {
+        Volume::mount(Loopback::new(bytes).unwrap()).unwrap()
     }
 
     #[test]
-    fn file_reads_back_what_was_written() {
+    fn file_reads_back_what_was_written() -> Result<(), FsError> {
         let bytes = image();
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
+        let mut volume = mount(&bytes);
 
-        let root = volume.object(volume.root()).expect("root object");
-        let id = volume.lookup(&root, b"hello.txt").expect("name in the root");
-        let file = volume.object(id).expect("file object");
+        let root = volume.object(volume.root())?;
+        let id = volume.lookup(&root, b"hello.txt")?;
+        let file = volume.object(id)?;
         let mut text = [0u8; 16];
-        let read = volume.read(&file, 0, &mut text).expect("readable file");
+        let read = volume.read(&file, 0, &mut text)?;
 
         assert_eq!(&text[..read], b"hello, molt");
+        Ok(())
     }
 
     #[test]
-    fn read_crossing_blocks_stays_contiguous() {
+    fn read_crossing_blocks_stays_contiguous() -> Result<(), FsError> {
         let bytes = image();
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
+        let mut volume = mount(&bytes);
 
-        let root = volume.object(volume.root()).expect("root object");
-        let id = volume.lookup(&root, b"big.bin").expect("name in the root");
-        let file = volume.object(id).expect("file object");
+        let root = volume.object(volume.root())?;
+        let id = volume.lookup(&root, b"big.bin")?;
+        let file = volume.object(id)?;
         let mut window = [0u8; 8];
-        let read = volume.read(&file, BLOCK as u64 - 4, &mut window).expect("readable file");
+        let read = volume.read(&file, BLOCK as u64 - 4, &mut window)?;
 
         assert_eq!(read, 8);
-        assert_eq!(window, [0xa5; 8], "the block boundary lost bytes");
+        assert_eq!(window, [0xa5; 8], "block boundary lost bytes");
+        Ok(())
     }
 
     #[test]
-    fn short_read_stops_at_end_of_file() {
+    fn short_read_stops_at_end() -> Result<(), FsError> {
         let bytes = image();
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
+        let mut volume = mount(&bytes);
 
-        let root = volume.object(volume.root()).expect("root object");
-        let id = volume.lookup(&root, b"hello.txt").expect("name in the root");
-        let file = volume.object(id).expect("file object");
+        let root = volume.object(volume.root())?;
+        let id = volume.lookup(&root, b"hello.txt")?;
+        let file = volume.object(id)?;
 
         assert_eq!(volume.read(&file, 6, &mut [0; 64]), Ok(5));
+        Ok(())
     }
 
     #[test]
-    fn missing_name_reported() {
+    fn missing_name_reported() -> Result<(), FsError> {
         let bytes = image();
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
+        let mut volume = mount(&bytes);
 
-        let root = volume.object(volume.root()).expect("root object");
+        let root = volume.object(volume.root())?;
 
         assert_eq!(volume.lookup(&root, b"nothing"), Err(FsError::Missing));
+        Ok(())
     }
 
     #[test]
-    fn entries_come_back_sorted() {
+    fn entries_come_back_sorted() -> Result<(), FsError> {
         let bytes = image();
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
+        let mut volume = mount(&bytes);
 
-        let root = volume.object(volume.root()).expect("root object");
-        let first = volume.entry(&root, 0).expect("entry").0;
-        let second = volume.entry(&root, 1).expect("entry").0;
+        let root = volume.object(volume.root())?;
+        let first = volume.entry(&root, 0)?.0;
+        let second = volume.entry(&root, 1)?.0;
 
         assert_eq!(first.as_str(), Some("big.bin"));
         assert_eq!(second.as_str(), Some("docs"));
+        Ok(())
     }
 
     #[test]
-    fn nested_directory_reachable() {
+    fn nested_directory_reachable() -> Result<(), FsError> {
         let bytes = image();
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
+        let mut volume = mount(&bytes);
 
-        let root = volume.object(volume.root()).expect("root object");
-        let docs = volume.lookup(&root, b"docs").expect("subdirectory");
-        let docs = volume.object(docs).expect("directory object");
-        let id = volume.lookup(&docs, b"readme").expect("name in the subdirectory");
+        let root = volume.object(volume.root())?;
+        let docs = volume.lookup(&root, b"docs")?;
+        let docs = volume.object(docs)?;
+        let id = volume.lookup(&docs, b"readme")?;
 
-        assert_eq!(volume.object(id).expect("file object").kind, Kind::File);
+        assert_eq!(volume.object(id)?.kind, Kind::File);
+        Ok(())
     }
 
     #[test]
-    fn entry_past_end_reported() {
+    fn entry_past_end_reported() -> Result<(), FsError> {
         let bytes = image();
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
+        let mut volume = mount(&bytes);
 
-        let root = volume.object(volume.root()).expect("root object");
+        let root = volume.object(volume.root())?;
 
         assert_eq!(volume.entry(&root, 3).map(|entry| entry.0), Err(FsError::Missing));
+        Ok(())
     }
 
     #[test]
-    fn corrupt_data_block_refused() {
+    fn corrupt_data_block_refused() -> Result<(), FsError> {
         let mut bytes = image();
-        let data = super::Super::parse(&bytes[..BLOCK]).expect("superblock").data_at;
+        let data = super::Super::parse(&bytes[..BLOCK])?.data_at;
         bytes[data as usize * BLOCK] ^= 0xff;
-
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
-        let root = volume.object(volume.root()).expect("root object");
-        let id = volume.lookup(&root, b"big.bin").expect("name in the root");
-        let file = volume.object(id).expect("file object");
+        let mut volume = mount(&bytes);
+        let root = volume.object(volume.root())?;
+        let id = volume.lookup(&root, b"big.bin")?;
+        let file = volume.object(id)?;
 
         assert_eq!(volume.read(&file, 0, &mut [0; 8]), Err(FsError::Checksum));
+        Ok(())
     }
 
     #[test]
-    fn extent_physical_overflow_refused() {
+    fn extent_physical_overflow_refused() -> Result<(), FsError> {
         let mut bytes = image();
-        let mut superblock = Super::parse(&bytes[..BLOCK]).expect("superblock");
+        let mut superblock = Super::parse(&bytes[..BLOCK])?;
         let mut extents = superblock.region(Area::Extents);
         let at = extents.at as usize * BLOCK;
         bytes[at + 8..at + 16].copy_from_slice(&u64::MAX.to_le_bytes());
@@ -554,43 +605,40 @@ mod tests {
         for copy in 0..super::SUPERS {
             superblock.encode(&mut bytes[copy as usize * BLOCK..]);
         }
-
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
-        let root = volume.object(volume.root()).expect("root object");
-        let id = volume.lookup(&root, b"big.bin").expect("name in the root");
-        let file = volume.object(id).expect("file object");
+        let mut volume = mount(&bytes);
+        let root = volume.object(volume.root())?;
+        let id = volume.lookup(&root, b"big.bin")?;
+        let file = volume.object(id)?;
 
         assert_eq!(volume.read(&file, BLOCK as u64, &mut [0; 8]), Err(FsError::Corrupt));
+        Ok(())
     }
 
     #[test]
-    fn corrupt_metadata_refused_at_mount() {
+    fn corrupt_metadata_refused_at_mount() -> Result<(), FsError> {
         let mut bytes = image();
-        let superblock = super::Super::parse(&bytes[..BLOCK]).expect("superblock");
+        let superblock = super::Super::parse(&bytes[..BLOCK])?;
         let at = superblock.region(Area::Objects).at as usize * BLOCK;
         bytes[at] ^= 0xff;
-
-        let mut buffer = [0u8; BLOCK];
-        let device = Loopback::new(&bytes).expect("whole sectors");
+        let device = Loopback::new(&bytes)?;
 
         assert_eq!(
-            Volume::mount(device, &mut buffer).err(),
+            Volume::mount(device).err(),
             Some(FsError::Checksum),
-            "a damaged object region mounted"
+            "damaged object region mounted"
         );
+        Ok(())
     }
 
     #[test]
-    fn torn_superblock_falls_back_to_older_copy() {
+    fn torn_superblock_falls_back() -> Result<(), FsError> {
         let mut bytes = image();
         bytes[0] ^= 0xff;
+        let mut volume = mount(&bytes);
+        let root = volume.object(volume.root())?;
 
-        let mut buffer = [0u8; BLOCK];
-        let mut volume = mount(&bytes, &mut buffer);
-        let root = volume.object(volume.root()).expect("root object");
-
-        assert!(volume.lookup(&root, b"hello.txt").is_ok(), "the older copy did not serve");
+        assert!(volume.lookup(&root, b"hello.txt").is_ok(), "older copy did not serve");
+        Ok(())
     }
 
     #[test]

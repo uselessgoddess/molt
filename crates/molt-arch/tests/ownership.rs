@@ -45,6 +45,32 @@ fn released_frames_return_to_pool() {
 }
 
 #[test]
+fn vacant_run_skips_claimed_frames() {
+    let mut slots = [None; 4];
+    let mut table = table(&mut slots);
+    let held = table.claim(Span::frames(0x5000, 1).unwrap(), Owner::Kernel).unwrap();
+
+    assert_eq!(table.vacant(1), Some(Span::frames(0x4000, 1).unwrap()));
+    assert_eq!(table.vacant(2), Some(Span::frames(0x6000, 2).unwrap()));
+    assert_eq!(table.vacant(4), None, "a run crossed a claimed frame");
+    table.release(held).unwrap();
+}
+
+#[test]
+fn evict_releases_one_owner() {
+    let mut slots = [None; 4];
+    let mut table = table(&mut slots);
+    let kept = table.claim(Span::frames(0x4000, 1).unwrap(), Owner::Kernel).unwrap();
+    let stale = table.claim(Span::frames(0x5000, 2).unwrap(), Owner::Device(1)).unwrap();
+
+    assert_eq!(table.evict(Owner::Device(1)), 2);
+
+    assert_eq!(table.claimed(), 1, "eviction reached another owner");
+    assert_eq!(table.release(stale), Err(Error::NotOwner), "a token outlived its eviction");
+    table.release(kept).unwrap();
+}
+
+#[test]
 fn frames_from_another_table_rejected() {
     let mut mine = [None; 4];
     let mut theirs = [None; 4];

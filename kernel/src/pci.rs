@@ -19,7 +19,11 @@ const DELIVERY_SPINS: u32 = 10_000_000;
 struct Interrupts(InterruptSlab<LINES>);
 
 impl Sink for Interrupts {
+    /// The kernel's interrupt entry, and so where the heap is barred: nothing
+    /// under here may allocate, and the guard makes the attempt a refusal
+    /// rather than a core spinning on a flag the interrupted code holds.
     fn raise(&self, line: u16) {
+        let _heap = crate::heap::interrupt();
         self.0.raise(line);
     }
 }

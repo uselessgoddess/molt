@@ -2,8 +2,7 @@
 //!
 //! It lives beside the reader rather than in `xtask` so both halves share one
 //! definition of the layout and a test can round-trip through them. Nothing in
-//! the kernel needs it, so it hides behind the `format` feature and is the only
-//! part of the crate that allocates.
+//! the kernel needs it, so it hides behind the `format` feature.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -256,43 +255,47 @@ mod tests {
 
     use super::{Tree, build, build_with_capacity};
     use crate::FsError;
-    use crate::layout::{BLOCK, MAX_TREE_BLOCKS, Super};
+    use crate::layout::{BLOCK, DEFAULT_TREE_BLOCKS, MAX_TREE_BLOCKS, Super};
 
     #[test]
-    fn empty_tree_still_mounts_as_volume() {
-        let image = build(&Tree::new(), 1).expect("image that fits");
-        let superblock = Super::parse(&image).expect("superblock");
+    fn empty_tree_mounts() -> Result<(), FsError> {
+        let image = build(&Tree::new(), 1)?;
+        let superblock = Super::parse(&image)?;
 
         assert_eq!(superblock.generation, 1);
         assert_eq!(superblock.data_blocks, 0);
-        assert_eq!(superblock.tree_blocks, MAX_TREE_BLOCKS);
+        assert_eq!(superblock.tree_blocks, DEFAULT_TREE_BLOCKS);
+        Ok(())
     }
 
     #[test]
-    fn both_superblock_copies_written() {
-        let image = build(&Tree::new(), 3).expect("image that fits");
+    fn both_superblock_copies_written() -> Result<(), FsError> {
+        let image = build(&Tree::new(), 3)?;
 
         assert_eq!(Super::parse(&image), Super::parse(&image[BLOCK..]));
+        Ok(())
     }
 
     #[test]
-    fn image_covers_whole_blocks() {
+    fn image_covers_whole_blocks() -> Result<(), FsError> {
         let mut tree = Tree::new();
-        tree.file("a", vec![1; BLOCK + 1]).expect("legal name");
+        tree.file("a", vec![1; BLOCK + 1])?;
 
-        let image = build(&tree, 1).expect("image that fits");
+        let image = build(&tree, 1)?;
 
         assert_eq!(image.len() % BLOCK, 0);
+        Ok(())
     }
 
     #[test]
-    fn hole_costs_no_data_block() {
+    fn hole_costs_no_data_block() -> Result<(), FsError> {
         let mut tree = Tree::new();
-        tree.file("sparse", vec![0; 4 * BLOCK]).expect("legal name");
+        tree.file("sparse", vec![0; 4 * BLOCK])?;
 
-        let image = build(&tree, 1).expect("image that fits");
+        let image = build(&tree, 1)?;
 
-        assert_eq!(Super::parse(&image).expect("superblock").data_blocks, 0);
+        assert_eq!(Super::parse(&image)?.data_blocks, 0);
+        Ok(())
     }
 
     #[test]
@@ -305,19 +308,21 @@ mod tests {
     }
 
     #[test]
-    fn directory_reopens_instead_of_duplicating() {
+    fn directory_reopens_instead_of_duplicating() -> Result<(), FsError> {
         let mut tree = Tree::new();
-        tree.dir("docs").expect("legal name").file("one", vec![]).expect("legal name");
-        tree.dir("docs").expect("legal name").file("two", vec![]).expect("legal name");
+        tree.dir("docs")?.file("one", vec![])?;
+        tree.dir("docs")?.file("two", vec![])?;
 
         assert_eq!(tree.nodes.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn directory_over_file_refused() {
+    fn directory_over_file_refused() -> Result<(), FsError> {
         let mut tree = Tree::new();
-        tree.file("name", vec![]).expect("legal name");
+        tree.file("name", vec![])?;
 
         assert_eq!(tree.dir("name").err(), Some(FsError::Kind));
+        Ok(())
     }
 }

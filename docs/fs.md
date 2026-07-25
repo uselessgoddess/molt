@@ -131,9 +131,8 @@ block 1   superblock copy 1
 Blocks are 4096 bytes. Every record size divides the block size, so no record
 straddles a boundary and a reader needs exactly one block of buffer to reach any
 of them — which is why an object is 32 bytes rather than the 24 its fields use.
-That constant is the reason `Volume` can be `no_std`, allocation-free, and
-usable from a kernel that has no heap: mounting costs one `[u8; 4096]` the
-caller supplies.
+That constant is what keeps reading bounded: a mounted `Volume` holds exactly
+one `[u8; 4096]`, boxed, and every record it parses is reachable from it.
 
 **The superblock** carries a magic, version, block size, generation, volume
 length, root object id, data geometry, tree arena and root, log-bank capacity,
@@ -180,8 +179,9 @@ have passed a durability barrier.
 
 The tree API is deliberately small: exact lookup, ordered successor, insert,
 and transaction root. Filesystem code builds object, directory, and write keys
-on top rather than teaching the tree about files. The path and split buffers
-are fixed-size, so the kernel still needs no RAM allocator.
+on top rather than teaching the tree about files. Nodes, the path a mutation
+walks, and the split scratch live on the heap — see [the stack budget](#the-stack-budget)
+for what that replaced.
 
 The tree arena has a bounded tracing allocator. Starting a transaction marks
 nodes reachable from the active and previous roots; every other arena block is
@@ -192,14 +192,86 @@ log capacity, and `FsError::Full` reports either finite bound explicitly.
 
 ## Metadata cache
 
-`MetadataTree` owns four parsed-node slots, about 16 KiB, and uses a bounded
+`MetadataTree` keeps sixteen parsed nodes, about 64 KiB of heap, under a bounded
 second-chance policy inspired by
 [SIEVE](https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo).
 A hit sets one visited bit and does not move the node. The eviction hand clears
 visited candidates and replaces the first unvisited one. This is useful here
 because it has constant metadata, no linked allocation, and makes repeated
-root and directory probes device-read free. `Journal::tree_stats` exposes hit,
-miss, and eviction counters for tests and diagnostics.
+root and directory probes device-read free. Entries are `Rc<Node>`, so a node a
+lookup is standing on survives its own eviction and the walk costs a refcount
+rather than a copy of 4 KiB. `Journal::tree_stats` exposes hit, miss, and
+eviction counters for tests and diagnostics.
+
+**Why the tree caches, and not a page cache underneath it.** The question is
+worth answering explicitly, because a page cache is the usual answer and it is
+the wrong one to reach for first. What this cache stores is a *parsed* node —
+header validated, checksum verified, keys addressable — so a hit skips the
+decode as well as the read. A block cache under `Device` would store bytes, and
+every hit above it would re-verify a checksum it already verified. The two are
+also owned by different people: node lifetime follows the COW discipline
+(a block reachable from a durable root is immutable, so a cached copy can never
+go stale), while page lifetime follows dirty state and writeback, which is a
+policy this filesystem does not have and does not want to inherit.
+
+A page cache still belongs in the system, one layer down and later: it is what
+makes readahead, data blocks, and a second filesystem cheap, and Stage 4 puts it
+behind `molt-block` with the `BlockOp` ring, where the SMP story can be settled
+once for every client. Two caches then is not duplication — the block cache
+holds bytes for whoever reads them, the metadata cache holds structure for the
+tree that owns it. Data reads keep the single-block window in `Volume` until
+that day, because a data cache without an eviction policy tied to writeback is
+the half of a page cache that only looks free.
+
+## The stack budget
+
+The kernel stack is 128 KiB, one per core, and nothing grows it. The first
+writable tree spent most of it: a mutation carried a root-to-leaf path of parsed
+nodes, a split carried two more, and each node is 4 KiB, so `Journal::mount`
+measured 78 912 bytes of stack and one `create` 98 304. On the host those frames
+are free; on the kernel stack they are two operations from an overflow that has
+no guard page under it.
+
+`crates/molt-fs/tests/stack.rs` is the record. It paints a 96 KiB window in a
+frame below the current one, runs a single mount or a single create/sync, and
+reads back how far the paint was disturbed. Both budgets are 16 KiB and both
+pass with room: in a debug build `Journal::mount` spends 10 264 bytes, a create
+7 616, and a sync 2 464. The test fails loudly if a future change puts a node
+back on the stack, which is the only way this property stays true.
+`experiments/stack_probe.rs` prints the same measurement phase by phase.
+
+What moved: nodes are built on the heap and cached as `Rc<Node>`; the mutation path is
+a `Vec` of block numbers rather than of nodes, so descending costs 8 bytes a
+level; the split scratch is one boxed block owned by the tree; the free-space
+bitmap is a `Vec<u64>` sized from the arena; and `Volume` owns its 4 KiB block
+buffer instead of borrowing one from every caller, which also erased a lifetime
+from `Volume`, `Journal`, and `Fs`. The kernel donates 4 MiB of claimed frames to
+`molt-alloc` at boot, which is where all of that now lives.
+
+The trade is honest rather than free: a bounded array cannot fail, and a heap
+can. `FsError::Full` still reports the arena and log bounds, and an exhausted
+heap is `FsError::Memory` next to it — a filesystem that already answers errors
+has no business taking the machine down over one node it could not get.
+`crates/molt-fs/src/mem.rs` is where that mapping lives: `Box::try_new_zeroed`,
+`Rc::try_new_zeroed`, and `try_reserve` behind names the call sites use, so no
+allocation in the crate reaches `handle_alloc_error`. `mkfs` is the exception
+and stays infallible — it runs on a host, behind a feature the kernel does not
+enable.
+
+`Rc::try_new_zeroed` rather than a `Box` converted afterwards, because a node is
+built field by field and shared only once it reaches the cache: converting would
+allocate the four kilobytes twice, and `Rc::try_new(node)` would build it on the
+stack the budget above measures. `mem::Unique` is the window while the handle is
+still the only one — it derefs mutably through `Rc::get_mut` and gives itself up
+with `shared()`.
+
+Bounding the filesystem's demand is still what keeps refusal rare: the cache is
+sixteen nodes reserved at mount, a path is `MAX_HEIGHT` block numbers, and a
+mutation allocates a replacement path, not a tree. `crates/molt-fs/tests/memory.rs`
+is the proof it is handled rather than merely typed — it replaces the global
+allocator with one that refuses large allocations on the calling thread, and
+shows a mount answering `FsError::Memory` and a refused create rolling back to
+its snapshot while the journal keeps taking work.
 
 ## Crash consistency
 
@@ -289,37 +361,49 @@ capabilities, not a URL namespace, and the roadmap already lists it as *a typed
 scheme/resource namespace*, emphasis on typed. This document is the record that
 "typed" means capabilities, not strings.
 
-## Cells: not yet, and the reason is measurable
+## Cells: the filesystem is a service now
 
 The sketch in the issue had `AppCell → FsCell → VirtioCell`, three cells and two
-rings. What shipped is a shell and an `Fs` on one ring, with the block driver
-called directly. That is a smaller thing than the sketch, and the difference is
-worth being precise about, because "make everything a cell" is the kind of
-decision that is very hard to walk back.
+rings. The read-only stage shipped one ring and no cell, because the restart
+story for a mount needs a write path to be worth writing. The write path exists,
+so `molt_fs::FsCell` does too: init starts one, hands out roots, and owns the
+only mount in the system.
 
-**What a cell buys.** `Supervisor` gives restart with state reset, and
-`CapabilityTable::revoke_owner` makes that restart *clean*: every handle the
-cell held goes stale, so nothing survives a restart holding authority it was
-granted in a previous life. `Fs::revoke` is exactly this, and it is already
-tested — a cell that dies loses its handles, and a stale handle is
-`CapabilityError::Stale` rather than a read of whatever now occupies that slot.
-That property is the point of a cell and it exists today.
+**What it is.** `FsCell::start` mounts the device and keeps it; `fs()` hands out
+the `Fs` other cells submit to; `restart(hooks)` is the lifecycle the name
+promises. A restart stops submissions, cancels in-flight requests, revokes every
+capability, and remounts — in that order, because a restart that let one more
+submission in would answer it from a filesystem that is half gone. The remount
+goes back to the last durable checkpoint, so what was synced survives and what
+was not is exactly what a power cut would have taken. `generation()` counts
+restarts, `checkpoint()` reports the volume's, and the two are deliberately
+different numbers.
 
-**What a cell costs, here.** Wrapping `Fs` in `Cell` means committing to
-`Message`/`Reply` for something that already has a richer protocol, and today
-would mean one message type that wraps `FsOp` and one reply that wraps
-`FsDone` — a layer whose entire content is the word "wraps". The supervisor also
-restarts a cell by rebuilding its state from `Default`, and a mounted volume's
-state is a borrowed block buffer and a device; the honest restart story for a
-filesystem is remount, which is a Stage 3 conversation with a write path in it.
+**When the remount fails.** By then the hooks have run: handles are revoked, the
+tree is dropped, and the log is unreplayed, so there is no filesystem left to
+answer with. The cell says so rather than pretending — `state()` turns
+`FsState::Failed` and every later `fs()` and `restart()` returns
+`FsError::Failed`. Restarting again is refused on purpose: the hooks would revoke
+a second time, and whatever made the disk unreadable is still there. Recovery
+belongs to the supervisor, which drops the cell and starts one on a device that
+mounts.
 
-**So the boundary is the ring, and the ring is already there.** `Fs::serve`
-drains submissions and posts completions without knowing who submitted them, and
-`Session` submits without knowing who serves. Putting either end in a cell later
-is a change to the outside of those two types. Nothing above the ring reaches
-into the volume — the shell has a capability and a buffer, and that is all it
-has — so the seam that a cell boundary would need is load-bearing today, which
-is the only way to know it is real.
+**Why it is not `impl Cell`.** `molt_core::cell::Cell` requires `Send + 'static`,
+a `State: Default`, and an infallible `spawn`. A mount is none of those: it owns
+a device that may carry a lifetime, and mounting is the operation that fails.
+Forcing the trait would mean a `Default` state that is "no filesystem" plus a
+`Message`/`Reply` pair whose entire content is the word "wraps" around `FsOp`.
+What the trait is actually for — supervised restart with clean state — is the
+part that carried over: `RestartHooks` is `molt-core`'s, the order is the
+supervisor's order, and `CapabilityTable::revoke_owner` is what makes the restart
+clean. When `Cell` grows a fallible spawn and a borrowed state, `FsCell` is where
+that lands, and its callers do not move.
+
+**The seam is still the ring.** `Fs::serve` drains submissions and posts
+completions without knowing who submitted them, and `Session` submits without
+knowing who serves. Nothing above the ring reaches into the volume — the shell
+has a capability and a buffer, and that is all it has — so the cell wraps a
+boundary that was already load-bearing rather than inventing one.
 
 **The block driver stays a call, deliberately.** A `BlockOp` ring under the
 filesystem is the sketch's second ring, and it is the one place the layering
@@ -332,11 +416,12 @@ readahead, concurrent extent fetches, and a cache behind it. That later scale
 stage gets `BlockOp`; direct traits keep this stage synchronous and make that
 change a substitution rather than a rewrite.
 
-**Naming.** No type here is called `FsCell` or `VirtioCell`. The module supplies
-the context, as [the style guide](style.md) says: `molt_fs::Fs`,
-`molt_virtio::Block`, `molt_block::Loopback`. If one of them becomes a cell, it
-becomes one by implementing `Cell`, and the trait in the `impl` line says so
-better than a suffix on every use site.
+**Naming.** `FsCell` is the one suffix in the crate, and it earns the exception:
+`Fs` is the protocol a client talks and `FsCell` is the service that owns one,
+and the two are exported side by side, where `Fs` and `Cell` alone would not say
+which is which. Everything else keeps the rule from
+[the style guide](style.md) — `molt_virtio::Block`, `molt_block::Loopback` — and
+nothing is called `VirtioCell`, because the driver is still a call.
 
 ## Where the driver ends: `molt-block`
 
@@ -507,17 +592,28 @@ line editor away and needs a serial `read` before it is worth writing.
 - **No rename, unlink, or compaction.** Create, sparse write, replay, and sync
   are complete; reclaiming log space and changing namespace links arrive with
   the B-tree/free-space stage.
-- **No B-tree, no snapshots, no reflinks, no compression, no encryption.** Stage
-  4, and each one needs the writer first.
-- **No cache.** `Volume` keeps the last block it read and nothing else. A
-  directory search re-reads a block only when the binary search moves off it,
-  and a data block costs a second read for the sum that covers it. A real cache
-  is an allocator and an eviction policy, and it wants the SMP story from Stage
-  4 to be safe rather than merely correct on one core.
+- **No snapshots, no reflinks, no compression, no encryption.** Stage 4, and
+  each one needs the writer first.
+- **No data cache.** Metadata nodes are cached; `Volume` keeps the last data
+  block it read and nothing else. A directory search re-reads a block only when
+  the binary search moves off it, and a data block costs a second read for the
+  sum that covers it. The rest is the page cache above, which waits for the
+  block ring.
 - **No scrub.** The sums region exists and is checked per block on read; walking
   it deliberately is a Stage 4 item, and the region layout is what makes it
   cheap when it comes.
-- **No `BlockOp` ring.** Above.
+- **No `BlockOp` ring, so no asynchronous I/O below the ring.** Above. `Fs`
+  answers submissions from a queue, but the device read under it blocks, so a
+  submission's latency is a device's. This is the next thing the filesystem
+  needs and it is deliberately a separate change: it moves `Volume`, `Journal`,
+  and every caller to `async fn`, and doing it in the same breath as the heap
+  and the service would have made both unreviewable.
+- **No SMP.** One core, one mount, no locks: the metadata cache is `Rc`, `Fs`
+  is `&mut`, and neither is `Send`. That is a bound the type system states
+  rather than a bug waiting — a second core cannot reach this filesystem by
+  accident. Stage 4 gives the block layer its own concurrency story, and the
+  shape that survives it is a filesystem *cell* other cores talk to by ring,
+  which is why the service exists now and the locks do not.
 - **crc32c uses a software fallback.** No `SSE4.2` or `Zbc` path. It is 75 lines and
   the disk it runs against is a boot-time image; the moment it shows up in a
   profile, the intrinsic is a one-file change.
@@ -542,6 +638,13 @@ buffer, and a revoked owner cannot write through a stale file handle. A full
 handle table refuses rather than overwrites, and a full completion queue
 preserves the next result until the client makes room.
 
+Cell tests cover the lifecycle: a restart keeps what was synced, drops what was
+not, leaves every handle stale, runs its hooks in the documented order, and
+counts itself. A disk that stops answering reads mid-restart proves the failed
+state: the cell reports the device error, refuses every later call, and does not
+run its hooks again even once the disk is back. Two tests hold the stack budget
+at 16 KiB for mount and for a create/sync cycle.
+
 The shell tests run scripts against a mounted image and compare what was
 printed, which is the only test that can catch a protocol that is technically
 complete and unusable: `cat` across several reads, `cat` on a directory, `ls` on
@@ -554,8 +657,9 @@ image, and the smoke disk is one of those rather than a signed pattern — the
 sector zero, the filesystem mounts, creates `runtime.txt`, writes and syncs it
 through virtio, reads it back, then the shell prints the original host file.
 The x86_64 smoke requires `MOLT_FS_WRITE_OK:` in addition to mount and shell
-markers. An xtask test performs the same write, drops the mount, remounts, and
-checks the durable bytes on the host.
+markers, then restarts the service and requires `MOLT_FS_RESTART_OK:` for the
+synced file still being there. An xtask test performs the same write, drops the
+mount, remounts, and checks the durable bytes on the host.
 
 ## Debts closed before the write path
 
@@ -594,9 +698,11 @@ allocator this layer refuses.
 submit `FsOp::Root` and receive a root handle, which made the one piece of
 ambient authority in the design mintable by anyone on the ring. It is now off
 the ring entirely: `Fs::root` is the only grant, only init holds the `Fs` to
-call it, and `Fs::seal` makes it one-shot for the mount's life. The protocol
-section above is the full argument; the debt was that the asymmetry existed in
-prose but not in the types.
+call it, and `Fs::seal` makes it one-shot for the mount's life. A restart is a
+new life: every handle from the old one is revoked, so the bootstrap opens again
+for a service that has no holders left to protect. The protocol section above is
+the full argument; the debt was that the asymmetry existed in prose but not in
+the types.
 
 ## Version and growth path
 
@@ -606,9 +712,8 @@ but that is a reason to keep migration policy small, not to label incompatible
 layouts with the same version. Version 1 and 2 images are rejected rather than
 guessed at; `xtask mkfs` rebuilds development images as version 3.
 
-- **Stage 3, cells.** `Fs` becomes a supervised cell when there is more than one
-  client and restart means remount. `revoke_owner` is the piece that has to
-  work then, and it already covers write authority.
+- **Stage 3, asynchronous I/O.** `Volume` and `Journal` go `async` over a
+  `BlockOp` ring, and `FsCell` is where the executor that awaits it lives.
 - **Stage 4, scale.** File payloads compact from the journal into extent keys;
   reference counts and bucket generations generalize the bounded tree arena;
   sums become a scrub work list; block layer gains its ring, data cache, and

@@ -1,4 +1,4 @@
-//! MoltFS, a checksummed writable filesystem over [`molt_block::Writable`].
+//! MoltFS, a checksummed writable filesystem over [`molt_block::Disk`].
 //!
 //! `xtask mkfs` lays out immutable objects, extents, entries, names, sums, and
 //! data. Runtime metadata lives in a checksummed copy-on-write B+ tree while
@@ -9,29 +9,36 @@
 //! generation mountable, without fsck.
 //!
 //! [`Volume`] is the reader, needing one block of buffer and nothing else.
-//! [`Journal`] adds allocation-free replay and mutation, and [`Fs`] wraps it in
-//! the ring protocol every other cell talks: typed [`FsOp`] submissions in,
-//! [`FsDone`] completions out, with directories and files named by capability
-//! rather than by path.
+//! [`Journal`] adds replay and mutation, and [`Fs`] wraps it in the ring
+//! protocol every other cell talks: typed [`FsOp`] submissions in, [`FsDone`]
+//! completions out, with directories and files named by capability rather than
+//! by path. Metadata nodes and the arena bitmap live on the heap, so a mutation
+//! costs its caller a path of block numbers rather than kilobytes of frame.
 //!
 //! See `docs/fs.md` for the format and the decisions behind it.
 
 #![no_std]
+#![feature(allocator_api)]
 
-#[cfg(feature = "format")]
 extern crate alloc;
 #[cfg(test)]
 extern crate std;
+
+use alloc::alloc::AllocError;
+use alloc::collections::TryReserveError;
 
 use molt_block::BlockError;
 use molt_core::buffer::BufferError;
 use molt_core::capability::CapabilityError;
 
+mod bitmap;
 mod btree;
+mod cell;
 mod crc;
 mod journal;
 mod layout;
 mod log;
+mod mem;
 mod name;
 mod op;
 mod service;
@@ -41,6 +48,7 @@ mod volume;
 pub mod format;
 
 pub use crate::btree::{CacheStats, TreeStats};
+pub use crate::cell::{FsCell, FsState};
 pub use crate::journal::Journal;
 pub use crate::layout::{BLOCK, Kind, MAGIC, MAX_NAME, Object, SUPERS, VERSION};
 pub use crate::name::Name;
@@ -81,6 +89,23 @@ pub enum FsError {
     Handles,
     /// The tree arena, mutation log, or object-id space is full.
     Full,
+    /// The service ran its restart hooks and could not remount, so there is no
+    /// filesystem behind it any more.
+    Failed,
+    /// The heap refused memory the operation needed.
+    Memory,
+}
+
+impl From<AllocError> for FsError {
+    fn from(_: AllocError) -> Self {
+        Self::Memory
+    }
+}
+
+impl From<TryReserveError> for FsError {
+    fn from(_: TryReserveError) -> Self {
+        Self::Memory
+    }
 }
 
 impl From<BlockError> for FsError {

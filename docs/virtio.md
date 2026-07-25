@@ -46,12 +46,14 @@ not free — a later audit walking the table sees device-owned memory as exactly
 that, and a second claim over the same span is `Error::Owned` rather than a
 silent overlap of two devices' DMA.
 
-The arena is bump-allocated and reclaimed *whole*. A block read needs five
-regions — three ring structures, a request-header block, and a data buffer —
-and rather than a free list with per-region lifetimes, the arena hands them out
-in rising order and takes the entire span back at once in
-[`reset`](../crates/molt-arch/src/dma.rs). A driver that owns one queue has one
-thing to release, and it releases it at one point in its life, which is the
+The arena tracks its span a frame at a time, in the frame table it already
+keeps. A block read needs five regions — three ring structures, a
+request-header block, and a data buffer — and each claims the lowest free run
+long enough to hold it. [`release`](../crates/molt-arch/src/dma.rs) hands one
+region's frames back for the next region to use, so a driver that reprograms a
+queue reuses its span instead of running it down;
+[`reset`](../crates/molt-arch/src/dma.rs) evicts the tag wholesale, whatever is
+still outstanding. Both are for a device already told to stop, which is the
 point the four semantics below are built around.
 
 ## Where a physical address becomes something you may touch

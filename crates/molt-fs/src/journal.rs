@@ -12,41 +12,65 @@ use crate::layout::{Area, BLOCK, Kind, OBJECT_BYTES, Object, Region};
 use crate::log::{ALIGN, HEADER, Record};
 use crate::{FsError, Name, Volume};
 
-#[derive(Clone, Copy)]
+/// The unpublished half of a checkpoint: where the new log bank is, how far it
+/// has been filled, and the tree generation indexing it.
 struct Transaction {
     at: u64,
     bytes: u64,
     tree: TreeTransaction,
 }
 
+impl Transaction {
+    /// A copy to roll back to, if the heap has room for the tree's arena maps.
+    fn try_clone(&self) -> Result<Self, FsError> {
+        Ok(Self { tree: self.tree.try_clone()?, ..*self })
+    }
+}
+
 /// A mounted writable filesystem.
-pub struct Journal<'buf, D> {
-    volume: Volume<'buf, D>,
+pub struct Journal<D> {
+    volume: Volume<D>,
     transaction: Option<Transaction>,
     tree: MetadataTree,
     base_objects: u32,
     next_object: u32,
 }
 
-impl<'buf, D: Disk> Journal<'buf, D> {
+impl<D: Disk> Journal<D> {
     /// Mounts the newest valid checkpoint and replays its mutation log.
-    pub fn mount(device: D, block: &'buf mut [u8; BLOCK]) -> Result<Self, FsError> {
-        let volume = Volume::mount(device, block)?;
-        let object_bytes = volume.checkpoint().region(Area::Objects).bytes;
+    pub fn mount(device: D) -> Result<Self, FsError> {
+        let mut journal = Self {
+            volume: Volume::mount(device)?,
+            transaction: None,
+            tree: MetadataTree::new()?,
+            base_objects: 0,
+            next_object: 0,
+        };
+        journal.replay()?;
+        Ok(journal)
+    }
+
+    /// Remounts the volume, dropping every uncommitted change.
+    ///
+    /// What was never synced was never a checkpoint, so it does not come back:
+    /// this is the state a power cut would have left, reached deliberately.
+    pub fn remount(&mut self) -> Result<(), FsError> {
+        self.volume.remount()?;
+        self.transaction = None;
+        self.tree = MetadataTree::new()?;
+        self.replay()
+    }
+
+    /// Sizes the object space from the mounted checkpoint and replays its log.
+    fn replay(&mut self) -> Result<(), FsError> {
+        let object_bytes = self.volume.checkpoint().region(Area::Objects).bytes;
         if object_bytes % OBJECT_BYTES as u64 != 0 {
             return Err(FsError::Corrupt);
         }
-        let base_objects =
+        self.base_objects =
             u32::try_from(object_bytes / OBJECT_BYTES as u64).map_err(|_| FsError::Corrupt)?;
-        let mut journal = Self {
-            volume,
-            transaction: None,
-            tree: MetadataTree::new(),
-            base_objects,
-            next_object: base_objects,
-        };
-        journal.validate_log()?;
-        Ok(journal)
+        self.next_object = self.base_objects;
+        self.validate_log()
     }
 
     /// The object id of the root directory.
@@ -71,7 +95,7 @@ impl<'buf, D: Disk> Journal<'buf, D> {
             return Err(FsError::Missing);
         }
         let root = self.tree_root();
-        if let Some(value) = self.tree.get(&mut self.volume, root, Key::object(id))? {
+        if let Some(value) = self.tree.get(&mut self.volume, root, &Key::object(id))? {
             return value.as_object();
         }
         if id < self.base_objects {
@@ -96,7 +120,7 @@ impl<'buf, D: Disk> Journal<'buf, D> {
         }
 
         let root = self.tree_root();
-        if let Some(value) = self.tree.get(&mut self.volume, root, Key::dirent(dir, name))? {
+        if let Some(value) = self.tree.get(&mut self.volume, root, &Key::dirent(dir, name))? {
             return Ok(value.as_dirent());
         }
         Err(FsError::Missing)
@@ -129,7 +153,7 @@ impl<'buf, D: Disk> Journal<'buf, D> {
                 None => Key::dirent_start(dir),
             };
             if let Some((key, value)) =
-                self.tree.next(&mut self.volume, root, key, previous.is_none())?
+                self.tree.next(&mut self.volume, root, &key, previous.is_none())?
                 && key.is_dirent(dir)
             {
                 choose(&mut candidate, previous, key.name()?, value.as_dirent());
@@ -165,7 +189,7 @@ impl<'buf, D: Disk> Journal<'buf, D> {
         let root = self.tree_root();
         let mut key = Key::write_start(file);
         let mut inclusive = true;
-        while let Some((found, value)) = self.tree.next(&mut self.volume, root, key, inclusive)? {
+        while let Some((found, value)) = self.tree.next(&mut self.volume, root, &key, inclusive)? {
             if !found.is_write(file) {
                 break;
             }
@@ -202,7 +226,7 @@ impl<'buf, D: Disk> Journal<'buf, D> {
         let object = self.next_object;
         let next = object.checked_add(1).ok_or(FsError::Full)?;
         parent_object.count = parent_object.count.checked_add(1).ok_or(FsError::Full)?;
-        let before = self.begin()?;
+        let before = self.snapshot()?;
         if let Err(error) = self
             .append(Record::create(object, parent, kind, name), name.as_bytes())
             .and_then(|_| self.index(Key::object(parent), Value::object(parent_object)))
@@ -232,7 +256,7 @@ impl<'buf, D: Disk> Journal<'buf, D> {
             return Ok(0);
         }
         let record = Record::write(file, offset, bytes.len())?;
-        let before = self.begin()?;
+        let before = self.snapshot()?;
         let cursor = match self.append(record, bytes) {
             Ok(cursor) => cursor,
             Err(error) => {
@@ -252,17 +276,17 @@ impl<'buf, D: Disk> Journal<'buf, D> {
 
     /// Makes every pending record durable and publishes a new generation.
     pub fn sync(&mut self) -> Result<u64, FsError> {
-        let Some(transaction) = self.transaction else {
+        let Some(transaction) = self.transaction.as_ref() else {
             self.volume.flush()?;
             return Ok(self.volume.generation());
         };
+        let (at, bytes, root) = (transaction.at, transaction.bytes, transaction.tree.root);
 
-        let crc = self.volume.checksum(transaction.at, transaction.bytes)?;
+        let crc = self.volume.checksum(at, bytes)?;
         let mut checkpoint = self.volume.checkpoint();
         checkpoint.generation = checkpoint.generation.checked_add(1).ok_or(FsError::Full)?;
-        checkpoint.tree_root = transaction.tree.root;
-        checkpoint
-            .set_region(Area::Log, Region { at: transaction.at, bytes: transaction.bytes, crc });
+        checkpoint.tree_root = root;
+        checkpoint.set_region(Area::Log, Region { at, bytes, crc });
         let copy = 1 - self.volume.active_copy();
 
         // The log must survive before any durable superblock is allowed to
@@ -327,12 +351,12 @@ impl<'buf, D: Disk> Journal<'buf, D> {
                     let name = self.record_name(cursor, record)?;
                     let state = self
                         .tree
-                        .get(&mut self.volume, root, Key::object(object))?
+                        .get(&mut self.volume, root, &Key::object(object))?
                         .ok_or(FsError::Corrupt)?
                         .as_object()?;
                     let linked = self
                         .tree
-                        .get(&mut self.volume, root, Key::dirent(parent, &name))?
+                        .get(&mut self.volume, root, &Key::dirent(parent, &name))?
                         .ok_or(FsError::Corrupt)?
                         .as_dirent();
                     if state.kind != kind || linked != object {
@@ -342,7 +366,7 @@ impl<'buf, D: Disk> Journal<'buf, D> {
                 Record::Write { object, offset, bytes } => {
                     let indexed = self
                         .tree
-                        .get(&mut self.volume, root, Key::write(object, cursor))?
+                        .get(&mut self.volume, root, &Key::write(object, cursor))?
                         .ok_or(FsError::Corrupt)?
                         .as_write();
                     if indexed != (offset, bytes) {
@@ -400,9 +424,10 @@ impl<'buf, D: Disk> Journal<'buf, D> {
         Ok(false)
     }
 
-    fn begin(&mut self) -> Result<Transaction, FsError> {
-        if let Some(transaction) = self.transaction {
-            return Ok(transaction);
+    /// Opens a transaction unless one is already open.
+    fn begin(&mut self) -> Result<(), FsError> {
+        if self.transaction.is_some() {
+            return Ok(());
         }
         let checkpoint = self.volume.checkpoint();
         let active = checkpoint.region(Area::Log);
@@ -412,19 +437,18 @@ impl<'buf, D: Disk> Journal<'buf, D> {
             .ok_or(FsError::Corrupt)?;
         let tree = self.tree.begin(&mut self.volume)?;
         self.volume.copy_aligned(active.at, target, active.bytes)?;
-        let transaction = Transaction { at: target, bytes: active.bytes, tree };
-        self.transaction = Some(transaction);
-        Ok(transaction)
+        self.transaction = Some(Transaction { at: target, bytes: active.bytes, tree });
+        Ok(())
     }
 
     fn append(&mut self, record: Record, payload: &[u8]) -> Result<u64, FsError> {
         if payload.len() != record.payload() as usize {
             return Err(FsError::Corrupt);
         }
-        let transaction = self.begin()?;
-        let cursor = transaction.bytes;
+        self.begin()?;
+        let (at, cursor) = self.bank()?;
         let span = record.span()?;
-        let end = transaction.bytes.checked_add(span).ok_or(FsError::Full)?;
+        let end = cursor.checked_add(span).ok_or(FsError::Full)?;
         let capacity = u64::from(self.volume.checkpoint().log_blocks)
             .checked_mul(BLOCK as u64)
             .ok_or(FsError::Corrupt)?;
@@ -451,27 +475,52 @@ impl<'buf, D: Disk> Journal<'buf, D> {
                 sector[target..target + (end - start) as usize]
                     .copy_from_slice(&payload[source..source + (end - start) as usize]);
             }
-            self.volume.write_aligned(transaction.at, transaction.bytes + written, &sector)?;
+            self.volume.write_aligned(at, cursor + written, &sector)?;
             written += ALIGN;
         }
-        self.transaction = Some(Transaction { bytes: end, ..transaction });
+        self.open()?.bytes = end;
         Ok(cursor)
     }
 
     fn index(&mut self, key: Key, value: Value) -> Result<(), FsError> {
-        let mut transaction = self.transaction.ok_or(FsError::Corrupt)?;
-        self.tree.insert(&mut self.volume, &mut transaction.tree, key, value)?;
+        // Taken out and put back: the tree needs the volume the journal owns,
+        // and a failed insert still leaves a transaction its caller rolls back.
+        let mut transaction = self.transaction.take().ok_or(FsError::Corrupt)?;
+        let inserted = self.tree.insert(&mut self.volume, &mut transaction.tree, &key, value);
         self.transaction = Some(transaction);
-        Ok(())
+        inserted
+    }
+
+    /// Opens a transaction and copies it aside for rollback.
+    ///
+    /// A mutation is several appends and inserts; if a later one fails, the
+    /// caller puts this copy back so the transaction keeps only what it had
+    /// before. Blocks the abandoned half wrote stay unreferenced in the arena
+    /// until the next generation reuses them.
+    fn snapshot(&mut self) -> Result<Transaction, FsError> {
+        self.begin()?;
+        self.transaction.as_ref().ok_or(FsError::Corrupt)?.try_clone()
+    }
+
+    /// The open transaction, or [`FsError::Corrupt`] if there is none.
+    fn open(&mut self) -> Result<&mut Transaction, FsError> {
+        self.transaction.as_mut().ok_or(FsError::Corrupt)
+    }
+
+    /// Where the pending log bank sits and how far it is filled.
+    fn bank(&self) -> Result<(u64, u64), FsError> {
+        let transaction = self.transaction.as_ref().ok_or(FsError::Corrupt)?;
+        Ok((transaction.at, transaction.bytes))
     }
 
     fn tree_root(&self) -> u64 {
         self.transaction
+            .as_ref()
             .map_or(self.volume.checkpoint().tree_root, |transaction| transaction.tree.root)
     }
 
     fn log_region(&self) -> Region {
-        match self.transaction {
+        match self.transaction.as_ref() {
             Some(transaction) => Region { at: transaction.at, bytes: transaction.bytes, crc: 0 },
             None => self.volume.checkpoint().region(Area::Log),
         }
@@ -554,32 +603,27 @@ mod tests {
     use crate::{BLOCK, FsError, Kind, Name};
 
     fn name(text: &str) -> Name {
-        Name::try_from(text).expect("legal name")
+        Name::try_from(text).unwrap()
     }
 
     fn image() -> alloc::vec::Vec<u8> {
         let mut tree = Tree::new();
-        tree.file("base", b"immutable".to_vec()).expect("legal name");
-        build(&tree, 1).expect("image")
+        tree.file("base", b"immutable".to_vec()).unwrap();
+        build(&tree, 1).unwrap()
     }
 
     fn commit_file(bytes: &mut [u8], file: &str, contents: &[u8]) -> u64 {
-        let mut block = [0; BLOCK];
-        let mut journal =
-            Journal::mount(Loopback::writable(bytes).expect("writable image"), &mut block)
-                .expect("mount");
-        let object = journal.create(journal.root(), name(file), Kind::File).expect("create");
-        journal.write(object, 0, contents).expect("write");
-        journal.sync().expect("sync")
+        let mut journal = Journal::mount(Loopback::writable(bytes).unwrap()).unwrap();
+        let object = journal.create(journal.root(), name(file), Kind::File).unwrap();
+        journal.write(object, 0, contents).unwrap();
+        journal.sync().unwrap()
     }
 
     fn assert_checkpoint(bytes: &[u8], generation: u64) {
-        let mut block = [0; BLOCK];
-        let mut journal =
-            Journal::mount(Loopback::new(bytes).expect("image"), &mut block).expect("mount");
+        let mut journal = Journal::mount(Loopback::new(bytes).unwrap()).unwrap();
         assert_eq!(journal.generation(), generation);
 
-        let first = journal.lookup(journal.root(), &name("first")).expect("first survives");
+        let first = journal.lookup(journal.root(), &name("first")).unwrap();
         let mut contents = [0; 8];
         assert_eq!(journal.read(first, 0, &mut contents), Ok(5));
         assert_eq!(&contents[..5], b"first");
@@ -587,8 +631,7 @@ mod tests {
         match generation {
             2 => assert_eq!(journal.lookup(journal.root(), &name("second")), Err(FsError::Missing)),
             3 => {
-                let second =
-                    journal.lookup(journal.root(), &name("second")).expect("second committed");
+                let second = journal.lookup(journal.root(), &name("second")).unwrap();
                 assert_eq!(journal.read(second, 0, &mut contents), Ok(6));
                 assert_eq!(&contents[..6], b"second");
             }
@@ -597,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn power_loss_at_every_checkpoint_action_mounts_old_or_new_generation() {
+    fn power_loss_mounts_old_or_new() {
         let mut baseline = image();
         assert_eq!(commit_file(&mut baseline, "first", b"first"), 2);
 
@@ -606,12 +649,8 @@ mod tests {
             let mut stable = baseline.clone();
             let mut volatile = alloc::vec![0; stable.len()];
             let outcome = {
-                let device = Fault::new(&mut stable, &mut volatile)
-                    .expect("matching storage")
-                    .cut_after(cut);
-                let mut block = [0; BLOCK];
-                let mut journal =
-                    Journal::mount(device, &mut block).expect("old checkpoint mounts");
+                let device = Fault::new(&mut stable, &mut volatile).unwrap().cut_after(cut);
+                let mut journal = Journal::mount(device).unwrap();
                 (|| {
                     let object = journal.create(journal.root(), name("second"), Kind::File)?;
                     journal.write(object, 0, b"second")?;
@@ -640,31 +679,27 @@ mod tests {
     }
 
     #[test]
-    fn newest_checkpoint_with_bad_log_falls_back_to_previous_generation() {
+    fn bad_log_falls_back() {
         let mut bytes = image();
         assert_eq!(commit_file(&mut bytes, "first", b"first"), 2);
 
-        let active = crate::layout::Super::parse(&bytes[BLOCK..2 * BLOCK]).expect("generation two");
+        let active = crate::layout::Super::parse(&bytes[BLOCK..2 * BLOCK]).unwrap();
         let log = active.region(crate::layout::Area::Log);
         bytes[log.at as usize * BLOCK] ^= 1;
-
-        let mut block = [0; BLOCK];
-        let mut journal =
-            Journal::mount(Loopback::new(&bytes).expect("image"), &mut block).expect("fallback");
+        let mut journal = Journal::mount(Loopback::new(&bytes).unwrap()).unwrap();
 
         assert_eq!(journal.generation(), 1);
         assert_eq!(journal.lookup(journal.root(), &name("first")), Err(FsError::Missing));
     }
 
     #[test]
-    fn newest_checkpoint_with_bad_tree_falls_back() {
+    fn bad_tree_falls_back() {
         let mut bytes = image();
         assert_eq!(commit_file(&mut bytes, "first", b"first"), 2);
         assert_eq!(commit_file(&mut bytes, "second", b"second"), 3);
 
-        let left = crate::layout::Super::parse(&bytes[..BLOCK]).expect("left checkpoint");
-        let right =
-            crate::layout::Super::parse(&bytes[BLOCK..2 * BLOCK]).expect("right checkpoint");
+        let left = crate::layout::Super::parse(&bytes[..BLOCK]).unwrap();
+        let right = crate::layout::Super::parse(&bytes[BLOCK..2 * BLOCK]).unwrap();
         let active = if left.generation > right.generation { left } else { right };
         bytes[active.tree_root as usize * BLOCK] ^= 1;
 
@@ -672,44 +707,38 @@ mod tests {
     }
 
     #[test]
-    fn tree_arena_reuses_old_generations() {
+    fn arena_reuses_old_generations() -> Result<(), FsError> {
         let mut bytes = image();
         {
-            let mut block = [0; BLOCK];
-            let mut journal =
-                Journal::mount(Loopback::writable(&mut bytes).expect("image"), &mut block)
-                    .expect("mount");
-            let file = journal.create(journal.root(), name("rolling"), Kind::File).expect("create");
+            let mut journal = Journal::mount(Loopback::writable(&mut bytes)?)?;
+            let file = journal.create(journal.root(), name("rolling"), Kind::File)?;
             for byte in 0..200u8 {
-                journal.write(file, 0, &[byte]).expect("write");
-                journal.sync().expect("checkpoint");
+                journal.write(file, 0, &[byte])?;
+                journal.sync()?;
             }
         }
-
-        let mut block = [0; BLOCK];
-        let mut journal =
-            Journal::mount(Loopback::new(&bytes).expect("image"), &mut block).expect("remount");
-        let file = journal.lookup(journal.root(), &name("rolling")).expect("file");
+        let mut journal = Journal::mount(Loopback::new(&bytes)?)?;
+        let file = journal.lookup(journal.root(), &name("rolling"))?;
         let mut byte = [0];
+
         assert_eq!(journal.read(file, 0, &mut byte), Ok(1));
         assert_eq!(byte, [199]);
+        Ok(())
     }
 
     #[test]
-    fn later_writes_overlay_base_data_and_can_extend_sparsely() {
+    fn writes_overlay_base_and_extend() -> Result<(), FsError> {
         let mut bytes = image();
-        let mut block = [0; BLOCK];
-        let mut journal =
-            Journal::mount(Loopback::writable(&mut bytes).expect("image"), &mut block)
-                .expect("mount");
-        let base = journal.lookup(journal.root(), &name("base")).expect("base file");
+        let mut journal = Journal::mount(Loopback::writable(&mut bytes)?)?;
+        let base = journal.lookup(journal.root(), &name("base"))?;
 
-        journal.write(base, 2, b"WRITE").expect("overwrite");
-        journal.write(base, 12, b"tail").expect("sparse extension");
+        journal.write(base, 2, b"WRITE")?;
+        journal.write(base, 12, b"tail")?;
         let mut contents = [0xa5; 20];
-        let read = journal.read(base, 0, &mut contents).expect("overlay read");
+        let read = journal.read(base, 0, &mut contents)?;
 
         assert_eq!(read, 16);
         assert_eq!(&contents[..16], b"imWRITEle\0\0\0tail");
+        Ok(())
     }
 }
