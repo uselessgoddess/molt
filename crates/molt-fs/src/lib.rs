@@ -29,6 +29,7 @@ use molt_core::capability::CapabilityError;
 
 mod bitmap;
 mod btree;
+mod cell;
 mod crc;
 mod journal;
 mod layout;
@@ -42,6 +43,7 @@ mod volume;
 pub mod format;
 
 pub use crate::btree::{CacheStats, TreeStats};
+pub use crate::cell::FsCell;
 pub use crate::journal::Journal;
 pub use crate::layout::{BLOCK, Kind, MAGIC, MAX_NAME, Object, SUPERS, VERSION};
 pub use crate::name::Name;

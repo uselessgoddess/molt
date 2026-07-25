@@ -1,8 +1,9 @@
-//! Mounting the disk, committing a write, and reading it as a cell would.
+//! Starting the filesystem service, committing a write, and restarting it.
 //!
-//! Nothing here reaches into the volume: the shell holds one root capability
-//! and talks over a ring, the filesystem answers on the same loop, and the only
-//! thing the kernel adds is the serial port both print through.
+//! Nothing here reaches into the volume: init starts one [`FsCell`], the shell
+//! holds one root capability and talks over a ring, the service answers on the
+//! same loop, and the only thing the kernel adds is the serial port both print
+//! through.
 
 use core::cell::RefCell;
 
@@ -10,8 +11,9 @@ use molt_arch::{Platform, SerialPort, SerialWriter};
 use molt_block::Disk;
 use molt_core::buffer::{BufferOperation, BufferRegistry};
 use molt_core::capability::CellId;
+use molt_core::cell::RestartHooks;
 use molt_core::ring::IoRing;
-use molt_fs::{Fs, FsDone, FsError, FsOp, Handle, Kind, Name};
+use molt_fs::{FsCell, FsDone, FsError, FsOp, Handle, Kind, Name};
 use molt_kernel::report;
 use molt_shell::{Console, Session, Shell, drive};
 
@@ -26,20 +28,28 @@ const WRITTEN: &[u8] = b"written through virtio";
 const SCRIPT: &[u8] = b"help\nls\nls docs\ncat hello.txt\nls nowhere\n";
 
 pub fn smoke<P: Platform>(platform: &mut P, device: impl Disk) {
-    let mut fs = match Fs::<_, HANDLES>::mount(device) {
-        Ok(mounted) => mounted,
+    let mut service = match FsCell::<_, HANDLES>::start(device) {
+        Ok(started) => started,
         Err(error) => {
             report!(platform, "MOLT_FS_FAILED: {error:?}");
             return;
         }
     };
-    report!(platform, "MOLT_FS_OK: generation {}", fs.generation());
+    report!(platform, "MOLT_FS_OK: generation {}", service.checkpoint());
+    if !session(platform, &mut service) {
+        return;
+    }
+    restart(platform, &mut service);
+}
 
+/// Runs the write cycle and the shell script against a started service.
+fn session<P: Platform, D: Disk>(platform: &mut P, service: &mut FsCell<D, HANDLES>) -> bool {
+    let fs = service.fs();
     let root = match fs.root(OWNER) {
         Ok(root) => root,
         Err(error) => {
             report!(platform, "MOLT_FS_FAILED: {error:?}");
-            return;
+            return false;
         }
     };
     fs.seal();
@@ -83,7 +93,7 @@ pub fn smoke<P: Platform>(platform: &mut P, device: impl Disk) {
         Ok(generation) => report!(platform, "MOLT_FS_WRITE_OK: generation {generation}"),
         Err(error) => {
             report!(platform, "MOLT_FS_FAILED: {error:?}");
-            return;
+            return false;
         }
     }
     let buffers = RefCell::new(registry);
@@ -107,6 +117,42 @@ pub fn smoke<P: Platform>(platform: &mut P, device: impl Disk) {
     };
     ran.expect("shell that meets only errors it can print");
     report!(platform, "MOLT_SHELL_OK: script ran to the end");
+    true
+}
+
+/// Restarts the service and looks for the file the write cycle made durable.
+fn restart<P: Platform, D: Disk>(platform: &mut P, service: &mut FsCell<D, HANDLES>) {
+    let mut registry = BufferRegistry::<1>::new();
+    let found = (|| {
+        service.restart(&mut Quiesced)?;
+        let name = Name::try_from("runtime.txt")?;
+        let root = service.fs().root(OWNER)?;
+        let opened = service.fs().apply(OWNER, FsOp::Open { dir: root, name }, &mut registry)?;
+        match opened.handle() {
+            Some(Handle::File(_)) => Ok(()),
+            _ => Err(FsError::Kind),
+        }
+    })();
+    match found {
+        Ok(()) => report!(
+            platform,
+            "MOLT_FS_RESTART_OK: restart {} at generation {}",
+            service.generation(),
+            service.checkpoint()
+        ),
+        Err(error) => report!(platform, "MOLT_FS_FAILED: {error:?}"),
+    }
+}
+
+/// The script has run and the ring is drained, so quiescing has nothing to do.
+struct Quiesced;
+
+impl RestartHooks for Quiesced {
+    fn stop_submissions(&mut self) {}
+
+    fn cancel_requests(&mut self) {}
+
+    fn revoke_capabilities(&mut self) {}
 }
 
 /// The shell's console, which is the port the kernel reports on.

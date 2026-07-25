@@ -33,22 +33,38 @@ pub struct Journal<D> {
 impl<D: Disk> Journal<D> {
     /// Mounts the newest valid checkpoint and replays its mutation log.
     pub fn mount(device: D) -> Result<Self, FsError> {
-        let volume = Volume::mount(device)?;
-        let object_bytes = volume.checkpoint().region(Area::Objects).bytes;
+        let mut journal = Self {
+            volume: Volume::mount(device)?,
+            transaction: None,
+            tree: MetadataTree::new(),
+            base_objects: 0,
+            next_object: 0,
+        };
+        journal.replay()?;
+        Ok(journal)
+    }
+
+    /// Remounts the volume, dropping every uncommitted change.
+    ///
+    /// What was never synced was never a checkpoint, so it does not come back:
+    /// this is the state a power cut would have left, reached deliberately.
+    pub fn remount(&mut self) -> Result<(), FsError> {
+        self.volume.remount()?;
+        self.transaction = None;
+        self.tree = MetadataTree::new();
+        self.replay()
+    }
+
+    /// Sizes the object space from the mounted checkpoint and replays its log.
+    fn replay(&mut self) -> Result<(), FsError> {
+        let object_bytes = self.volume.checkpoint().region(Area::Objects).bytes;
         if object_bytes % OBJECT_BYTES as u64 != 0 {
             return Err(FsError::Corrupt);
         }
-        let base_objects =
+        self.base_objects =
             u32::try_from(object_bytes / OBJECT_BYTES as u64).map_err(|_| FsError::Corrupt)?;
-        let mut journal = Self {
-            volume,
-            transaction: None,
-            tree: MetadataTree::new(),
-            base_objects,
-            next_object: base_objects,
-        };
-        journal.validate_log()?;
-        Ok(journal)
+        self.next_object = self.base_objects;
+        self.validate_log()
     }
 
     /// The object id of the root directory.

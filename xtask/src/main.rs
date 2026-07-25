@@ -163,6 +163,7 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
             "molt> cat hello.txt",
             "hello, molt",
             "MOLT_SHELL_OK:",
+            "MOLT_FS_RESTART_OK:",
             "MOLT_VIRTIO_RESET_OK:",
         ],
         _ => &[],

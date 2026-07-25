@@ -162,6 +162,19 @@ impl<D: Disk, const N: usize> Fs<D, N> {
         self.open.revoke_owner(owner)
     }
 
+    /// Comes back at the last durable checkpoint, holding nothing.
+    ///
+    /// Work that was never synced is dropped, every handle is revoked — the
+    /// cells that held them are talking to a filesystem that no longer knows
+    /// them — and the root bootstrap opens again for the new epoch.
+    pub fn restart(&mut self) -> Result<(), FsError> {
+        self.journal.remount()?;
+        self.open = CapabilityTable::new();
+        self.pending = None;
+        self.sealed = false;
+        Ok(())
+    }
+
     fn hold(&mut self, owner: CellId, id: u32, kind: Kind) -> Result<Handle, FsError> {
         let object = OpenObject { id, kind };
         match kind {

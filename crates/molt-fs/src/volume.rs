@@ -34,72 +34,34 @@ pub struct Volume<D> {
 }
 
 impl<D: Device> Volume<D> {
-    /// Mounts `device`.
-    ///
-    /// Takes the newest superblock copy that verifies, then checks every
-    /// metadata region against the checksum the superblock records, so a
-    /// corrupt volume fails at mount rather than at the first lookup that
-    /// happens to touch the damaged block.
+    /// Mounts `device` at the newest checkpoint that verifies.
     pub fn mount(mut device: D) -> Result<Self, FsError> {
-        let mut owned = buffer();
-        let block = &mut *owned;
-        let mut copies = [None; SUPERS as usize];
-        let mut last_error = FsError::Magic;
-        for copy in 0..SUPERS {
-            read(&mut device, block, copy)?;
-            match Super::parse(block) {
-                Ok(parsed) => copies[copy as usize] = Some(parsed),
-                Err(error) => last_error = error,
-            }
-        }
+        let mut block = buffer();
+        let checkpoint = survey(&mut device, &mut block)?;
+        Ok(Self {
+            device,
+            block,
+            cached: None,
+            superblock: checkpoint.superblock,
+            active_copy: checkpoint.active_copy,
+            previous_log: checkpoint.previous_log,
+            previous_tree: checkpoint.previous_tree,
+        })
+    }
 
-        // Newest generation first, each candidate dropped if it fails to
-        // verify. Loops rather than iterator chains: every frame of one carries
-        // a superblock, and mount runs on whatever stack its caller has.
-        let mut rejected = [false; SUPERS as usize];
-        for _ in 0..SUPERS {
-            let Some(active_copy) = newest(&copies, &rejected) else {
-                break;
-            };
-            rejected[active_copy] = true;
-            let Some(superblock) = copies[active_copy] else {
-                break;
-            };
-            if superblock.blocks.saturating_mul(SECTORS) > device.sectors() {
-                last_error = FsError::Corrupt;
-                continue;
-            }
-            if let Err(error) = verify_checkpoint(&mut device, block, &superblock) {
-                last_error = error;
-                continue;
-            }
-
-            let mut previous = None;
-            for (copy, parsed) in copies.iter().enumerate() {
-                if copy == active_copy {
-                    continue;
-                }
-                if let Some(parsed) = parsed
-                    && parsed.blocks.saturating_mul(SECTORS) <= device.sectors()
-                    && verify_checkpoint(&mut device, block, parsed).is_ok()
-                {
-                    previous = Some(*parsed);
-                    break;
-                }
-            }
-            let previous_log = previous.map(|parsed| parsed.region(Area::Log).at);
-            let previous_tree = previous.map(|parsed| parsed.tree_root).filter(|root| *root != 0);
-            return Ok(Self {
-                device,
-                block: owned,
-                cached: None,
-                superblock,
-                active_copy: active_copy as u64,
-                previous_log,
-                previous_tree,
-            });
-        }
-        Err(last_error)
+    /// Re-reads the volume as a fresh mount would.
+    ///
+    /// Everything the mount held about the disk is dropped for what the disk
+    /// now says, so a service restarting on top of this volume comes back at
+    /// the last checkpoint that was made durable.
+    pub fn remount(&mut self) -> Result<(), FsError> {
+        let checkpoint = survey(&mut self.device, &mut self.block)?;
+        self.cached = None;
+        self.superblock = checkpoint.superblock;
+        self.active_copy = checkpoint.active_copy;
+        self.previous_log = checkpoint.previous_log;
+        self.previous_tree = checkpoint.previous_tree;
+        Ok(())
     }
 
     /// The object id of the root directory.
@@ -388,6 +350,74 @@ impl<D: Disk> Volume<D> {
     pub(crate) fn flush(&mut self) -> Result<(), FsError> {
         self.device.flush().map_err(FsError::Device)
     }
+}
+
+/// Which checkpoint a mount settled on, and what the one before it held.
+struct Checkpoint {
+    superblock: Super,
+    active_copy: u64,
+    previous_log: Option<u64>,
+    previous_tree: Option<u64>,
+}
+
+/// Takes the newest superblock copy that verifies.
+///
+/// Every metadata region is checked against the checksum the superblock
+/// records, so a corrupt volume fails here rather than at the first lookup that
+/// happens to touch the damaged block.
+fn survey<D: Device>(device: &mut D, block: &mut [u8; BLOCK]) -> Result<Checkpoint, FsError> {
+    let mut copies = [None; SUPERS as usize];
+    let mut last_error = FsError::Magic;
+    for copy in 0..SUPERS {
+        read(device, block, copy)?;
+        match Super::parse(block) {
+            Ok(parsed) => copies[copy as usize] = Some(parsed),
+            Err(error) => last_error = error,
+        }
+    }
+
+    // Newest generation first, each candidate dropped if it fails to verify.
+    // Loops rather than iterator chains: every frame of one carries a
+    // superblock, and mount runs on whatever stack its caller has.
+    let mut rejected = [false; SUPERS as usize];
+    for _ in 0..SUPERS {
+        let Some(active_copy) = newest(&copies, &rejected) else {
+            break;
+        };
+        rejected[active_copy] = true;
+        let Some(superblock) = copies[active_copy] else {
+            break;
+        };
+        if superblock.blocks.saturating_mul(SECTORS) > device.sectors() {
+            last_error = FsError::Corrupt;
+            continue;
+        }
+        if let Err(error) = verify_checkpoint(device, block, &superblock) {
+            last_error = error;
+            continue;
+        }
+
+        let mut previous = None;
+        for (copy, parsed) in copies.iter().enumerate() {
+            if copy == active_copy {
+                continue;
+            }
+            if let Some(parsed) = parsed
+                && parsed.blocks.saturating_mul(SECTORS) <= device.sectors()
+                && verify_checkpoint(device, block, parsed).is_ok()
+            {
+                previous = Some(*parsed);
+                break;
+            }
+        }
+        return Ok(Checkpoint {
+            superblock,
+            active_copy: active_copy as u64,
+            previous_log: previous.map(|parsed| parsed.region(Area::Log).at),
+            previous_tree: previous.map(|parsed| parsed.tree_root).filter(|root| *root != 0),
+        });
+    }
+    Err(last_error)
 }
 
 fn read<D: Device>(device: &mut D, block: &mut [u8; BLOCK], index: u64) -> Result<(), FsError> {
