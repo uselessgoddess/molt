@@ -202,6 +202,17 @@ is sixteen nodes, a path is eight block numbers). And the heap is global and not
 `Sync`-clever — `Global` is a spinlock over one `Heap` — so Stage 4's SMP work
 either shards it or replaces it, and that is a change with one consumer.
 
+A spinlock has a sharper consequence on one core than on many. An interrupt
+preempts whoever was running; if that code held the flag, an allocation from the
+handler spins for a release that cannot come, because the only core that could
+give it is the one spinning. So "the kernel does not allocate in interrupt
+context" is not left as a comment: the kernel's interrupt entry — `Sink::raise`
+in `kernel/src/pci.rs` — opens with `Global::interrupt`, and while that guard is
+held the heap refuses everything. A debug assert names the handler that asked,
+and a release build hands back null, which every caller already treats as an
+empty heap. A free made under it is dropped instead, because a leaked block is
+recoverable and a wedged core is not.
+
 ## Where it is enforced
 
 Policy that is only checked on the way in is a convention. The existing audit

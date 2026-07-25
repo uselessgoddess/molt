@@ -211,7 +211,10 @@ impl<'slots, 'window> Block<'slots, 'window> {
 /// already stopped: returning early on a refused region would leave the rest of
 /// the span claimed in the frame table for good, with no handle left to free it
 /// through. The refusal is still reported once the frames are back.
-fn reclaim(mut arena: Arena<'_>, regions: impl IntoIterator<Item = Region>) -> Result<(), DmaError> {
+fn reclaim(
+    mut arena: Arena<'_>,
+    regions: impl IntoIterator<Item = Region>,
+) -> Result<(), DmaError> {
     let released = regions.into_iter().try_for_each(|region| arena.release(region));
     arena.reset();
     released

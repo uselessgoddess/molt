@@ -15,5 +15,5 @@ extern crate std;
 mod global;
 mod heap;
 
-pub use crate::global::Global;
+pub use crate::global::{Global, Interrupt};
 pub use crate::heap::Heap;

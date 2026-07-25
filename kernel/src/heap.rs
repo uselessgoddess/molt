@@ -4,7 +4,7 @@
 //! back: the frames stay the heap's for the life of the kernel, and the free
 //! list inside recycles them.
 
-use molt_alloc::Global;
+use molt_alloc::{Global, Interrupt};
 use molt_arch::{BootInfo, Platform, PlatformError};
 
 /// Frames per claim, and how many claims. A heap needs no contiguous span, so
@@ -45,4 +45,12 @@ pub fn init<P: Platform>(
 /// Bytes held by live allocations.
 pub fn used() -> usize {
     HEAP.used()
+}
+
+/// Bars the heap for the interrupt the caller is about to service.
+///
+/// Held for the whole handler: the heap's lock is a spin flag, so an allocation
+/// from an interrupt that arrived while the flag was held would spin forever.
+pub fn interrupt() -> Interrupt<'static> {
+    HEAP.interrupt()
 }
