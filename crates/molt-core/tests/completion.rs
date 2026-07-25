@@ -44,7 +44,9 @@ fn restart_rejects_stale() {
 
 #[test]
 fn poll_race_keeps_wake() {
-    for expected in 0..256 {
+    let limit = if cfg!(miri) { 16 } else { 256 };
+
+    for expected in 0..limit {
         let slab = Arc::new(CompletionSlab::<usize, 1>::new());
         let token = slab.reserve().unwrap();
         let publisher = slab.clone();
@@ -71,7 +73,9 @@ fn poll_race_keeps_wake() {
 
 #[test]
 fn cancel_race_reuses_slot() {
-    for _ in 0..1024 {
+    let limit = if cfg!(miri) { 16 } else { 1024 };
+
+    for _ in 0..limit {
         let slab = Arc::new(CompletionSlab::<usize, 1>::new());
         let token = slab.reserve().unwrap();
 

@@ -5,11 +5,21 @@
 //! buffer to reach any of them. That constraint is why an object is 32 bytes
 //! rather than the 24 its fields need.
 
-use crate::FsError;
+use alloc::boxed::Box;
+
 use crate::crc::crc32c;
+use crate::{FsError, mem};
 
 /// The unit everything on a volume is addressed in.
 pub const BLOCK: usize = 4096;
+
+/// A zeroed block of buffer on the heap.
+///
+/// Whoever needs one needs it for as long as they live, and none of them is
+/// small enough to be a local.
+pub(crate) fn buffer() -> Result<Box<[u8; BLOCK]>, FsError> {
+    mem::zeroed()
+}
 
 /// The signature a volume opens with.
 pub const MAGIC: [u8; 8] = *b"MOLTROFS";
@@ -36,10 +46,14 @@ pub const DEFAULT_LOG_BLOCKS: u32 = 64;
 
 /// COW metadata nodes an image builder reserves by default.
 #[cfg(feature = "format")]
-pub const DEFAULT_TREE_BLOCKS: u32 = MAX_TREE_BLOCKS;
+pub const DEFAULT_TREE_BLOCKS: u32 = 256;
 
-/// Largest tree arena mount can track without dynamic allocation.
-pub const MAX_TREE_BLOCKS: u32 = 256;
+/// Largest tree arena a superblock may claim.
+///
+/// Mount sizes its arena bitmaps from this field, so the bound is what keeps a
+/// corrupt superblock from asking the heap for megabytes of bits. At 64 Ki
+/// nodes that is a 256 MiB arena tracked by 8 KiB.
+pub const MAX_TREE_BLOCKS: u32 = 1 << 16;
 
 /// Where each superblock field sits.
 mod field {
@@ -567,11 +581,11 @@ mod tests {
     }
 
     #[test]
-    fn extent_covers_its_own_blocks_only() {
+    fn extent_covers_own_blocks_only() {
         let extent = Extent { logical: 4, blocks: 2, block: 100 };
 
         assert_eq!(extent.covers(5), Ok(Some(101)));
-        assert_eq!(extent.covers(6), Ok(None), "an extent claimed a block past its end");
+        assert_eq!(extent.covers(6), Ok(None), "extent claimed block past its end");
     }
 
     #[test]

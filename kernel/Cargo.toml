@@ -18,6 +18,7 @@ bench = false
 panic-smoke = []
 
 [dependencies]
+molt-alloc.workspace = true
 molt-arch.workspace = true
 molt-block.workspace = true
 molt-core.workspace = true

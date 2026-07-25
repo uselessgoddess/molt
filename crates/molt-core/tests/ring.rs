@@ -47,20 +47,21 @@ fn drop_pending_values() {
 
 #[test]
 fn transfer_values_between_threads() {
-    const ITEMS: usize = 10_000;
+    let items = if cfg!(miri) { 128 } else { 10 * 1024 };
+
     let mut ring = SpscRing::<usize, 64>::new();
     let (mut producer, mut consumer) = ring.split();
 
     thread::scope(|scope| {
         scope.spawn(move || {
-            for expected in 0..ITEMS {
+            for expected in 0..items {
                 while consumer.try_pop() != Some(expected) {
                     spin_loop();
                 }
             }
         });
 
-        for value in 0..ITEMS {
+        for value in 0..items {
             let mut pending = value;
             loop {
                 match producer.try_push(pending) {

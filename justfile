@@ -19,7 +19,9 @@ doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --exclude molt-kernel --no-deps
 
 miri:
-    MIRIFLAGS="-Zmiri-strict-provenance" cargo miri test --package molt-core
+    MIRIFLAGS="-Zmiri-strict-provenance" cargo miri test \
+     --package molt-core \
+     --package molt-alloc
 
 loom:
     LOOM_MAX_PREEMPTIONS=2 RUSTFLAGS="--cfg loom" \

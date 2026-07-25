@@ -1,6 +1,6 @@
 //! Sector storage, described independently of the bus it hangs off.
 //!
-//! [`Device`] is the read contract; [`Writable`] adds sector writes and a
+//! [`Device`] is the read contract; [`Disk`] adds sector writes and a
 //! durability boundary. `molt-virtio` implements them over a virtqueue,
 //! [`Loopback`] over bytes already in memory, and a future NVMe or SD driver
 //! over whatever it likes — none of which the filesystem above has to know.

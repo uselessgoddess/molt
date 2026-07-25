@@ -218,7 +218,7 @@ mod tests {
     use molt_core::capability::CellId;
     use molt_core::ring::IoRing;
     use molt_fs::format::{Tree, build};
-    use molt_fs::{BLOCK, Fs, FsDone, FsError, FsOp};
+    use molt_fs::{Fs, FsDone, FsError, FsOp};
 
     use super::Shell;
     use crate::capture::Capture;
@@ -240,11 +240,10 @@ mod tests {
     /// Runs `script` against a fresh volume and returns everything printed.
     fn run(script: &[u8]) -> String {
         let bytes = image();
-        let mut block = [0u8; BLOCK];
         let mut scratch = [0u8; WINDOW];
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
 
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap(), &mut block).expect("mount");
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).expect("mount");
         let mut registry = BufferRegistry::<1>::new();
         let scratch = registry.register_read_write(OWNER, &mut scratch).expect("free slot");
         let buffers = RefCell::new(registry);

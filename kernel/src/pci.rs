@@ -20,6 +20,7 @@ struct Interrupts(InterruptSlab<LINES>);
 
 impl Sink for Interrupts {
     fn raise(&self, line: u16) {
+        let _heap = crate::heap::interrupt();
         self.0.raise(line);
     }
 }

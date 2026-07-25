@@ -39,11 +39,11 @@ mod imp {
     use core::arch::{asm, global_asm};
     use core::fmt::Write as _;
 
-    use molt_arch::memory::{Device, Rights};
+    use molt_arch::memory::{Device, Rights, Span};
     use molt_arch::{
-        BootInfo, ConfigSpace, DeviceMapper, ExitStatus, FRAME_SIZE, FabricError, InterruptFabric,
-        MappingError, MemoryMap, MemoryRegion, MemoryRegionKind, Mmio, MsiMessage, Platform,
-        PlatformError, SerialPort, SerialWriter, Sink,
+        BootInfo, ConfigSpace, DeviceMapper, ExitStatus, FRAME_SIZE, FabricError, FrameCursor,
+        InterruptFabric, MappingError, MemoryMap, MemoryRegion, MemoryRegionKind, Mmio, MsiMessage,
+        Platform, PlatformError, SerialPort, SerialWriter, Sink,
     };
 
     use crate::{csr, fdt, paging, sbi, trap};
@@ -256,6 +256,18 @@ _start:
 
         fn monotonic_ticks(&self) -> u64 {
             trap::ticks()
+        }
+
+        fn free_frames(&self) -> Option<FrameCursor> {
+            paging::free_frames()
+        }
+
+        fn claim_ram(
+            &mut self,
+            boot_info: &BootInfo<'_>,
+            count: u64,
+        ) -> Result<Span, PlatformError> {
+            paging::claim_ram(boot_info, count)
         }
 
         fn wait_for_timer_change(&mut self, previous: u64) {

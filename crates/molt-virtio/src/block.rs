@@ -13,7 +13,7 @@
 //! image.
 
 use molt_arch::Mmio;
-use molt_arch::dma::{Arena, Region};
+use molt_arch::dma::{Arena, DmaError, Region};
 use molt_block::{BlockError, Device, Disk};
 
 use crate::VirtioError;
@@ -199,11 +199,25 @@ impl<'slots, 'window> Block<'slots, 'window> {
     /// The reset comes first so the device stops touching the rings and buffers
     /// before the frames behind them return to the table.
     pub fn reset(self) -> Result<(), VirtioError> {
-        let Self { mut common, arena, .. } = self;
+        let Self { mut common, queue, control, data, arena, .. } = self;
         common.reset()?;
-        arena.reset()?;
-        Ok(())
+        Ok(reclaim(arena, queue.regions().into_iter().chain([control, data]))?)
     }
+}
+
+/// Hands `regions` back and drops the arena's whole span behind them.
+///
+/// The reset runs whatever a release does, because by here the device is
+/// already stopped: returning early on a refused region would leave the rest of
+/// the span claimed in the frame table for good, with no handle left to free it
+/// through. The refusal is still reported once the frames are back.
+fn reclaim(
+    mut arena: Arena<'_>,
+    regions: impl IntoIterator<Item = Region>,
+) -> Result<(), DmaError> {
+    let released = regions.into_iter().try_for_each(|region| arena.release(region));
+    arena.reset();
+    released
 }
 
 impl Device for Block<'_, '_> {
@@ -278,8 +292,44 @@ fn clamp_queue(device_max: u16) -> Result<u16, VirtioError> {
 
 #[cfg(test)]
 mod tests {
-    use super::clamp_queue;
+    use molt_arch::dma::{Arena, DmaError, Region};
+    use molt_arch::{FRAME_SIZE, FrameAllocator, MemoryMap, MemoryRegion, MemoryRegionKind};
+
+    use super::{clamp_queue, reclaim};
     use crate::VirtioError;
+
+    struct Map([MemoryRegion; 1]);
+
+    impl MemoryMap for Map {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        fn region(&self, index: usize) -> Option<MemoryRegion> {
+            self.0.get(index).copied()
+        }
+    }
+
+    #[test]
+    fn refused_release_still_frees_span() {
+        let map = Map([MemoryRegion::new(
+            0x10_0000,
+            0x10_0000 + 4 * FRAME_SIZE,
+            MemoryRegionKind::Usable,
+        )]);
+        let mut allocator = FrameAllocator::new(&map);
+        let mut slots = [None; 4];
+        let mut arena = Arena::claim(&mut allocator, 0, 3, &mut slots).unwrap();
+        let held = arena.region(FRAME_SIZE).unwrap();
+        let mut elsewhere = [0u8; 16];
+        // SAFETY: the array is live for the borrow and nothing else names it.
+        let foreign = unsafe { Region::new(elsewhere.as_mut_ptr(), 0x20_0000, 16) };
+
+        let refused = reclaim(arena, [foreign, held]);
+
+        assert_eq!(refused, Err(DmaError::Foreign));
+        assert!(slots.iter().all(Option::is_none), "a refused release stranded frames");
+    }
 
     #[test]
     fn deep_device_queue_capped_at_drivers_maximum() {

@@ -20,7 +20,7 @@ use bootloader_api::info::{MemoryRegionKind as BootMemoryRegionKind, MemoryRegio
 pub use bootloader_api::{
     BootInfo as BootloaderInfo, BootloaderConfig, entry_point as __bootloader_entry_point,
 };
-use molt_arch::memory::{Device, Rights};
+use molt_arch::memory::{Device, Rights, Span};
 use molt_arch::{
     BootInfo, ConfigSpace, DeviceMapper, ExitStatus, FabricError, FrameCursor, ImageRange,
     InterruptFabric, MappingError, MemoryMap, MemoryRegion, MemoryRegionKind, Mmio, MsiMessage,
@@ -224,6 +224,10 @@ impl Platform for X86_64 {
 
     fn free_frames(&self) -> Option<FrameCursor> {
         memory::free_frames()
+    }
+
+    fn claim_ram(&mut self, boot_info: &BootInfo<'_>, count: u64) -> Result<Span, PlatformError> {
+        memory::claim_ram(boot_info.memory_map(), count)
     }
 
     fn terminate(&mut self, status: ExitStatus) -> ! {

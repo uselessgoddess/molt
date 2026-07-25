@@ -164,6 +164,11 @@ impl Queue {
         self.device.physical()
     }
 
+    /// Gives up the three regions, for a caller that has stopped the device.
+    pub fn regions(self) -> [Region; 3] {
+        [self.descriptors, self.driver, self.device]
+    }
+
     /// Publishes `segments` as one descriptor chain and returns its head.
     ///
     /// Returns [`VirtioError::Full`] when the chain will not fit in the free

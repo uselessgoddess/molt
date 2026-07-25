@@ -161,6 +161,63 @@ frames.release(queue)?;
   slice, so `molt-arch` still allocates nothing and the kernel decides whether
   it is tracking all of RAM or the eight frames a driver may be handed. At one
   byte per frame that is 0.024% of RAM, against Redox's 16 bytes and 0.39%.
+- `vacant` and `evict` are what a driver's DMA arena is built from: the first
+  finds the lowest free run of frames, the second drops one owner's frames
+  wholesale at teardown. A `Region` therefore comes back one at a time through
+  `Arena::release` and only the survivors are swept by `Arena::reset`, which is
+  what a long-running driver needs and a bump pointer could not give. See
+  [`docs/virtio.md`](virtio.md).
+
+## The heap, and why it arrived late
+
+Stage 2 ran on fixed arrays on purpose: no allocator means no allocation
+failure, no fragmentation, and no global state, and for a boot page table and a
+virtqueue that is the right answer. The filesystem is where it stopped being
+one. A COW B+ tree walks a root-to-leaf path of 4 KiB nodes and splits into two
+more, so the fixed-array version put ~78 KiB on the stack to mount and ~96 KiB
+to create one file, against a 128 KiB kernel stack with no guard page below it.
+A bounded array cannot be made smaller without making the tree shallower, so the
+nodes had to move, and "move where" is the question `molt-alloc` answers.
+
+`Heap` is the smallest allocator that answers it: one address-ordered free list,
+first fit, immediate coalescing on both sides, no size classes, no per-CPU
+caches. Not a buddy allocator, because the filesystem's demand is a handful of
+sizes repeated (4 KiB nodes, small vectors), and the split/merge machinery would
+buy a fragmentation property nothing here can measure. Not a slab allocator,
+because slabs want per-type caches and there is one hot type. The whole thing is
+about 300 lines with the lock, and its tests are host tests over a `Vec<u8>`,
+which is the same trick `Loopback` plays for the filesystem.
+
+The kernel donates in chunks: sixteen claims of 64 frames each, 4 MiB, from
+`Platform::claim_ram` at boot. Chunks rather than one span because a heap needs
+no contiguity, and a claim that crosses a hole in the memory map ends the
+donation instead of failing the boot — what was donated is still a heap. The
+frames are `Owner::Kernel` and never come back; the free list inside recycles
+them for the life of the kernel. `MOLT_HEAP_OK` reports the bytes it took.
+
+A heap that runs out says so. `Heap::allocate` returns `None` and `Global`
+hands back a null pointer, which is what `Box::try_new` and friends turn into an
+`AllocError`; the filesystem asks that way and answers `FsError::Memory`, so an
+exhausted heap costs a request rather than the machine. `Box::new` and `vec!`
+still end in `handle_alloc_error` and still panic — the fallible form is a
+choice each caller makes, and `molt-fs` is the caller that made it. What keeps
+even that rare is that every consumer is bounded: the metadata cache is sixteen
+nodes, a path is eight block numbers.
+
+One limit is worth stating rather than discovering. The heap is global and not
+`Sync`-clever — `Global` is a spinlock over one `Heap` — so Stage 4's SMP work
+either shards it or replaces it, and that is a change with one consumer.
+
+A spinlock has a sharper consequence on one core than on many. An interrupt
+preempts whoever was running; if that code held the flag, an allocation from the
+handler spins for a release that cannot come, because the only core that could
+give it is the one spinning. So "the kernel does not allocate in interrupt
+context" is not left as a comment: the kernel's interrupt entry — `Sink::raise`
+in `kernel/src/pci.rs` — opens with `Global::interrupt`, and while that guard is
+held the heap refuses everything. A debug assert names the handler that asked,
+and a release build hands back null, which every caller already treats as an
+empty heap. A free made under it is dropped instead, because a leaked block is
+recoverable and a wedged core is not.
 
 ## Where it is enforced
 
