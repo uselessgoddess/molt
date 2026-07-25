@@ -2,6 +2,7 @@
 #![no_main]
 
 use alloc::boxed::Box;
+use core::convert::Infallible;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 
@@ -10,7 +11,7 @@ use molt_arch::{
     BootInfo, ExitStatus, FRAME_SIZE, Platform, SerialPort, SerialWriter, UsableRegions,
 };
 use molt_core::capability::{CapabilityError, CapabilityTable, ReadWrite};
-use molt_core::cell::{Cell, CellId, Supervisor};
+use molt_core::cell::{Cell, CellId, Handler, RestartHooks, Supervisor};
 use molt_core::completion::{CompletionError, CompletionSlab};
 use molt_core::ring::{Completion, IoRing, Submission};
 
@@ -182,23 +183,43 @@ fn run_timer_future<P: Platform>(platform: &mut P) {
     assert_eq!(future.as_mut().poll(&mut context), Poll::Ready(Ok(elapsed)));
 }
 
-#[derive(Default)]
-struct ProbeState(u32);
-
-struct ProbeCell(ProbeState);
+struct ProbeCell(u32);
 
 impl Cell for ProbeCell {
-    type Message = u32;
-    type Reply = u32;
-    type State = ProbeState;
+    type Error = Infallible;
+    type State = u32;
 
-    fn spawn(state: Self::State) -> Self {
-        Self(state)
+    fn spawn(start: Self::State) -> Result<Self, Infallible> {
+        Ok(Self(start))
     }
 
+    fn restart(&mut self) -> Result<(), Infallible> {
+        self.0 = 0;
+        Ok(())
+    }
+}
+
+impl Handler for ProbeCell {
+    type Message = u32;
+    type Reply = u32;
+
     fn handle(&mut self, increment: Self::Message) -> Self::Reply {
-        self.0.0 += increment;
-        self.0.0
+        self.0 += increment;
+        self.0
+    }
+}
+
+/// Drops what the restarting cell handed out, which is what the filesystem's
+/// supervisor will hook up to its handle table.
+struct Revoke<'t>(&'t mut CapabilityTable<u32, 2>, CellId);
+
+impl RestartHooks for Revoke<'_> {
+    fn stop_submissions(&mut self) {}
+
+    fn cancel_requests(&mut self) {}
+
+    fn revoke_capabilities(&mut self) {
+        assert_eq!(self.0.revoke_owner(self.1), 1, "the cell exported one capability");
     }
 }
 
@@ -206,11 +227,11 @@ fn verify_cell_restart() {
     let owner = CellId::new(1);
     let mut capabilities = CapabilityTable::<u32, 2>::new();
     let old = capabilities.insert::<ReadWrite>(owner, 9).expect("free capability slot");
-    let mut supervisor = Supervisor::<ProbeCell>::new(ProbeState(4));
+    let mut supervisor = Supervisor::<ProbeCell>::new(4).unwrap();
     assert_eq!(supervisor.call(1), 5);
 
-    assert_eq!(capabilities.revoke_owner(owner), 1);
-    supervisor.restart_default();
+    supervisor.restart(&mut Revoke(&mut capabilities, owner)).unwrap();
+
     assert_eq!(supervisor.generation(), 1);
     assert_eq!(capabilities.get(old), Err(CapabilityError::Stale));
     assert_eq!(supervisor.call(2), 2);

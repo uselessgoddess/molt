@@ -48,7 +48,7 @@ mod volume;
 pub mod format;
 
 pub use crate::btree::{CacheStats, TreeStats};
-pub use crate::cell::{FsCell, FsState};
+pub use crate::cell::FsCell;
 pub use crate::journal::Journal;
 pub use crate::layout::{BLOCK, Kind, MAGIC, MAX_NAME, Object, SUPERS, VERSION};
 pub use crate::name::Name;

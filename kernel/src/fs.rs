@@ -11,7 +11,7 @@ use molt_arch::{Platform, SerialPort, SerialWriter};
 use molt_block::Disk;
 use molt_core::buffer::{BufferOperation, BufferRegistry};
 use molt_core::capability::CellId;
-use molt_core::cell::RestartHooks;
+use molt_core::cell::{Quiesced, Supervisor};
 use molt_core::ring::IoRing;
 use molt_fs::{FsCell, FsDone, FsError, FsOp, Handle, Kind, Name};
 use molt_kernel::report;
@@ -28,14 +28,14 @@ const WRITTEN: &[u8] = b"written through virtio";
 const SCRIPT: &[u8] = b"help\nls\nls docs\ncat hello.txt\nls nowhere\n";
 
 pub fn smoke<P: Platform>(platform: &mut P, device: impl Disk) {
-    let mut service = match FsCell::<_, HANDLES>::start(device) {
+    let mut service = match Supervisor::<FsCell<_, HANDLES>>::new(device) {
         Ok(started) => started,
         Err(error) => {
             report!(platform, "MOLT_FS_FAILED: {error:?}");
             return;
         }
     };
-    report!(platform, "MOLT_FS_OK: generation {}", service.checkpoint());
+    report!(platform, "MOLT_FS_OK: generation {}", service.cell().checkpoint());
     if !session(platform, &mut service) {
         return;
     }
@@ -43,8 +43,11 @@ pub fn smoke<P: Platform>(platform: &mut P, device: impl Disk) {
 }
 
 /// Runs the write cycle and the shell script against a started service.
-fn session<P: Platform, D: Disk>(platform: &mut P, service: &mut FsCell<D, HANDLES>) -> bool {
-    let fs = match service.fs() {
+fn session<P: Platform, D: Disk>(
+    platform: &mut P,
+    service: &mut Supervisor<FsCell<D, HANDLES>>,
+) -> bool {
+    let fs = match service.cell_mut().fs() {
         Ok(fs) => fs,
         Err(error) => {
             report!(platform, "MOLT_FS_FAILED: {error:?}");
@@ -127,13 +130,17 @@ fn session<P: Platform, D: Disk>(platform: &mut P, service: &mut FsCell<D, HANDL
 }
 
 /// Restarts the service and looks for the file the write cycle made durable.
-fn restart<P: Platform, D: Disk>(platform: &mut P, service: &mut FsCell<D, HANDLES>) {
+///
+/// The script has run and the ring is drained by now, so [`Quiesced`] is the
+/// truth about this restart rather than a stub standing in for hooks.
+fn restart<P: Platform, D: Disk>(platform: &mut P, service: &mut Supervisor<FsCell<D, HANDLES>>) {
     let mut registry = BufferRegistry::<1>::new();
     let found = (|| {
         service.restart(&mut Quiesced)?;
         let name = Name::try_from("runtime.txt")?;
-        let root = service.fs()?.root(OWNER)?;
-        let opened = service.fs()?.apply(OWNER, FsOp::Open { dir: root, name }, &mut registry)?;
+        let cell = service.cell_mut();
+        let root = cell.fs()?.root(OWNER)?;
+        let opened = cell.fs()?.apply(OWNER, FsOp::Open { dir: root, name }, &mut registry)?;
         match opened.handle() {
             Some(Handle::File(_)) => Ok(()),
             _ => Err(FsError::Kind),
@@ -144,21 +151,10 @@ fn restart<P: Platform, D: Disk>(platform: &mut P, service: &mut FsCell<D, HANDL
             platform,
             "MOLT_FS_RESTART_OK: restart {} at generation {}",
             service.generation(),
-            service.checkpoint()
+            service.cell().checkpoint()
         ),
         Err(error) => report!(platform, "MOLT_FS_FAILED: {error:?}"),
     }
-}
-
-/// The script has run and the ring is drained, so quiescing has nothing to do.
-struct Quiesced;
-
-impl RestartHooks for Quiesced {
-    fn stop_submissions(&mut self) {}
-
-    fn cancel_requests(&mut self) {}
-
-    fn revoke_capabilities(&mut self) {}
 }
 
 /// The shell's console, which is the port the kernel reports on.

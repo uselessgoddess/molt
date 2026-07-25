@@ -369,35 +369,40 @@ story for a mount needs a write path to be worth writing. The write path exists,
 so `molt_fs::FsCell` does too: init starts one, hands out roots, and owns the
 only mount in the system.
 
-**What it is.** `FsCell::start` mounts the device and keeps it; `fs()` hands out
-the `Fs` other cells submit to; `restart(hooks)` is the lifecycle the name
-promises. A restart stops submissions, cancels in-flight requests, revokes every
-capability, and remounts — in that order, because a restart that let one more
-submission in would answer it from a filesystem that is half gone. The remount
-goes back to the last durable checkpoint, so what was synced survives and what
-was not is exactly what a power cut would have taken. `generation()` counts
-restarts, `checkpoint()` reports the volume's, and the two are deliberately
-different numbers.
+**What it is.** `FsCell::spawn` mounts the device and keeps it; `fs()` hands out
+the `Fs` other cells submit to; `Supervisor` runs the lifecycle around both. A
+restart stops submissions, cancels in-flight requests, revokes every capability,
+and remounts — in that order, because a restart that let one more submission in
+would answer it from a filesystem that is half gone. The remount goes back to
+the last durable checkpoint, so what was synced survives and what was not is
+exactly what a power cut would have taken. The supervisor's `generation()`
+counts restarts, `checkpoint()` reports the volume's, and the two are
+deliberately different numbers.
 
 **When the remount fails.** By then the hooks have run: handles are revoked, the
 tree is dropped, and the log is unreplayed, so there is no filesystem left to
-answer with. The cell says so rather than pretending — `state()` turns
-`FsState::Failed` and every later `fs()` and `restart()` returns
-`FsError::Failed`. Restarting again is refused on purpose: the hooks would revoke
-a second time, and whatever made the disk unreadable is still there. Recovery
-belongs to the supervisor, which drops the cell and starts one on a device that
-mounts.
+answer with. The cell says so rather than pretending — `health()` turns
+`Health::Failed` and every later `fs()` and `restart()` returns
+`FsError::Failed`, while the supervisor holds its generation where it was, since
+no new epoch started. Restarting again is refused on purpose: the hooks would
+revoke a second time, and whatever made the disk unreadable is still there.
+Recovery belongs to the supervisor, which drops the cell and starts one on a
+device that mounts.
 
-**Why it is not `impl Cell`.** `molt_core::cell::Cell` requires `Send + 'static`,
-a `State: Default`, and an infallible `spawn`. A mount is none of those: it owns
-a device that may carry a lifetime, and mounting is the operation that fails.
-Forcing the trait would mean a `Default` state that is "no filesystem" plus a
-`Message`/`Reply` pair whose entire content is the word "wraps" around `FsOp`.
-What the trait is actually for — supervised restart with clean state — is the
-part that carried over: `RestartHooks` is `molt-core`'s, the order is the
-supervisor's order, and `CapabilityTable::revoke_owner` is what makes the restart
-clean. When `Cell` grows a fallible spawn and a borrowed state, `FsCell` is where
-that lands, and its callers do not move.
+**Why it is a `Cell`.** It was not, once: the trait wanted `Send + 'static`, a
+`State: Default`, and an infallible `spawn`, and a mount is none of those — it
+owns a device that carries a lifetime, and mounting is the operation that fails.
+Rather than bend the filesystem to the trait, the trait bent to its first real
+implementor: `spawn` returns `Result<Self, Self::Error>`, `restart` puts a
+cell back in place instead of rebuilding it from `Default`, the message pair
+moved to a separate `Handler` (the filesystem takes an owner and a buffer
+registry per request, so a `Message`/`Reply` around `FsOp` would say nothing),
+and the thread bounds went with them — `Loopback<'a>` and the kernel's borrowed
+`Block<'_>` are the disks that exist, so a `'static` supervisor could supervise
+neither. `State = D` is the device the cell owns for its life, `Error = FsError`
+is what mounting already returns, and `RestartHooks` plus
+`CapabilityTable::revoke_owner` do what they did before, in the supervisor now
+so that one place fixes the order.
 
 **The seam is still the ring.** `Fs::serve` drains submissions and posts
 completions without knowing who submitted them, and `Session` submits without
@@ -639,10 +644,12 @@ handle table refuses rather than overwrites, and a full completion queue
 preserves the next result until the client makes room.
 
 Cell tests cover the lifecycle: a restart keeps what was synced, drops what was
-not, leaves every handle stale, runs its hooks in the documented order, and
-counts itself. A disk that stops answering reads mid-restart proves the failed
-state: the cell reports the device error, refuses every later call, and does not
-run its hooks again even once the disk is back. Two tests hold the stack budget
+not, and leaves every handle stale, while a supervised cell over a borrowed disk
+runs its hooks in the documented order and counts the generations — the same
+test that would stop compiling if `Cell` asked for `'static` again. A disk that
+stops answering reads mid-restart proves the failed state: the cell reports the
+device error, refuses every later call, and does not run its hooks again even
+once the disk is back. Two tests hold the stack budget
 at 16 KiB for mount and for a create/sync cycle.
 
 The shell tests run scripts against a mounted image and compare what was

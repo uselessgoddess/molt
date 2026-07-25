@@ -167,15 +167,27 @@ is asynchronous.
 ## Cells, state, and recovery
 
 The `Cell` trait and `Supervisor` establish that the supervisor owns the cell,
-restart replaces owned state, and a generation changes on every restart. Calls
-are statically typed and allocation-free. Each managed supervisor also owns an
-arena value and invokes integrations in this deterministic order:
+restart returns it to what it started from, and a generation changes on every
+restart that comes back. Starting is fallible, because mounting is, so `spawn`
+and the supervisor's constructors return `Result`; the message pair lives in
+`Handler` instead, since a lifecycle is not a protocol and a cell without a ring
+has nothing to put there. Calls are statically typed and allocation-free. Each
+managed supervisor also owns an arena value and invokes integrations in this
+deterministic order:
 
 1. stop new submissions to the old generation;
 2. cancel or drain outstanding operations;
 3. revoke exported capabilities;
 4. drop the cell-owned arena as a unit;
-5. spawn new state and publish a new generation.
+5. restart the cell in place and publish a new generation.
+
+A cell that cannot come back is left `Health::Failed`: the generation stays
+where it was, so nobody mistakes a failed restart for an epoch, the hooks do not
+run again over an epoch that already ended, and recovery belongs to whoever
+holds the supervisor. Neither the trait nor the supervisor asks for
+`Send + 'static` — the first real cell owns a device borrowed from a mapped
+window, and thread bounds belong where a cell is moved between cores rather than
+on every implementor.
 
 A heartbeat detects liveness, not correctness. Restart cannot repair memory
 corruption caused by unsafe code or DMA. Unsafe code should therefore be kept in
