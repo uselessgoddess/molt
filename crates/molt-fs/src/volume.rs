@@ -475,120 +475,128 @@ mod tests {
 
     fn image() -> alloc::vec::Vec<u8> {
         let mut tree = Tree::new();
-        tree.file("hello.txt", b"hello, molt".to_vec()).expect("legal name");
-        tree.file("big.bin", alloc::vec![0xa5; 3 * BLOCK + 7]).expect("legal name");
-        tree.dir("docs").expect("legal name").file("readme", b"read me".to_vec()).unwrap();
-        build(&tree, 1).expect("image that fits")
+        tree.file("hello.txt", b"hello, molt".to_vec()).unwrap();
+        tree.file("big.bin", alloc::vec![0xa5; 3 * BLOCK + 7]).unwrap();
+        tree.dir("docs").unwrap().file("readme", b"read me".to_vec()).unwrap();
+        build(&tree, 1).unwrap()
     }
 
     fn mount(bytes: &[u8]) -> Volume<Loopback<'_>> {
-        Volume::mount(Loopback::new(bytes).expect("whole sectors")).expect("live volume")
+        Volume::mount(Loopback::new(bytes).unwrap()).unwrap()
     }
 
     #[test]
-    fn file_reads_back_what_was_written() {
+    fn file_reads_back_what_was_written() -> Result<(), FsError> {
         let bytes = image();
         let mut volume = mount(&bytes);
 
-        let root = volume.object(volume.root()).expect("root object");
-        let id = volume.lookup(&root, b"hello.txt").expect("name in the root");
-        let file = volume.object(id).expect("file object");
+        let root = volume.object(volume.root())?;
+        let id = volume.lookup(&root, b"hello.txt")?;
+        let file = volume.object(id)?;
         let mut text = [0u8; 16];
-        let read = volume.read(&file, 0, &mut text).expect("readable file");
+        let read = volume.read(&file, 0, &mut text)?;
 
         assert_eq!(&text[..read], b"hello, molt");
+        Ok(())
     }
 
     #[test]
-    fn read_crossing_blocks_stays_contiguous() {
+    fn read_crossing_blocks_stays_contiguous() -> Result<(), FsError> {
         let bytes = image();
         let mut volume = mount(&bytes);
 
-        let root = volume.object(volume.root()).expect("root object");
-        let id = volume.lookup(&root, b"big.bin").expect("name in the root");
-        let file = volume.object(id).expect("file object");
+        let root = volume.object(volume.root())?;
+        let id = volume.lookup(&root, b"big.bin")?;
+        let file = volume.object(id)?;
         let mut window = [0u8; 8];
-        let read = volume.read(&file, BLOCK as u64 - 4, &mut window).expect("readable file");
+        let read = volume.read(&file, BLOCK as u64 - 4, &mut window)?;
 
         assert_eq!(read, 8);
-        assert_eq!(window, [0xa5; 8], "the block boundary lost bytes");
+        assert_eq!(window, [0xa5; 8], "block boundary lost bytes");
+        Ok(())
     }
 
     #[test]
-    fn short_read_stops_at_end_of_file() {
+    fn short_read_stops_at_end() -> Result<(), FsError> {
         let bytes = image();
         let mut volume = mount(&bytes);
 
-        let root = volume.object(volume.root()).expect("root object");
-        let id = volume.lookup(&root, b"hello.txt").expect("name in the root");
-        let file = volume.object(id).expect("file object");
+        let root = volume.object(volume.root())?;
+        let id = volume.lookup(&root, b"hello.txt")?;
+        let file = volume.object(id)?;
 
         assert_eq!(volume.read(&file, 6, &mut [0; 64]), Ok(5));
+        Ok(())
     }
 
     #[test]
-    fn missing_name_reported() {
+    fn missing_name_reported() -> Result<(), FsError> {
         let bytes = image();
         let mut volume = mount(&bytes);
 
-        let root = volume.object(volume.root()).expect("root object");
+        let root = volume.object(volume.root())?;
 
         assert_eq!(volume.lookup(&root, b"nothing"), Err(FsError::Missing));
+        Ok(())
     }
 
     #[test]
-    fn entries_come_back_sorted() {
+    fn entries_come_back_sorted() -> Result<(), FsError> {
         let bytes = image();
         let mut volume = mount(&bytes);
 
-        let root = volume.object(volume.root()).expect("root object");
-        let first = volume.entry(&root, 0).expect("entry").0;
-        let second = volume.entry(&root, 1).expect("entry").0;
+        let root = volume.object(volume.root())?;
+        let first = volume.entry(&root, 0)?.0;
+        let second = volume.entry(&root, 1)?.0;
 
         assert_eq!(first.as_str(), Some("big.bin"));
         assert_eq!(second.as_str(), Some("docs"));
+        Ok(())
     }
 
     #[test]
-    fn nested_directory_reachable() {
+    fn nested_directory_reachable() -> Result<(), FsError> {
         let bytes = image();
         let mut volume = mount(&bytes);
 
-        let root = volume.object(volume.root()).expect("root object");
-        let docs = volume.lookup(&root, b"docs").expect("subdirectory");
-        let docs = volume.object(docs).expect("directory object");
-        let id = volume.lookup(&docs, b"readme").expect("name in the subdirectory");
+        let root = volume.object(volume.root())?;
+        let docs = volume.lookup(&root, b"docs")?;
+        let docs = volume.object(docs)?;
+        let id = volume.lookup(&docs, b"readme")?;
 
-        assert_eq!(volume.object(id).expect("file object").kind, Kind::File);
+        assert_eq!(volume.object(id)?.kind, Kind::File);
+        Ok(())
     }
 
     #[test]
-    fn entry_past_end_reported() {
+    fn entry_past_end_reported() -> Result<(), FsError> {
         let bytes = image();
         let mut volume = mount(&bytes);
 
-        let root = volume.object(volume.root()).expect("root object");
+        let root = volume.object(volume.root())?;
 
         assert_eq!(volume.entry(&root, 3).map(|entry| entry.0), Err(FsError::Missing));
+        Ok(())
     }
 
     #[test]
-    fn corrupt_data_block_refused() {
+    fn corrupt_data_block_refused() -> Result<(), FsError> {
         let mut bytes = image();
-        let data = super::Super::parse(&bytes[..BLOCK]).expect("superblock").data_at;
+        let data = super::Super::parse(&bytes[..BLOCK])?.data_at;
         bytes[data as usize * BLOCK] ^= 0xff;
         let mut volume = mount(&bytes);
-        let root = volume.object(volume.root()).expect("root object");
-        let id = volume.lookup(&root, b"big.bin").expect("name in the root");
-        let file = volume.object(id).expect("file object");
+        let root = volume.object(volume.root())?;
+        let id = volume.lookup(&root, b"big.bin")?;
+        let file = volume.object(id)?;
 
         assert_eq!(volume.read(&file, 0, &mut [0; 8]), Err(FsError::Checksum));
+        Ok(())
     }
 
     #[test]
-    fn extent_physical_overflow_refused() {
+    fn extent_physical_overflow_refused() -> Result<(), FsError> {
         let mut bytes = image();
-        let mut superblock = Super::parse(&bytes[..BLOCK]).expect("superblock");
+        let mut superblock = Super::parse(&bytes[..BLOCK])?;
         let mut extents = superblock.region(Area::Extents);
         let at = extents.at as usize * BLOCK;
         bytes[at + 8..at + 16].copy_from_slice(&u64::MAX.to_le_bytes());
@@ -598,36 +606,39 @@ mod tests {
             superblock.encode(&mut bytes[copy as usize * BLOCK..]);
         }
         let mut volume = mount(&bytes);
-        let root = volume.object(volume.root()).expect("root object");
-        let id = volume.lookup(&root, b"big.bin").expect("name in the root");
-        let file = volume.object(id).expect("file object");
+        let root = volume.object(volume.root())?;
+        let id = volume.lookup(&root, b"big.bin")?;
+        let file = volume.object(id)?;
 
         assert_eq!(volume.read(&file, BLOCK as u64, &mut [0; 8]), Err(FsError::Corrupt));
+        Ok(())
     }
 
     #[test]
-    fn corrupt_metadata_refused_at_mount() {
+    fn corrupt_metadata_refused_at_mount() -> Result<(), FsError> {
         let mut bytes = image();
-        let superblock = super::Super::parse(&bytes[..BLOCK]).expect("superblock");
+        let superblock = super::Super::parse(&bytes[..BLOCK])?;
         let at = superblock.region(Area::Objects).at as usize * BLOCK;
         bytes[at] ^= 0xff;
-        let device = Loopback::new(&bytes).expect("whole sectors");
+        let device = Loopback::new(&bytes)?;
 
         assert_eq!(
             Volume::mount(device).err(),
             Some(FsError::Checksum),
-            "a damaged object region mounted"
+            "damaged object region mounted"
         );
+        Ok(())
     }
 
     #[test]
-    fn torn_superblock_falls_back_to_older_copy() {
+    fn torn_superblock_falls_back() -> Result<(), FsError> {
         let mut bytes = image();
         bytes[0] ^= 0xff;
         let mut volume = mount(&bytes);
-        let root = volume.object(volume.root()).expect("root object");
+        let root = volume.object(volume.root())?;
 
-        assert!(volume.lookup(&root, b"hello.txt").is_ok(), "the older copy did not serve");
+        assert!(volume.lookup(&root, b"hello.txt").is_ok(), "older copy did not serve");
+        Ok(())
     }
 
     #[test]

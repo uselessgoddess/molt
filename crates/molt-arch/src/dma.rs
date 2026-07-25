@@ -304,7 +304,7 @@ mod tests {
         let mut buffer = [0u8; 16];
         let region = region(&mut buffer, 0xdead_0000);
 
-        region.write_u32(4, 0x0102_0304).expect("aligned write inside the region");
+        region.write_u32(4, 0x0102_0304).unwrap();
 
         assert_eq!(region.physical(), 0xdead_0000);
         assert_eq!(u32::from_le_bytes(buffer[4..8].try_into().unwrap()), 0x0102_0304);
@@ -315,9 +315,9 @@ mod tests {
         let mut buffer = [0u8; 8];
         let region = region(&mut buffer, 0x1000);
 
-        region.write_from(0, &[1, 2, 3, 4]).expect("a copy inside the region");
+        region.write_from(0, &[1, 2, 3, 4]).unwrap();
         let mut read = [0u8; 4];
-        region.read_into(0, &mut read).expect("a copy inside the region");
+        region.read_into(0, &mut read).unwrap();
 
         assert_eq!(read, [1, 2, 3, 4]);
     }
@@ -346,10 +346,10 @@ mod tests {
         let map = Map(&regions);
         let mut allocator = FrameAllocator::new(&map);
         let mut slots = [None; 8];
-        let mut arena = Arena::claim(&mut allocator, 0, 7, &mut slots).expect("eight free frames");
+        let mut arena = Arena::claim(&mut allocator, 0, 7, &mut slots).unwrap();
 
-        let first = arena.region(16).expect("room for a header");
-        let second = arena.region(FRAME_SIZE + 1).expect("room for two more frames");
+        let first = arena.region(16).unwrap();
+        let second = arena.region(FRAME_SIZE + 1).unwrap();
 
         assert_eq!(first.physical(), 0x10_0000);
         assert_eq!(second.physical(), 0x10_0000 + FRAME_SIZE, "regions shared a frame");
@@ -362,7 +362,7 @@ mod tests {
         let map = Map(&regions);
         let mut allocator = FrameAllocator::new(&map);
         let mut slots = [None; 2];
-        let mut arena = Arena::claim(&mut allocator, 0, 1, &mut slots).expect("two free frames");
+        let mut arena = Arena::claim(&mut allocator, 0, 1, &mut slots).unwrap();
 
         assert_eq!(arena.region(3 * FRAME_SIZE).err(), Some(DmaError::OutOfSpace));
     }
@@ -389,17 +389,17 @@ mod tests {
         let map = Map(&regions);
         let mut allocator = FrameAllocator::new(&map);
         let mut slots = [None; 3];
-        let mut arena = Arena::claim(&mut allocator, 0, 4, &mut slots).expect("three free frames");
+        let mut arena = Arena::claim(&mut allocator, 0, 4, &mut slots).unwrap();
 
-        let first = arena.region(FRAME_SIZE).expect("room for one frame");
-        let second = arena.region(2 * FRAME_SIZE).expect("room for two more");
+        let first = arena.region(FRAME_SIZE).unwrap();
+        let second = arena.region(2 * FRAME_SIZE).unwrap();
         assert_eq!(arena.region(FRAME_SIZE).err(), Some(DmaError::OutOfSpace));
-        arena.release(first).expect("a region this arena handed out");
+        arena.release(first).unwrap();
 
-        let third = arena.region(FRAME_SIZE).expect("the frame just released");
+        let third = arena.region(FRAME_SIZE).unwrap();
 
         assert_eq!(third.physical(), 0x10_0000);
-        assert_eq!(second.physical(), 0x10_0000 + FRAME_SIZE, "a live region moved");
+        assert_eq!(second.physical(), 0x10_0000 + FRAME_SIZE, "live region moved");
     }
 
     #[test]
@@ -408,13 +408,13 @@ mod tests {
         let map = Map(&regions);
         let mut allocator = FrameAllocator::new(&map);
         let mut slots = [None; 1];
-        let mut arena = Arena::claim(&mut allocator, 0, 5, &mut slots).expect("one free frame");
+        let mut arena = Arena::claim(&mut allocator, 0, 5, &mut slots).unwrap();
         let mut buffer = [0u8; 16];
 
         let borrowed = region(&mut buffer, 0x10_0000);
 
         assert_eq!(arena.release(borrowed).err(), Some(DmaError::Foreign));
-        assert!(arena.region(FRAME_SIZE).is_ok(), "the arena lost a frame it still holds");
+        assert!(arena.region(FRAME_SIZE).is_ok(), "arena lost frame it still holds");
     }
 
     #[test]
@@ -423,8 +423,8 @@ mod tests {
         let map = Map(&regions);
         let mut allocator = FrameAllocator::new(&map);
         let mut slots = [None; 4];
-        let mut arena = Arena::claim(&mut allocator, 0, 2, &mut slots).expect("four free frames");
-        let outstanding = arena.region(FRAME_SIZE).expect("room for one frame");
+        let mut arena = Arena::claim(&mut allocator, 0, 2, &mut slots).unwrap();
+        let outstanding = arena.region(FRAME_SIZE).unwrap();
 
         arena.reset();
 

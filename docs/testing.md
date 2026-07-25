@@ -168,14 +168,34 @@ proves the whole path, because markers expose the same bytes at five heights:
 `MOLT_FS_WRITE_OK` for a durable create/write/sync/read cycle, then the shell's
 own `molt> cat hello.txt` and `hello, molt` lines before `MOLT_SHELL_OK`.
 Requiring data rather than only component markers says contents survived
-driver, format, and ring. See
-[`docs/fs.md`](fs.md).
+driver, format, and ring. Stage 3 adds one more height above them:
+`MOLT_FS_RESTART_OK` restarts the filesystem service on the same live device
+and reopens the file the write cycle synced, so the marker says a crash-free
+restart is as good as a checkpoint — and says it against a real disk, which no
+host test can. See [`docs/fs.md`](fs.md).
 
 Everything under those markers that can be tested without a machine is. The
 `Device` trait has a `Loopback` implementation over bytes in memory, so
 `molt-fs` mounts real images built by its own writer on the host, and `xtask`
 lays out the smoke tree and mounts it back — which keeps the image honest even
 where QEMU is not installed.
+
+## Testing a budget nothing declares
+
+Stage 3 added a layer the table above does not name: a test that measures stack
+depth. The kernel gives the boot path 128 KiB and no guard page, so a call that
+spends 78 KiB of frame is a fault waiting for a deeper caller — and nothing in
+the type system says so. `crates/molt-fs/tests/stack.rs` paints a 96 KiB window
+with `0xa5`, runs one filesystem call over the same frames, and reads back how
+far down the mark was disturbed. Mount and commit each get 16 KiB.
+
+Two things make it a test rather than a measurement. It fails on a regression
+instead of printing a number nobody reads, and it names the limit that the
+crash it prevents would not: a stack overflow in a kernel without a guard page
+corrupts whatever lies below and reports something else entirely. It reads a
+frame the compiler considers dead, which is exactly what Miri is right to
+object to, so it is `cfg(not(miri))` and the safe API around it carries the
+Miri coverage instead. See [the stack budget](fs.md#the-stack-budget).
 
 ## Conventions
 

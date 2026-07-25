@@ -597,28 +597,27 @@ mod tests {
     use crate::{BLOCK, FsError, Kind, Name};
 
     fn name(text: &str) -> Name {
-        Name::try_from(text).expect("legal name")
+        Name::try_from(text).unwrap()
     }
 
     fn image() -> alloc::vec::Vec<u8> {
         let mut tree = Tree::new();
-        tree.file("base", b"immutable".to_vec()).expect("legal name");
-        build(&tree, 1).expect("image")
+        tree.file("base", b"immutable".to_vec()).unwrap();
+        build(&tree, 1).unwrap()
     }
 
     fn commit_file(bytes: &mut [u8], file: &str, contents: &[u8]) -> u64 {
-        let mut journal =
-            Journal::mount(Loopback::writable(bytes).expect("writable image")).expect("mount");
-        let object = journal.create(journal.root(), name(file), Kind::File).expect("create");
-        journal.write(object, 0, contents).expect("write");
-        journal.sync().expect("sync")
+        let mut journal = Journal::mount(Loopback::writable(bytes).unwrap()).unwrap();
+        let object = journal.create(journal.root(), name(file), Kind::File).unwrap();
+        journal.write(object, 0, contents).unwrap();
+        journal.sync().unwrap()
     }
 
     fn assert_checkpoint(bytes: &[u8], generation: u64) {
-        let mut journal = Journal::mount(Loopback::new(bytes).expect("image")).expect("mount");
+        let mut journal = Journal::mount(Loopback::new(bytes).unwrap()).unwrap();
         assert_eq!(journal.generation(), generation);
 
-        let first = journal.lookup(journal.root(), &name("first")).expect("first survives");
+        let first = journal.lookup(journal.root(), &name("first")).unwrap();
         let mut contents = [0; 8];
         assert_eq!(journal.read(first, 0, &mut contents), Ok(5));
         assert_eq!(&contents[..5], b"first");
@@ -626,8 +625,7 @@ mod tests {
         match generation {
             2 => assert_eq!(journal.lookup(journal.root(), &name("second")), Err(FsError::Missing)),
             3 => {
-                let second =
-                    journal.lookup(journal.root(), &name("second")).expect("second committed");
+                let second = journal.lookup(journal.root(), &name("second")).unwrap();
                 assert_eq!(journal.read(second, 0, &mut contents), Ok(6));
                 assert_eq!(&contents[..6], b"second");
             }
@@ -636,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn power_loss_at_every_checkpoint_action_mounts_old_or_new_generation() {
+    fn power_loss_mounts_old_or_new() {
         let mut baseline = image();
         assert_eq!(commit_file(&mut baseline, "first", b"first"), 2);
 
@@ -645,10 +643,8 @@ mod tests {
             let mut stable = baseline.clone();
             let mut volatile = alloc::vec![0; stable.len()];
             let outcome = {
-                let device = Fault::new(&mut stable, &mut volatile)
-                    .expect("matching storage")
-                    .cut_after(cut);
-                let mut journal = Journal::mount(device).expect("old checkpoint mounts");
+                let device = Fault::new(&mut stable, &mut volatile).unwrap().cut_after(cut);
+                let mut journal = Journal::mount(device).unwrap();
                 (|| {
                     let object = journal.create(journal.root(), name("second"), Kind::File)?;
                     journal.write(object, 0, b"second")?;
@@ -677,28 +673,27 @@ mod tests {
     }
 
     #[test]
-    fn newest_checkpoint_with_bad_log_falls_back_to_previous_generation() {
+    fn bad_log_falls_back() {
         let mut bytes = image();
         assert_eq!(commit_file(&mut bytes, "first", b"first"), 2);
 
-        let active = crate::layout::Super::parse(&bytes[BLOCK..2 * BLOCK]).expect("generation two");
+        let active = crate::layout::Super::parse(&bytes[BLOCK..2 * BLOCK]).unwrap();
         let log = active.region(crate::layout::Area::Log);
         bytes[log.at as usize * BLOCK] ^= 1;
-        let mut journal = Journal::mount(Loopback::new(&bytes).expect("image")).expect("fallback");
+        let mut journal = Journal::mount(Loopback::new(&bytes).unwrap()).unwrap();
 
         assert_eq!(journal.generation(), 1);
         assert_eq!(journal.lookup(journal.root(), &name("first")), Err(FsError::Missing));
     }
 
     #[test]
-    fn newest_checkpoint_with_bad_tree_falls_back() {
+    fn bad_tree_falls_back() {
         let mut bytes = image();
         assert_eq!(commit_file(&mut bytes, "first", b"first"), 2);
         assert_eq!(commit_file(&mut bytes, "second", b"second"), 3);
 
-        let left = crate::layout::Super::parse(&bytes[..BLOCK]).expect("left checkpoint");
-        let right =
-            crate::layout::Super::parse(&bytes[BLOCK..2 * BLOCK]).expect("right checkpoint");
+        let left = crate::layout::Super::parse(&bytes[..BLOCK]).unwrap();
+        let right = crate::layout::Super::parse(&bytes[BLOCK..2 * BLOCK]).unwrap();
         let active = if left.generation > right.generation { left } else { right };
         bytes[active.tree_root as usize * BLOCK] ^= 1;
 
@@ -706,37 +701,38 @@ mod tests {
     }
 
     #[test]
-    fn tree_arena_reuses_old_generations() {
+    fn arena_reuses_old_generations() -> Result<(), FsError> {
         let mut bytes = image();
         {
-            let mut journal =
-                Journal::mount(Loopback::writable(&mut bytes).expect("image")).expect("mount");
-            let file = journal.create(journal.root(), name("rolling"), Kind::File).expect("create");
+            let mut journal = Journal::mount(Loopback::writable(&mut bytes)?)?;
+            let file = journal.create(journal.root(), name("rolling"), Kind::File)?;
             for byte in 0..200u8 {
-                journal.write(file, 0, &[byte]).expect("write");
-                journal.sync().expect("checkpoint");
+                journal.write(file, 0, &[byte])?;
+                journal.sync()?;
             }
         }
-        let mut journal = Journal::mount(Loopback::new(&bytes).expect("image")).expect("remount");
-        let file = journal.lookup(journal.root(), &name("rolling")).expect("file");
+        let mut journal = Journal::mount(Loopback::new(&bytes)?)?;
+        let file = journal.lookup(journal.root(), &name("rolling"))?;
         let mut byte = [0];
+
         assert_eq!(journal.read(file, 0, &mut byte), Ok(1));
         assert_eq!(byte, [199]);
+        Ok(())
     }
 
     #[test]
-    fn later_writes_overlay_base_data_and_can_extend_sparsely() {
+    fn writes_overlay_base_and_extend() -> Result<(), FsError> {
         let mut bytes = image();
-        let mut journal =
-            Journal::mount(Loopback::writable(&mut bytes).expect("image")).expect("mount");
-        let base = journal.lookup(journal.root(), &name("base")).expect("base file");
+        let mut journal = Journal::mount(Loopback::writable(&mut bytes)?)?;
+        let base = journal.lookup(journal.root(), &name("base"))?;
 
-        journal.write(base, 2, b"WRITE").expect("overwrite");
-        journal.write(base, 12, b"tail").expect("sparse extension");
+        journal.write(base, 2, b"WRITE")?;
+        journal.write(base, 12, b"tail")?;
         let mut contents = [0xa5; 20];
-        let read = journal.read(base, 0, &mut contents).expect("overlay read");
+        let read = journal.read(base, 0, &mut contents)?;
 
         assert_eq!(read, 16);
         assert_eq!(&contents[..16], b"imWRITEle\0\0\0tail");
+        Ok(())
     }
 }

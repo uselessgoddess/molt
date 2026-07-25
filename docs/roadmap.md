@@ -188,17 +188,18 @@ deterministically on reset, and prints a file from that disk through a
 filesystem addressed only by capability — with the live-table audit passing on
 both platforms.
 
-Two decisions are recorded rather than checked off. The filesystem is not a cell
-yet: the ring is the seam a cell boundary would need and it is load-bearing
-today, but wrapping `Fs` in `Cell` before there is a second client and a remount
-story would buy a layer whose content is the word "wraps". And the block driver
-is called rather than awaited: a `BlockOp` ring worth having comes with
-readahead and a cache, both of which want the writable filesystem's structure.
-Both are argued in `docs/fs.md`.
+One decision is recorded rather than checked off. The block driver is called
+rather than awaited: a `BlockOp` ring worth having comes with readahead and a
+cache, both of which want the writable filesystem's structure. The other — the
+filesystem is not a cell yet — held only until there was a remount story, which
+Stage 3 supplies. Both are argued in `docs/fs.md`.
 
 ## Stage 3 — Services and networking
 
 - [x] writable filesystem and crash-consistency tests
+- [x] `molt-alloc`: a kernel heap, and the B-tree moved onto it
+- [x] DMA regions a driver returns and reuses, not held until reset
+- [x] the filesystem started, served, and restarted as one service
 - [ ] VirtIO network, Ethernet, ARP, IPv4, UDP, then TCP
 - [ ] a typed scheme/resource namespace inspired by Redox
 - [ ] capability delegation and audit events
@@ -211,6 +212,22 @@ operations, and fault injection that cuts power before every checkpoint action.
 Mount always selects a complete old or new generation and never depends on
 fsck. `MOLT_FS_WRITE_OK` proves the same path through QEMU's virtio-blk device.
 
+The three items after it are what that filesystem then demanded. A B-tree whose
+nodes and paths lived in fixed arrays spent 78 KiB of a 128 KiB stack with no
+guard page beneath it, so the kernel grew a heap — first fit, address-ordered,
+coalescing — donated 4 MiB of frames at boot, and the tree moved onto it;
+a test now holds mount and commit under 16 KiB each. A driver that could only
+return DMA frames by resetting its queue grew per-region release. And `FsCell`
+makes the filesystem a service with a lifecycle rather than a library every
+caller links: it mounts once, answers on a ring, and restarts at the last
+durable checkpoint with every handle from the old epoch revoked. See
+[`docs/memory.md`](memory.md) and [`docs/fs.md`](fs.md).
+
+Asynchronous I/O below the ring is deliberately not on this list. `Volume` and
+`Journal` still call the block device and block; making them `await` a
+`BlockOp` ring is a change of its own, and doing it inside the one that moved
+the tree to the heap would have made both harder to review.
+
 ## Stage 4 — SMP, hardware breadth, and performance
 
 - [ ] per-CPU executors and rings; explicit cross-core fan-in
@@ -219,6 +236,12 @@ fsck. `MOLT_FS_WRITE_OK` proves the same path through QEMU's virtio-blk device.
 - [ ] NVMe and selected real NIC/storage targets
 - [ ] reproducible bare-metal benchmark runner
 - [ ] matched Linux io_uring throughput/tail-latency comparisons
+
+The heap and the filesystem are both single-threaded today — one global
+spinlock over the free list, `Rc` and `&mut` inside the tree — and that is what
+this stage has to answer for. Neither shape is an obstacle: a service reached
+only by ring is already the unit a core owns, so the sharding happens under the
+lock and around the cell, not through the filesystem's types.
 
 ## Stage 5 — Evolution experiments
 

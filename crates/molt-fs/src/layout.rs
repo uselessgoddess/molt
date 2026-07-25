@@ -582,11 +582,11 @@ mod tests {
     }
 
     #[test]
-    fn extent_covers_its_own_blocks_only() {
+    fn extent_covers_own_blocks_only() {
         let extent = Extent { logical: 4, blocks: 2, block: 100 };
 
         assert_eq!(extent.covers(5), Ok(Some(101)));
-        assert_eq!(extent.covers(6), Ok(None), "an extent claimed a block past its end");
+        assert_eq!(extent.covers(6), Ok(None), "extent claimed block past its end");
     }
 
     #[test]

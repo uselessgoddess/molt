@@ -63,7 +63,7 @@ mod tests {
         bits.set(70);
 
         assert!(bits.get(70));
-        assert!(!bits.get(69), "a neighbour was set too");
+        assert!(!bits.get(69), "neighbour was set too");
     }
 
     #[test]
@@ -82,7 +82,7 @@ mod tests {
         for at in 0..8 {
             bits.set(at);
         }
-        assert_eq!(bits.first_clear(), None, "a full map offered an index");
+        assert_eq!(bits.first_clear(), None, "full map offered an index");
 
         bits.clear(3);
 
@@ -97,7 +97,7 @@ mod tests {
         }
         bits.set(9);
 
-        assert_eq!(bits.first_clear(), None, "the map handed out an index it does not hold");
+        assert_eq!(bits.first_clear(), None, "map handed out index it does not hold");
         assert!(!bits.get(9));
     }
 }
