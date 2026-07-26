@@ -8,10 +8,12 @@
 use molt_block::Disk;
 use molt_core::buffer::BufferRegistry;
 use molt_core::capability::{Capability, CapabilityTable, CellId};
+use molt_core::registry::Registry;
 use molt_core::ring::{Completion, IoDriver};
 
 use crate::layout::{Kind, Object};
 use crate::op::{Dir, File, FsDone, FsOp, Handle, Stat};
+use crate::storage::{Mount, Storage};
 use crate::{FsError, Journal};
 
 #[derive(Clone, Copy)]
@@ -63,6 +65,23 @@ impl<D: Disk, const N: usize> Fs<D, N> {
         self.open
             .insert::<Dir>(owner, OpenObject { id: root, kind: object.kind })
             .map_err(|_| FsError::Handles)
+    }
+
+    /// Puts the mount under [`Storage`] and shuts the bootstrap behind it.
+    ///
+    /// The root is minted for `provider` — the filesystem's own cell — rather
+    /// than for whoever acquires it later, so that a client restarting takes
+    /// only the handles it opened with it. Publishing is the last thing an epoch
+    /// does with the bootstrap: a name anybody can ask through makes a second
+    /// hand-out pointless, and the sealing says so.
+    pub fn publish<const M: usize>(
+        &mut self,
+        names: &mut Registry<Storage, M>,
+        provider: CellId,
+    ) -> Result<Capability<Storage>, FsError> {
+        let mount = Mount::new(self.root(provider)?, self.generation());
+        self.seal();
+        Ok(names.publish(provider, mount)?)
     }
 
     /// Closes the root bootstrap for good, so no later caller can grant one.
