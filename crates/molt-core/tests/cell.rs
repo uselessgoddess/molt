@@ -116,6 +116,54 @@ fn failed_restart_holds_generation() -> Result<(), Fault> {
 }
 
 #[test]
+fn cell_reports_alone() -> Result<(), Fault> {
+    let mut supervisor = Supervisor::<Counter>::new(4)?;
+    supervisor.record_heartbeat(10);
+
+    assert_eq!(supervisor.watch(20, 10, &mut Quiesced), None);
+
+    assert_eq!(supervisor.call(1), 5, "the cell kept what it had counted");
+    assert_eq!(supervisor.generation(), 0);
+    Ok(())
+}
+
+#[test]
+fn missed_deadline_restarts() -> Result<(), Fault> {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut supervisor = Supervisor::<Counter>::new(4)?;
+    let mut hooks = Hooks(events.clone());
+    supervisor.record_heartbeat(10);
+
+    assert_eq!(supervisor.watch(21, 10, &mut hooks), Some(Ok(())));
+
+    assert_eq!(*events.lock().unwrap(), ["stop", "cancel", "revoke"]);
+    assert_eq!(supervisor.call(2), 2, "the cell came back from where it started");
+    assert_eq!(supervisor.generation(), 1);
+    Ok(())
+}
+
+#[test]
+fn watchdog_starts_next_deadline() -> Result<(), Fault> {
+    let mut supervisor = Supervisor::<Counter>::new(4)?;
+
+    supervisor.watch(11, 10, &mut Quiesced).unwrap()?;
+
+    assert_eq!(supervisor.watch(12, 10, &mut Quiesced), None, "the new epoch inherited the miss");
+    Ok(())
+}
+
+#[test]
+fn asked_once_per_deadline() -> Result<(), Fault> {
+    let mut supervisor = Supervisor::<Fragile>::new(true)?;
+
+    assert_eq!(supervisor.watch(11, 10, &mut Quiesced), Some(Err(Fault)));
+
+    assert_eq!(supervisor.watch(15, 10, &mut Quiesced), None);
+    assert_eq!(supervisor.watch(22, 10, &mut Quiesced), Some(Err(Fault)));
+    Ok(())
+}
+
+#[test]
 fn failed_restart_runs_hooks_once() -> Result<(), Fault> {
     let events = Arc::new(Mutex::new(Vec::new()));
     let mut supervisor = Supervisor::<Fragile>::new(true)?;

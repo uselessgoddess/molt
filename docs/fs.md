@@ -361,13 +361,35 @@ capabilities, not a URL namespace, and the roadmap already lists it as *a typed
 scheme/resource namespace*, emphasis on typed. This document is the record that
 "typed" means capabilities, not strings.
 
+**What discovery turned out to be.** `molt_core::registry` is that registry, and
+it is smaller than the sentence above suggested. A `Scheme` is a type with an
+`Endpoint` type beside it — `Storage`, whose endpoint is a `Mount` carrying a
+`Capability<Dir>` root — and the registry is a `CapabilityTable` of endpoints
+with the scheme as the marker. `publish` takes an endpoint and returns nothing a
+client can use; `acquire` returns a `Capability<S>` lease; `endpoint` exchanges a
+lease for `&S::Endpoint`. There is no name to spell, no lookup that can be
+misspelled, and one scheme per registry slot, so "which service answers for
+storage" is answered by the type system and the miss is `RegistryError::Unavailable`
+rather than a path that does not resolve.
+
+The lease is the part that earns its existence. A client that took the `Mount`
+by value would hold a root capability across a restart of the thing that minted
+it, and would find out only when a handle came back `Stale` — three operations
+later, from the middle of a command. Naming the *publication* instead means the
+service's restart hooks withdraw it, so the next `endpoint` call fails at the
+first hop with `CapabilityError::Stale` and the client re-acquires there. That is
+what [`molt_fs::Teardown`](../crates/molt-fs/src/restart.rs) does between
+`cancel_requests` and the remount, and what `Fs::publish` restores afterwards.
+The mount is published for the service's own `CellId`, so revoking a *client*
+cannot take the publication down with it.
+
 ## Cells: the filesystem is a service now
 
 The sketch in the issue had `AppCell → FsCell → VirtioCell`, three cells and two
 rings. The read-only stage shipped one ring and no cell, because the restart
 story for a mount needs a write path to be worth writing. The write path exists,
-so `molt_fs::FsCell` does too: init starts one, hands out roots, and owns the
-only mount in the system.
+so `molt_fs::FsCell` does too: init starts one, it publishes the only mount in
+the system, and the shell is a cell beside it rather than a task init drives.
 
 **What it is.** `FsCell::spawn` mounts the device and keeps it; `fs()` hands out
 the `Fs` other cells submit to; `Supervisor` runs the lifecycle around both. A
@@ -409,6 +431,28 @@ completions without knowing who submitted them, and `Session` submits without
 knowing who serves. Nothing above the ring reaches into the volume — the shell
 has a capability and a buffer, and that is all it has — so the cell wraps a
 boundary that was already load-bearing rather than inventing one.
+
+**The client is a cell too.** `molt_shell::Shell` implements `Cell` with a
+`Session` as its state: it starts holding no lease, and a restart resets the
+session — the lease goes, the pending request is abandoned, and the completions
+still in the ring are drained so the next command does not read an answer to a
+question the previous epoch asked. Its supervisor's hooks are
+[`Disconnect`](../crates/molt-fs/src/restart.rs), which cancels what the shell
+submitted and revokes what it held, because a cell that has stopped cannot close
+its own handles. That is the second half of the restart story: until now every
+revocation in the system was the service taking back what it had minted, and
+this is the supervisor of the *holder* giving it up.
+
+**And two cells make a tick worth counting.** `Supervisor::record_heartbeat`
+existed with no reader, which is another way of saying nothing in the system had
+a liveness policy. It has one now: `watch(tick, deadline, hooks)` restarts a cell
+whose last heartbeat is more than `deadline` ticks old, and init calls it after
+every line the shell runs. A line the shell finishes is the heartbeat; a line
+nothing answers is a missed one; two in a row and the shell is restarted by
+something other than the code that started it. The tick is a line rather than a
+timer on purpose — nothing preempts a cell here, so between units of work is the
+only place a supervisor can honestly look at a clock, and a timer would report a
+cell as late while it was still holding the only core.
 
 **The block driver stays a call, deliberately.** A `BlockOp` ring under the
 filesystem is the sketch's second ring, and it is the one place the layering
@@ -523,12 +567,15 @@ the current generation.
 **The root handle comes from nowhere, and off the ring.** Every other handle is
 opened from a directory somebody already holds; the first cannot be, so there is
 no `FsOp` for it. `Fs::root` mints it, and only code holding the mounted `Fs` —
-init — can call that. Init hands each first holder its root and then calls
-`Fs::seal`, after which the grant is gone for the mount's life and a later
-caller gets `FsError::Sealed`. That single asymmetry is where a namespace would
-otherwise be: authority to reach the tree enters the system once, from the one
-place that already has all of it, rather than being mintable by anything that
-can submit an operation.
+the service itself — can call that. `Fs::publish` mints one root, puts it in the
+registry as the `Storage` endpoint, and calls `Fs::seal`, after which the grant
+is gone for the mount's life and a later caller gets `FsError::Sealed`. That
+single asymmetry is where a namespace would otherwise be: authority to reach the
+tree enters the system once, from the one place that already has all of it,
+rather than being mintable by anything that can submit an operation. What
+changed when the registry arrived is only who receives it — the root goes to a
+publication clients lease rather than into a client's hand — which is what lets
+the mount underneath a holder be replaced.
 
 **A listing carries `Stat`.** `FsDone::Entry` returns the name *and* the kind,
 size, and entry count, because the volume already read the object record to
@@ -656,17 +703,31 @@ The shell tests run scripts against a mounted image and compare what was
 printed, which is the only test that can catch a protocol that is technically
 complete and unusable: `cat` across several reads, `cat` on a directory, `ls` on
 a file, a name that does not exist reported rather than returned, and a command
-that does not exist naming itself.
+that does not exist naming itself. Four more run the shell as a cell rather than
+a script: a shell with nothing published says `no storage` instead of hanging, a
+withdrawn mount is reported and then re-acquired once it is republished, an
+answer to a command that was abandoned is skipped rather than printed against
+the next one, and a restarted shell loses the directory it had open — its hooks
+revoke exactly one handle. A fifth is the watchdog policy itself, driven the way
+init drives it: two lines nobody serves, a `watch` call after each, one restart
+on the second, and a working `ls` afterwards to prove the cell came back.
 
 `cargo xtask mkfs <tree> <image>` writes a directory tree out as a mountable
 image, and the smoke disk is one of those rather than a signed pattern — the
 `disk/` tree in the repository, laid out at smoke time. The block driver reads
 sector zero, the filesystem mounts, creates `runtime.txt`, writes and syncs it
-through virtio, reads it back, then the shell prints the original host file.
-The x86_64 smoke requires `MOLT_FS_WRITE_OK:` in addition to mount and shell
-markers, then restarts the service and requires `MOLT_FS_RESTART_OK:` for the
-synced file still being there. An xtask test performs the same write, drops the
-mount, remounts, and checks the durable bytes on the host.
+through virtio, reads it back, publishes its root, and only then does the shell
+run — against a lease it acquired itself. The x86_64 smoke requires
+`MOLT_FS_WRITE_OK:` in addition to mount and shell markers. Mid-script the
+service restarts under the shell, which requires `MOLT_REGISTRY_OK:` for the
+older leases going stale; two starved lines later the shell is restarted by its
+own supervisor, which requires `MOLT_WATCHDOG_OK:`. The `cat` that prints the
+original host file is the line after both, so the markers that were already
+required — `molt> cat hello.txt` and its contents — now assert that a client
+survives losing its service and then losing itself. Init then restarts the
+service once more and requires `MOLT_FS_RESTART_OK:` for the synced file still
+being there. An xtask test performs the same write, drops the mount, remounts,
+and checks the durable bytes on the host.
 
 ## Debts closed before the write path
 

@@ -13,6 +13,7 @@ pub mod cell;
 pub mod completion;
 pub mod executor;
 pub mod interrupt;
+pub mod registry;
 pub mod ring;
 pub(crate) mod sync;
 pub mod waker;

@@ -160,6 +160,8 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
             "MOLT_BLOCK_OK:",
             "MOLT_FS_OK:",
             "MOLT_FS_WRITE_OK:",
+            "MOLT_REGISTRY_OK:",
+            "MOLT_WATCHDOG_OK:",
             "molt> cat hello.txt",
             "hello, molt",
             "MOLT_SHELL_OK:",
