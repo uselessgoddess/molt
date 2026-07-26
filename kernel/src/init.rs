@@ -16,7 +16,7 @@ use molt_block::Disk;
 use molt_core::buffer::{BufferOperation, BufferRegistry};
 use molt_core::capability::{Capability, CellId, ReadWrite};
 use molt_core::cell::Supervisor;
-use molt_core::registry::Registry;
+use molt_core::registry::{Registry, Scheme};
 use molt_core::ring::{IoDriver, IoRing};
 use molt_fs::{
     Disconnect, Fs, FsCell, FsDone, FsError, FsOp, Handle, Kind, Name, Storage, Teardown,
@@ -173,16 +173,19 @@ fn script<P: Platform, D: Disk>(
         if event == Event::Republish {
             let stale = names.borrow().acquire().map_err(FsError::from)?;
             service.restart(&mut Teardown::new(driver, names, FS))?;
-            service.cell_mut().fs()?.publish(&mut names.borrow_mut(), FS)?;
+            let published = service.cell_mut().fs()?.publish(&mut names.borrow_mut(), FS)?;
             if names.borrow().endpoint(stale).is_ok() {
                 // A lease that outlived its publication would make every later
                 // restart invisible to whoever holds one.
                 return Err(FsError::Corrupt.into());
             }
+            // Reported from the new publication rather than from the cell, so
+            // the number is the one a client acquiring now would find.
+            let mount = names.borrow().endpoint(published).map_err(FsError::Handle)?.checkpoint();
             report!(
                 platform,
-                "MOLT_REGISTRY_OK: storage republished at generation {}, older leases stale",
-                service.cell().checkpoint()
+                "MOLT_REGISTRY_OK: {} republished at generation {mount}, older leases stale",
+                Storage::NAME
             );
         }
 
