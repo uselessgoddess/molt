@@ -62,6 +62,7 @@ pub struct Log<const N: usize> {
 
 impl<const N: usize> Log<N> {
     pub const fn new() -> Self {
+        const { assert!(N > 0, "an audit log needs at least one slot") };
         Self { events: [None; N], len: 0, next: 0, dropped: 0 }
     }
 
