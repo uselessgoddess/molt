@@ -3,10 +3,11 @@
 //! Every command is an `async fn` that talks to the filesystem the same way any
 //! other cell would: capabilities in operations, answers in completions, file
 //! bytes in a registered buffer. There is no privileged path from the shell to
-//! the volume, so what `ls` can reach is exactly what its root handle allows.
+//! the volume, so what `ls` can reach is exactly what the root it leased allows.
 
-use molt_core::capability::Capability;
-use molt_fs::{Dir, FsDone, FsError, FsOp, Handle, Kind, Name};
+use molt_core::capability::CapabilityError;
+use molt_core::cell::Cell;
+use molt_fs::{FsDone, FsError, FsOp, Handle, Kind, Name};
 
 use crate::ShellError;
 use crate::console::Console;
@@ -20,24 +21,34 @@ const HELP: &[u8] = b"commands:\n\
     \x20 ls [name]   list root, or a directory inside it\n\
     \x20 cat <name>  print a file\n";
 
-/// A shell holding one directory handle, and nothing else.
-pub struct Shell<'ring, 'registry, 'buffer, const R: usize, const N: usize> {
-    session: Session<'ring, 'registry, 'buffer, R, N>,
-    root: Capability<Dir>,
+/// A shell holding a session, and nothing else.
+pub struct Shell<'ring, 'registry, 'buffer, const R: usize, const N: usize, const M: usize> {
+    session: Session<'ring, 'registry, 'buffer, R, N, M>,
 }
 
-impl<'ring, 'registry, 'buffer, const R: usize, const N: usize>
-    Shell<'ring, 'registry, 'buffer, R, N>
+/// The shell is a cell like any other: it starts from a session, and it comes
+/// back from a restart holding no lease, no handle, and no unanswered request.
+/// Its supervisor revokes what it opened on its behalf, because a cell that has
+/// stopped cannot close anything itself.
+impl<'ring, 'registry, 'buffer, const R: usize, const N: usize, const M: usize> Cell
+    for Shell<'ring, 'registry, 'buffer, R, N, M>
 {
-    /// Takes the session and the root handle the shell starts from.
-    ///
-    /// The root is handed in, not requested: the shell holds exactly the
-    /// authority init chose to delegate and has no operation that would widen
-    /// it.
-    pub fn new(session: Session<'ring, 'registry, 'buffer, R, N>, root: Capability<Dir>) -> Self {
-        Self { session, root }
+    type Error = ShellError;
+    type State = Session<'ring, 'registry, 'buffer, R, N, M>;
+
+    fn spawn(session: Self::State) -> Result<Self, ShellError> {
+        Ok(Self { session })
     }
 
+    fn restart(&mut self) -> Result<(), ShellError> {
+        self.session.reset();
+        Ok(())
+    }
+}
+
+impl<'ring, 'registry, 'buffer, const R: usize, const N: usize, const M: usize>
+    Shell<'ring, 'registry, 'buffer, R, N, M>
+{
     /// Runs every line of `text`, echoing each one behind a prompt.
     ///
     /// A canned script is how the shell is exercised until a platform reads
@@ -75,12 +86,12 @@ impl<'ring, 'registry, 'buffer, const R: usize, const N: usize>
                 Ok(())
             }
             b"ls" => match self.ls(argument, out).await {
-                Err(error) => excuse(b"ls", error, out),
+                Err(error) => self.excuse(b"ls", error, out),
                 Ok(()) => Ok(()),
             },
             b"cat" => match argument {
                 Some(name) => match self.cat(name, out).await {
-                    Err(error) => excuse(b"cat", error, out),
+                    Err(error) => self.excuse(b"cat", error, out),
                     Ok(()) => Ok(()),
                 },
                 None => {
@@ -109,7 +120,7 @@ impl<'ring, 'registry, 'buffer, const R: usize, const N: usize>
                 out.line(b"ls: not a directory");
                 return Ok(());
             }
-            None => self.root,
+            None => self.session.root()?,
         };
 
         let FsDone::Stat(stat) = self.session.request(FsOp::Stat(Handle::Dir(dir))).await? else {
@@ -175,7 +186,8 @@ impl<'ring, 'registry, 'buffer, const R: usize, const N: usize>
 
     async fn open_entry(&mut self, name: &[u8]) -> Result<Handle, ShellError> {
         let name = Name::new(name).map_err(ShellError::Fs)?;
-        let opened = self.session.request(FsOp::Open { dir: self.root, name }).await?;
+        let dir = self.session.root()?;
+        let opened = self.session.request(FsOp::Open { dir, name }).await?;
         opened.handle().ok_or(ShellError::Protocol)
     }
 
@@ -185,20 +197,35 @@ impl<'ring, 'registry, 'buffer, const R: usize, const N: usize>
             _ => Err(ShellError::Protocol),
         }
     }
-}
 
-/// Reports what the user can fix, and passes on what only the shell can.
-fn excuse(command: &[u8], error: ShellError, out: &mut impl Console) -> Result<(), ShellError> {
-    let reason: &[u8] = match error {
-        ShellError::Fs(FsError::Missing) => b"no such entry",
-        ShellError::Fs(FsError::Name) => b"not a usable name",
-        ShellError::Fs(FsError::Kind) => b"wrong kind of object",
-        other => return Err(other),
-    };
-    out.write(command);
-    out.write(b": ");
-    out.line(reason);
-    Ok(())
+    /// Reports what the user can fix, and passes on what only the shell can.
+    ///
+    /// A command that met an ended epoch says so and stops rather than retrying
+    /// itself: half a listing is already printed by then, and reprinting it
+    /// would be a worse answer than telling the user what happened between the
+    /// two halves.
+    fn excuse(
+        &mut self,
+        command: &[u8],
+        error: ShellError,
+        out: &mut impl Console,
+    ) -> Result<(), ShellError> {
+        let reason: &[u8] = match error {
+            ShellError::Fs(FsError::Missing) => b"no such entry",
+            ShellError::Fs(FsError::Name) => b"not a usable name",
+            ShellError::Fs(FsError::Kind) => b"wrong kind of object",
+            ShellError::Fs(FsError::Cancelled | FsError::Handle(CapabilityError::Stale)) => {
+                self.session.release();
+                b"storage restarted"
+            }
+            ShellError::Unavailable => b"no storage",
+            other => return Err(other),
+        };
+        out.write(command);
+        out.write(b": ");
+        out.line(reason);
+        Ok(())
+    }
 }
 
 fn trim(line: &[u8]) -> &[u8] {
@@ -216,16 +243,20 @@ mod tests {
     use molt_block::Loopback;
     use molt_core::buffer::BufferRegistry;
     use molt_core::capability::CellId;
+    use molt_core::cell::{Cell, RestartHooks, Supervisor};
+    use molt_core::registry::Registry;
     use molt_core::ring::IoRing;
     use molt_fs::format::{Tree, build};
-    use molt_fs::{Fs, FsDone, FsError, FsOp};
+    use molt_fs::{Disconnect, Fs, FsDone, FsError, FsOp, Storage, Teardown};
 
     use super::Shell;
+    use crate::ShellError;
     use crate::capture::Capture;
-    use crate::drive::drive;
+    use crate::drive::{drive, drive_bounded};
     use crate::session::Session;
 
-    const OWNER: CellId = CellId::new(7);
+    const SERVICE: CellId = CellId::new(2);
+    const CLIENT: CellId = CellId::new(7);
     /// Smaller than `hello.txt`, so `cat` has to come back for the rest.
     const WINDOW: usize = 8;
 
@@ -245,20 +276,21 @@ mod tests {
 
         let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap();
         let mut registry = BufferRegistry::<1>::new();
-        let scratch = registry.register_read_write(OWNER, &mut scratch).unwrap();
+        let scratch = registry.register_read_write(CLIENT, &mut scratch).unwrap();
         let buffers = RefCell::new(registry);
+        let names = RefCell::new(Registry::<Storage, 1>::new());
         let (client, mut driver) = ring.split();
 
-        let root = fs.root(OWNER).unwrap();
-        let session = Session::new(client, &buffers, scratch, WINDOW).unwrap();
+        fs.publish(&mut names.borrow_mut(), SERVICE).unwrap();
+        let session = Session::new(client, &buffers, &names, scratch, WINDOW).unwrap();
         let mut out = Capture::new();
         drive(
             async {
-                let mut shell = Shell::new(session, root);
+                let mut shell = Shell::spawn(session).unwrap();
                 shell.script(script, &mut out).await
             },
             || {
-                fs.serve(OWNER, &mut driver, &mut buffers.borrow_mut());
+                fs.serve(CLIENT, &mut driver, &mut buffers.borrow_mut());
             },
         )
         .expect("shell that only meets errors it can print");
@@ -332,5 +364,117 @@ mod tests {
             printed,
             "molt> ls\ndocs/\nhello.txt  11\nnote.txt  8\nmolt> ls docs\nreadme  8\n"
         );
+    }
+
+    #[test]
+    fn a_shell_with_nothing_published_says_so() -> Result<(), ShellError> {
+        let mut scratch = [0u8; WINDOW];
+        let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
+        let mut registry = BufferRegistry::<1>::new();
+        let scratch = registry.register_read_write(CLIENT, &mut scratch).unwrap();
+        let buffers = RefCell::new(registry);
+        let names = RefCell::new(Registry::<Storage, 1>::new());
+        let (client, _driver) = ring.split();
+        let mut shell = Shell::spawn(Session::new(client, &buffers, &names, scratch, WINDOW)?)?;
+        let mut out = Capture::new();
+
+        drive(shell.run(b"ls", &mut out), || panic!("a command that asked a service nobody runs"))?;
+
+        assert_eq!(out.text(), "ls: no storage\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_withdrawn_mount_is_reported_then_reacquired() -> Result<(), ShellError> {
+        let bytes = image();
+        let mut scratch = [0u8; WINDOW];
+        let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap();
+        let mut registry = BufferRegistry::<1>::new();
+        let scratch = registry.register_read_write(CLIENT, &mut scratch).unwrap();
+        let buffers = RefCell::new(registry);
+        let names = RefCell::new(Registry::<Storage, 1>::new());
+        let (client, mut driver) = ring.split();
+        fs.publish(&mut names.borrow_mut(), SERVICE).unwrap();
+        let mut shell = Shell::spawn(Session::new(client, &buffers, &names, scratch, WINDOW)?)?;
+        let mut out = Capture::new();
+        drive(shell.run(b"ls docs", &mut out), || {
+            fs.serve(CLIENT, &mut driver, &mut buffers.borrow_mut());
+        })?;
+
+        let mut hooks = Teardown::new(&mut driver, &names, SERVICE);
+        hooks.stop_submissions();
+        hooks.cancel_requests();
+        hooks.revoke_capabilities();
+        fs.restart().unwrap();
+
+        drive(shell.run(b"ls", &mut out), || panic!("a command that outlived its service"))?;
+        fs.publish(&mut names.borrow_mut(), SERVICE).unwrap();
+        drive(shell.run(b"ls docs", &mut out), || {
+            fs.serve(CLIENT, &mut driver, &mut buffers.borrow_mut());
+        })?;
+
+        assert_eq!(out.text(), "readme  8\nls: no storage\nreadme  8\n");
+        Ok(())
+    }
+
+    #[test]
+    fn an_answer_to_an_abandoned_request_is_skipped() -> Result<(), ShellError> {
+        let bytes = image();
+        let mut scratch = [0u8; WINDOW];
+        let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap();
+        let mut registry = BufferRegistry::<1>::new();
+        let scratch = registry.register_read_write(CLIENT, &mut scratch).unwrap();
+        let buffers = RefCell::new(registry);
+        let names = RefCell::new(Registry::<Storage, 1>::new());
+        let (client, mut driver) = ring.split();
+        fs.publish(&mut names.borrow_mut(), SERVICE).unwrap();
+        let mut shell = Shell::spawn(Session::new(client, &buffers, &names, scratch, WINDOW)?)?;
+        let mut out = Capture::new();
+
+        let given_up = drive_bounded(shell.run(b"ls docs", &mut out), 2, || {});
+
+        assert!(given_up.is_none(), "a command finished without anything answering it");
+        drive(shell.run(b"ls", &mut out), || {
+            fs.serve(CLIENT, &mut driver, &mut buffers.borrow_mut());
+        })?;
+        assert_eq!(out.text(), "docs/\nhello.txt  11\nnote.txt  8\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_restarted_shell_loses_what_it_opened() -> Result<(), ShellError> {
+        let bytes = image();
+        let mut scratch = [0u8; WINDOW];
+        let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap();
+        let mut registry = BufferRegistry::<1>::new();
+        let scratch = registry.register_read_write(CLIENT, &mut scratch).unwrap();
+        let buffers = RefCell::new(registry);
+        let names = RefCell::new(Registry::<Storage, 1>::new());
+        let (client, mut driver) = ring.split();
+        fs.publish(&mut names.borrow_mut(), SERVICE).unwrap();
+        let session = Session::new(client, &buffers, &names, scratch, WINDOW)?;
+        let mut shell = Supervisor::<Shell<'_, '_, '_, 4, 1, 1>>::new(session)?;
+        let mut out = Capture::new();
+        // Enough rounds to open `docs` and no more, so the handle is still the
+        // shell's when it stops.
+        drive_bounded(shell.cell_mut().run(b"ls docs", &mut out), 2, || {
+            fs.serve(CLIENT, &mut driver, &mut buffers.borrow_mut());
+        });
+
+        let mut hooks = Disconnect::new(&mut driver, &mut fs, CLIENT);
+        shell.restart(&mut hooks)?;
+        let revoked = hooks.revoked();
+
+        assert_eq!(revoked, 1, "a stopped client kept a directory open");
+        assert_eq!(shell.generation(), 1);
+        assert_eq!(out.text(), "", "an unfinished listing printed half of itself");
+        drive(shell.cell_mut().run(b"ls", &mut out), || {
+            fs.serve(CLIENT, &mut driver, &mut buffers.borrow_mut());
+        })?;
+        assert_eq!(out.text(), "docs/\nhello.txt  11\nnote.txt  8\n");
+        Ok(())
     }
 }

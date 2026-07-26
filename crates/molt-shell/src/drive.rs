@@ -20,3 +20,25 @@ pub fn drive<F: Future>(future: F, mut serve: impl FnMut()) -> F::Output {
         serve();
     }
 }
+
+/// Polls `future` at most `rounds` times, returning `None` if it wants more.
+///
+/// The budget is what makes a watchdog possible from outside the cell: a task
+/// that will never finish — waiting on a service that stopped answering, or
+/// looping on work that cannot complete — is dropped here rather than spun on,
+/// and its supervisor is the one that decides what to do about it.
+pub fn drive_bounded<F: Future>(
+    future: F,
+    rounds: usize,
+    mut serve: impl FnMut(),
+) -> Option<F::Output> {
+    let mut future = pin!(future);
+    let mut context = Context::from_waker(Waker::noop());
+    for _ in 0..rounds {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+            return Some(output);
+        }
+        serve();
+    }
+    None
+}
