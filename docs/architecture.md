@@ -189,6 +189,22 @@ holds the supervisor. Neither the trait nor the supervisor asks for
 window, and thread bounds belong where a cell is moved between cores rather than
 on every implementor.
 
+A cell finds the services it needs through a typed registry rather than through
+whoever started it. `molt_core::registry` publishes an endpoint under a `Scheme`
+and hands clients a lease that names the publication, not the endpoint, so the
+service can be replaced under a holder and the holder finds out at its next
+lookup with `CapabilityError::Stale`. This is discovery without a resolver:
+there is no string to parse and no name that can be spelled wrong, and a miss is
+`RegistryError::Unavailable` at the one place a client asked. It also removes the
+argument for init as a wiring harness — init publishes and supervises, and the
+cells acquire.
+
+`Supervisor::watch` is the liveness policy over the heartbeat: a cell that has
+not reported within a deadline is restarted through the same hooks a deliberate
+restart runs. The tick is a unit of work rather than wall time, because nothing
+preempts a cell in this design — between the pieces of work a supervisor hands
+out is the only moment it can read a clock and be right.
+
 A heartbeat detects liveness, not correctness. Restart cannot repair memory
 corruption caused by unsafe code or DMA. Unsafe code should therefore be kept in
 small audited hardware crates, with IOMMU protection considered when hardware

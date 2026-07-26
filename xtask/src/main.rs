@@ -160,6 +160,10 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
             "MOLT_BLOCK_OK:",
             "MOLT_FS_OK:",
             "MOLT_FS_WRITE_OK:",
+            "MOLT_REGISTRY_OK:",
+            "MOLT_WATCHDOG_OK:",
+            // Printed by a shell that re-acquired storage after the service
+            // restarted under it, and came back from a restart of its own.
             "molt> cat hello.txt",
             "hello, molt",
             "MOLT_SHELL_OK:",

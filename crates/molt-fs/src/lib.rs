@@ -30,6 +30,7 @@ use alloc::collections::TryReserveError;
 use molt_block::BlockError;
 use molt_core::buffer::BufferError;
 use molt_core::capability::CapabilityError;
+use molt_core::registry::RegistryError;
 
 mod bitmap;
 mod btree;
@@ -41,7 +42,9 @@ mod log;
 mod mem;
 mod name;
 mod op;
+mod restart;
 mod service;
+mod storage;
 mod volume;
 
 #[cfg(feature = "format")]
@@ -53,7 +56,9 @@ pub use crate::journal::Journal;
 pub use crate::layout::{BLOCK, Kind, MAGIC, MAX_NAME, Object, SUPERS, VERSION};
 pub use crate::name::Name;
 pub use crate::op::{Dir, File, FsDone, FsOp, Handle, Stat};
+pub use crate::restart::{Disconnect, Teardown};
 pub use crate::service::Fs;
+pub use crate::storage::{Mount, Storage};
 pub use crate::volume::Volume;
 
 /// Why a filesystem operation failed.
@@ -81,6 +86,11 @@ pub enum FsError {
     Device(BlockError),
     /// A root grant asked for after the bootstrap was sealed.
     Sealed,
+    /// The service restarted while the request was on the ring, so nothing ran
+    /// it. Nothing it would have changed happened.
+    Cancelled,
+    /// The namespace could not publish the mount, so nobody can acquire it.
+    Namespace(RegistryError),
     /// A handle that is unknown, stale, or short of rights.
     Handle(CapabilityError),
     /// A buffer that is unknown or does not hold the range claimed for it.
@@ -123,5 +133,11 @@ impl From<CapabilityError> for FsError {
 impl From<BufferError> for FsError {
     fn from(error: BufferError) -> Self {
         Self::Buffer(error)
+    }
+}
+
+impl From<RegistryError> for FsError {
+    fn from(error: RegistryError) -> Self {
+        Self::Namespace(error)
     }
 }

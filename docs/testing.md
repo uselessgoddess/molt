@@ -174,6 +174,17 @@ and reopens the file the write cycle synced, so the marker says a crash-free
 restart is as good as a checkpoint — and says it against a real disk, which no
 host test can. See [`docs/fs.md`](fs.md).
 
+**Two markers assert a recovery rather than a component.** `MOLT_REGISTRY_OK`
+and `MOLT_WATCHDOG_OK` are printed by init between the shell's lines: the first
+after the filesystem service restarts underneath a shell holding a lease on its
+mount, the second after the shell misses two ticks and its own supervisor
+restarts it unasked. Neither marker is the interesting assertion on its own —
+what they buy is that `molt> cat hello.txt` and `hello, molt`, which the smoke
+already required, are now printed by a cell that lost its service and then lost
+itself and came back from both. A recovery that only prints its own success
+marker proves that something ran; a recovery followed by required data proves
+that what came back works.
+
 Everything under those markers that can be tested without a machine is. The
 `Device` trait has a `Loopback` implementation over bytes in memory, so
 `molt-fs` mounts real images built by its own writer on the host, and `xtask`

@@ -92,9 +92,9 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     assert_eq!(&sector[..SIGNATURE.len()], &SIGNATURE, "sector zero holds no volume signature");
     report!(platform, "MOLT_BLOCK_OK: sector zero carries the volume signature");
 
-    // The filesystem borrows the driver, so the device is still this function's
-    // to stop afterwards.
-    crate::fs::smoke(platform, &mut block);
+    // The cells init starts borrow the driver, so the device is still this
+    // function's to stop afterwards.
+    crate::init::smoke(platform, &mut block);
 
     block.reset().expect("the device stops and its frames return");
     report!(platform, "MOLT_VIRTIO_RESET_OK: device stopped and frames reclaimed");
