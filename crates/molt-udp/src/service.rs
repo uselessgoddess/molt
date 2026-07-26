@@ -105,7 +105,15 @@ impl<const N: usize, const Q: usize> Udp<N, Q> {
     }
 
     pub(crate) fn reset(&mut self) {
-        *self = Self::new(self.local, self.tx, self.rx);
+        self.sockets.revoke_all();
+        self.bound = [None; N];
+        self.receives = [None; N];
+        self.inbox = [None; Q];
+        self.endpoint = None;
+        self.bind_inflight = false;
+        self.recv_inflight = false;
+        self.send = None;
+        self.completion = None;
     }
 
     /// Drains client work and advances the lower IP ring without polling a device.

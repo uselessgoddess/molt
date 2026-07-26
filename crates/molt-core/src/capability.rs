@@ -241,6 +241,24 @@ impl<T, const N: usize> CapabilityTable<T, N> {
         revoked
     }
 
+    /// Drops every live resource while preserving each slot's generation.
+    ///
+    /// A service restart uses this instead of replacing its table: replacing
+    /// it would reset generations to one and could make a pre-restart handle
+    /// valid again as soon as the same slot was reused.
+    pub fn revoke_all(&mut self) -> usize {
+        let mut revoked = 0;
+        for slot in &mut self.slots {
+            if slot.resource.is_some() {
+                drop(slot.resource.take());
+                slot.rights = Rights(0);
+                slot.advance_generation();
+                revoked += 1;
+            }
+        }
+        revoked
+    }
+
     fn validate<R: CapabilityRights>(
         &self,
         capability: Capability<R>,

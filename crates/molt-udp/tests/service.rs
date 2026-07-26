@@ -110,7 +110,7 @@ fn datagram_crosses_rings() -> Result<(), UdpError> {
 }
 
 #[test]
-fn restart_stales_sockets() -> Result<(), UdpError> {
+fn restart_stales_reused_socket() -> Result<(), UdpError> {
     let mut tx = [0u8; 32];
     let mut rx = [0u8; 32];
     let mut buffers = BufferRegistry::<2>::new();
@@ -134,12 +134,22 @@ fn restart_stales_sockets() -> Result<(), UdpError> {
     };
 
     cell.restart()?;
-    client.try_submit(Submission::new(RequestId::new(2), UdpOp::Close(stale))).unwrap();
+    client.try_submit(Submission::new(RequestId::new(2), UdpOp::Bind { port: 7 })).unwrap();
+    cell.udp().serve(OWNER, &mut driver, &mut ip_client, &mut buffers);
+    let Some(Ok(UdpDone::Bound(fresh))) = client.try_completion().map(|done| done.into_result())
+    else {
+        panic!("UDP rebind did not return a socket");
+    };
+
+    client.try_submit(Submission::new(RequestId::new(3), UdpOp::Close(stale))).unwrap();
     cell.udp().serve(OWNER, &mut driver, &mut ip_client, &mut buffers);
 
     assert!(matches!(
         client.try_completion().map(|done| done.into_result()),
         Some(Err(UdpError::Capability(_)))
     ));
+    client.try_submit(Submission::new(RequestId::new(4), UdpOp::Close(fresh))).unwrap();
+    cell.udp().serve(OWNER, &mut driver, &mut ip_client, &mut buffers);
+    assert_eq!(client.try_completion().map(|done| done.into_result()), Some(Ok(UdpDone::Closed)));
     Ok(())
 }
