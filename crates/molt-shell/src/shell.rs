@@ -443,6 +443,46 @@ mod tests {
         Ok(())
     }
 
+    /// The policy init runs: a line is a tick, a finished line is a heartbeat,
+    /// and a cell that stops reporting is restarted by the thing watching it.
+    #[test]
+    fn a_shell_that_misses_its_deadline_is_restarted_unasked() -> Result<(), ShellError> {
+        const DEADLINE: u64 = 1;
+        let bytes = image();
+        let mut scratch = [0u8; WINDOW];
+        let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
+        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap();
+        let mut registry = BufferRegistry::<1>::new();
+        let scratch = registry.register_read_write(CLIENT, &mut scratch).unwrap();
+        let buffers = RefCell::new(registry);
+        let names = RefCell::new(Registry::<Storage, 1>::new());
+        let (client, mut driver) = ring.split();
+        fs.publish(&mut names.borrow_mut(), SERVICE).unwrap();
+        let session = Session::new(client, &buffers, &names, scratch, WINDOW)?;
+        let mut shell = Supervisor::<Shell<'_, '_, '_, 4, 1, 1>>::new(session)?;
+        let mut out = Capture::new();
+
+        // Two lines nobody answers, so neither reports the tick it was given.
+        let mut restarts = 0;
+        for (tick, line) in [(1, b"ls".as_slice()), (2, b"ls docs")] {
+            assert!(drive_bounded(shell.cell_mut().run(line, &mut out), 4, || {}).is_none());
+            let mut hooks = Disconnect::new(&mut driver, &mut fs, CLIENT);
+            if let Some(restarted) = shell.watch(tick, DEADLINE, &mut hooks) {
+                restarted?;
+                restarts += 1;
+                assert_eq!(hooks.cancelled(), 2, "a request outlived the epoch that took it");
+            }
+        }
+
+        assert_eq!(restarts, 1, "one late line is a fault, or two are not");
+        assert_eq!(shell.generation(), 1);
+        drive(shell.cell_mut().run(b"ls", &mut out), || {
+            fs.serve(CLIENT, &mut driver, &mut buffers.borrow_mut());
+        })?;
+        assert_eq!(out.text(), "docs/\nhello.txt  11\nnote.txt  8\n");
+        Ok(())
+    }
+
     #[test]
     fn a_restarted_shell_loses_what_it_opened() -> Result<(), ShellError> {
         let bytes = image();
