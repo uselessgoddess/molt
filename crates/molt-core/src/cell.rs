@@ -113,6 +113,32 @@ impl<C: Cell> Supervisor<C, ()> {
     pub fn restart(&mut self, hooks: &mut impl RestartHooks) -> Result<(), C::Error> {
         self.restart_with_arena((), hooks)
     }
+
+    /// Restarts the cell when its heartbeat is older than `deadline` allows.
+    ///
+    /// Returns `None` while the cell is keeping up. A heartbeat is the cell's
+    /// own statement that it finished something, and on a cooperative kernel it
+    /// is the only liveness signal there is: nothing preempts a cell that never
+    /// yields, so a supervisor can either watch the clock between the pieces of
+    /// work a cell does or wait forever with it.
+    ///
+    /// The new epoch's deadline starts at `tick` rather than inheriting the
+    /// miss that ended the last one. A cell that will not come back fails here
+    /// once per deadline; whether to stop asking is its supervisor's call, so
+    /// the error is returned rather than counted.
+    pub fn watch(
+        &mut self,
+        tick: u64,
+        deadline: u64,
+        hooks: &mut impl RestartHooks,
+    ) -> Option<Result<(), C::Error>> {
+        if !self.overdue(tick, deadline) {
+            return None;
+        }
+        let restarted = self.restart(hooks);
+        self.record_heartbeat(tick);
+        Some(restarted)
+    }
 }
 
 impl<C: Cell, A> Supervisor<C, A> {
@@ -159,6 +185,14 @@ impl<C: Cell, A> Supervisor<C, A> {
 
     pub fn record_heartbeat(&mut self, tick: u64) {
         self.heartbeat = tick;
+    }
+
+    /// Whether more than `deadline` has passed since the cell last reported in.
+    ///
+    /// The tick is whatever the caller counts progress in — a timer interrupt,
+    /// a serviced line — and only has to move forward.
+    pub const fn overdue(&self, tick: u64, deadline: u64) -> bool {
+        tick.saturating_sub(self.heartbeat) > deadline
     }
 
     pub fn arena(&self) -> &A {
