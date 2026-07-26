@@ -536,6 +536,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "molt-net"
+version = "0.1.0"
+dependencies = [
+ "molt-core",
+]
+
+[[package]]
 name = "molt-pci"
 version = "0.1.0"
 dependencies = [
@@ -556,6 +563,14 @@ dependencies = [
  "molt-block",
  "molt-core",
  "molt-fs",
+]
+
+[[package]]
+name = "molt-udp"
+version = "0.1.0"
+dependencies = [
+ "molt-core",
+ "molt-net",
 ]
 
 [[package]]

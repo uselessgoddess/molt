@@ -1,0 +1,12 @@
+[package]
+name = "molt-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+molt-core.workspace = true
+
+[lib]
+bench = false
