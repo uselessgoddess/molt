@@ -21,6 +21,11 @@ const TRANSMIT_QUEUE: u16 = 1;
 /// Device configuration contains a stable MAC address.
 const VIRTIO_NET_F_MAC: u64 = 1 << 5;
 
+/// The device uses the complete modern header, including `num_buffers`.
+const VIRTIO_NET_F_MRG_RXBUF: u64 = 1 << 15;
+
+const REQUIRED_FEATURES: u64 = VIRTIO_NET_F_MAC | VIRTIO_NET_F_MRG_RXBUF;
+
 /// The modern VirtIO network header includes `num_buffers`.
 const HEADER: usize = 12;
 const FRAME: usize = 1514;
@@ -128,10 +133,8 @@ impl<'slots, 'window> Net<'slots, 'window> {
         common.reset()?;
         common.add_status(status::ACKNOWLEDGE)?;
         common.add_status(status::DRIVER)?;
-        let features = common.negotiate(VIRTIO_NET_F_MAC)?;
-        if features & VIRTIO_NET_F_MAC == 0 {
-            return Err(VirtioError::Features);
-        }
+        let features = common.negotiate(REQUIRED_FEATURES)?;
+        require_features(features)?;
         if common.num_queues()? < 2 {
             return Err(VirtioError::Missing);
         }
@@ -273,11 +276,21 @@ fn clamp_queue(device_max: u16) -> Result<u16, VirtioError> {
     Ok(size)
 }
 
+fn require_features(features: u64) -> Result<(), VirtioError> {
+    if features & REQUIRED_FEATURES != REQUIRED_FEATURES {
+        return Err(VirtioError::Features);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use molt_arch::dma::Region;
 
-    use super::{HEADER, RECEIVE_BUFFER, Receive};
+    use super::{
+        HEADER, RECEIVE_BUFFER, REQUIRED_FEATURES, Receive, VIRTIO_NET_F_MAC, require_features,
+    };
+    use crate::VirtioError;
     use crate::queue::{Queue, device_bytes, driver_bytes};
 
     fn region(bytes: &mut [u8], physical: u64) -> Region {
@@ -311,5 +324,11 @@ mod tests {
         assert_eq!(&frame[..4], b"ping");
         assert_eq!(&driver[2..4], &9u16.to_le_bytes(), "RX buffer was not republished");
         assert_eq!(receive.queue.available(), 0, "RX queue lost a descriptor");
+    }
+
+    #[test]
+    fn modern_header_requires_merge_buffer_format() {
+        assert_eq!(require_features(VIRTIO_NET_F_MAC), Err(VirtioError::Features));
+        assert_eq!(require_features(REQUIRED_FEATURES), Ok(()));
     }
 }
