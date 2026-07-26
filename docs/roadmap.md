@@ -200,8 +200,8 @@ Stage 3 supplies. Both are argued in `docs/fs.md`.
 - [x] `molt-alloc`: a kernel heap, and the B-tree moved onto it
 - [x] DMA regions a driver returns and reuses, not held until reset
 - [x] the filesystem started, served, and restarted as one service
+- [x] a typed scheme/resource namespace inspired by Redox
 - [ ] VirtIO network, Ethernet, ARP, IPv4, UDP, then TCP
-- [ ] a typed scheme/resource namespace inspired by Redox
 - [ ] capability delegation and audit events
 
 Writable filesystem includes sector writes, required virtio flush support,
@@ -225,6 +225,24 @@ real cell, it is also what `Cell` was measured against and rewritten for —
 fallible `spawn`, restart in place through the supervisor's hooks, the message
 pair moved out to `Handler`, and no thread bounds on a service that owns a
 borrowed device. See [`docs/memory.md`](memory.md) and [`docs/fs.md`](fs.md).
+
+The namespace is the item that turned init into something other than a script.
+`molt_core::registry` is a `Registry<S, N>` of typed endpoints: a service
+publishes one under a `Scheme` — `Storage` is the only one today — and a client
+acquires a `Capability<S>` lease that names the publication rather than the
+endpoint, so a service that restarts leaves every outstanding lease `Stale`
+instead of pointing at a mount that is gone. No string is parsed anywhere in it,
+which is the whole argument in [`docs/fs.md`](fs.md) about what *typed* was
+meant to buy. With a place to look things up, the shell stopped being wiring in
+the kernel and became a cell: init publishes, the shell acquires, the service
+restarts underneath it, and the shell meets `CapabilityError::Stale`,
+re-acquires, and carries on — `MOLT_REGISTRY_OK` on the serial line is that
+round trip. Two cells then made a policy possible that one could not:
+`Supervisor::watch` compares a tick against the heartbeat a cell last reported
+and restarts what has gone quiet, so the smoke test contains one restart nobody
+asked for on the line above it, reported as `MOLT_WATCHDOG_OK`. Delegation and
+audit events are the remaining half — a lease that can be handed on with fewer
+rights, and a record of who did — and they are unblocked rather than done.
 
 Asynchronous I/O below the ring is deliberately not on this list. `Volume` and
 `Journal` still call the block device and block; making them `await` a
