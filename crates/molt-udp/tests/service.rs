@@ -153,3 +153,53 @@ fn restart_stales_reused_socket() -> Result<(), UdpError> {
     assert_eq!(client.try_completion().map(|done| done.into_result()), Some(Ok(UdpDone::Closed)));
     Ok(())
 }
+
+#[test]
+fn restart_retains_ip_lease() -> Result<(), UdpError> {
+    let mut source = *b"ping";
+    let mut tx = [0u8; 32];
+    let mut rx = [0u8; 32];
+    let mut buffers = BufferRegistry::<3>::new();
+    let source = buffers.register_read(OWNER, &mut source).unwrap();
+    let tx = buffers.register_read_write(OWNER, &mut tx).unwrap();
+    let rx = buffers.register_read_write(OWNER, &mut rx).unwrap();
+    let state = UdpState::new(
+        LOCAL_IP,
+        Scratch::from_registered(tx, 32, &buffers)?,
+        Scratch::from_registered(rx, 32, &buffers)?,
+    );
+    let mut cell = UdpCell::<1, 1>::spawn(state)?;
+    let mut ip_ring = IoRing::<IpOp, Result<IpDone, IpError>, 2>::new();
+    let (mut ip_client, mut ip_driver) = ip_ring.split();
+    let mut udp_ring = IoRing::<UdpOp, Result<UdpDone, UdpError>, 2>::new();
+    let (mut client, mut driver) = udp_ring.split();
+    let config = Config::new(LOCAL_MAC, LOCAL_IP, 24, PEER_IP);
+    let mut ip = Ip::<_, 1>::new(Capture::default(), config);
+
+    cell.udp().serve(OWNER, &mut driver, &mut ip_client, &mut buffers);
+    ip.serve(OWNER, &mut ip_driver, &mut buffers);
+    cell.udp().serve(OWNER, &mut driver, &mut ip_client, &mut buffers);
+    ip.serve(OWNER, &mut ip_driver, &mut buffers);
+    cell.restart()?;
+
+    client.try_submit(Submission::new(RequestId::new(1), UdpOp::Bind { port: 7 })).unwrap();
+    cell.udp().serve(OWNER, &mut driver, &mut ip_client, &mut buffers);
+    let Some(Ok(UdpDone::Bound(socket))) = client.try_completion().map(|done| done.into_result())
+    else {
+        panic!("UDP bind did not return a socket");
+    };
+    let operation = UdpOp::Send {
+        socket,
+        to: Endpoint::new(PEER_IP, 7),
+        payload: BufferOperation::new(source, 0, 4),
+    };
+    client.try_submit(Submission::new(RequestId::new(2), operation)).unwrap();
+    cell.udp().serve(OWNER, &mut driver, &mut ip_client, &mut buffers);
+
+    assert!(client.try_completion().is_none());
+    assert!(matches!(
+        ip_driver.try_next().map(Submission::into_operation),
+        Some(IpOp::Send { .. })
+    ));
+    Ok(())
+}

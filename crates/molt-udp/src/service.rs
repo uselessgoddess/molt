@@ -81,6 +81,7 @@ pub struct Udp<const N: usize, const Q: usize> {
     endpoint: Option<Capability<Protocol>>,
     bind_inflight: bool,
     recv_inflight: bool,
+    send_inflight: bool,
     send: Option<Send>,
     completion: Option<Completion<Result<UdpDone, UdpError>>>,
 }
@@ -99,6 +100,7 @@ impl<const N: usize, const Q: usize> Udp<N, Q> {
             endpoint: None,
             bind_inflight: false,
             recv_inflight: false,
+            send_inflight: false,
             send: None,
             completion: None,
         }
@@ -109,9 +111,7 @@ impl<const N: usize, const Q: usize> Udp<N, Q> {
         self.bound = [None; N];
         self.receives = [None; N];
         self.inbox = [None; Q];
-        self.endpoint = None;
-        self.bind_inflight = false;
-        self.recv_inflight = false;
+        // Lower-ring leases and accepted requests survive the upper service epoch.
         self.send = None;
         self.completion = None;
     }
@@ -193,6 +193,9 @@ impl<const N: usize, const Q: usize> Udp<N, Q> {
                 *slot = None;
             }
         }
+        if self.send.is_some_and(|send| self.sockets.get(send.socket).is_err()) {
+            self.send = None;
+        }
         revoked
     }
 
@@ -216,7 +219,7 @@ impl<const N: usize, const Q: usize> Udp<N, Q> {
         buffers: &mut BufferRegistry<'_, M>,
     ) -> Result<Option<UdpDone>, UdpError> {
         let endpoint = self.endpoint.ok_or(UdpError::Busy)?;
-        if self.send.is_some() {
+        if self.send_inflight {
             return Err(UdpError::Busy);
         }
         let port = *self.sockets.get(socket)?;
@@ -238,6 +241,7 @@ impl<const N: usize, const Q: usize> Udp<N, Q> {
         if ip.try_submit(Submission::new(SEND_ID, op)).is_err() {
             return Err(UdpError::Busy);
         }
+        self.send_inflight = true;
         self.send = Some(Send { id, socket, len: source_len });
         Ok(None)
     }
@@ -308,6 +312,7 @@ impl<const N: usize, const Q: usize> Udp<N, Q> {
                     }
                 }
                 SEND_ID => {
+                    self.send_inflight = false;
                     let result = completion.into_result();
                     if let Some(send) = self.send.take() {
                         let result = match result {
