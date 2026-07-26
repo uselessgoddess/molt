@@ -199,6 +199,20 @@ impl<T, const N: usize> CapabilityTable<T, N> {
         Ok(resource)
     }
 
+    /// The capability naming the first live resource this table holds.
+    ///
+    /// Every other way in needs a capability already, which is the point of the
+    /// type. Discovery is the one caller that cannot have one yet, so it is
+    /// deliberately `pub(crate)`: [`Registry`](crate::registry::Registry) is
+    /// the only table that answers "who provides this" to a holder of nothing.
+    pub(crate) fn first<R: CapabilityRights>(&self) -> Option<Capability<R>> {
+        self.slots
+            .iter()
+            .enumerate()
+            .find(|(_, slot)| slot.resource.is_some() && slot.rights.contains(R::MASK))
+            .map(|(index, slot)| Capability::new(index as u32, slot.generation))
+    }
+
     pub fn revoke_owner(&mut self, owner: CellId) -> usize {
         let mut revoked = 0;
         for slot in &mut self.slots {
