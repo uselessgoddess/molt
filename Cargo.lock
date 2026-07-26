@@ -528,9 +528,11 @@ dependencies = [
  "molt-block",
  "molt-core",
  "molt-fs",
+ "molt-net",
  "molt-pci",
  "molt-riscv",
  "molt-shell",
+ "molt-udp",
  "molt-virtio",
  "molt-x86_64",
 ]

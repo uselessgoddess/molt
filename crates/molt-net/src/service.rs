@@ -134,6 +134,11 @@ impl<L: Link, const N: usize> Ip<L, N> {
         &mut self.link
     }
 
+    /// Returns the stopped service's link to its device owner.
+    pub fn into_link(self) -> L {
+        self.link
+    }
+
     pub fn bind(&mut self, owner: CellId, protocol: u8) -> Result<Capability<Protocol>, IpError> {
         if self.bound.contains(&Some(protocol)) {
             return Err(IpError::Bound);
