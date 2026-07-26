@@ -201,8 +201,8 @@ Stage 3 supplies. Both are argued in `docs/fs.md`.
 - [x] DMA regions a driver returns and reuses, not held until reset
 - [x] the filesystem started, served, and restarted as one service
 - [x] a typed scheme/resource namespace inspired by Redox
-- [ ] VirtIO network, Ethernet, ARP, IPv4, UDP, then TCP
-- [ ] capability delegation and audit events
+- [x] capability delegation and audit events
+- [ ] VirtIO network, Ethernet, ARP, IPv4, UDP, then TCP — see [`docs/net.md`](net.md)
 
 Writable filesystem includes sector writes, required virtio flush support,
 three rotating checkpoint-log banks, a checksummed copy-on-write metadata
@@ -240,9 +240,19 @@ re-acquires, and carries on — `MOLT_REGISTRY_OK` on the serial line is that
 round trip. Two cells then made a policy possible that one could not:
 `Supervisor::watch` compares a tick against the heartbeat a cell last reported
 and restarts what has gone quiet, so the smoke test contains one restart nobody
-asked for on the line above it, reported as `MOLT_WATCHDOG_OK`. Delegation and
-audit events are the remaining half — a lease that can be handed on with fewer
-rights, and a record of who did — and they are unblocked rather than done.
+asked for on the line above it, reported as `MOLT_WATCHDOG_OK`.
+
+Delegation and audit events are the other half, and now done. `CapabilityTable::delegate`
+attenuates a capability and hands it to a second cell in one step: `To` must be a
+subset of both the source type and the slot's live rights, so no copy outgrows
+its source, and revoking the owner stales every copy at once. Possession is the
+authority to delegate — the delegator is audited, not checked against the slot's
+owner, so a delegate can delegate further, exactly as a capability system wants.
+`audit::Log` is the record of who did: a bounded ring of `Grant`/`Delegate`/`Revoke`
+events that overwrites its oldest entry under pressure and counts what it dropped,
+so a full log is visibly lossy rather than silently short. Delegation is the one
+authority change a capability's value does not already reveal — a grant returns
+its handle, a revoke its count — so it is the one the log exists to catch.
 
 Asynchronous I/O below the ring is deliberately not on this list. `Volume` and
 `Journal` still call the block device and block; making them `await` a

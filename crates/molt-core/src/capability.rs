@@ -2,6 +2,7 @@
 
 use core::marker::PhantomData;
 
+use crate::audit::{Audit, Event};
 pub use crate::cell::CellId;
 
 /// Runtime rights stored beside a resource in the supervisor-owned table.
@@ -151,6 +152,25 @@ impl<T, const N: usize> CapabilityTable<T, N> {
             return Err(CapabilityError::InsufficientRights);
         }
         Ok(Capability { raw: capability.raw, rights: PhantomData })
+    }
+
+    /// Hands `capability` to `to` with `To` rights, recording the transfer.
+    ///
+    /// Holding a capability is the authority to pass a copy of it on: `from` is
+    /// audited, not checked against the slot's owner, so a delegate can delegate
+    /// further. `To` must be a subset of both `From` and the slot's live rights,
+    /// so no copy outgrows its source, and revoking the owner stales every copy
+    /// at once. A refused delegation records nothing.
+    pub fn delegate<From: CapabilityRights, To: CapabilityRights>(
+        &self,
+        capability: Capability<From>,
+        from: CellId,
+        to: CellId,
+        audit: &mut impl Audit,
+    ) -> Result<Capability<To>, CapabilityError> {
+        let delegated = self.attenuate::<From, To>(capability)?;
+        audit.record(Event::delegate(from, to, capability.index() as u32, To::MASK));
+        Ok(delegated)
     }
 
     pub fn get<R: CapabilityRights>(

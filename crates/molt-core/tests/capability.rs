@@ -1,3 +1,4 @@
+use molt_core::audit::{Action, Event, Log};
 use molt_core::capability::{
     CapabilityError, CapabilityTable, CellId, Read, ReadWrite, Rights, Write,
 };
@@ -43,4 +44,47 @@ fn attenuation_cannot_add_rights() {
     let read = table.insert::<Read>(CellId::new(1), Buffer(1)).unwrap();
 
     assert_eq!(table.attenuate::<Read, ReadWrite>(read), Err(CapabilityError::InsufficientRights));
+}
+
+#[test]
+fn delegate_narrows_and_records() -> Result<(), CapabilityError> {
+    let owner = CellId::new(1);
+    let peer = CellId::new(2);
+    let mut audit = Log::<4>::new();
+    let mut table = CapabilityTable::<Buffer, 1>::new();
+    let read_write = table.insert::<ReadWrite>(owner, Buffer(7)).unwrap();
+
+    let read = table.delegate::<ReadWrite, Read>(read_write, owner, peer, &mut audit)?;
+
+    assert_eq!(table.get(read)?, &Buffer(7));
+    assert_eq!(audit.last(), Some(Event::delegate(owner, peer, 0, Rights::READ)));
+    Ok(())
+}
+
+#[test]
+fn delegate_cannot_widen() {
+    let owner = CellId::new(1);
+    let mut audit = Log::<1>::new();
+    let mut table = CapabilityTable::<Buffer, 1>::new();
+    let read = table.insert::<Read>(owner, Buffer(1)).unwrap();
+
+    let widened = table.delegate::<Read, ReadWrite>(read, owner, CellId::new(2), &mut audit);
+
+    assert_eq!(widened, Err(CapabilityError::InsufficientRights));
+    assert!(audit.is_empty(), "a refused delegation records nothing");
+}
+
+#[test]
+fn revoke_stales_delegated() -> Result<(), CapabilityError> {
+    let owner = CellId::new(1);
+    let mut audit = Log::<1>::new();
+    let mut table = CapabilityTable::<Buffer, 1>::new();
+    let read_write = table.insert::<ReadWrite>(owner, Buffer(3)).unwrap();
+    let read = table.delegate::<ReadWrite, Read>(read_write, owner, CellId::new(2), &mut audit)?;
+
+    table.revoke_owner(owner);
+
+    assert_eq!(table.get(read), Err(CapabilityError::Stale));
+    assert_eq!(audit.last().map(|event| event.action), Some(Action::Delegate));
+    Ok(())
 }
