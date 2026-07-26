@@ -202,7 +202,8 @@ Stage 3 supplies. Both are argued in `docs/fs.md`.
 - [x] the filesystem started, served, and restarted as one service
 - [x] a typed scheme/resource namespace inspired by Redox
 - [x] capability delegation and audit events
-- [ ] VirtIO network, Ethernet, ARP, IPv4, UDP, then TCP — see [`docs/net.md`](net.md)
+- [x] interrupt-driven VirtIO network, Ethernet, ARP, IPv4, and capability-addressed UDP
+- [ ] TCP behind the same link and service boundary — see [`docs/net.md`](net.md)
 
 Writable filesystem includes sector writes, required virtio flush support,
 three rotating checkpoint-log banks, a checksummed copy-on-write metadata
@@ -211,6 +212,13 @@ tree/log/flush/root-swing/flush ordering, `Create`/`Write`/`Sync` capability
 operations, and fault injection that cuts power before every checkpoint action.
 Mount always selects a complete old or new generation and never depends on
 fsck. `MOLT_FS_WRITE_OK` proves the same path through QEMU's virtio-blk device.
+
+Networking follows the ring-first boundary rather than adding sockets to the
+kernel. `molt-net` owns Ethernet, ARP, IPv4, and protocol capabilities;
+`molt-udp` owns port demultiplexing and socket capabilities; and the kernel
+only maps modern VirtIO-net and routes its MSI-X entry through
+`InterruptSlab`. `MOLT_UDP_OK` requires a checked DNS reply to cross the real
+device and both service rings.
 
 The three items after it are what that filesystem then demanded. A B-tree whose
 nodes and paths lived in fixed arrays spent 78 KiB of a 128 KiB stack with no
