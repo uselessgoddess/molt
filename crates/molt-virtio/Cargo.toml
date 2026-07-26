@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 molt-arch.workspace = true
 molt-block.workspace = true
+molt-net.workspace = true
 molt-pci.workspace = true
 
 [lib]

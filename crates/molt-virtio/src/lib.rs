@@ -1,4 +1,4 @@
-//! A modern VirtIO block driver, built out of the frames the kernel owns.
+//! Modern VirtIO block and network drivers over kernel-owned frames.
 //!
 //! The pieces mirror the transport the specification defines. [`Transport`]
 //! finds the device's structures in its PCI BARs; [`Common`] drives the
@@ -20,6 +20,7 @@ extern crate std;
 
 mod block;
 mod config;
+mod net;
 mod notify;
 mod queue;
 mod request;
@@ -32,6 +33,7 @@ use molt_pci::PciError;
 
 pub use crate::block::Block;
 pub use crate::config::Common;
+pub use crate::net::Net;
 pub use crate::notify::Notify;
 pub use crate::queue::{Queue, Segment, Used};
 pub use crate::transport::{Location, Structure, Transport};
@@ -50,6 +52,8 @@ pub enum VirtioError {
     Dma(DmaError),
     /// The device would not accept the features the driver requires.
     Features,
+    /// The device would not route a queue through the requested MSI-X entry.
+    Interrupt,
     /// The device advertises itself as read-only.
     ReadOnly,
     /// The device reported a size or layout the driver cannot honour.

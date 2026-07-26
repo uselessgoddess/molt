@@ -579,6 +579,7 @@ version = "0.1.0"
 dependencies = [
  "molt-arch",
  "molt-block",
+ "molt-net",
  "molt-pci",
 ]
 
