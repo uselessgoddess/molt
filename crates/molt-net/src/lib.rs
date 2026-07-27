@@ -1,4 +1,4 @@
-//! Allocation-free Ethernet, ARP, and IPv4 wire primitives.
+//! Allocation-free Ethernet and IP wire primitives.
 
 #![no_std]
 
@@ -8,6 +8,7 @@ pub mod checksum;
 pub mod ethernet;
 pub mod ipv4;
 mod link;
+pub mod neighbor;
 mod op;
 mod service;
 

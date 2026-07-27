@@ -1,7 +1,7 @@
 //! Ethernet/IPv4 address resolution packets.
 
 use crate::NetError;
-use crate::address::{Ipv4Address, MacAddress};
+use crate::address::{Ipv4Addr, MacAddress};
 
 const LEN: usize = 28;
 
@@ -34,18 +34,18 @@ impl Operation {
 pub struct Packet {
     operation: Operation,
     sender_hardware: MacAddress,
-    sender_protocol: Ipv4Address,
+    sender_protocol: Ipv4Addr,
     target_hardware: MacAddress,
-    target_protocol: Ipv4Address,
+    target_protocol: Ipv4Addr,
 }
 
 impl Packet {
     pub const fn new(
         operation: Operation,
         sender_hardware: MacAddress,
-        sender_protocol: Ipv4Address,
+        sender_protocol: Ipv4Addr,
         target_hardware: MacAddress,
-        target_protocol: Ipv4Address,
+        target_protocol: Ipv4Addr,
     ) -> Self {
         Self { operation, sender_hardware, sender_protocol, target_hardware, target_protocol }
     }
@@ -64,9 +64,9 @@ impl Packet {
         Ok(Self::new(
             Operation::parse(u16::from_be_bytes(bytes[6..8].try_into().unwrap()))?,
             MacAddress::new(bytes[8..14].try_into().unwrap()),
-            Ipv4Address::from_octets(bytes[14..18].try_into().unwrap()),
+            Ipv4Addr::new(bytes[14], bytes[15], bytes[16], bytes[17]),
             MacAddress::new(bytes[18..24].try_into().unwrap()),
-            Ipv4Address::from_octets(bytes[24..28].try_into().unwrap()),
+            Ipv4Addr::new(bytes[24], bytes[25], bytes[26], bytes[27]),
         ))
     }
 
@@ -94,7 +94,7 @@ impl Packet {
         self.sender_hardware
     }
 
-    pub const fn sender_protocol(self) -> Ipv4Address {
+    pub const fn sender_protocol(self) -> Ipv4Addr {
         self.sender_protocol
     }
 
@@ -102,7 +102,7 @@ impl Packet {
         self.target_hardware
     }
 
-    pub const fn target_protocol(self) -> Ipv4Address {
+    pub const fn target_protocol(self) -> Ipv4Addr {
         self.target_protocol
     }
 }

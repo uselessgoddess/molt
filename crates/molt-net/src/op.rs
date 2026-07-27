@@ -3,7 +3,7 @@
 use molt_core::buffer::BufferOperation;
 use molt_core::capability::{Capability, CapabilityRights, Read, Rights, Write};
 
-use crate::address::Ipv4Address;
+use crate::address::IpAddr;
 
 /// Authority to send and receive one IP protocol number.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -17,7 +17,7 @@ impl CapabilityRights for Protocol {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IpOp {
     Bind { protocol: u8 },
-    Send { endpoint: Capability<Protocol>, to: Ipv4Address, payload: BufferOperation<Read> },
+    Send { endpoint: Capability<Protocol>, to: IpAddr, payload: BufferOperation<Read> },
     Recv { endpoint: Capability<Protocol>, payload: BufferOperation<Write> },
     Close(Capability<Protocol>),
 }
@@ -27,6 +27,6 @@ pub enum IpOp {
 pub enum IpDone {
     Bound(Capability<Protocol>),
     Sent(usize),
-    Received { from: Ipv4Address, len: usize },
+    Received { from: IpAddr, len: usize },
     Closed,
 }

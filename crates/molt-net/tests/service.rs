@@ -1,15 +1,15 @@
 use molt_core::buffer::{BufferOperation, BufferRegistry};
 use molt_core::capability::CellId;
 use molt_core::ring::{IoRing, RequestId, Submission};
-use molt_net::address::{Ipv4Address, MacAddress};
+use molt_net::address::{IpAddr, Ipv4Addr, Ipv6Addr, MacAddress};
 use molt_net::arp::{Operation, Packet as Arp};
 use molt_net::ethernet::{EtherType, Frame};
 use molt_net::ipv4::Packet as Ipv4;
 use molt_net::{Config, Ip, IpDone, IpError, IpOp, Link, LinkError};
 
 const OWNER: CellId = CellId::new(7);
-const LOCAL_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
-const PEER_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
+const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
+const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
 const LOCAL_MAC: MacAddress = MacAddress::new([0x02, 0, 0, 0, 0, 1]);
 const PEER_MAC: MacAddress = MacAddress::new([0x52, 0x55, 0x0a, 0, 2, 2]);
 
@@ -26,7 +26,7 @@ impl Link for Capture {
 }
 
 fn config() -> Config {
-    Config::new(LOCAL_MAC, LOCAL_IP, 24, PEER_IP)
+    Config::new(LOCAL_MAC, IpAddr::V4(LOCAL_IP), 24, IpAddr::V4(PEER_IP))
 }
 
 #[test]
@@ -56,7 +56,11 @@ fn send_waits_for_arp() -> Result<(), IpError> {
     let buffer = buffers.register_read(OWNER, &mut payload).unwrap();
     let mut ip = Ip::<_, 2>::new(Capture::default(), config());
     let endpoint = ip.bind(OWNER, 17)?;
-    let op = IpOp::Send { endpoint, to: PEER_IP, payload: BufferOperation::new(buffer, 0, 3) };
+    let op = IpOp::Send {
+        endpoint,
+        to: IpAddr::V4(PEER_IP),
+        payload: BufferOperation::new(buffer, 0, 3),
+    };
     client.try_submit(Submission::new(RequestId::new(1), op)).unwrap();
 
     assert_eq!(ip.serve(OWNER, &mut driver, &mut buffers), 0);
@@ -100,8 +104,34 @@ fn receive_follows_capability() -> Result<(), IpError> {
 
     assert_eq!(
         client.try_completion().map(|done| done.into_result()),
-        Some(Ok(IpDone::Received { from: PEER_IP, len: 5 }))
+        Some(Ok(IpDone::Received { from: IpAddr::V4(PEER_IP), len: 5 }))
     );
     assert_eq!(&buffers.resolve_write(BufferOperation::new(buffer, 0, 5))?, b"reply");
+    Ok(())
+}
+
+#[test]
+fn ipv6_send_stays_unsupported() -> Result<(), IpError> {
+    let mut payload = *b"udp";
+    let mut ring = IoRing::<IpOp, Result<IpDone, IpError>, 2>::new();
+    let (mut client, mut driver) = ring.split();
+    let mut buffers = BufferRegistry::<1>::new();
+    let buffer = buffers.register_read(OWNER, &mut payload).unwrap();
+    let mut ip = Ip::<_, 1>::new(Capture::default(), config());
+    let endpoint = ip.bind(OWNER, 17)?;
+    let op = IpOp::Send {
+        endpoint,
+        to: IpAddr::V6(Ipv6Addr::LOCALHOST),
+        payload: BufferOperation::new(buffer, 0, 3),
+    };
+    client.try_submit(Submission::new(RequestId::new(1), op)).unwrap();
+
+    ip.serve(OWNER, &mut driver, &mut buffers);
+
+    assert_eq!(
+        client.try_completion().map(|done| done.into_result()),
+        Some(Err(IpError::Unsupported))
+    );
+    assert!(ip.link().frames.is_empty());
     Ok(())
 }

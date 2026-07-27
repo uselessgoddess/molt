@@ -7,7 +7,7 @@ use molt_core::buffer::{BufferOperation, BufferRegistry};
 use molt_core::capability::CellId;
 use molt_core::ring::{IoRing, RequestId, Submission};
 use molt_kernel::report;
-use molt_net::address::Ipv4Address;
+use molt_net::address::{IpAddr, Ipv4Addr};
 use molt_net::{Config, Ip, IpDone, IpError, IpOp};
 use molt_pci::{Bar, Bus, Command, Function, MsiX, Vector, bus_span};
 use molt_udp::{Endpoint, Scratch, Udp, UdpDone, UdpError, UdpOp};
@@ -18,9 +18,9 @@ const VIRTIO_NET: u16 = 0x1041;
 const DMA_FRAMES: usize = 10;
 const NET_TAG: u32 = 0x6e65_7400;
 const OWNER: CellId = CellId::new(3);
-const LOCAL: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
-const GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
-const DNS: Ipv4Address = Ipv4Address::new(10, 0, 2, 3);
+const LOCAL: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
+const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
+const DNS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
 const DNS_PORT: u16 = 53;
 const LOCAL_PORT: u16 = 49_152;
 const DELIVERY_SPINS: u32 = 50_000_000;
@@ -113,7 +113,7 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let mac = net.mac();
     report!(platform, "MOLT_NET_OK: {} mac {:02x?}", function.address(), mac.octets(),);
 
-    let mut ip = Ip::<_, 4>::new(net, Config::new(mac, LOCAL, 24, GATEWAY));
+    let mut ip = Ip::<_, 4>::new(net, Config::new(mac, IpAddr::V4(LOCAL), 24, IpAddr::V4(GATEWAY)));
     let reply = udp_round_trip(platform, token, &mut ip);
     report!(platform, "MOLT_UDP_OK: DNS replied with {reply} bytes");
 
@@ -142,7 +142,7 @@ fn udp_round_trip<P: Platform>(
     let (mut ip_client, mut ip_driver) = ip_ring.split();
     let mut udp_ring = IoRing::<UdpOp, Result<UdpDone, UdpError>, 8>::new();
     let (mut client, mut driver) = udp_ring.split();
-    let mut udp = Udp::<4, 2>::new(LOCAL, tx, rx);
+    let mut udp = Udp::<4, 2>::new(IpAddr::V4(LOCAL), tx, rx);
 
     // Establish the UDP cell's protocol capability and persistent lower receive.
     udp.serve(OWNER, &mut driver, &mut ip_client, &mut buffers);
@@ -171,7 +171,7 @@ fn udp_round_trip<P: Platform>(
             RequestId::new(3),
             UdpOp::Send {
                 socket,
-                to: Endpoint::new(DNS, DNS_PORT),
+                to: Endpoint::new(IpAddr::V4(DNS), DNS_PORT),
                 payload: BufferOperation::new(source, 0, DNS_QUERY.len()),
             },
         ))
@@ -200,7 +200,7 @@ fn udp_round_trip<P: Platform>(
         while let Some(completion) = client.try_completion() {
             match (completion.id(), completion.into_result()) {
                 (id, Ok(UdpDone::Received { from, len })) if id == RequestId::new(2) => {
-                    assert_eq!(from, Endpoint::new(DNS, DNS_PORT));
+                    assert_eq!(from, Endpoint::new(IpAddr::V4(DNS), DNS_PORT));
                     let bytes = buffers
                         .resolve_write(BufferOperation::new(target, 0, len))
                         .expect("the registered DNS reply");

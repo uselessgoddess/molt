@@ -2,7 +2,7 @@ use molt_core::buffer::{BufferOperation, BufferRegistry};
 use molt_core::capability::CellId;
 use molt_core::cell::Cell;
 use molt_core::ring::{IoRing, RequestId, Submission};
-use molt_net::address::{Ipv4Address, MacAddress};
+use molt_net::address::{IpAddr, Ipv4Addr, MacAddress};
 use molt_net::arp::{Operation, Packet as Arp};
 use molt_net::ethernet::{EtherType, Frame};
 use molt_net::ipv4::Packet as Ipv4;
@@ -10,8 +10,8 @@ use molt_net::{Config, Ip, IpDone, IpError, IpOp, Link, LinkError};
 use molt_udp::{Datagram, Endpoint, Scratch, Udp, UdpCell, UdpDone, UdpError, UdpOp, UdpState};
 
 const OWNER: CellId = CellId::new(7);
-const LOCAL_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
-const PEER_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
+const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
+const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
 const LOCAL_MAC: MacAddress = MacAddress::new([0x02, 0, 0, 0, 0, 1]);
 const PEER_MAC: MacAddress = MacAddress::new([0x52, 0x55, 0x0a, 0, 2, 2]);
 
@@ -50,9 +50,9 @@ fn datagram_crosses_rings() -> Result<(), UdpError> {
     let (mut ip_client, mut ip_driver) = ip_ring.split();
     let mut udp_ring = IoRing::<UdpOp, Result<UdpDone, UdpError>, 8>::new();
     let (mut client, mut driver) = udp_ring.split();
-    let config = Config::new(LOCAL_MAC, LOCAL_IP, 24, PEER_IP);
+    let config = Config::new(LOCAL_MAC, IpAddr::V4(LOCAL_IP), 24, IpAddr::V4(PEER_IP));
     let mut ip = Ip::<_, 2>::new(Capture::default(), config);
-    let mut udp = Udp::<2, 2>::new(LOCAL_IP, tx, rx);
+    let mut udp = Udp::<2, 2>::new(IpAddr::V4(LOCAL_IP), tx, rx);
 
     udp.serve(OWNER, &mut driver, &mut ip_client, &mut buffers);
     ip.serve(OWNER, &mut ip_driver, &mut buffers);
@@ -66,7 +66,7 @@ fn datagram_crosses_rings() -> Result<(), UdpError> {
 
     let send = UdpOp::Send {
         socket,
-        to: Endpoint::new(PEER_IP, 7),
+        to: Endpoint::new(IpAddr::V4(PEER_IP), 7),
         payload: BufferOperation::new(source, 0, 4),
     };
     client.try_submit(Submission::new(RequestId::new(2), send)).unwrap();
@@ -82,16 +82,20 @@ fn datagram_crosses_rings() -> Result<(), UdpError> {
     assert_eq!(client.try_completion().map(|done| done.into_result()), Some(Ok(UdpDone::Sent(4))));
     let sent = Frame::parse(&ip.link().frames[1])?;
     let sent = Ipv4::parse(sent.payload())?;
-    let sent = Datagram::parse(sent.source(), sent.destination(), sent.payload())?;
+    let sent =
+        Datagram::parse(IpAddr::V4(sent.source()), IpAddr::V4(sent.destination()), sent.payload())?;
     assert_eq!(sent.payload(), b"ping");
 
     let recv = UdpOp::Recv { socket, payload: BufferOperation::new(target, 0, 16) };
     client.try_submit(Submission::new(RequestId::new(3), recv)).unwrap();
     udp.serve(OWNER, &mut driver, &mut ip_client, &mut buffers);
     let mut datagram = [0u8; 32];
-    let datagram_len =
-        Datagram::new(Endpoint::new(PEER_IP, 7), Endpoint::new(LOCAL_IP, 49152), b"pong")
-            .emit(&mut datagram)?;
+    let datagram_len = Datagram::new(
+        Endpoint::new(IpAddr::V4(PEER_IP), 7),
+        Endpoint::new(IpAddr::V4(LOCAL_IP), 49152),
+        b"pong",
+    )
+    .emit(&mut datagram)?;
     let mut packet = [0u8; 64];
     let packet_len =
         Ipv4::new(PEER_IP, LOCAL_IP, 17, &datagram[..datagram_len]).emit(&mut packet)?;
@@ -103,7 +107,7 @@ fn datagram_crosses_rings() -> Result<(), UdpError> {
 
     assert_eq!(
         client.try_completion().map(|done| done.into_result()),
-        Some(Ok(UdpDone::Received { from: Endpoint::new(PEER_IP, 7), len: 4 }))
+        Some(Ok(UdpDone::Received { from: Endpoint::new(IpAddr::V4(PEER_IP), 7), len: 4 }))
     );
     assert_eq!(&buffers.resolve_write(BufferOperation::new(target, 0, 4))?, b"pong");
     Ok(())
@@ -117,7 +121,7 @@ fn restart_stales_reused_socket() -> Result<(), UdpError> {
     let tx = buffers.register_read_write(OWNER, &mut tx).unwrap();
     let rx = buffers.register_read_write(OWNER, &mut rx).unwrap();
     let state = UdpState::new(
-        LOCAL_IP,
+        IpAddr::V4(LOCAL_IP),
         Scratch::from_registered(tx, 32, &buffers)?,
         Scratch::from_registered(rx, 32, &buffers)?,
     );
@@ -164,7 +168,7 @@ fn restart_retains_ip_lease() -> Result<(), UdpError> {
     let tx = buffers.register_read_write(OWNER, &mut tx).unwrap();
     let rx = buffers.register_read_write(OWNER, &mut rx).unwrap();
     let state = UdpState::new(
-        LOCAL_IP,
+        IpAddr::V4(LOCAL_IP),
         Scratch::from_registered(tx, 32, &buffers)?,
         Scratch::from_registered(rx, 32, &buffers)?,
     );
@@ -173,7 +177,7 @@ fn restart_retains_ip_lease() -> Result<(), UdpError> {
     let (mut ip_client, mut ip_driver) = ip_ring.split();
     let mut udp_ring = IoRing::<UdpOp, Result<UdpDone, UdpError>, 2>::new();
     let (mut client, mut driver) = udp_ring.split();
-    let config = Config::new(LOCAL_MAC, LOCAL_IP, 24, PEER_IP);
+    let config = Config::new(LOCAL_MAC, IpAddr::V4(LOCAL_IP), 24, IpAddr::V4(PEER_IP));
     let mut ip = Ip::<_, 1>::new(Capture::default(), config);
 
     cell.udp().serve(OWNER, &mut driver, &mut ip_client, &mut buffers);
@@ -190,7 +194,7 @@ fn restart_retains_ip_lease() -> Result<(), UdpError> {
     };
     let operation = UdpOp::Send {
         socket,
-        to: Endpoint::new(PEER_IP, 7),
+        to: Endpoint::new(IpAddr::V4(PEER_IP), 7),
         payload: BufferOperation::new(source, 0, 4),
     };
     client.try_submit(Submission::new(RequestId::new(2), operation)).unwrap();

@@ -1,21 +1,21 @@
 //! The restart boundary around a UDP service.
 
 use molt_core::cell::Cell;
-use molt_net::address::Ipv4Address;
+use molt_net::address::IpAddr;
 
 use crate::{Scratch, Udp, UdpError};
 
 /// The addressing and registered buffers retained across a restart.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UdpState {
-    local: Ipv4Address,
+    local: IpAddr,
     tx: Scratch,
     rx: Scratch,
 }
 
 impl UdpState {
     /// Retains only static addressing and service-owned scratch buffers.
-    pub const fn new(local: Ipv4Address, tx: Scratch, rx: Scratch) -> Self {
+    pub const fn new(local: IpAddr, tx: Scratch, rx: Scratch) -> Self {
         Self { local, tx, rx }
     }
 }

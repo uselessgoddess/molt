@@ -9,6 +9,7 @@ const HEADER: usize = 14;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EtherType {
     Ipv4,
+    Ipv6,
     Arp,
 }
 
@@ -16,6 +17,7 @@ impl EtherType {
     const fn value(self) -> u16 {
         match self {
             Self::Ipv4 => 0x0800,
+            Self::Ipv6 => 0x86dd,
             Self::Arp => 0x0806,
         }
     }
@@ -23,6 +25,7 @@ impl EtherType {
     fn parse(value: u16) -> Result<Self, NetError> {
         match value {
             0x0800 => Ok(Self::Ipv4),
+            0x86dd => Ok(Self::Ipv6),
             0x0806 => Ok(Self::Arp),
             _ => Err(NetError::Unsupported),
         }

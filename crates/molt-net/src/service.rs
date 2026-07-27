@@ -5,33 +5,29 @@ use molt_core::capability::{Capability, CapabilityError, CapabilityTable, CellId
 use molt_core::ring::{Completion, IoDriver, Submission};
 
 use crate::NetError;
-use crate::address::{Ipv4Address, MacAddress};
+use crate::address::{IpAddr, Ipv4Addr, MacAddress};
 use crate::arp::{Operation as ArpOperation, Packet as Arp};
 use crate::ethernet::{EtherType, Frame};
 use crate::ipv4::Packet as Ipv4;
 use crate::link::{Link, LinkError};
+use crate::neighbor::Cache;
 use crate::op::{IpDone, IpOp, Protocol};
 
 const FRAME: usize = 1514;
 const IP_PACKET: usize = 1500;
 const IP_PAYLOAD: usize = 1480;
 
-/// Static addressing for one IPv4 link.
+/// Static addressing for one IP link.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
     mac: MacAddress,
-    address: Ipv4Address,
+    address: IpAddr,
     prefix: u8,
-    gateway: Ipv4Address,
+    gateway: IpAddr,
 }
 
 impl Config {
-    pub const fn new(
-        mac: MacAddress,
-        address: Ipv4Address,
-        prefix: u8,
-        gateway: Ipv4Address,
-    ) -> Self {
+    pub const fn new(mac: MacAddress, address: IpAddr, prefix: u8, gateway: IpAddr) -> Self {
         Self { mac, address, prefix, gateway }
     }
 
@@ -39,7 +35,7 @@ impl Config {
         self.mac
     }
 
-    pub const fn address(self) -> Ipv4Address {
+    pub const fn address(self) -> IpAddr {
         self.address
     }
 }
@@ -55,6 +51,7 @@ pub enum IpError {
     Full,
     Link,
     TooLarge,
+    Unsupported,
 }
 
 impl From<NetError> for IpError {
@@ -73,12 +70,6 @@ impl From<BufferError> for IpError {
     fn from(error: BufferError) -> Self {
         Self::Buffer(error)
     }
-}
-
-#[derive(Clone, Copy)]
-struct Neighbor {
-    address: Ipv4Address,
-    hardware: MacAddress,
 }
 
 #[derive(Clone, Copy)]
@@ -106,7 +97,7 @@ pub struct Ip<L, const N: usize> {
     config: Config,
     protocols: CapabilityTable<u8, N>,
     bound: [Option<u8>; N],
-    neighbors: [Option<Neighbor>; N],
+    neighbors: Cache<N>,
     receives: [Option<Receive>; N],
     send: Option<PendingSend>,
     completion: Option<Completion<Result<IpDone, IpError>>>,
@@ -119,7 +110,7 @@ impl<L: Link, const N: usize> Ip<L, N> {
             config,
             protocols: CapabilityTable::new(),
             bound: [None; N],
-            neighbors: [None; N],
+            neighbors: Cache::new(),
             receives: [None; N],
             send: None,
             completion: None,
@@ -226,6 +217,7 @@ impl<L: Link, const N: usize> Ip<L, N> {
         match frame.ether_type() {
             EtherType::Arp => self.ingest_arp(frame.payload(), driver, buffers),
             EtherType::Ipv4 => self.ingest_ipv4(frame.payload(), driver, buffers),
+            EtherType::Ipv6 => Ok(false),
         }
     }
 
@@ -273,8 +265,8 @@ impl<L: Link, const N: usize> Ip<L, N> {
         if payload.len() > IP_PAYLOAD {
             return Err(IpError::TooLarge);
         }
-        let next = self.next_hop(to);
-        let Some(hardware) = self.neighbor(next) else {
+        let next = self.next_hop(to)?;
+        let Some(hardware) = self.neighbors.resolve(IpAddr::V4(next)) else {
             return match self.arp_request(next) {
                 Ok(()) => Ok(SendState::Waiting),
                 Err(LinkError::Busy) => Ok(SendState::Retry),
@@ -282,7 +274,11 @@ impl<L: Link, const N: usize> Ip<L, N> {
             };
         };
         let mut packet = [0u8; IP_PACKET];
-        let len = Ipv4::new(self.config.address, to, protocol, payload).emit(&mut packet)?;
+        let source = self.ipv4_address()?;
+        let IpAddr::V4(to) = to else {
+            return Err(IpError::Unsupported);
+        };
+        let len = Ipv4::new(source, to, protocol, payload).emit(&mut packet)?;
         let mut frame = [0u8; FRAME];
         let len = Frame::new(hardware, self.config.mac, EtherType::Ipv4, &packet[..len])
             .emit(&mut frame)?;
@@ -329,9 +325,9 @@ impl<L: Link, const N: usize> Ip<L, N> {
         buffers: &BufferRegistry<'_, M>,
     ) -> Result<bool, IpError> {
         let packet = Arp::parse(bytes)?;
-        self.learn(packet.sender_protocol(), packet.sender_hardware());
+        self.neighbors.learn(IpAddr::V4(packet.sender_protocol()), packet.sender_hardware());
         if packet.operation() == ArpOperation::Request
-            && packet.target_protocol() == self.config.address
+            && IpAddr::V4(packet.target_protocol()) == self.config.address
         {
             self.arp_reply(packet.sender_hardware(), packet.sender_protocol())
                 .map_err(|_| IpError::Link)?;
@@ -340,7 +336,12 @@ impl<L: Link, const N: usize> Ip<L, N> {
             let IpOp::Send { to, .. } = *pending.submission.operation() else {
                 return Err(IpError::Busy);
             };
-            if self.neighbor(self.next_hop(to)).is_some() {
+            if self
+                .next_hop(to)
+                .ok()
+                .and_then(|next| self.neighbors.resolve(IpAddr::V4(next)))
+                .is_some()
+            {
                 self.send = Some(PendingSend { waiting: false, ..pending });
                 self.retry(driver, buffers);
             }
@@ -355,7 +356,7 @@ impl<L: Link, const N: usize> Ip<L, N> {
         buffers: &mut BufferRegistry<'_, M>,
     ) -> Result<bool, IpError> {
         let packet = Ipv4::parse(bytes)?;
-        if packet.destination() != self.config.address {
+        if IpAddr::V4(packet.destination()) != self.config.address {
             return Ok(false);
         }
         let Some(index) = self.receives.iter().position(|slot| {
@@ -371,18 +372,18 @@ impl<L: Link, const N: usize> Ip<L, N> {
         } else {
             let target = buffers.resolve_write(wait.payload)?;
             target[..packet.payload().len()].copy_from_slice(packet.payload());
-            Ok(IpDone::Received { from: packet.source(), len: packet.payload().len() })
+            Ok(IpDone::Received { from: IpAddr::V4(packet.source()), len: packet.payload().len() })
         };
         self.publish(driver, Completion::new(wait.id, result));
         Ok(true)
     }
 
-    fn arp_request(&mut self, target: Ipv4Address) -> Result<(), LinkError> {
+    fn arp_request(&mut self, target: Ipv4Addr) -> Result<(), LinkError> {
         let mut packet = [0u8; 28];
         Arp::new(
             ArpOperation::Request,
             self.config.mac,
-            self.config.address,
+            self.ipv4_address().map_err(|_| LinkError::Device)?,
             MacAddress::new([0; 6]),
             target,
         )
@@ -395,11 +396,17 @@ impl<L: Link, const N: usize> Ip<L, N> {
         self.link.transmit(&frame[..len])
     }
 
-    fn arp_reply(&mut self, hardware: MacAddress, target: Ipv4Address) -> Result<(), LinkError> {
+    fn arp_reply(&mut self, hardware: MacAddress, target: Ipv4Addr) -> Result<(), LinkError> {
         let mut packet = [0u8; 28];
-        Arp::new(ArpOperation::Reply, self.config.mac, self.config.address, hardware, target)
-            .emit(&mut packet)
-            .map_err(|_| LinkError::Device)?;
+        Arp::new(
+            ArpOperation::Reply,
+            self.config.mac,
+            self.ipv4_address().map_err(|_| LinkError::Device)?,
+            hardware,
+            target,
+        )
+        .emit(&mut packet)
+        .map_err(|_| LinkError::Device)?;
         let mut frame = [0u8; 64];
         let len = Frame::new(hardware, self.config.mac, EtherType::Arp, &packet)
             .emit(&mut frame)
@@ -407,33 +414,25 @@ impl<L: Link, const N: usize> Ip<L, N> {
         self.link.transmit(&frame[..len])
     }
 
-    fn next_hop(&self, destination: Ipv4Address) -> Ipv4Address {
-        if same_network(self.config.address, destination, self.config.prefix.min(32)) {
-            destination
+    fn ipv4_address(&self) -> Result<Ipv4Addr, IpError> {
+        match self.config.address {
+            IpAddr::V4(address) => Ok(address),
+            IpAddr::V6(_) => Err(IpError::Unsupported),
+        }
+    }
+
+    fn next_hop(&self, destination: IpAddr) -> Result<Ipv4Addr, IpError> {
+        let source = self.ipv4_address()?;
+        let IpAddr::V4(destination) = destination else {
+            return Err(IpError::Unsupported);
+        };
+        if same_network(source, destination, self.config.prefix.min(32)) {
+            Ok(destination)
         } else {
-            self.config.gateway
-        }
-    }
-
-    fn neighbor(&self, address: Ipv4Address) -> Option<MacAddress> {
-        self.neighbors
-            .iter()
-            .flatten()
-            .find(|neighbor| neighbor.address == address)
-            .map(|neighbor| neighbor.hardware)
-    }
-
-    fn learn(&mut self, address: Ipv4Address, hardware: MacAddress) {
-        if let Some(neighbor) =
-            self.neighbors.iter_mut().flatten().find(|neighbor| neighbor.address == address)
-        {
-            neighbor.hardware = hardware;
-            return;
-        }
-        if let Some(slot) = self.neighbors.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(Neighbor { address, hardware });
-        } else if let Some(slot) = self.neighbors.first_mut() {
-            *slot = Some(Neighbor { address, hardware });
+            match self.config.gateway {
+                IpAddr::V4(gateway) => Ok(gateway),
+                IpAddr::V6(_) => Err(IpError::Unsupported),
+            }
         }
     }
 
@@ -468,7 +467,7 @@ impl<L: Link, const N: usize> Ip<L, N> {
     }
 }
 
-fn same_network(left: Ipv4Address, right: Ipv4Address, prefix: u8) -> bool {
+fn same_network(left: Ipv4Addr, right: Ipv4Addr, prefix: u8) -> bool {
     let left = u32::from_be_bytes(left.octets());
     let right = u32::from_be_bytes(right.octets());
     let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };

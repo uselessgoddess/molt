@@ -1,6 +1,6 @@
 //! IPv4 packets without options or fragmentation.
 
-use crate::address::Ipv4Address;
+use crate::address::Ipv4Addr;
 use crate::{NetError, checksum};
 
 const HEADER: usize = 20;
@@ -8,16 +8,16 @@ const HEADER: usize = 20;
 /// An IPv4 header and borrowed protocol payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Packet<'a> {
-    source: Ipv4Address,
-    destination: Ipv4Address,
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
     protocol: u8,
     payload: &'a [u8],
 }
 
 impl<'a> Packet<'a> {
     pub const fn new(
-        source: Ipv4Address,
-        destination: Ipv4Address,
+        source: Ipv4Addr,
+        destination: Ipv4Addr,
         protocol: u8,
         payload: &'a [u8],
     ) -> Self {
@@ -44,8 +44,8 @@ impl<'a> Packet<'a> {
             return Err(NetError::Fragmented);
         }
         Ok(Self::new(
-            Ipv4Address::from_octets(bytes[12..16].try_into().unwrap()),
-            Ipv4Address::from_octets(bytes[16..20].try_into().unwrap()),
+            Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]),
+            Ipv4Addr::new(bytes[16], bytes[17], bytes[18], bytes[19]),
             bytes[9],
             &bytes[header..total],
         ))
@@ -71,11 +71,11 @@ impl<'a> Packet<'a> {
         Ok(total as usize)
     }
 
-    pub const fn source(&self) -> Ipv4Address {
+    pub const fn source(&self) -> Ipv4Addr {
         self.source
     }
 
-    pub const fn destination(&self) -> Ipv4Address {
+    pub const fn destination(&self) -> Ipv4Addr {
         self.destination
     }
 

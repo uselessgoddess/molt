@@ -111,11 +111,16 @@ MSI-X -> InterruptSlab -> VirtIO RX queue -> molt-net IP ring
    guest segmentation feature is accepted, each 1526-byte buffer holds one
    complete maximum-size frame and `num_buffers` must remain one.
 2. **Ethernet + ARP.** `molt-net` parses and emits bounded frames and keeps a
-   fixed neighbor table. An unresolved next hop emits ARP and leaves the IP send
-   pending; the reply retries it without blocking or allocating.
-3. **IPv4.** The service checks header and payload checksums, has one static
-   route, and refuses fragments rather than accepting data it cannot reassemble.
-   A protocol number can be bound by only one live capability.
+   fixed neighbor cache keyed by `core::net::IpAddr`. ARP learns IPv4 entries;
+   later NDP can learn IPv6 entries without changing routing or cache clients.
+   An unresolved next hop emits ARP and leaves the IP send pending; the reply
+   retries it without blocking or allocating.
+3. **IPv4.** Ring operations, UDP endpoints, and static configuration use
+   `IpAddr`; IPv4 wire code narrows to `Ipv4Addr`. The service checks header and
+   payload checksums, has one static route, and refuses fragments rather than
+   accepting data it cannot reassemble. IPv6 EtherType and UDP pseudo-header
+   primitives are present, but IPv6 packet and NDP logic remain unsupported. A
+   protocol number can be bound by only one live capability.
 4. **UDP + `UdpCell`.** `molt-udp` owns port demultiplexing and socket
    capabilities. Payloads cross its ring only through registered buffers; its
    private registered scratch buffers carry the nested IP-ring operations.

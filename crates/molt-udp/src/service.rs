@@ -3,7 +3,7 @@
 use molt_core::buffer::{BufferOperation, BufferRegistry};
 use molt_core::capability::{Capability, CapabilityTable, CellId, Read, ReadWrite, Write};
 use molt_core::ring::{Completion, IoClient, IoDriver, RequestId, Submission};
-use molt_net::address::Ipv4Address;
+use molt_net::address::IpAddr;
 use molt_net::{IpDone, IpError, IpOp, Protocol};
 
 use crate::op::{Socket, UdpDone, UdpOp};
@@ -71,7 +71,7 @@ struct Stored {
 
 /// A UDP socket table and pair of IP-ring scratch buffers.
 pub struct Udp<const N: usize, const Q: usize> {
-    local: Ipv4Address,
+    local: IpAddr,
     tx: Scratch,
     rx: Scratch,
     sockets: CapabilityTable<u16, N>,
@@ -88,7 +88,7 @@ pub struct Udp<const N: usize, const Q: usize> {
 
 impl<const N: usize, const Q: usize> Udp<N, Q> {
     /// Creates an empty socket table over two service-owned scratch buffers.
-    pub const fn new(local: Ipv4Address, tx: Scratch, rx: Scratch) -> Self {
+    pub const fn new(local: IpAddr, tx: Scratch, rx: Scratch) -> Self {
         Self {
             local,
             tx,
@@ -335,7 +335,7 @@ impl<const N: usize, const Q: usize> Udp<N, Q> {
 
     fn receive<const M: usize>(
         &mut self,
-        source: Ipv4Address,
+        source: IpAddr,
         len: usize,
         buffers: &mut BufferRegistry<'_, M>,
     ) -> Option<(RequestId, Result<UdpDone, UdpError>)> {
