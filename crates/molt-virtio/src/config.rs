@@ -22,6 +22,7 @@ mod register {
     pub const CONFIG_GENERATION: u64 = 0x15;
     pub const QUEUE_SELECT: u64 = 0x16;
     pub const QUEUE_SIZE: u64 = 0x18;
+    pub const QUEUE_MSIX_VECTOR: u64 = 0x1a;
     pub const QUEUE_ENABLE: u64 = 0x1c;
     pub const QUEUE_NOTIFY_OFF: u64 = 0x1e;
     pub const QUEUE_DESC: u64 = 0x20;
@@ -146,6 +147,15 @@ impl<'w> Common<'w> {
         Ok(())
     }
 
+    /// Routes the selected queue through one MSI-X table entry.
+    pub fn set_queue_vector(&mut self, vector: u16) -> Result<(), VirtioError> {
+        self.window.write_u16(register::QUEUE_MSIX_VECTOR, vector)?;
+        if self.window.read_u16(register::QUEUE_MSIX_VECTOR)? != vector {
+            return Err(VirtioError::Interrupt);
+        }
+        Ok(())
+    }
+
     /// Programs the selected queue's three ring physical addresses.
     pub fn set_queue_rings(
         &mut self,
@@ -215,5 +225,15 @@ mod tests {
         assert_eq!(&registers[0x20..0x28], &0x1000u64.to_le_bytes());
         assert_eq!(&registers[0x28..0x30], &0x2000u64.to_le_bytes());
         assert_eq!(&registers[0x30..0x38], &0x3000u64.to_le_bytes());
+    }
+
+    #[test]
+    fn queue_vector_is_read_back() {
+        let mut registers = [0u8; 64];
+        let mut common = common(&mut registers);
+
+        common.set_queue_vector(3).expect("a legal MSI-X vector");
+
+        assert_eq!(&registers[register::QUEUE_MSIX_VECTOR as usize..0x1c], &[3, 0]);
     }
 }

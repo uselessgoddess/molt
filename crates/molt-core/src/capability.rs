@@ -2,6 +2,7 @@
 
 use core::marker::PhantomData;
 
+use crate::audit::{Audit, Event};
 pub use crate::cell::CellId;
 
 /// Runtime rights stored beside a resource in the supervisor-owned table.
@@ -153,6 +154,25 @@ impl<T, const N: usize> CapabilityTable<T, N> {
         Ok(Capability { raw: capability.raw, rights: PhantomData })
     }
 
+    /// Hands `capability` to `to` with `To` rights, recording the transfer.
+    ///
+    /// Holding a capability is the authority to pass a copy of it on: `from` is
+    /// audited, not checked against the slot's owner, so a delegate can delegate
+    /// further. `To` must be a subset of both `From` and the slot's live rights,
+    /// so no copy outgrows its source, and revoking the owner stales every copy
+    /// at once. A refused delegation records nothing.
+    pub fn delegate<From: CapabilityRights, To: CapabilityRights>(
+        &self,
+        capability: Capability<From>,
+        from: CellId,
+        to: CellId,
+        audit: &mut impl Audit,
+    ) -> Result<Capability<To>, CapabilityError> {
+        let delegated = self.attenuate::<From, To>(capability)?;
+        audit.record(Event::delegate(from, to, capability.index() as u32, To::MASK));
+        Ok(delegated)
+    }
+
     pub fn get<R: CapabilityRights>(
         &self,
         capability: Capability<R>,
@@ -212,6 +232,24 @@ impl<T, const N: usize> CapabilityTable<T, N> {
         let mut revoked = 0;
         for slot in &mut self.slots {
             if slot.resource.is_some() && slot.owner == owner {
+                drop(slot.resource.take());
+                slot.rights = Rights(0);
+                slot.advance_generation();
+                revoked += 1;
+            }
+        }
+        revoked
+    }
+
+    /// Drops every live resource while preserving each slot's generation.
+    ///
+    /// A service restart uses this instead of replacing its table: replacing
+    /// it would reset generations to one and could make a pre-restart handle
+    /// valid again as soon as the same slot was reused.
+    pub fn revoke_all(&mut self) -> usize {
+        let mut revoked = 0;
+        for slot in &mut self.slots {
+            if slot.resource.is_some() {
                 drop(slot.resource.take());
                 slot.rights = Rights(0);
                 slot.advance_generation();

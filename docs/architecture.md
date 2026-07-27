@@ -164,6 +164,14 @@ queued. Pure calculations and lifecycle control remain direct typed calls.
 Interrupt handlers and device work publish through rings; awaiting those results
 is asynchronous.
 
+Networking applies the rule twice. An MSI-X arrival wakes the owner of the
+VirtIO-net queue; `molt-net` turns the completed Ethernet frame into an IP-ring
+completion for the one capability bound to its protocol number; and
+`molt-udp` turns that completion into a UDP-ring completion for the socket
+capability bound to its destination port. Neither protocol layer can poll the
+device, and no operation contains a caller pointer — payloads name registered
+buffers throughout.
+
 ## Cells, state, and recovery
 
 The `Cell` trait and `Supervisor` establish that the supervisor owns the cell,

@@ -1,15 +1,12 @@
 [package]
-name = "molt-virtio"
+name = "molt-net"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
 
 [dependencies]
-molt-arch.workspace = true
-molt-block.workspace = true
-molt-net.workspace = true
-molt-pci.workspace = true
+molt-core.workspace = true
 
 [lib]
 bench = false

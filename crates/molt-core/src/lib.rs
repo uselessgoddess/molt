@@ -6,6 +6,7 @@
 //! The lock-free primitives use `sync` to substitute loom's instrumented
 //! atomics under `--cfg loom` while production builds remain `no_std`.
 
+pub mod audit;
 pub mod buffer;
 pub mod cache;
 pub mod capability;
