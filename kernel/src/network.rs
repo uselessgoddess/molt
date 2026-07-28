@@ -2,16 +2,18 @@
 
 use molt_arch::dma::Arena;
 use molt_arch::memory::{Inventory, Owner, Rights};
-use molt_arch::{BootInfo, FrameAllocator, Mmio, Platform, SerialWriter};
+use molt_arch::{BootInfo, FrameAllocator, Platform, SerialWriter};
 use molt_core::buffer::{BufferOperation, BufferRegistry};
 use molt_core::capability::CellId;
 use molt_core::ring::{IoRing, RequestId, Submission};
 use molt_kernel::report;
 use molt_net::addr::{IpAddr, Ipv4Addr};
 use molt_net::{Config, Ip, IpDone, IpError, IpOp};
-use molt_pci::{Bar, Bus, Command, Function, MsiX, Vector, bus_span};
+use molt_pci::{Bus, Command, bus_span};
 use molt_udp::{Endpoint, Scratch, Udp, UdpDone, UdpError, UdpOp};
 use molt_virtio::{Net, Transport};
+
+use crate::device::{self, Line};
 
 const VIRTIO_VENDOR: u16 = 0x1af4;
 const VIRTIO_NET: u16 = 0x1041;
@@ -69,11 +71,11 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     );
     let capability = function.msix().expect("virtio-net exposes MSI-X");
     let table_bar = capability.table_bar();
-    let (bar, registers) = map_bar(platform, &inventory, &mut function, transport_bar);
+    let (bar, registers) = device::map_bar(platform, &inventory, &mut function, transport_bar);
     let (table_bar, table_mapping) = if table_bar == transport_bar {
         (bar, None)
     } else {
-        let (table_bar, mapping) = map_bar(platform, &inventory, &mut function, table_bar);
+        let (table_bar, mapping) = device::map_bar(platform, &inventory, &mut function, table_bar);
         (table_bar, Some(mapping))
     };
 
@@ -84,49 +86,32 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
         )
         .expect("network decode and DMA authority");
 
-    let table_parent = table_mapping.as_ref().unwrap_or(&registers);
-    let table_delta =
-        table_bar.base() - table_bar.span().expect("a frame-aligned table BAR").start();
-    let table = table_parent
-        .subwindow(table_delta + capability.table_offset(), capability.table_bytes())
-        .expect("the MSI-X table inside its BAR");
-    let control = function
-        .window()
-        .subwindow(capability.offset(), capability.bytes())
-        .expect("the MSI-X capability");
-    let (token, message) = crate::pci::bind(platform).expect("one network interrupt line");
-    let mut msix = MsiX::new(capability, control, table).expect("a complete MSI-X table");
-    let vector = msix.route(0, message).expect("network vector zero");
-    msix.enable().expect("MSI-X enabled");
-
-    let delta = bar.base() - bar.span().expect("a frame-aligned transport BAR").start();
-    let common = subwindow(&registers, delta, transport.common());
-    let notify = subwindow(&registers, delta, transport.notify());
-    let config = subwindow(&registers, delta, transport.device());
+    let table = table_mapping.as_ref().unwrap_or(&registers);
+    let vectored = device::route(platform, &function, capability, table, device::delta(table_bar));
+    let delta = device::delta(bar);
+    let common = device::subwindow(&registers, delta, transport.common());
+    let notify = device::subwindow(&registers, delta, transport.notify());
+    let config = device::subwindow(&registers, delta, transport.device());
     let mut allocator = FrameAllocator::resume(boot_info.memory_map(), cursor);
     let mut slots: [Option<Owner>; DMA_FRAMES] = [None; DMA_FRAMES];
     let arena = Arena::claim(&mut allocator, offset, NET_TAG, &mut slots)
         .expect("ten contiguous network DMA frames");
     let net =
-        Net::start(common, notify, config, transport.notify_multiplier(), vector.index(), arena)
+        Net::start(common, notify, config, transport.notify_multiplier(), vectored.index(), arena)
             .expect("the network device completes its handshake");
     let mac = net.mac();
     report!(platform, "MOLT_NET_OK: {} mac {:02x?}", function.address(), mac.octets(),);
 
     let mut ip = Ip::<_, 4>::new(net, Config::new(mac, IpAddr::V4(LOCAL), 24, IpAddr::V4(GATEWAY)));
-    let reply = udp_round_trip(platform, token, &mut ip);
+    let reply = udp_round_trip(&vectored.line(), &mut ip);
     report!(platform, "MOLT_UDP_OK: DNS replied with {reply} bytes");
 
     let net = ip.into_link();
     net.reset().expect("the network device stops before DMA frames return");
-    stop_msix(platform, token, vector, &mut msix);
+    vectored.stop(platform);
 }
 
-fn udp_round_trip<P: Platform>(
-    _platform: &mut P,
-    token: molt_core::interrupt::InterruptToken,
-    ip: &mut Ip<Net<'_, '_>, 4>,
-) -> usize {
+fn udp_round_trip(line: &Line, ip: &mut Ip<Net<'_, '_>, 4>) -> usize {
     let mut source = DNS_QUERY;
     let mut target = [0u8; 512];
     let mut tx = [0u8; 1480];
@@ -181,7 +166,7 @@ fn udp_round_trip<P: Platform>(
     let mut frame = [0u8; 1514];
     let mut spins = 0;
     loop {
-        if crate::pci::arrivals(token) == 0 {
+        if line.arrivals() == 0 {
             spins += 1;
             assert!(spins < DELIVERY_SPINS, "the DNS datagram received no device interrupt");
             core::hint::spin_loop();
@@ -215,34 +200,4 @@ fn udp_round_trip<P: Platform>(
             }
         }
     }
-}
-
-fn map_bar<P: Platform>(
-    platform: &mut P,
-    inventory: &Inventory<'_>,
-    function: &mut Function<'_>,
-    index: u8,
-) -> (Bar, Mmio<'static>) {
-    let bar = function.bar(index).expect("a readable BAR").expect("an implemented BAR");
-    let span = bar.span().expect("a frame-aligned BAR");
-    let device = inventory.device(span).expect("a BAR outside kernel RAM");
-    let mapping = platform.map_device(device, Rights::READ_WRITE).expect("a mappable BAR");
-    (bar, mapping)
-}
-
-fn subwindow<'a>(registers: &'a Mmio<'_>, delta: u64, location: molt_virtio::Location) -> Mmio<'a> {
-    registers
-        .subwindow(delta + location.offset() as u64, location.length() as u64)
-        .expect("a VirtIO structure inside its BAR")
-}
-
-fn stop_msix<P: Platform>(
-    platform: &mut P,
-    token: molt_core::interrupt::InterruptToken,
-    vector: Vector,
-    msix: &mut MsiX<'_, '_>,
-) {
-    msix.mask(vector).expect("mask the stopped network queue");
-    msix.disable().expect("disable the stopped network capability");
-    crate::pci::release(platform, token);
 }

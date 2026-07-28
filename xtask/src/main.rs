@@ -158,6 +158,7 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
             "MOLT_INTERRUPT_OK:",
             "MOLT_VIRTIO_OK:",
             "MOLT_BLOCK_OK:",
+            "MOLT_BLK_IRQ_OK:",
             "MOLT_FS_OK:",
             "MOLT_FS_WRITE_OK:",
             "MOLT_REGISTRY_OK:",

@@ -1,3 +1,6 @@
+use core::pin::pin;
+use core::task::{Context, Poll, Waker};
+
 use molt_arch::memory::{Inventory, Rights};
 use molt_arch::{BootInfo, Mmio, MsiMessage, Platform, SerialWriter, Sink};
 use molt_core::interrupt::{InterruptSlab, InterruptToken};
@@ -48,6 +51,24 @@ pub(crate) fn bind<P: Platform>(platform: &mut P) -> Option<(InterruptToken, Msi
 /// Takes the arrivals recorded since this owner last drained its line.
 pub(crate) fn arrivals(token: InterruptToken) -> u64 {
     INTERRUPTS.0.arrivals(token).expect("a live device interrupt token")
+}
+
+/// Awaits the next arrival on `token`, giving up after `spins` polls.
+///
+/// The future is the real one — the counter and waker a task will park on once
+/// there is an executor to park it — so what a driver above this sees is
+/// already the interrupt-driven shape. Only the scheduler is missing, and
+/// until Stage 4 brings one the loop below stands in for it.
+pub(crate) fn wait(token: InterruptToken, spins: u32) -> u64 {
+    let mut future = pin!(INTERRUPTS.0.wait(token));
+    let mut context = Context::from_waker(Waker::noop());
+    for _ in 0..spins {
+        if let Poll::Ready(arrivals) = future.as_mut().poll(&mut context) {
+            return arrivals.expect("a live device interrupt token");
+        }
+        core::hint::spin_loop();
+    }
+    0
 }
 
 /// Returns a stopped device's line to both the slab and the platform fabric.

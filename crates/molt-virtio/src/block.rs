@@ -2,9 +2,10 @@
 //! durable flush, and the reset that reclaims its frames.
 //!
 //! [`Block::start`] runs the modern initialization sequence, requires cache
-//! flush support, and programs a single queue out of an [`Arena`] of
-//! device-owned frames. Each command polls the used ring for its answer, giving
-//! up with [`VirtioError::Timeout`] after a bounded spin so a wedged device
+//! flush support, routes queue zero through an MSI-X vector, and programs it
+//! out of an [`Arena`] of device-owned frames. Each command waits on
+//! [`Arrivals`] for the interrupt that says the used ring moved, giving up with
+//! [`VirtioError::Timeout`] when the line stays quiet, so a wedged device
 //! cannot hang the caller. [`Block::reset`] stops the device *before* it hands
 //! the frames back, so no in-flight DMA can land in a reclaimed frame.
 //!
@@ -18,6 +19,7 @@ use molt_block::{BlockError, Device, Disk};
 
 use crate::VirtioError;
 use crate::config::{Common, status};
+use crate::interrupt::Arrivals;
 use crate::notify::Notify;
 use crate::queue::{self, Queue, Segment};
 use crate::request::{Completion, Requests};
@@ -63,15 +65,13 @@ const DATA_BYTES: u64 = 4096;
 /// The largest transfer the driver issues as one request.
 const TRANSFER: usize = DATA_BYTES as usize;
 
-/// How long `read` polls the used ring before declaring the request timed out.
-const TIMEOUT_SPINS: u32 = 50_000_000;
-
 /// A VirtIO block device driven through one queue of frames it owns.
-pub struct Block<'slots, 'window> {
+pub struct Block<'slots, 'window, A> {
     common: Common<'window>,
     notify: Notify<'window>,
     queue: Queue,
     requests: Requests<{ queue::MAX_SIZE as usize }>,
+    arrivals: A,
     control: Region,
     data: Region,
     arena: Arena<'slots>,
@@ -79,19 +79,22 @@ pub struct Block<'slots, 'window> {
     capacity: u64,
 }
 
-impl<'slots, 'window> Block<'slots, 'window> {
+impl<'slots, 'window, A: Arrivals> Block<'slots, 'window, A> {
     /// Brings a device up over its `common`, `notify`, and `device` windows,
     /// allocating every ring and buffer from `arena`.
     ///
     /// Runs the modern handshake, refuses read-only devices, requires durable
-    /// flush support, and programs queue zero. A device that offers no usable
-    /// queue, or rejects the feature set, is refused rather than left
-    /// half-initialized.
+    /// flush support, and programs queue zero onto `vector`, which the caller
+    /// must already have routed and enabled — `arrivals` is the line it lands
+    /// on. A device that offers no usable queue, will not take the vector, or
+    /// rejects the feature set, is refused rather than left half-initialized.
     pub fn start(
         common: Mmio<'window>,
         notify: Mmio<'window>,
         device: Mmio<'window>,
         notify_multiplier: u32,
+        vector: u16,
+        arrivals: A,
         mut arena: Arena<'slots>,
     ) -> Result<Self, VirtioError> {
         let mut common = Common::new(common);
@@ -120,6 +123,7 @@ impl<'slots, 'window> Block<'slots, 'window> {
 
         let queue = Queue::new(size, descriptors, driver, device)?;
         common.set_queue_size(size)?;
+        common.set_queue_vector(vector)?;
         common.set_queue_rings(
             queue.descriptors_physical(),
             queue.driver_physical(),
@@ -136,6 +140,7 @@ impl<'slots, 'window> Block<'slots, 'window> {
             notify: Notify::new(notify, notify_multiplier),
             queue,
             requests: Requests::new(),
+            arrivals,
             control,
             data,
             arena,
@@ -152,10 +157,11 @@ impl<'slots, 'window> Block<'slots, 'window> {
     /// Runs one request and waits for its status byte.
     ///
     /// Submits a read, write, or two-descriptor flush chain, kicks the device,
-    /// and polls its completion. A device that does not answer within
-    /// `TIMEOUT_SPINS` has its request cancelled — the slot stays reserved
-    /// until the device returns it — and the command fails with
-    /// [`VirtioError::Timeout`].
+    /// and sleeps on its vector until the used ring moves. One arrival can
+    /// cover several used entries, so each drains the ring rather than
+    /// assuming one entry per interrupt. A device whose line stays quiet has
+    /// its request cancelled — the slot stays reserved until the device
+    /// returns it — and the command fails with [`VirtioError::Timeout`].
     fn command(
         &mut self,
         request: u32,
@@ -178,8 +184,8 @@ impl<'slots, 'window> Block<'slots, 'window> {
         let token = self.requests.issue(head);
         self.notify.signal(0, self.notify_off)?;
 
-        for _ in 0..TIMEOUT_SPINS {
-            if let Some(used) = self.queue.pop()? {
+        while self.arrivals.wait() != 0 {
+            while let Some(used) = self.queue.pop()? {
                 if let Completion::Delivered = self.requests.complete(used.head()) {
                     if self.control.read_u8(STATUS_AT)? != VIRTIO_BLK_S_OK {
                         return Err(VirtioError::Device);
@@ -187,7 +193,6 @@ impl<'slots, 'window> Block<'slots, 'window> {
                     return Ok(());
                 }
             }
-            core::hint::spin_loop();
         }
 
         self.requests.cancel(token);
@@ -220,7 +225,7 @@ fn reclaim(
     released
 }
 
-impl Device for Block<'_, '_> {
+impl<A: Arrivals> Device for Block<'_, '_, A> {
     fn sectors(&self) -> u64 {
         self.capacity
     }
@@ -241,7 +246,7 @@ impl Device for Block<'_, '_> {
     }
 }
 
-impl Disk for Block<'_, '_> {
+impl<A: Arrivals> Disk for Block<'_, '_, A> {
     /// Splits `buf` into transfers the data region can hold, one request each.
     fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), BlockError> {
         molt_block::bounds(self.capacity, sector, buf)?;

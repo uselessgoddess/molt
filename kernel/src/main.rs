@@ -17,6 +17,7 @@ use molt_core::ring::{Completion, IoRing, Submission};
 
 extern crate alloc;
 
+mod device;
 mod heap;
 mod init;
 mod network;
