@@ -25,6 +25,10 @@ impl Link for Capture {
         self.frames.push(frame.to_vec());
         Ok(())
     }
+
+    fn receive(&mut self, _frame: &mut [u8]) -> Result<Option<usize>, LinkError> {
+        Ok(None)
+    }
 }
 
 #[test]

@@ -1,33 +1,12 @@
 //! UDP wire format.
 
-use molt_net::addr::IpAddr;
+use molt_net::addr::{Endpoint, IpAddr};
 use molt_net::checksum;
 
 use crate::UdpError;
 
 /// The IP protocol number carrying datagrams.
 pub const PROTOCOL: u8 = 17;
-
-/// An IP address and UDP port.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Endpoint {
-    addr: IpAddr,
-    port: u16,
-}
-
-impl Endpoint {
-    pub const fn new(addr: IpAddr, port: u16) -> Self {
-        Self { addr, port }
-    }
-
-    pub const fn addr(self) -> IpAddr {
-        self.addr
-    }
-
-    pub const fn port(self) -> u16 {
-        self.port
-    }
-}
 
 /// A UDP header and borrowed payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,12 +51,12 @@ impl<'a> Datagram<'a> {
         if bytes.len() < len as usize {
             return Err(UdpError::Buffer);
         }
-        bytes[0..2].copy_from_slice(&self.src.port.to_be_bytes());
-        bytes[2..4].copy_from_slice(&self.dst.port.to_be_bytes());
+        bytes[0..2].copy_from_slice(&self.src.port().to_be_bytes());
+        bytes[2..4].copy_from_slice(&self.dst.port().to_be_bytes());
         bytes[4..6].copy_from_slice(&len.to_be_bytes());
         bytes[6..8].fill(0);
         bytes[Self::HEADER..len as usize].copy_from_slice(self.payload);
-        let sum = checksum(self.src.addr, self.dst.addr, &bytes[..len as usize])?;
+        let sum = checksum(self.src.addr(), self.dst.addr(), &bytes[..len as usize])?;
         bytes[6..8].copy_from_slice(&if sum == 0 { u16::MAX } else { sum }.to_be_bytes());
         Ok(len as usize)
     }

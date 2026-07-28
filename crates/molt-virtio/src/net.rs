@@ -226,6 +226,10 @@ impl Link for Net<'_, '_> {
         self.transmit_head = Some(head);
         self.notify.signal(TRANSMIT_QUEUE, self.transmit_notify).map_err(|_| LinkError::Device)
     }
+
+    fn receive(&mut self, frame: &mut [u8]) -> Result<Option<usize>, LinkError> {
+        Net::receive(self, frame).map_err(|_| LinkError::Device)
+    }
 }
 
 fn queue(

@@ -29,6 +29,27 @@ impl MacAddr {
     }
 }
 
+/// An IP address and transport port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Endpoint {
+    addr: IpAddr,
+    port: u16,
+}
+
+impl Endpoint {
+    pub const fn new(addr: IpAddr, port: u16) -> Self {
+        Self { addr, port }
+    }
+
+    pub const fn addr(self) -> IpAddr {
+        self.addr
+    }
+
+    pub const fn port(self) -> u16 {
+        self.port
+    }
+}
+
 /// The address a host answers discovery for `addr` on (RFC 4291 §2.7.1).
 ///
 /// Solicitations reach it instead of the all-nodes group, so a link only wakes

@@ -43,6 +43,14 @@ impl Config {
         self.addr
     }
 
+    pub const fn prefix(self) -> u8 {
+        self.prefix
+    }
+
+    pub const fn gateway(self) -> IpAddr {
+        self.gateway
+    }
+
     /// The address this host answers on before anything configures it.
     pub const fn link_local(self) -> Ipv6Addr {
         link_local(self.mac)

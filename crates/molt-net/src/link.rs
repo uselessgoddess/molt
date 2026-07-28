@@ -7,7 +7,10 @@ pub enum LinkError {
     Device,
 }
 
-/// A device that accepts complete Ethernet frames.
+/// A device that carries complete Ethernet frames both ways.
 pub trait Link {
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError>;
+
+    /// Takes the next frame the device has for the host, if any.
+    fn receive(&mut self, frame: &mut [u8]) -> Result<Option<usize>, LinkError>;
 }
