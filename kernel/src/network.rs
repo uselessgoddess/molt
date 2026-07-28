@@ -1,4 +1,4 @@
-//! The QEMU VirtIO-net and UDP round-trip smoke.
+//! The QEMU VirtIO-net, UDP, and TCP round-trip smokes.
 
 use molt_arch::dma::Arena;
 use molt_arch::memory::{Inventory, Owner, Rights};
@@ -8,8 +8,9 @@ use molt_core::capability::CellId;
 use molt_core::ring::{IoRing, RequestId, Submission};
 use molt_kernel::report;
 use molt_net::addr::{IpAddr, Ipv4Addr, Ipv6Addr};
-use molt_net::{Config, Ip, IpDone, IpError, IpOp};
+use molt_net::{Config, Ip, IpDone, IpError, IpOp, Link};
 use molt_pci::{Bus, Command, bus_span};
+use molt_tcp::{SocketStorage, Tcp, TcpDone, TcpError, TcpOp};
 use molt_udp::{Endpoint, Scratch, Udp, UdpDone, UdpError, UdpOp};
 use molt_virtio::{Net, Transport};
 
@@ -30,6 +31,12 @@ const DNS_V6: Ipv6Addr = Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 3);
 const DNS_PORT: u16 = 53;
 const LOCAL_PORT: u16 = 49_152;
 const DELIVERY_SPINS: u32 = 50_000_000;
+// Where xtask points slirp's forwarder, which answers with what it was sent.
+const ECHO: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 100);
+const ECHO_PORT: u16 = 80;
+const ECHO_PAYLOAD: [u8; 4] = *b"molt";
+/// How often a stream is driven with nothing arriving, so its timers still run.
+const IDLE_SPINS: u32 = 100_000;
 
 const DNS_QUERY: [u8; 29] = [
     0x4d, 0x4f, // transaction ID
@@ -118,7 +125,10 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let _ = udp_round_trip(&vectored.line(), &mut ip, IpAddr::V6(DNS_V6));
     report!(platform, "MOLT_NDP_OK: {DNS_V6} answered a solicitation");
 
-    let net = ip.into_link();
+    let config = Config::new(mac, IpAddr::V4(LOCAL), 24, IpAddr::V4(GATEWAY));
+    let (net, echoed) = tcp_echo(&vectored.line(), ip.into_link(), config);
+    report!(platform, "MOLT_TCP_OK: {ECHO} echoed {echoed} bytes");
+
     net.reset().expect("the network device stops before DMA frames return");
     vectored.stop(platform);
 }
@@ -219,6 +229,80 @@ fn udp_round_trip(line: &Line, ip: &mut Ip<Net<'_, '_>, 4>, dns: IpAddr) -> Opti
                     }
                 }
                 (_, result) => panic!("unexpected UDP completion: {result:?}"),
+            }
+        }
+    }
+}
+
+/// Opens a stream to slirp's forwarder, writes to it, and reads the echo back.
+///
+/// Time is counted in polls rather than milliseconds: nothing here has a
+/// calibrated timer yet, and smoltcp asks only that the clock move forward.
+/// Idle polls keep it moving so a delayed acknowledgement still leaves.
+fn tcp_echo<L: Link>(line: &Line, link: L, config: Config) -> (L, usize) {
+    let mut source = ECHO_PAYLOAD;
+    let mut target = [0u8; 16];
+    let mut slots = [SocketStorage::EMPTY; 1];
+    let mut rings = [0u8; 4096];
+    let mut buffers = BufferRegistry::<2>::new();
+    let source = buffers.register_read(OWNER, &mut source).expect("one source slot");
+    let target = buffers.register_write(OWNER, &mut target).expect("one receive slot");
+    let mut tcp = Tcp::<_, 1>::new(link, config, &mut slots, &mut rings).expect("one TCP stream");
+    let mut ring = IoRing::<TcpOp, Result<TcpDone, TcpError>, 4>::new();
+    let (mut client, mut driver) = ring.split();
+
+    let to = Endpoint::new(IpAddr::V4(ECHO), ECHO_PORT);
+    client
+        .try_submit(Submission::new(RequestId::new(1), TcpOp::Connect { to }))
+        .expect("room for a TCP connect");
+
+    let mut stream = None;
+    let (mut seen, mut spins, mut clock, mut submitted) = (line.arrivals(), 0, 0, true);
+    loop {
+        spins += 1;
+        assert!(spins < DELIVERY_SPINS, "the echo stream never came back");
+        let arrivals = line.arrivals();
+        if !submitted && arrivals == seen && spins % IDLE_SPINS != 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+        (seen, submitted, clock) = (arrivals, false, clock + 1);
+        tcp.serve(OWNER, clock, &mut driver, &mut buffers);
+
+        while let Some(completion) = client.try_completion() {
+            match completion.into_result() {
+                // A stream serves one request at a time, so the read is only
+                // submitted once the write it answers has left.
+                Ok(TcpDone::Opened(socket)) => {
+                    let payload = BufferOperation::new(source, 0, ECHO_PAYLOAD.len());
+                    client
+                        .try_submit(Submission::new(
+                            RequestId::new(2),
+                            TcpOp::Send { socket, payload },
+                        ))
+                        .expect("room for a TCP send");
+                    stream = Some(socket);
+                    submitted = true;
+                }
+                Ok(TcpDone::Sent(len)) => {
+                    assert_eq!(len, ECHO_PAYLOAD.len());
+                    let socket = stream.expect("a stream the send went out on");
+                    client
+                        .try_submit(Submission::new(
+                            RequestId::new(3),
+                            TcpOp::Recv { socket, payload: BufferOperation::new(target, 0, 16) },
+                        ))
+                        .expect("room for a TCP receive");
+                    submitted = true;
+                }
+                Ok(TcpDone::Received(len)) => {
+                    let bytes = buffers
+                        .resolve_write(BufferOperation::new(target, 0, len))
+                        .expect("the registered echo");
+                    assert_eq!(bytes, &ECHO_PAYLOAD, "the forwarder changed the payload");
+                    return (tcp.into_link(), len);
+                }
+                result => panic!("unexpected TCP completion: {result:?}"),
             }
         }
     }

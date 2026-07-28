@@ -100,6 +100,11 @@ impl<'a, L: Link, const N: usize> Tcp<'a, L, N> {
         self.device.link()
     }
 
+    /// Gives the link back, dropping every stream on it.
+    pub fn into_link(self) -> L {
+        self.device.into_link()
+    }
+
     pub(crate) fn reset(&mut self) {
         self.sockets.revoke_all();
         self.held = [None; N];

@@ -22,6 +22,10 @@ impl<L: Link> Device<L> {
     pub const fn link(&self) -> &L {
         &self.link
     }
+
+    pub fn into_link(self) -> L {
+        self.link
+    }
 }
 
 impl<L: Link> PhyDevice for Device<L> {

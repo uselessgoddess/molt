@@ -171,6 +171,7 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
             "MOLT_NET_OK:",
             "MOLT_UDP_OK:",
             "MOLT_NDP_OK:",
+            "MOLT_TCP_OK:",
         ],
         _ => &[],
     }
@@ -359,7 +360,10 @@ fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
     command.arg("-drive").arg(format!("format=raw,file={}", image.display()));
     command.arg("-drive").arg(format!("if=none,id=molt-disk,format=raw,file={}", disk.display()));
     command.arg("-device").arg("virtio-blk-pci,drive=molt-disk,disable-legacy=on");
-    command.args(["-netdev", "user,id=molt-net"]);
+    // `cat` behind the forwarder is the TCP smoke's peer: slirp runs one per
+    // connection and pipes the stream through it, so it answers with the bytes
+    // it was sent without the host having to listen anywhere.
+    command.args(["-netdev", "user,id=molt-net,guestfwd=tcp:10.0.2.100:80-cmd:cat"]);
     command
         .arg("-device")
         .arg("virtio-net-pci,netdev=molt-net,disable-legacy=on,mac=52:54:00:12:34:56");

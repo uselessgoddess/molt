@@ -557,6 +557,7 @@ dependencies = [
  "molt-pci",
  "molt-riscv",
  "molt-shell",
+ "molt-tcp",
  "molt-udp",
  "molt-virtio",
  "molt-x86_64",

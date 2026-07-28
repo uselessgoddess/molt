@@ -26,6 +26,7 @@ molt-fs.workspace = true
 molt-net.workspace = true
 molt-pci.workspace = true
 molt-shell.workspace = true
+molt-tcp.workspace = true
 molt-udp.workspace = true
 molt-virtio.workspace = true
 
