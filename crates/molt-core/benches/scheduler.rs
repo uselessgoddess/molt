@@ -12,22 +12,22 @@ use molt_core::waker::AtomicWaker;
 
 fn executor(criterion: &mut Criterion) {
     let compact = Executor::<64>::new();
-    let compact_task = compact.register().expect("free slot");
+    let compact_task = compact.register().unwrap();
     let padded = Executor::<64, Padded>::new();
-    let padded_task = padded.register().expect("free slot");
+    let padded_task = padded.register().unwrap();
     let mut group = criterion.benchmark_group("executor_wake_and_scan");
 
     group.bench_function("compact", |bencher| {
         bencher.iter(|| {
             compact.wake(black_box(compact_task));
-            let ready = compact.next_ready().expect("the task just woken");
+            let ready = compact.next_ready().unwrap();
             compact.complete_poll(ready);
         });
     });
     group.bench_function("padded", |bencher| {
         bencher.iter(|| {
             padded.wake(black_box(padded_task));
-            let ready = padded.next_ready().expect("the task just woken");
+            let ready = padded.next_ready().unwrap();
             padded.complete_poll(ready);
         });
     });
@@ -41,8 +41,7 @@ fn executor_contended(criterion: &mut Criterion) {
     group.bench_function("compact", |bencher| {
         bencher.iter_custom(|iters| {
             let executor = Executor::<64>::new();
-            let tasks: Vec<_> =
-                (0..THREADS).map(|_| executor.register().expect("free slot")).collect();
+            let tasks: Vec<_> = (0..THREADS).map(|_| executor.register().unwrap()).collect();
 
             let start = Instant::now();
             thread::scope(|scope| {
@@ -62,8 +61,7 @@ fn executor_contended(criterion: &mut Criterion) {
     group.bench_function("padded", |bencher| {
         bencher.iter_custom(|iters| {
             let executor = Executor::<64, Padded>::new();
-            let tasks: Vec<_> =
-                (0..THREADS).map(|_| executor.register().expect("free slot")).collect();
+            let tasks: Vec<_> = (0..THREADS).map(|_| executor.register().unwrap()).collect();
 
             let start = Instant::now();
             thread::scope(|scope| {
@@ -92,19 +90,19 @@ fn completion(criterion: &mut Criterion) {
 
     group.bench_function("compact", |bencher| {
         bencher.iter(|| {
-            let token = compact.reserve().expect("free slot");
+            let token = compact.reserve().unwrap();
             let mut future = pin!(compact.wait(token));
             let _ = future.as_mut().poll(&mut context);
-            compact.complete(token.request_id(), black_box(7)).expect("live id");
+            compact.complete(token.request_id(), black_box(7)).unwrap();
             let _ = black_box(future.as_mut().poll(&mut context));
         });
     });
     group.bench_function("padded", |bencher| {
         bencher.iter(|| {
-            let token = padded.reserve().expect("free slot");
+            let token = padded.reserve().unwrap();
             let mut future = pin!(padded.wait(token));
             let _ = future.as_mut().poll(&mut context);
-            padded.complete(token.request_id(), black_box(7)).expect("live id");
+            padded.complete(token.request_id(), black_box(7)).unwrap();
             let _ = black_box(future.as_mut().poll(&mut context));
         });
     });

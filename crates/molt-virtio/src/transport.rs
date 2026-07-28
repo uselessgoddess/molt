@@ -206,14 +206,12 @@ mod tests {
             // SAFETY: the array outlives the borrow, is uniquely borrowed, and
             // no other window is handed out over it.
             let window = unsafe { Mmio::new(self.bytes.as_mut_ptr(), self.bytes.len() as u64) };
-            Function::probe(window, Address::new(0, 0, 0).expect("00:00.0"))
-                .expect("a legal read")
-                .expect("a present function")
+            Function::probe(window, Address::new(0, 0, 0).unwrap()).unwrap().unwrap()
         }
     }
 
     #[test]
-    fn probe_records_each_structure_by_bar_and_offset() {
+    fn probe_records_each_structure_by_bar_and_offset() -> Result<(), VirtioError> {
         let mut config = Config::present();
         // The notify cap carries a trailing multiplier, so the device cap sits
         // past its twenty bytes rather than over them.
@@ -223,15 +221,16 @@ mod tests {
             .multiplier(0x50, 4)
             .cap(0x70, 4, 4, 0x2000, 0x0100);
 
-        let transport = Transport::probe(&config.function()).expect("all three structures");
+        let transport = Transport::probe(&config.function())?;
 
         assert_eq!((transport.common().bar(), transport.common().offset()), (4, 0x0000));
         assert_eq!((transport.notify().bar(), transport.notify().offset()), (4, 0x3000));
         assert_eq!(transport.notify_multiplier(), 4);
+        Ok(())
     }
 
     #[test]
-    fn probe_refuses_a_device_missing_a_structure() {
+    fn probe_refuses_missing_structure() {
         let mut config = Config::present();
         config.cap(0x40, 1, 4, 0x0000, 0x1000).cap(0x50, 2, 4, 0x3000, 0x0100);
 

@@ -74,6 +74,10 @@ fn padding_is_typed()
 Not `test_wake`, not `executor_test_2`. If the name does not read as a
 sentence about behaviour, the test does not know what it is testing.
 
+Names drop articles and every other word the claim survives without:
+`absent_vector_refused`, not `a_vector_the_device_does_not_have_is_refused`.
+Prose drops them too where the sentence still reads.
+
 Keep the body to three beats — set up, act, assert — separated by blank lines,
 and prefer under ten lines. Give the assertion a message when the failure would
 otherwise be a bare `false`:
@@ -88,6 +92,11 @@ properties want two names.
 
 No helper frameworks, no shared fixtures, no `setup()`. A test that needs a
 paragraph of scaffolding is telling you the API needs the work, not the test.
+
+A test whose only answer to an error is to fail returns `Result` and uses `?`.
+`unwrap` covers what `?` cannot reach — an `Option`, a closure, a foreign error
+type. `expect` is for the message that says something the line does not;
+`.expect("cell")` says nothing, and the `?` or the `unwrap` reads better.
 
 ## Structure
 

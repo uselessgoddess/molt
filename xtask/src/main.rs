@@ -470,8 +470,8 @@ mod tests {
     #[test]
     fn smoke_disk_mounts_reads_and_writes() {
         let tree = workspace_root().join(DISK_TREE);
-        let on_disk = fs::read(tree.join("hello.txt")).expect("file the image was built from");
-        let mut image = lay_out(&tree).expect("image of the smoke tree");
+        let on_disk = fs::read(tree.join("hello.txt")).unwrap();
+        let mut image = lay_out(&tree).unwrap();
         {
             let mut fs = Fs::<_, 4>::mount(Loopback::writable(&mut image).unwrap()).unwrap();
 

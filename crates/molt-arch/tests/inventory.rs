@@ -33,57 +33,62 @@ fn firmware_regions_reserved_holes_are_devices() {
 }
 
 #[test]
-fn image_outranks_region() {
+fn image_outranks_region() -> Result<(), Error> {
     let map = map();
-    let inventory = Inventory::new(&map).with_image(Span::new(0x5000, 0x6000).unwrap());
+    let inventory = Inventory::new(&map).with_image(Span::new(0x5000, 0x6000)?);
 
     assert_eq!(inventory.kind(0x5000), Kind::Image);
     assert_eq!(inventory.kind(0x6000), Kind::Ram, "one frame past the image");
+    Ok(())
 }
 
 #[test]
-fn span_straddling_two_kinds_has_none() {
+fn span_straddling_two_kinds_has_none() -> Result<(), Error> {
     let map = map();
     let inventory = Inventory::new(&map);
 
-    assert_eq!(inventory.classify(Span::new(0x1000, 0x4000).unwrap()), Ok(Kind::Ram));
-    assert_eq!(inventory.classify(Span::new(0x3000, 0x5000).unwrap()), Err(Error::Mixed));
-    assert_eq!(inventory.classify(Span::new(0x8000, 0xa000).unwrap()), Ok(Kind::Device));
+    assert_eq!(inventory.classify(Span::new(0x1000, 0x4000)?), Ok(Kind::Ram));
+    assert_eq!(inventory.classify(Span::new(0x3000, 0x5000)?), Err(Error::Mixed));
+    assert_eq!(inventory.classify(Span::new(0x8000, 0xa000)?), Ok(Kind::Device));
+    Ok(())
 }
 
 #[test]
-fn device_window_inside_ram_refused() {
+fn device_window_inside_ram_refused() -> Result<(), Error> {
     let map = map();
     let inventory = Inventory::new(&map);
 
-    assert_eq!(inventory.device(Span::new(0x1000, 0x2000).unwrap()), Err(Error::Kind));
+    assert_eq!(inventory.device(Span::new(0x1000, 0x2000)?), Err(Error::Kind));
     assert_eq!(
-        inventory.device(Span::new(0x5000, 0x6000).unwrap()),
+        inventory.device(Span::new(0x5000, 0x6000)?),
         Err(Error::Kind),
         "usable RAM is not a device window whichever end of the map it is at",
     );
+    Ok(())
 }
 
 #[test]
-fn firmware_reservation_is_device_window() {
+fn firmware_reservation_is_device_window() -> Result<(), Error> {
     let map = map();
     let inventory = Inventory::new(&map);
-    let span = Span::new(0x4000, 0x5000).unwrap();
+    let span = Span::new(0x4000, 0x5000)?;
 
     assert_eq!(inventory.classify(span), Ok(Kind::Reserved));
-    let window = inventory.device(span).expect("a reserved range is not the kernel's RAM");
+    let window = inventory.device(span)?;
 
     assert_eq!(window.mapping(Rights::READ_WRITE), Ok((Rights::READ_WRITE, Cache::Device)));
+    Ok(())
 }
 
 #[test]
-fn device_window_is_uncached_and_never_executable() {
+fn device_window_is_uncached_and_never_executable() -> Result<(), Error> {
     let map = map();
     let inventory = Inventory::new(&map);
-    let window = inventory.device(Span::new(0x8000, 0x9000).unwrap()).unwrap();
+    let window = inventory.device(Span::new(0x8000, 0x9000)?)?;
 
     assert_eq!(window.mapping(Rights::READ_WRITE), Ok((Rights::READ_WRITE, Cache::Device)));
     assert_eq!(window.mapping(Rights::READ_EXECUTE), Err(MappingError::Permissions));
+    Ok(())
 }
 
 #[test]

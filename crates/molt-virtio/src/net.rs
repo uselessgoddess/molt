@@ -303,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn receive_reposts_completed_buffer() {
+    fn receive_reposts_completed_buffer() -> Result<(), VirtioError> {
         let mut descriptors = [0u8; 128];
         let mut driver = [0u8; 32];
         let mut device = [0u8; 72];
@@ -312,11 +312,10 @@ mod tests {
             region(&mut descriptors, 0x1000),
             region(&mut driver[..driver_bytes(8) as usize], 0x2000),
             region(&mut device[..device_bytes(8) as usize], 0x3000),
-        )
-        .expect("an eight-slot receive queue");
+        )?;
         let mut storage = [0u8; RECEIVE_BUFFER * 8];
         let buffers = region(&mut storage, 0x4000);
-        let mut receive = Receive::new(queue, buffers).expect("eight preposted buffers");
+        let mut receive = Receive::new(queue, buffers)?;
         storage[10..12].copy_from_slice(&1u16.to_le_bytes());
         storage[HEADER..HEADER + 4].copy_from_slice(b"ping");
         device[4..8].copy_from_slice(&0u32.to_le_bytes());
@@ -328,6 +327,7 @@ mod tests {
         assert_eq!(&frame[..4], b"ping");
         assert_eq!(&driver[2..4], &9u16.to_le_bytes(), "RX buffer was not republished");
         assert_eq!(receive.queue.available(), 0, "RX queue lost a descriptor");
+        Ok(())
     }
 
     #[test]

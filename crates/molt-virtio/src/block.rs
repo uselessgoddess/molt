@@ -316,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn refused_release_still_frees_span() {
+    fn refused_release_still_frees_span() -> Result<(), VirtioError> {
         let map = Map([MemoryRegion::new(
             0x10_0000,
             0x10_0000 + 4 * FRAME_SIZE,
@@ -324,8 +324,8 @@ mod tests {
         )]);
         let mut allocator = FrameAllocator::new(&map);
         let mut slots = [None; 4];
-        let mut arena = Arena::claim(&mut allocator, 0, 3, &mut slots).unwrap();
-        let held = arena.region(FRAME_SIZE).unwrap();
+        let mut arena = Arena::claim(&mut allocator, 0, 3, &mut slots)?;
+        let held = arena.region(FRAME_SIZE)?;
         let mut elsewhere = [0u8; 16];
         // SAFETY: the array is live for the borrow and nothing else names it.
         let foreign = unsafe { Region::new(elsewhere.as_mut_ptr(), 0x20_0000, 16) };
@@ -334,13 +334,15 @@ mod tests {
 
         assert_eq!(refused, Err(DmaError::Foreign));
         assert!(slots.iter().all(Option::is_none), "a refused release stranded frames");
+        Ok(())
     }
 
     #[test]
-    fn deep_device_queue_capped_at_drivers_maximum() {
-        let size = clamp_queue(256).expect("a power-of-two queue");
+    fn deep_device_queue_capped_at_drivers_maximum() -> Result<(), VirtioError> {
+        let size = clamp_queue(256)?;
 
         assert_eq!(size, super::queue::MAX_SIZE, "the driver hosted more than it can");
+        Ok(())
     }
 
     #[test]

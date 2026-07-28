@@ -185,6 +185,7 @@ mod tests {
     use molt_arch::Mmio;
 
     use super::{Common, register};
+    use crate::VirtioError;
 
     fn common(bytes: &mut [u8]) -> Common<'_> {
         // SAFETY: the slice outlives the borrow, is uniquely borrowed, and no
@@ -194,46 +195,50 @@ mod tests {
     }
 
     #[test]
-    fn reset_settles_accepted() {
+    fn reset_settles_accepted() -> Result<(), VirtioError> {
         let mut registers = [0xffu8; 64];
         let mut common = common(&mut registers);
 
-        common.reset().expect("a device that clears its status");
+        common.reset()?;
 
         assert_eq!(common.status(), Ok(0), "reset left status bits set");
+        Ok(())
     }
 
     #[test]
-    fn status_bits_accumulate() {
+    fn status_bits_accumulate() -> Result<(), VirtioError> {
         let mut registers = [0u8; 64];
         let mut common = common(&mut registers);
 
-        common.add_status(super::status::ACKNOWLEDGE).expect("a legal write");
-        common.add_status(super::status::DRIVER).expect("a legal write");
+        common.add_status(super::status::ACKNOWLEDGE)?;
+        common.add_status(super::status::DRIVER)?;
 
         assert_eq!(registers[register::DEVICE_STATUS as usize], 0b11);
+        Ok(())
     }
 
     #[test]
-    fn queue_writes_all_three_rings() {
+    fn queue_writes_all_three_rings() -> Result<(), VirtioError> {
         let mut registers = [0u8; 64];
         let mut common = common(&mut registers);
 
-        common.select_queue(0).expect("a legal write");
-        common.set_queue_rings(0x1000, 0x2000, 0x3000).expect("a legal write");
+        common.select_queue(0)?;
+        common.set_queue_rings(0x1000, 0x2000, 0x3000)?;
 
         assert_eq!(&registers[0x20..0x28], &0x1000u64.to_le_bytes());
         assert_eq!(&registers[0x28..0x30], &0x2000u64.to_le_bytes());
         assert_eq!(&registers[0x30..0x38], &0x3000u64.to_le_bytes());
+        Ok(())
     }
 
     #[test]
-    fn queue_vector_is_read_back() {
+    fn queue_vector_is_read_back() -> Result<(), VirtioError> {
         let mut registers = [0u8; 64];
         let mut common = common(&mut registers);
 
-        common.set_queue_vector(3).expect("a legal MSI-X vector");
+        common.set_queue_vector(3)?;
 
         assert_eq!(&registers[register::QUEUE_MSIX_VECTOR as usize..0x1c], &[3, 0]);
+        Ok(())
     }
 }

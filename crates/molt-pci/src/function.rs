@@ -250,83 +250,85 @@ mod tests {
     use crate::{Address, PciError};
 
     fn address() -> Address {
-        Address::new(0, 0, 0).expect("00:00.0")
+        Address::new(0, 0, 0).unwrap()
     }
 
     #[test]
-    fn an_absent_function_is_not_an_error() {
+    fn absent_function_is_not_error() -> Result<(), PciError> {
         let mut space = Space::new();
 
-        let function = Function::probe(space.config(0, 0), address()).expect("a legal read");
+        let function = Function::probe(space.config(0, 0), address())?;
 
         assert!(function.is_none(), "an unanswered bus invented a device");
+        Ok(())
     }
 
     #[test]
-    fn a_header_reports_what_the_device_wrote() {
+    fn header_reports_device_writes() -> Result<(), PciError> {
         let mut space = Space::new();
         space.function(0, 0).header(0x1af4, 0x1000).class(0x02, 0x00, 0x00);
         let window = space.window();
-        let config = window.subwindow(0, 4096).expect("the first function's window");
+        let config = window.subwindow(0, 4096)?;
 
-        let function = Function::probe(config, address()).expect("a legal read").expect("present");
+        let function = Function::probe(config, address())?.unwrap();
 
         assert_eq!((function.vendor(), function.device()), (0x1af4, 0x1000));
         assert_eq!(function.class().class(), 0x02);
         assert_eq!(function.header_type(), 0);
+        Ok(())
     }
 
     #[test]
-    fn the_command_register_is_written_whole() {
+    fn command_register_written_whole() -> Result<(), PciError> {
         let mut space = Space::new();
         space.function(0, 0).header(0x1234, 0x0001);
-        let mut function =
-            Function::probe(space.config(0, 0), address()).expect("a legal read").expect("present");
+        let mut function = Function::probe(space.config(0, 0), address())?.unwrap();
 
         let wanted = Command::MEMORY.with(Command::INTX_DISABLE);
-        function.set_command(wanted).expect("a legal write");
+        function.set_command(wanted)?;
 
         assert_eq!(function.command(), Ok(wanted));
-        assert!(function.command().expect("readable").contains(Command::MEMORY));
-        assert!(!function.command().expect("readable").contains(Command::BUS_MASTER));
+        assert!(function.command()?.contains(Command::MEMORY));
+        assert!(!function.command()?.contains(Command::BUS_MASTER));
+        Ok(())
     }
 
     #[test]
-    fn capabilities_are_walked_in_order() {
+    fn capabilities_are_walked_in_order() -> Result<(), PciError> {
         let mut space = Space::new();
         space
             .function(0, 0)
             .header(0x1234, 0x0001)
             .capability(0x40, 0x05, 0x50)
             .capability(0x50, 0x11, 0x00);
-        let function =
-            Function::probe(space.config(0, 0), address()).expect("a legal read").expect("present");
+        let function = Function::probe(space.config(0, 0), address())?.unwrap();
 
         let mut found = [0u8; 4];
         let mut len = 0;
-        for capability in function.capabilities().expect("a capability list") {
-            found[len] = capability.expect("a well-formed capability").id();
+        for capability in function.capabilities()? {
+            found[len] = capability?.id();
             len += 1;
         }
 
         assert_eq!(&found[..len], &[0x05, 0x11]);
-        assert_eq!(function.capability(0x11).expect("MSI-X").offset(), 0x50);
+        assert_eq!(function.capability(0x11)?.offset(), 0x50);
         assert_eq!(function.capability(0x10), Err(PciError::Absent));
+        Ok(())
     }
 
     #[test]
-    fn a_function_without_a_capability_list_reports_none() {
+    fn no_capability_list_reports_none() -> Result<(), PciError> {
         let mut space = Space::new();
         space.function(0, 0).header(0x1234, 0x0001);
-        let function =
-            Function::probe(space.config(0, 0), address()).expect("a legal read").expect("present");
+        let function = Function::probe(space.config(0, 0), address())?.unwrap();
 
-        assert_eq!(function.capabilities().expect("an empty walk").count(), 0);
+        assert_eq!(function.capabilities()?.count(), 0);
         assert_eq!(function.capability(0x11), Err(PciError::Absent));
+        Ok(())
     }
 
     #[test]
-    fn a_looping_capability_list_is_refused() {
+    fn looping_capability_list_refused() -> Result<(), PciError> {
         let mut space = Space::new();
         // Two capabilities that point at each other: a device can describe this
         // and a walk that trusts it never returns.
@@ -335,26 +337,24 @@ mod tests {
             .header(0x1234, 0x0001)
             .capability(0x40, 0x05, 0x50)
             .capability(0x50, 0x11, 0x40);
-        let function =
-            Function::probe(space.config(0, 0), address()).expect("a legal read").expect("present");
+        let function = Function::probe(space.config(0, 0), address())?.unwrap();
 
-        let refused = function
-            .capabilities()
-            .expect("a capability list")
-            .any(|capability| capability == Err(PciError::Capability));
+        let refused =
+            function.capabilities()?.any(|capability| capability == Err(PciError::Capability));
 
         assert!(refused, "the walk followed a cycle instead of refusing it");
+        Ok(())
     }
 
     #[test]
-    fn a_capability_inside_the_header_is_refused() {
+    fn capability_inside_header_refused() -> Result<(), PciError> {
         let mut space = Space::new();
         space.function(0, 0).header(0x1234, 0x0001).capability(0x40, 0x05, 0x10);
-        let function =
-            Function::probe(space.config(0, 0), address()).expect("a legal read").expect("present");
+        let function = Function::probe(space.config(0, 0), address())?.unwrap();
 
-        let walked = function.capabilities().expect("a capability list").last();
+        let walked = function.capabilities()?.last();
 
         assert_eq!(walked, Some(Err(PciError::Capability)));
+        Ok(())
     }
 }

@@ -7,13 +7,13 @@ use molt_core::capability::{
 struct Buffer(u32);
 
 #[test]
-fn typed_caps_revoked_by_cell() {
+fn typed_caps_revoked_by_cell() -> Result<(), CapabilityError> {
     let owner = CellId::new(7);
     let mut table = CapabilityTable::<Buffer, 2>::new();
     let read_write = table.insert::<ReadWrite>(owner, Buffer(41)).unwrap();
-    let read = table.attenuate::<ReadWrite, Read>(read_write).unwrap();
+    let read = table.attenuate::<ReadWrite, Read>(read_write)?;
 
-    assert_eq!(table.get(read).unwrap(), &Buffer(41));
+    assert_eq!(table.get(read)?, &Buffer(41));
     assert_eq!(Read::MASK, Rights::READ);
     assert_eq!(Write::MASK, Rights::WRITE);
 
@@ -23,7 +23,8 @@ fn typed_caps_revoked_by_cell() {
 
     let replacement = table.insert::<ReadWrite>(owner, Buffer(99)).unwrap();
     assert_ne!(replacement.raw(), read_write.raw());
-    assert_eq!(table.get(replacement).unwrap(), &Buffer(99));
+    assert_eq!(table.get(replacement)?, &Buffer(99));
+    Ok(())
 }
 
 #[test]

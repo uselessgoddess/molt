@@ -412,70 +412,75 @@ mod tests {
     }
 
     #[test]
-    fn ecam_window_comes_from_the_pci_node() {
+    fn ecam_window_comes_from_pci_node() -> Result<(), FdtError> {
         let bytes = tree(&[
             ("compatible", b"pci-host-ecam-generic\0"),
             ("reg", &reg(0x3000_0000, 0x1000_0000)),
         ]);
 
-        let space = DeviceTree::new(&bytes).expect("a well-formed blob").config_space();
+        let space = DeviceTree::new(&bytes)?.config_space();
 
-        let space = space.expect("a well-formed PCI node");
-        assert_eq!(space.span().expect("an ECAM span").start(), 0x3000_0000);
+        let space = space?;
+        assert_eq!(space.span().unwrap().start(), 0x3000_0000);
         assert_eq!(
             (space.first_bus(), space.last_bus()),
             (0, 0xff),
             "no bus-range means all buses"
         );
+        Ok(())
     }
 
     #[test]
-    fn pci_domain_becomes_the_segment() {
+    fn pci_domain_becomes_segment() -> Result<(), FdtError> {
         let bytes = tree(&[
             ("compatible", b"pci-host-ecam-generic\0"),
             ("reg", &reg(0x3000_0000, 0x1000_0000)),
             ("linux,pci-domain", &7u32.to_be_bytes()),
         ]);
 
-        let space = DeviceTree::new(&bytes).expect("a well-formed blob").config_space();
+        let space = DeviceTree::new(&bytes)?.config_space();
 
-        assert_eq!(space.expect("a well-formed PCI node").segment(), 7);
+        assert_eq!(space?.segment(), 7);
+        Ok(())
     }
 
     #[test]
-    fn bus_range_narrows_the_last_bus() {
+    fn bus_range_narrows_last_bus() -> Result<(), FdtError> {
         let bytes = tree(&[
             ("compatible", b"pci-host-ecam-generic\0"),
             ("reg", &reg(0x3000_0000, 0x1000_0000)),
             ("bus-range", &bus_range(0, 15)),
         ]);
 
-        let space = DeviceTree::new(&bytes).expect("a well-formed blob").config_space();
+        let space = DeviceTree::new(&bytes)?.config_space();
 
-        assert_eq!(space.expect("a well-formed PCI node").last_bus(), 15);
+        assert_eq!(space?.last_bus(), 15);
+        Ok(())
     }
 
     #[test]
-    fn window_too_small_for_the_bus_range_is_refused() {
+    fn window_under_bus_range_refused() -> Result<(), FdtError> {
         let bytes =
             tree(&[("compatible", b"pci-host-ecam-generic\0"), ("reg", &reg(0x3000_0000, 0x1000))]);
 
-        let space = DeviceTree::new(&bytes).expect("a well-formed blob").config_space();
+        let space = DeviceTree::new(&bytes)?.config_space();
 
         assert_eq!(space, Err(FdtError::Range), "256 buses need 256 MiB of window");
+        Ok(())
     }
 
     #[test]
-    fn tree_without_a_pci_node_is_missing() {
+    fn tree_without_pci_node_is_missing() -> Result<(), FdtError> {
         let bytes = tree(&[("compatible", b"virtio,mmio\0"), ("reg", &reg(0x1000_1000, 0x1000))]);
 
-        let space = DeviceTree::new(&bytes).expect("a well-formed blob").config_space();
+        let space = DeviceTree::new(&bytes)?.config_space();
 
         assert_eq!(space, Err(FdtError::Missing));
+        Ok(())
     }
 
     #[test]
-    fn a_null_device_tree_pointer_is_refused_without_a_load() {
+    fn null_tree_pointer_refused() {
         // SAFETY: zero is the one address `config_space_at` promises to answer
         // without dereferencing anything.
         let space = unsafe { super::config_space_at(0) };
@@ -484,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn a_device_tree_in_memory_yields_its_ecam_window() {
+    fn device_tree_yields_ecam_window() -> Result<(), FdtError> {
         let bytes = tree(&[
             ("compatible", b"pci-host-ecam-generic\0"),
             ("reg", &reg(0x3000_0000, 0x1000_0000)),
@@ -493,10 +498,8 @@ mod tests {
         // SAFETY: the blob is live for the call and is not mutated during it.
         let space = unsafe { super::config_space_at(bytes.as_ptr() as usize) };
 
-        assert_eq!(
-            space.expect("a well-formed PCI node").span().expect("a span").start(),
-            0x3000_0000
-        );
+        assert_eq!(space?.span().unwrap().start(), 0x3000_0000);
+        Ok(())
     }
 
     #[test]
@@ -509,18 +512,19 @@ mod tests {
     }
 
     #[test]
-    fn truncated_struct_block_is_refused() {
+    fn truncated_struct_block_is_refused() -> Result<(), FdtError> {
         let mut bytes = tree(&[
             ("compatible", b"pci-host-ecam-generic\0"),
             ("reg", &reg(0x3000_0000, 0x1000_0000)),
         ]);
         // Drop the two closing tokens and the end token from `size_dt_struct`,
         // so the walk runs out of block with the node still open.
-        let short = u32::from_be_bytes(bytes[36..40].try_into().expect("four bytes")) - 12;
+        let short = u32::from_be_bytes(bytes[36..40].try_into().unwrap()) - 12;
 
         bytes[36..40].copy_from_slice(&short.to_be_bytes());
 
-        let space = DeviceTree::new(&bytes).expect("an intact header").config_space();
+        let space = DeviceTree::new(&bytes)?.config_space();
         assert_eq!(space, Err(FdtError::Truncated), "the last token reaches past the block");
+        Ok(())
     }
 }

@@ -283,13 +283,13 @@ mod tests {
     }
 
     #[test]
-    fn rsdt_entries_read_32_bit_addresses() {
+    fn rsdt_entries_read_32_bit_addresses() -> Result<(), AcpiError> {
         let bytes = rsdt_image([0x7fff_1000, 0x7fff_2000]);
 
-        let listed: Vec<u64> =
-            entries(Root::Rsdt(0), &bytes).expect("a well-formed RSDT").collect();
+        let listed: Vec<u64> = entries(Root::Rsdt(0), &bytes)?.collect();
 
         assert_eq!(listed, [0x7fff_1000, 0x7fff_2000]);
+        Ok(())
     }
 
     #[test]
@@ -311,24 +311,25 @@ mod tests {
     }
 
     #[test]
-    fn mcfg_reports_ecam_window() {
+    fn mcfg_reports_ecam_window() -> Result<(), AcpiError> {
         let bytes = mcfg_image(0xb000_0000, 1, 0x10, 0x20);
 
-        let space = mcfg(&bytes).expect("a well-formed allocation");
+        let space = mcfg(&bytes)?;
 
-        assert_eq!(space.span().expect("an ECAM span").start(), 0xb000_0000);
+        assert_eq!(space.span().unwrap().start(), 0xb000_0000);
         assert_eq!((space.segment(), space.first_bus(), space.last_bus()), (1, 0x10, 0x20));
+        Ok(())
     }
 
     #[test]
-    fn unaligned_xsdt_entries_read() {
+    fn unaligned_xsdt_entries_read() -> Result<(), AcpiError> {
         let image = xsdt_image([0x7fff_1000, 0x7fff_2000]);
         let mut buffer = [0u8; 55];
         buffer[3..].copy_from_slice(&image);
 
-        let listed: Vec<u64> =
-            entries(Root::Xsdt(0), &buffer[3..]).expect("a well-formed XSDT").collect();
+        let listed: Vec<u64> = entries(Root::Xsdt(0), &buffer[3..])?.collect();
 
         assert_eq!(listed, [0x7fff_1000, 0x7fff_2000], "entries at odd addresses");
+        Ok(())
     }
 }

@@ -204,44 +204,46 @@ mod tests {
     use core::pin::pin;
     use core::task::{Context, Poll};
 
-    use super::Executor;
+    use super::{Executor, SpawnError};
     use crate::cache::Padded;
     use crate::completion::CompletionSlab;
 
     #[test]
-    fn waker_is_task_local() {
+    fn waker_is_task_local() -> Result<(), SpawnError> {
         static EXECUTOR: Executor<4> = Executor::<4>::new();
         let executor = &EXECUTOR;
-        let first = executor.register().expect("free slot");
-        let second = executor.register().expect("free slot");
+        let first = executor.register()?;
+        let second = executor.register()?;
 
         executor.waker(second).wake();
 
         assert_eq!(executor.next_ready(), Some(second), "the woken task became ready");
         assert_eq!(executor.next_ready(), None, "no other task was disturbed");
         let _ = first;
+        Ok(())
     }
 
     #[test]
-    fn clone_keeps_task() {
+    fn clone_keeps_task() -> Result<(), SpawnError> {
         static EXECUTOR: Executor<2> = Executor::<2>::new();
         let executor = &EXECUTOR;
-        let task = executor.register().expect("free slot");
+        let task = executor.register()?;
 
         let clone = executor.waker(task).clone();
         clone.wake();
 
         assert_eq!(executor.next_ready(), Some(task));
+        Ok(())
     }
 
     #[test]
-    fn completion_wakes_task() {
+    fn completion_wakes_task() -> Result<(), SpawnError> {
         static EXECUTOR: Executor<2> = Executor::<2>::new();
         let executor = &EXECUTOR;
-        let task = executor.register().expect("free slot");
+        let task = executor.register()?;
 
         let slab = CompletionSlab::<u32, 2>::new();
-        let token = slab.reserve().expect("free completion slot");
+        let token = slab.reserve().unwrap();
         let mut future = pin!(slab.wait(token));
 
         let waker = executor.waker(task);
@@ -249,21 +251,23 @@ mod tests {
         assert_eq!(future.as_mut().poll(&mut context), Poll::Pending, "no result yet");
         assert_eq!(executor.next_ready(), None, "still parked before completion");
 
-        slab.complete(token.request_id(), 42).expect("live request id");
+        slab.complete(token.request_id(), 42).unwrap();
         assert_eq!(executor.next_ready(), Some(task), "completion woke the task by id");
 
         executor.complete_poll(task);
         assert_eq!(future.as_mut().poll(&mut context), Poll::Ready(Ok(42)));
+        Ok(())
     }
 
     #[test]
-    fn padded_layout_schedules() {
+    fn padded_layout_schedules() -> Result<(), SpawnError> {
         let executor = Executor::<2, Padded>::new();
-        let task = executor.register().expect("free slot");
+        let task = executor.register()?;
 
         executor.wake(task);
 
         assert_eq!(executor.next_ready(), Some(task));
+        Ok(())
     }
 
     #[test]

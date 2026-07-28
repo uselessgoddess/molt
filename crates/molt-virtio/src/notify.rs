@@ -34,16 +34,18 @@ mod tests {
     use molt_arch::Mmio;
 
     use super::Notify;
+    use crate::VirtioError;
 
     #[test]
-    fn kick_lands_queues_scaled_offset() {
+    fn kick_lands_queues_scaled_offset() -> Result<(), VirtioError> {
         let mut registers = [0u8; 32];
         // SAFETY: the slice outlives the borrow and is uniquely borrowed.
         let window = unsafe { Mmio::new(registers.as_mut_ptr(), registers.len() as u64) };
         let notify = Notify::new(window, 4);
 
-        notify.signal(1, 3).expect("a write inside the notify window");
+        notify.signal(1, 3)?;
 
         assert_eq!(&registers[12..14], &1u16.to_le_bytes(), "kick missed offset 3 * 4");
+        Ok(())
     }
 }

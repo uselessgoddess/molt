@@ -324,26 +324,28 @@ mod tests {
     }
 
     #[test]
-    fn region_addresses_same_bytes_two_ways() {
+    fn region_addresses_same_bytes_two_ways() -> Result<(), DmaError> {
         let mut buffer = [0u8; 16];
         let region = region(&mut buffer, 0xdead_0000);
 
-        region.write_u32(4, 0x0102_0304).unwrap();
+        region.write_u32(4, 0x0102_0304)?;
 
         assert_eq!(region.physical(), 0xdead_0000);
         assert_eq!(u32::from_le_bytes(buffer[4..8].try_into().unwrap()), 0x0102_0304);
+        Ok(())
     }
 
     #[test]
-    fn bulk_copy_round_trips() {
+    fn bulk_copy_round_trips() -> Result<(), DmaError> {
         let mut buffer = [0u8; 8];
         let region = region(&mut buffer, 0x1000);
 
-        region.write_from(0, &[1, 2, 3, 4]).unwrap();
+        region.write_from(0, &[1, 2, 3, 4])?;
         let mut read = [0u8; 4];
-        region.read_into(0, &mut read).unwrap();
+        region.read_into(0, &mut read)?;
 
         assert_eq!(read, [1, 2, 3, 4]);
+        Ok(())
     }
 
     #[test]
@@ -365,30 +367,32 @@ mod tests {
     }
 
     #[test]
-    fn arena_disjoint_frame_regions() {
+    fn arena_disjoint_frame_regions() -> Result<(), DmaError> {
         let regions = [usable(0x10_0000, 0x10_0000 + 8 * FRAME_SIZE)];
         let map = Map(&regions);
         let mut allocator = FrameAllocator::new(&map);
         let mut slots = [None; 8];
-        let mut arena = Arena::claim(&mut allocator, 0, 7, &mut slots).unwrap();
+        let mut arena = Arena::claim(&mut allocator, 0, 7, &mut slots)?;
 
-        let first = arena.region(16).unwrap();
-        let second = arena.region(FRAME_SIZE + 1).unwrap();
+        let first = arena.region(16)?;
+        let second = arena.region(FRAME_SIZE + 1)?;
 
         assert_eq!(first.physical(), 0x10_0000);
         assert_eq!(second.physical(), 0x10_0000 + FRAME_SIZE, "regions shared a frame");
         assert_eq!(arena.span().count(), 8);
+        Ok(())
     }
 
     #[test]
-    fn arena_refuses_region_past_its_span() {
+    fn arena_refuses_region_past_its_span() -> Result<(), DmaError> {
         let regions = [usable(0x10_0000, 0x10_0000 + 2 * FRAME_SIZE)];
         let map = Map(&regions);
         let mut allocator = FrameAllocator::new(&map);
         let mut slots = [None; 2];
-        let mut arena = Arena::claim(&mut allocator, 0, 1, &mut slots).unwrap();
+        let mut arena = Arena::claim(&mut allocator, 0, 1, &mut slots)?;
 
         assert_eq!(arena.region(3 * FRAME_SIZE).err(), Some(DmaError::OutOfSpace));
+        Ok(())
     }
 
     #[test]
@@ -408,36 +412,37 @@ mod tests {
     }
 
     #[test]
-    fn released_region_frames_come_back() {
+    fn released_region_frames_come_back() -> Result<(), DmaError> {
         let regions = [usable(0x10_0000, 0x10_0000 + 3 * FRAME_SIZE)];
         let map = Map(&regions);
         let mut allocator = FrameAllocator::new(&map);
         let mut slots = [None; 3];
-        let mut arena = Arena::claim(&mut allocator, 0, 4, &mut slots).unwrap();
+        let mut arena = Arena::claim(&mut allocator, 0, 4, &mut slots)?;
 
-        let first = arena.region(FRAME_SIZE).unwrap();
-        let second = arena.region(2 * FRAME_SIZE).unwrap();
+        let first = arena.region(FRAME_SIZE)?;
+        let second = arena.region(2 * FRAME_SIZE)?;
         assert_eq!(arena.region(FRAME_SIZE).err(), Some(DmaError::OutOfSpace));
-        arena.release(first).unwrap();
+        arena.release(first)?;
 
-        let third = arena.region(FRAME_SIZE).unwrap();
+        let third = arena.region(FRAME_SIZE)?;
 
         assert_eq!(third.physical(), 0x10_0000);
         assert_eq!(second.physical(), 0x10_0000 + FRAME_SIZE, "live region moved");
+        Ok(())
     }
 
     #[test]
-    fn look_alike_of_released_region_refused() {
+    fn look_alike_of_released_region_refused() -> Result<(), DmaError> {
         let regions = [usable(0x10_0000, 0x10_0000 + FRAME_SIZE)];
         let map = Map(&regions);
         let mut allocator = FrameAllocator::new(&map);
         let mut slots = [None; 1];
-        let mut arena = Arena::claim(&mut allocator, 0, 6, &mut slots).unwrap();
+        let mut arena = Arena::claim(&mut allocator, 0, 6, &mut slots)?;
         let mut buffer = [0u8; 16];
 
-        let first = arena.region(FRAME_SIZE).unwrap();
+        let first = arena.region(FRAME_SIZE)?;
         let physical = first.physical();
-        arena.release(first).unwrap();
+        arena.release(first)?;
         // The nearest thing to releasing the same region twice: only the claim
         // a region carries frees frames, so a stand-in over the same address
         // cannot free them a second time.
@@ -445,35 +450,38 @@ mod tests {
 
         assert_eq!(arena.release(twin).err(), Some(DmaError::Foreign));
         assert!(arena.region(FRAME_SIZE).is_ok(), "the frames were freed twice over");
+        Ok(())
     }
 
     #[test]
-    fn foreign_region_refused() {
+    fn foreign_region_refused() -> Result<(), DmaError> {
         let regions = [usable(0x10_0000, 0x10_0000 + FRAME_SIZE)];
         let map = Map(&regions);
         let mut allocator = FrameAllocator::new(&map);
         let mut slots = [None; 1];
-        let mut arena = Arena::claim(&mut allocator, 0, 5, &mut slots).unwrap();
+        let mut arena = Arena::claim(&mut allocator, 0, 5, &mut slots)?;
         let mut buffer = [0u8; 16];
 
         let borrowed = region(&mut buffer, 0x10_0000);
 
         assert_eq!(arena.release(borrowed).err(), Some(DmaError::Foreign));
         assert!(arena.region(FRAME_SIZE).is_ok(), "arena lost frame it still holds");
+        Ok(())
     }
 
     #[test]
-    fn reset_returns_span_to_table() {
+    fn reset_returns_span_to_table() -> Result<(), DmaError> {
         let regions = [usable(0x10_0000, 0x10_0000 + 4 * FRAME_SIZE)];
         let map = Map(&regions);
         let mut allocator = FrameAllocator::new(&map);
         let mut slots = [None; 4];
-        let mut arena = Arena::claim(&mut allocator, 0, 2, &mut slots).unwrap();
-        let outstanding = arena.region(FRAME_SIZE).unwrap();
+        let mut arena = Arena::claim(&mut allocator, 0, 2, &mut slots)?;
+        let outstanding = arena.region(FRAME_SIZE)?;
 
         arena.reset();
 
         assert_eq!(outstanding.physical(), 0x10_0000);
         assert!(slots.iter().all(Option::is_none), "reset left frames claimed");
+        Ok(())
     }
 }

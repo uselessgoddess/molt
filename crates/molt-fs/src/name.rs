@@ -80,10 +80,11 @@ mod tests {
     use crate::layout::MAX_NAME;
 
     #[test]
-    fn name_keeps_its_bytes() {
-        let name = Name::new(b"molt.txt").unwrap();
+    fn name_keeps_its_bytes() -> Result<(), FsError> {
+        let name = Name::new(b"molt.txt")?;
 
         assert_eq!(name.as_str(), Some("molt.txt"));
+        Ok(())
     }
 
     #[test]
@@ -102,8 +103,9 @@ mod tests {
     }
 
     #[test]
-    fn padding_does_not_affect_equality() {
-        assert_eq!(Name::new(b"a").unwrap(), Name::new(b"a").unwrap());
-        assert_ne!(Name::new(b"a").unwrap(), Name::new(b"ab").unwrap());
+    fn padding_does_not_affect_equality() -> Result<(), FsError> {
+        assert_eq!(Name::new(b"a")?, Name::new(b"a")?);
+        assert_ne!(Name::new(b"a")?, Name::new(b"ab")?);
+        Ok(())
     }
 }

@@ -200,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_request_is_answered_cancelled() -> Result<(), FsError> {
+    fn stopped_request_answers_cancelled() -> Result<(), FsError> {
         let bytes = image();
         let names = RefCell::new(Registry::<Storage, 1>::new());
         let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes)?)?;
@@ -217,7 +217,7 @@ mod tests {
 
         assert_eq!(hooks.cancelled(), 1);
         assert_eq!(hooks.unanswered(), 0);
-        let answer = client.try_completion().expect("every submission is answered");
+        let answer = client.try_completion().unwrap();
         assert_eq!(answer.id(), RequestId::new(7));
         assert_eq!(answer.into_result(), Err(FsError::Cancelled));
         Ok(())
@@ -231,7 +231,7 @@ mod tests {
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
         let (_client, mut driver) = ring.split();
         fs.publish(&mut names.borrow_mut(), SERVICE)?;
-        let lease = names.borrow().acquire().expect("a published scheme");
+        let lease = names.borrow().acquire().unwrap();
 
         let mut hooks = Teardown::new(&mut driver, &names, SERVICE);
         hooks.revoke_capabilities();
@@ -242,26 +242,26 @@ mod tests {
     }
 
     #[test]
-    fn a_supervised_restart_republishes_the_mount() -> Result<(), FsError> {
+    fn supervised_restart_republishes_mount() -> Result<(), FsError> {
         let bytes = image();
         let names = RefCell::new(Registry::<Storage, 1>::new());
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
         let (_client, mut driver) = ring.split();
         let mut service = Supervisor::<FsCell<_, 4>>::new(Loopback::new(&bytes)?)?;
         service.cell_mut().fs()?.publish(&mut names.borrow_mut(), SERVICE)?;
-        let lease = names.borrow().acquire().expect("a published scheme");
+        let lease = names.borrow().acquire().unwrap();
 
         service.restart(&mut Teardown::new(&mut driver, &names, SERVICE))?;
         service.cell_mut().fs()?.publish(&mut names.borrow_mut(), SERVICE)?;
 
         assert_eq!(names.borrow().endpoint(lease), Err(CapabilityError::Stale), "a lease survived");
-        let fresh = names.borrow().acquire().expect("a republished scheme");
+        let fresh = names.borrow().acquire().unwrap();
         assert!(names.borrow().endpoint(fresh).is_ok());
         Ok(())
     }
 
     #[test]
-    fn disconnect_revokes_only_what_the_client_opened() -> Result<(), FsError> {
+    fn disconnect_revokes_only_client_opened() -> Result<(), FsError> {
         let bytes = image();
         let names = RefCell::new(Registry::<Storage, 1>::new());
         let mut buffers = BufferRegistry::<1>::new();
