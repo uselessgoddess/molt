@@ -5,6 +5,9 @@ use molt_net::checksum;
 
 use crate::UdpError;
 
+/// The IP protocol number carrying datagrams.
+pub const PROTOCOL: u8 = 17;
+
 /// An IP address and UDP port.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Endpoint {
@@ -94,25 +97,8 @@ impl<'a> Datagram<'a> {
 
 fn checksum(src: IpAddr, dst: IpAddr, bytes: &[u8]) -> Result<u16, UdpError> {
     match (src, dst) {
-        (IpAddr::V4(src), IpAddr::V4(dst)) => {
-            let len = (bytes.len() as u16).to_be_bytes();
-            let src = src.octets();
-            let dst = dst.octets();
-            let pseudo = [
-                src[0], src[1], src[2], src[3], dst[0], dst[1], dst[2], dst[3], 0, 17, len[0],
-                len[1],
-            ];
-            Ok(checksum::compute_parts(&[&pseudo, bytes]))
-        }
-        (IpAddr::V6(src), IpAddr::V6(dst)) => {
-            let len = (bytes.len() as u32).to_be_bytes();
-            let mut pseudo = [0u8; 40];
-            pseudo[..16].copy_from_slice(&src.octets());
-            pseudo[16..32].copy_from_slice(&dst.octets());
-            pseudo[32..36].copy_from_slice(&len);
-            pseudo[39] = 17;
-            Ok(checksum::compute_parts(&[&pseudo, bytes]))
-        }
+        (IpAddr::V4(src), IpAddr::V4(dst)) => Ok(checksum::over_ipv4(src, dst, PROTOCOL, bytes)),
+        (IpAddr::V6(src), IpAddr::V6(dst)) => Ok(checksum::over_ipv6(src, dst, PROTOCOL, bytes)),
         _ => Err(UdpError::Malformed),
     }
 }
