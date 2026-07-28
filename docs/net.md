@@ -2,8 +2,9 @@
 
 Status: Stage 3 implementation record, July 2026.
 
-Molt now carries packets through VirtIO-net, Ethernet, ARP, IPv4, and UDP. TCP
-remains the next protocol. This is the decision and implementation record —
+Molt carries packets through VirtIO-net, Ethernet, ARP, IPv4, IPv6 with ICMPv6
+and neighbor discovery, UDP, and TCP. This is the decision and implementation
+record —
 what the stack borrows from seL4, Theseus, Redox, and smoltcp, what it
 deliberately does not, and how it lands on the primitives the kernel already
 has: DMA arenas, paired rings, typed capabilities, cells, and the registry.
@@ -35,9 +36,10 @@ hardware the way MoltFS is tested over a loopback disk.
 
 The issue's framing holds: there is no UDP abstraction in the kernel. The
 `molt-udp` service binds ports, answers on a ring, and revokes its socket
-capabilities when its `UdpCell` restarts. `molt-net` owns Ethernet, ARP, IPv4,
-and protocol capabilities. The kernel below them maps the device, routes its
-interrupt, and moves frames; it owns nothing about ports.
+capabilities when its `UdpCell` restarts; `molt-tcp` does the same for streams.
+`molt-net` owns Ethernet, ARP, IPv4, IPv6, ICMPv6, and protocol capabilities.
+The kernel below them maps the device, routes its interrupt, and moves frames;
+it owns nothing about ports.
 
 This is the same move MoltFS made: the kernel has no `open(2)` and no path
 resolver, only rings and capabilities, and the filesystem is a cell built out
@@ -67,7 +69,7 @@ layer, and completion through the same mechanism the rest of the OS uses.
 
 **Redox** contributes the namespace, which Molt already took: a scheme is a
 service, a socket is acquired through it, and `smoltcp` sits behind Redox's
-`netstack` as the protocol engine. Redox validates the split Molt plans — a thin
+`netstack` as the protocol engine. Redox validates the split Molt took — a thin
 scheme boundary in front of a protocol library — and validates smoltcp as that
 library.
 
@@ -76,29 +78,27 @@ IPv4/IPv6, ICMP, UDP, and TCP, driven by a `Device` trait that hands it frames.
 Its `Device` trait is almost exactly the `Link` seam above. The decision it
 forces is below.
 
-## smoltcp: UDP now, or TCP later
+## smoltcp: UDP here, TCP there
 
-UDP is small — parse/emit IPv4 and a UDP header, checksum, demux by port — and
+UDP is small — parse/emit IP and a UDP header, checksum, demux by port — and
 writing it against Molt's own buffers keeps the datagram path in types the
 kernel already checks, with no dependency to audit and no allocation smoltcp
 sometimes wants. TCP is not small: congestion control, retransmission, reassembly,
 and timers are the part nobody should reimplement to learn nothing.
 
-So: Molt writes UDP (and the Ethernet/ARP/IPv4 beneath it) itself, and smoltcp
-becomes the engine inside `tcp-cell` when TCP arrives, fed by the same `Link`.
-The issue's own read — "smoltcp maybe later as a TCP backend" — is the plan.
-This keeps the `udp-cell` free of a large dependency for a protocol that does not
-need it, and reserves the dependency for the protocol that earns it. Both cells
-can present the same registry scheme and ring protocol, so a client need not
-learn which one answers.
+So Molt writes UDP, and the Ethernet/ARP/IPv4/IPv6 beneath it, itself; smoltcp
+is the engine inside `molt-tcp`, fed by the same `Link` through a `phy::Device`
+shim. The dependency stays where it is earned and does not reach the datagram
+path. Both cells present the same ring shape — an operation, a capability, a
+completion — so a client does not learn which one answers.
 
 ## The implemented path
 
 Each layer is the least the next needs, mirroring Stage 2:
 
 ```text
-MSI-X -> InterruptSlab -> VirtIO RX queue -> molt-net IP ring
-                                           -> molt-udp socket ring
+MSI-X -> InterruptSlab -> VirtIO RX queue -> molt-net IP ring -> molt-udp ring
+                                          -> smoltcp phy shim -> molt-tcp ring
 ```
 
 1. **VirtIO-net over the existing transport.** `molt_virtio::Net` requires the
@@ -111,39 +111,59 @@ MSI-X -> InterruptSlab -> VirtIO RX queue -> molt-net IP ring
    guest segmentation feature is accepted, each 1526-byte buffer holds one
    complete maximum-size frame and `num_buffers` must remain one.
 2. **Ethernet + ARP.** `molt-net` parses and emits bounded frames and keeps a
-   fixed neighbor cache keyed by `core::net::IpAddr`. ARP learns IPv4 entries;
-   later NDP can learn IPv6 entries without changing routing or cache clients.
-   An unresolved next hop emits ARP and leaves the IP send pending; the reply
-   retries it without blocking or allocating.
+   fixed neighbor cache keyed by `core::net::IpAddr`. ARP learns IPv4 entries
+   and NDP learns IPv6 ones into the same table, so routing and every cache
+   client stayed as they were. An unresolved next hop emits a request and
+   leaves the IP send pending; the reply retries it without blocking or
+   allocating.
 3. **IPv4.** Ring operations, UDP endpoints, and static configuration use
    `IpAddr`; IPv4 wire code narrows to `Ipv4Addr`. The service checks header and
    payload checksums, has one static route, and refuses fragments rather than
-   accepting data it cannot reassemble. IPv6 EtherType and UDP pseudo-header
-   primitives are present, but IPv6 packet and NDP logic remain unsupported. A
-   protocol number can be bound by only one live capability.
-4. **UDP + `UdpCell`.** `molt-udp` owns port demultiplexing and socket
+   accepting data it cannot reassemble. A protocol number can be bound by only
+   one live capability.
+4. **IPv6 + ICMPv6 + NDP.** `ipv6` parses and emits headers with no extension
+   chain: a fragment header is `Fragmented`, every other extension header is
+   `Unsupported`, because a header the parser walks past is a header nothing
+   above it can police. `icmpv6` speaks four messages — echo request and reply,
+   solicitation and advertisement — over the pseudo-header checksum UDP already
+   used. Discovery sends and accepts at hop limit 255 (RFC 4861 §3.1), so a
+   router cannot forward a neighbour message onto a link it did not come from,
+   and the receive filter accepts the solicited-node group for each configured
+   address as well as the frame's own unicast destination.
+5. **UDP + `UdpCell`.** `molt-udp` owns port demultiplexing and socket
    capabilities. Payloads cross its ring only through registered buffers; its
    private registered scratch buffers carry the nested IP-ring operations.
    Restart revokes the old generation's sockets.
-5. **Hardware proof.** The x86_64 smoke attaches modern VirtIO-net to QEMU's
+6. **TCP + `TcpCell`.** `molt-tcp` puts smoltcp behind a `phy::Device` shim over
+   `Link` and keeps the boundary: `TcpOp::{Listen, Connect, Send, Recv, Close}`
+   on a ring, streams named by `Capability<Socket>`, one request parked per
+   stream because the ring is where concurrency lives. `serve` polls, drains
+   what the sockets produced, and polls again, so a send submitted against an
+   established stream leaves within the call that accepted it. Restart aborts
+   every stream the dead generation held.
+7. **Hardware proof.** The x86_64 smoke attaches modern VirtIO-net to QEMU's
    user network. It resolves the gateway by ARP and sends a DNS request to the
-   user-network DNS proxy. `MOLT_NET_OK` proves device startup and
+   user-network DNS proxy: `MOLT_NET_OK` proves device startup, and
    `MOLT_UDP_OK` requires a checked DNS response to traverse the device, IP
-   ring, and UDP ring.
-
-TCP remains a separate `tcp-cell`; smoltcp can sit behind the same `Link`
-without changing the device or capability boundary.
+   ring, and UDP ring. It then reconfigures for the slirp `fec0::/64` leg and
+   sends a v6 datagram whose completion cannot arrive until a solicitation is
+   answered and the cache learns the next hop — `MOLT_NDP_OK`. Finally it
+   connects to `10.0.2.100:80`, which slirp forwards to `cat`, and requires its
+   own bytes back before `MOLT_TCP_OK`. The clock in all three is counted in
+   polls, since nothing here has a calibrated timer yet.
 
 ## What is deliberately not here
 
 - **No sockets in the kernel.** A socket is a cell's capability, not a kernel
   descriptor, for the reason MoltFS gives about files.
-- **No allocation in the datagram path.** Device frames come from a DMA arena,
+- **No allocation anywhere in the stack.** Device frames come from a DMA arena,
   and protocol operations use fixed arrays plus registered buffers, consistent
-  with `molt-core`'s bounded rings. smoltcp's optional allocation stays inside
-  `tcp-cell`, where a heap already exists.
+  with `molt-core`'s bounded rings. smoltcp is taken without default features
+  and without `alloc`: its socket set, slots, and send/receive rings are storage
+  the caller lends it, so the stream path allocates no more than the datagram
+  one.
 - **No IOMMU assumption.** The NIC's DMA is as trusted as the disk's until Stage
-  4 supplies device isolation; this is stated, not silently assumed.
-- **No device polling in the network path.** Receive work is drained only after
-  `InterruptSlab` reports MSI-X activity. The older block smoke still uses its
-  explicitly bounded polling path; networking does not copy that exception.
+  4.5 supplies device isolation; this is stated, not silently assumed.
+- **No device polling.** Receive work is drained only after `InterruptSlab`
+  reports MSI-X activity, and the block driver now waits the same way — the
+  used-ring poll that was networking's one exception is gone.
