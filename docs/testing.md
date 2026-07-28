@@ -142,6 +142,15 @@ never takes, so it could rot silently. `cargo smoke` now also boots a
 `panic-smoke` build per architecture and requires both the `MOLT_PANIC:` marker
 and a failure exit status.
 
+The x86_64 boot also attaches a modern VirtIO-net device to QEMU's user
+network. `MOLT_NET_OK` requires the device to start with both queues routed to
+MSI-X. The kernel then resolves its gateway by ARP and submits a DNS query
+through the IP and UDP service rings. `MOLT_UDP_OK` is printed only after the
+reply's endpoint, transaction ID, and response bit are checked. This is an
+external packet round trip, not a loopback marker; wire parsing, capability
+demultiplexing, restart invalidation, and RX reposting remain deterministic
+host tests beneath it.
+
 **Markers that only one machine can produce.** Stage 2.2 added the first ones.
 `MOLT_PCI_OK` is required everywhere, but `MOLT_BAR_OK`, `MOLT_MSI_OK`, and
 `MOLT_INTERRUPT_OK` are x86_64-only, because RISC-V mints no MSI vectors yet and

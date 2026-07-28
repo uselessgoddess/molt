@@ -40,11 +40,11 @@ pub enum RegistryError {
 
 /// The published endpoints of one scheme.
 ///
-/// A lease and the publication are the same name today: a client acquires
+/// A lease and the publication are the same name here: a client acquires
 /// exactly what the provider offered, because the rights are the scheme's and
-/// there is nothing per-client to narrow yet. Attenuating a lease below the
-/// publication is what delegation adds; the generation check that ends one is
-/// already here.
+/// there is nothing per-client to narrow. Handing a lease on with fewer rights
+/// is [`CapabilityTable::delegate`], which the generation check that ends a
+/// lease already backs.
 pub struct Registry<S: Scheme, const N: usize> {
     published: CapabilityTable<S::Endpoint, N>,
 }

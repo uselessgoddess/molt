@@ -167,6 +167,8 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
             "MOLT_SHELL_OK:",
             "MOLT_FS_RESTART_OK:",
             "MOLT_VIRTIO_RESET_OK:",
+            "MOLT_NET_OK:",
+            "MOLT_UDP_OK:",
         ],
         _ => &[],
     }
@@ -355,6 +357,10 @@ fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
     command.arg("-drive").arg(format!("format=raw,file={}", image.display()));
     command.arg("-drive").arg(format!("if=none,id=molt-disk,format=raw,file={}", disk.display()));
     command.arg("-device").arg("virtio-blk-pci,drive=molt-disk,disable-legacy=on");
+    command.args(["-netdev", "user,id=molt-net"]);
+    command
+        .arg("-device")
+        .arg("virtio-net-pci,netdev=molt-net,disable-legacy=on,mac=52:54:00:12:34:56");
     Ok(command)
 }
 

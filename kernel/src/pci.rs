@@ -1,5 +1,5 @@
 use molt_arch::memory::{Inventory, Rights};
-use molt_arch::{BootInfo, Mmio, Platform, SerialWriter, Sink};
+use molt_arch::{BootInfo, Mmio, MsiMessage, Platform, SerialWriter, Sink};
 use molt_core::interrupt::{InterruptSlab, InterruptToken};
 use molt_kernel::report;
 use molt_pci::{Bus, Command, Function, bus_span, preferred};
@@ -26,6 +26,35 @@ impl Sink for Interrupts {
 }
 
 static INTERRUPTS: Interrupts = Interrupts(InterruptSlab::new());
+
+/// Reserves one device line and connects the platform entry path to the slab.
+pub(crate) fn bind<P: Platform>(platform: &mut P) -> Option<(InterruptToken, MsiMessage)> {
+    let (line, message) = platform.allocate().ok()?;
+    let token = match INTERRUPTS.0.bind(line) {
+        Ok(token) => token,
+        Err(_) => {
+            let _ = platform.release(line);
+            return None;
+        }
+    };
+    if platform.route_interrupts(&INTERRUPTS).is_err() {
+        let _ = INTERRUPTS.0.release(token);
+        let _ = platform.release(line);
+        return None;
+    }
+    Some((token, message))
+}
+
+/// Takes the arrivals recorded since this owner last drained its line.
+pub(crate) fn arrivals(token: InterruptToken) -> u64 {
+    INTERRUPTS.0.arrivals(token).expect("a live device interrupt token")
+}
+
+/// Returns a stopped device's line to both the slab and the platform fabric.
+pub(crate) fn release<P: Platform>(platform: &mut P, token: InterruptToken) {
+    INTERRUPTS.0.release(token).expect("the line this device bound");
+    platform.release(token.line()).expect("a line this platform allocated");
+}
 
 /// A device found during the walk, routed and ready to be provoked.
 struct Routed {
@@ -125,12 +154,10 @@ fn route<P: Platform>(
     function: &mut Function<'_>,
 ) -> Option<Routed> {
     let capability = preferred(function).ok()?;
-    let (line, message) = platform.allocate().ok()?;
-
     // The line is bound before the device is programmed, never after: a device
     // able to deliver into a line nobody owns is a dropped interrupt at best.
-    let token = INTERRUPTS.0.bind(line).expect("a line the fabric just handed out");
-    platform.route_interrupts(&INTERRUPTS).expect("a platform that hands out vectors delivers");
+    let (token, message) = bind(platform)?;
+    let line = token.line();
 
     // `edu` implements MSI, not MSI-X: its table would need a BAR mapping of
     // its own, and `preferred` picking MSI-X here would be a different path.

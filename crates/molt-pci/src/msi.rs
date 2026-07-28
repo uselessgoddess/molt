@@ -249,14 +249,16 @@ impl<'control, 'table> MsiX<'control, 'table> {
         Ok(())
     }
 
-    /// Turns the whole capability on, and INTx off with it.
-    pub fn enable(&mut self, function: &mut Function<'_>) -> Result<(), PciError> {
+    /// Turns the whole capability on.
+    ///
+    /// The caller disables INTx in the function command before enabling memory
+    /// decode; this handle only borrows the capability and cannot reach that
+    /// command register.
+    pub fn enable(&mut self) -> Result<(), PciError> {
         let control = self.control.read_u16(2)?;
         // Bit 15 enables, bit 14 masks every vector at once; clearing the
         // latter is what makes the per-entry masks the only thing in the way.
         self.control.write_u16(2, control & !(1 << 14) | 1 << 15)?;
-        let command = function.command()?;
-        function.set_command(command.with(Command::INTX_DISABLE))?;
         Ok(())
     }
 
@@ -338,6 +340,25 @@ mod tests {
         assert_eq!(vector.index(), 1);
         assert_eq!(msix.is_masked(vector), Ok(false));
         assert_eq!(&entries[16..28], &[0x00, 0x00, 0xe0, 0xfe, 0, 0, 0, 0, 0x51, 0, 0, 0]);
+    }
+
+    #[test]
+    fn enabling_clears_the_function_mask() {
+        let mut space = Space::new();
+        space.function(0, 0).header(0x1af4, 0x1041).msix(0x40, 1, 0, 0);
+        let mut entries = [0u8; 16];
+        let capability = function(&mut space).msix().expect("an MSI-X capability");
+        let control = space.window();
+        let control = control.subwindow(0x40, capability.bytes()).expect("the capability");
+        control.write_u16(2, 1 << 14).expect("the function mask");
+        let mut msix =
+            MsiX::new(capability, control, table(&mut entries)).expect("one table entry");
+
+        msix.enable().expect("the capability enables");
+
+        let control = space.window().read_u16(0x42).expect("the capability control");
+        assert_ne!(control & 1 << 15, 0);
+        assert_eq!(control & 1 << 14, 0);
     }
 
     #[test]

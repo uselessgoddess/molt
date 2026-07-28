@@ -2,6 +2,7 @@
 
 use core::marker::PhantomData;
 
+use crate::audit::{Audit, Event};
 pub use crate::cell::CellId;
 
 /// Runtime rights stored beside a resource in the supervisor-owned table.
@@ -153,6 +154,19 @@ impl<T, const N: usize> CapabilityTable<T, N> {
         Ok(Capability { raw: capability.raw, rights: PhantomData })
     }
 
+    /// Hands `capability` to `to` with `To` rights, recording the transfer.
+    pub fn delegate<From: CapabilityRights, To: CapabilityRights>(
+        &self,
+        capability: Capability<From>,
+        from: CellId,
+        to: CellId,
+        audit: &mut impl Audit,
+    ) -> Result<Capability<To>, CapabilityError> {
+        let delegated = self.attenuate::<From, To>(capability)?;
+        audit.record(Event::delegate(from, to, capability.index() as u32, To::MASK));
+        Ok(delegated)
+    }
+
     pub fn get<R: CapabilityRights>(
         &self,
         capability: Capability<R>,
@@ -212,6 +226,20 @@ impl<T, const N: usize> CapabilityTable<T, N> {
         let mut revoked = 0;
         for slot in &mut self.slots {
             if slot.resource.is_some() && slot.owner == owner {
+                drop(slot.resource.take());
+                slot.rights = Rights(0);
+                slot.advance_generation();
+                revoked += 1;
+            }
+        }
+        revoked
+    }
+
+    /// Drops every live resource while preserving each slot's generation.
+    pub fn revoke_all(&mut self) -> usize {
+        let mut revoked = 0;
+        for slot in &mut self.slots {
+            if slot.resource.is_some() {
                 drop(slot.resource.take());
                 slot.rights = Rights(0);
                 slot.advance_generation();

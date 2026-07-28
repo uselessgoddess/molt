@@ -1,6 +1,6 @@
-# VirtIO block
+# VirtIO devices
 
-Status: Stage 2.3 decision record, July 2026.
+Status: Stage 2.3 block and Stage 3 network implementation record, July 2026.
 
 Why a queue is built out of frames the kernel owns rather than memory the device
 names, where a physical address is allowed to exist, what the four request
@@ -171,10 +171,36 @@ after classifying that function's BAR — an interrupt-capable or DMA-capable
 device on this kernel is as privileged as the kernel, and the arena's frame
 ownership is what bounds *where* it writes in practice, not hardware isolation.
 
-**Completion is polled, and only one queue is programmed.** No MSI-X vector is
-routed to the block device and only queue zero is built. A block device with
-multiple queues, or one driven from an interrupt, is Stage 3's concern, when a
-scheduler exists to be woken.
+**Block completion is polled, and only one block queue is programmed.** No
+MSI-X vector is routed to the block device and only queue zero is built. This
+bounded early-boot exception is not the model used by the network driver.
+
+## The interrupt-driven network pair
+
+`molt_virtio::Net` reuses the same transport, split queue, and DMA arena but
+programs receive queue 0 and transmit queue 1. Both queue configuration records
+name one MSI-X table entry, which the kernel binds to `InterruptSlab` before it
+enables the device. The PCI command grants memory decode and bus mastering and
+disables INTx, so there is one unambiguous completion path.
+
+The driver requires `VIRTIO_F_VERSION_1`, `VIRTIO_NET_F_MAC`, and
+`VIRTIO_NET_F_MRG_RXBUF`. The merged-buffer feature makes the modern 12-byte
+header, including `num_buffers`, explicit across QEMU versions. Molt does not
+accept checksum or segmentation offloads; each receive buffer is therefore the
+full 1526 bytes and must carry one complete maximum-size Ethernet frame with
+`num_buffers == 1`.
+
+Receive ownership is a cycle, not an allocation. Startup posts one writable
+buffer for every queue slot before setting `DRIVER_OK`. A completion maps its
+descriptor head back to that buffer, validates the device header, copies the
+bounded Ethernet frame to the protocol layer, and republishes the same buffer
+before returning — including on malformed input. Thus a bad packet cannot
+silently drain the queue. Transmit keeps one frame in flight and reports
+backpressure until the used ring returns it.
+
+Reset preserves the same ordering as block: device status reaches zero before
+either queue or any packet buffer returns to the arena. Only after reset does
+the kernel mask and disable MSI-X and release the interrupt token.
 
 ## How it is tested
 
@@ -194,6 +220,13 @@ brings the device up, reads sector zero, commits a filesystem write, and resets.
 It requires `MOLT_VIRTIO_OK`, `MOLT_BLOCK_OK`, `MOLT_FS_WRITE_OK`, and
 `MOLT_VIRTIO_RESET_OK` on the serial line. The last marker proves queue-reset
 ordering: the device stopped, then frames came back.
+
+The same smoke then brings up modern VirtIO-net over a second ten-frame arena.
+`MOLT_NET_OK` requires its two queues and MSI-X route to complete startup.
+`MOLT_UDP_OK` requires an ARP exchange followed by a DNS response through
+Ethernet, IPv4, the nested IP ring, and the capability-addressed UDP ring. Host
+tests separately damage every wire header and return one RX descriptor through
+the used ring to prove it is immediately reposted.
 
 The disk is a real filesystem rather than a signed pattern so that one artifact
 carries the whole path: the same bytes this driver reads are what MoltFS writes,

@@ -528,11 +528,20 @@ dependencies = [
  "molt-block",
  "molt-core",
  "molt-fs",
+ "molt-net",
  "molt-pci",
  "molt-riscv",
  "molt-shell",
+ "molt-udp",
  "molt-virtio",
  "molt-x86_64",
+]
+
+[[package]]
+name = "molt-net"
+version = "0.1.0"
+dependencies = [
+ "molt-core",
 ]
 
 [[package]]
@@ -559,11 +568,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "molt-udp"
+version = "0.1.0"
+dependencies = [
+ "molt-core",
+ "molt-net",
+]
+
+[[package]]
 name = "molt-virtio"
 version = "0.1.0"
 dependencies = [
  "molt-arch",
  "molt-block",
+ "molt-net",
  "molt-pci",
 ]
 
