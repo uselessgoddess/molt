@@ -7,7 +7,7 @@ use molt_core::buffer::{BufferOperation, BufferRegistry};
 use molt_core::capability::CellId;
 use molt_core::ring::{IoRing, RequestId, Submission};
 use molt_kernel::report;
-use molt_net::addr::{IpAddr, Ipv4Addr};
+use molt_net::addr::{IpAddr, Ipv4Addr, Ipv6Addr};
 use molt_net::{Config, Ip, IpDone, IpError, IpOp};
 use molt_pci::{Bus, Command, bus_span};
 use molt_udp::{Endpoint, Scratch, Udp, UdpDone, UdpError, UdpOp};
@@ -23,6 +23,10 @@ const OWNER: CellId = CellId::new(3);
 const LOCAL: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
 const DNS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
+// QEMU hands the same slirp network out on fec0::/64.
+const LOCAL_V6: Ipv6Addr = Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0x15);
+const GATEWAY_V6: Ipv6Addr = Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 2);
+const DNS_V6: Ipv6Addr = Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 3);
 const DNS_PORT: u16 = 53;
 const LOCAL_PORT: u16 = 49_152;
 const DELIVERY_SPINS: u32 = 50_000_000;
@@ -102,16 +106,27 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let mac = net.mac();
     report!(platform, "MOLT_NET_OK: {} mac {:02x?}", function.address(), mac.octets(),);
 
-    let mut ip = Ip::<_, 4>::new(net, Config::new(mac, IpAddr::V4(LOCAL), 24, IpAddr::V4(GATEWAY)));
-    let reply = udp_round_trip(&vectored.line(), &mut ip);
+    let config = Config::new(mac, IpAddr::V4(LOCAL), 24, IpAddr::V4(GATEWAY));
+    let mut ip = Ip::<_, 4>::new(net, config);
+    let reply = udp_round_trip(&vectored.line(), &mut ip, IpAddr::V4(DNS)).expect("a DNS reply");
     report!(platform, "MOLT_UDP_OK: DNS replied with {reply} bytes");
+
+    // The same query over v6, which cannot leave the host until an
+    // advertisement answers it: nothing here knows the resolver's MAC yet.
+    let config = Config::new(mac, IpAddr::V6(LOCAL_V6), 64, IpAddr::V6(GATEWAY_V6));
+    let mut ip = Ip::<_, 4>::new(ip.into_link(), config);
+    let _ = udp_round_trip(&vectored.line(), &mut ip, IpAddr::V6(DNS_V6));
+    report!(platform, "MOLT_NDP_OK: {DNS_V6} answered a solicitation");
 
     let net = ip.into_link();
     net.reset().expect("the network device stops before DMA frames return");
     vectored.stop(platform);
 }
 
-fn udp_round_trip(line: &Line, ip: &mut Ip<Net<'_, '_>, 4>) -> usize {
+/// Queries DNS and returns the reply, which only v4 gets: slirp resolves over
+/// whatever nameservers the host has, and those answer on v4. A v6 query stops
+/// once it is on the wire, which discovery alone decides.
+fn udp_round_trip(line: &Line, ip: &mut Ip<Net<'_, '_>, 4>, dns: IpAddr) -> Option<usize> {
     let mut source = DNS_QUERY;
     let mut target = [0u8; 512];
     let mut tx = [0u8; 1480];
@@ -127,7 +142,11 @@ fn udp_round_trip(line: &Line, ip: &mut Ip<Net<'_, '_>, 4>) -> usize {
     let (mut ip_client, mut ip_driver) = ip_ring.split();
     let mut udp_ring = IoRing::<UdpOp, Result<UdpDone, UdpError>, 8>::new();
     let (mut client, mut driver) = udp_ring.split();
-    let mut udp = Udp::<4, 2>::new(IpAddr::V4(LOCAL), tx, rx);
+    let local = match dns {
+        IpAddr::V4(_) => IpAddr::V4(LOCAL),
+        IpAddr::V6(_) => IpAddr::V6(LOCAL_V6),
+    };
+    let mut udp = Udp::<4, 2>::new(local, tx, rx);
 
     udp.serve(OWNER, &mut driver, &mut ip_client, &mut buffers);
     ip.serve(OWNER, &mut ip_driver, &mut buffers);
@@ -155,7 +174,7 @@ fn udp_round_trip(line: &Line, ip: &mut Ip<Net<'_, '_>, 4>) -> usize {
             RequestId::new(3),
             UdpOp::Send {
                 socket,
-                to: Endpoint::new(IpAddr::V4(DNS), DNS_PORT),
+                to: Endpoint::new(dns, DNS_PORT),
                 payload: BufferOperation::new(source, 0, DNS_QUERY.len()),
             },
         ))
@@ -184,17 +203,20 @@ fn udp_round_trip(line: &Line, ip: &mut Ip<Net<'_, '_>, 4>) -> usize {
         while let Some(completion) = client.try_completion() {
             match (completion.id(), completion.into_result()) {
                 (id, Ok(UdpDone::Received { from, len })) if id == RequestId::new(2) => {
-                    assert_eq!(from, Endpoint::new(IpAddr::V4(DNS), DNS_PORT));
+                    assert_eq!(from, Endpoint::new(dns, DNS_PORT));
                     let bytes = buffers
                         .resolve_write(BufferOperation::new(target, 0, len))
                         .expect("the registered DNS reply");
                     assert!(len >= 12, "DNS returned a truncated header");
                     assert_eq!(&bytes[..2], &DNS_QUERY[..2], "DNS transaction ID changed");
                     assert_ne!(bytes[2] & 0x80, 0, "DNS reply bit was clear");
-                    return len;
+                    return Some(len);
                 }
                 (id, Ok(UdpDone::Sent(len))) if id == RequestId::new(3) => {
                     assert_eq!(len, DNS_QUERY.len());
+                    if matches!(dns, IpAddr::V6(_)) {
+                        return None;
+                    }
                 }
                 (_, result) => panic!("unexpected UDP completion: {result:?}"),
             }

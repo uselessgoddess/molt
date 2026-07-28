@@ -170,6 +170,7 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
             "MOLT_VIRTIO_RESET_OK:",
             "MOLT_NET_OK:",
             "MOLT_UDP_OK:",
+            "MOLT_NDP_OK:",
         ],
         _ => &[],
     }
