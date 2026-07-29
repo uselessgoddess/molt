@@ -6,8 +6,10 @@
 //! the lower wheel wraps, so a timer moves a bounded number of times no matter
 //! how far ahead it was set.
 //!
-//! Ticks are the caller's, and the wheel walks one slot per tick: the unit
-//! should be the scheduling quantum, not a cycle counter.
+//! Ticks are the machine's, and the wheel walks one slot per tick: the unit
+//! should be the scheduling quantum, not a cycle counter. The clock is read
+//! from the machine and never from the wheel, which only trails it — a
+//! deadline taken off a wheel nobody has advanced yet is one already past.
 
 use alloc::rc::Rc;
 use alloc::vec::Vec;
@@ -16,6 +18,8 @@ use core::future::Future;
 use core::mem;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
+
+use crate::machine::Machine;
 
 const BITS: usize = 6;
 const SLOTS: usize = 1 << BITS;
@@ -120,21 +124,26 @@ impl Wheel {
 pub struct Timers(Rc<Inner>);
 
 struct Inner {
+    machine: &'static dyn Machine,
     wheel: RefCell<Wheel>,
     /// Kept between turns so waking a hundred timers costs no allocation.
     expired: RefCell<Vec<Waker>>,
 }
 
 impl Timers {
-    pub fn new() -> Self {
+    pub fn new(machine: &'static dyn Machine) -> Self {
         Self(Rc::new(Inner {
+            machine,
             wheel: RefCell::new(Wheel::new()),
             expired: RefCell::new(Vec::new()),
         }))
     }
 
+    /// The machine's clock, which the wheel trails until the next [`advance`].
+    ///
+    /// [`advance`]: Timers::advance
     pub fn now(&self) -> u64 {
-        self.0.wheel.borrow().now
+        self.0.machine.ticks()
     }
 
     /// Sleeps `delay` ticks from now.
@@ -153,24 +162,18 @@ impl Timers {
         Timeout { future, sleep: self.after(delay) }
     }
 
-    /// Walks the wheel to `ticks` and wakes what expired, reporting how many.
-    pub fn advance(&self, ticks: u64) -> usize {
+    /// Walks the wheel to the clock and wakes what expired, reporting how many.
+    pub fn advance(&self) -> usize {
         // The scratch leaves the cell for the walk, so a waker that comes back
         // here finds nothing borrowed.
         let mut expired = mem::take(&mut *self.0.expired.borrow_mut());
-        self.0.wheel.borrow_mut().upto(ticks, &mut expired);
+        self.0.wheel.borrow_mut().upto(self.now(), &mut expired);
         let woken = expired.len();
         for waker in expired.drain(..) {
             waker.wake();
         }
         *self.0.expired.borrow_mut() = expired;
         woken
-    }
-}
-
-impl Default for Timers {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

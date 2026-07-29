@@ -169,7 +169,7 @@ impl Executor {
             }),
             local: RefCell::new(Local::new()),
             tasks: RefCell::new(Vec::new()),
-            timers: Timers::new(),
+            timers: Timers::new(machine),
         }
     }
 
@@ -201,7 +201,7 @@ impl Executor {
 
     /// Walks the wheel to the machine's clock, waking whatever came due.
     pub fn tick(&self) -> usize {
-        self.timers.advance(self.shared.machine.ticks())
+        self.timers.advance()
     }
 
     /// Polls until nothing is ready, and reports how many polls that took.

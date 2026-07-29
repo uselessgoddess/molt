@@ -124,9 +124,14 @@ Deadlines live in a hierarchical wheel: four levels of sixty-four slots, so
 arming is a shift and a push and a tick looks at one slot instead of every
 deadline. A deadline further out than a level can express waits in the level
 above and cascades down when the lower wheel wraps, so a timer moves a bounded
-number of times no matter how far ahead it was set. Ticks are the caller's and
+number of times no matter how far ahead it was set. Ticks are the machine's and
 the wheel walks one slot per tick, which means the unit should be the
 scheduling quantum rather than a cycle counter.
+
+The clock a deadline is taken from is the machine's, never the wheel's. The
+wheel only trails it — it moves when the core ticks, and a core that has been
+starting its neighbours has not ticked in a while. Arming off the wheel there
+is arming in the past, and the timeout is over before the first poll.
 
 Both were built with the cores rather than after them, on purpose. A priority
 added later is a second ready queue and a second inbox on a path two cores
