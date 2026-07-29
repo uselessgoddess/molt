@@ -28,6 +28,8 @@ pub struct Percpu {
     hart: AtomicU64,
     /// A wake that arrived before the core parked.
     doorbell: AtomicBool,
+    /// Set by the hart itself, in [`attach`]: nothing else can tell.
+    up: AtomicBool,
     /// Timer interrupts taken here.
     ticks: AtomicU64,
 }
@@ -39,6 +41,7 @@ impl Percpu {
             cpu: AtomicU16::new(0),
             hart: AtomicU64::new(0),
             doorbell: AtomicBool::new(false),
+            up: AtomicBool::new(false),
             ticks: AtomicU64::new(0),
         }
     }
@@ -49,6 +52,11 @@ impl Percpu {
 
     pub fn hart(&self) -> u64 {
         self.hart.load(Ordering::Relaxed)
+    }
+
+    /// Whether the hart reached [`attach`], which is how a start is answered.
+    pub fn up(&self) -> bool {
+        self.up.load(Ordering::Acquire)
     }
 
     pub fn block(&self) -> *mut () {
@@ -110,6 +118,8 @@ pub unsafe fn attach(cpu: CpuId, hart: u64) {
     slot.hart.store(hart, Ordering::Relaxed);
     // SAFETY: `tp` is molt's to set; the address is a static that outlives us.
     unsafe { asm!("mv tp, {}", in(reg) ptr::from_ref(slot), options(nostack)) };
+    // Last, so that whoever started this hart sees a block already filled in.
+    slot.up.store(true, Ordering::Release);
 }
 
 /// Numbers the harts firmware listed, boot hart first.

@@ -5,6 +5,7 @@
 
 pub mod acpi;
 
+mod ap;
 mod apic;
 mod interrupts;
 mod memory;
@@ -23,9 +24,9 @@ pub use bootloader_api::{
 };
 use molt_arch::memory::{Device, Rights, Span};
 use molt_arch::{
-    BootInfo, ConfigSpace, CpuId, DeviceMapper, ExitStatus, FabricError, FrameCursor, ImageRange,
-    InterruptFabric, Local, MappingError, MemoryMap, MemoryRegion, MemoryRegionKind, Mmio,
-    MsiMessage, Platform, PlatformError, SerialPort, Sink, Smp, SmpError,
+    BootInfo, ConfigSpace, CpuId, DeviceMapper, Entry, ExitStatus, FabricError, FrameCursor,
+    ImageRange, InterruptFabric, Local, MappingError, MemoryMap, MemoryRegion, MemoryRegionKind,
+    Mmio, MsiMessage, Platform, PlatformError, SerialPort, Sink, Smp, SmpError, Stack,
 };
 
 /// Fixed boot-stack window cloned into kernel-owned page tables.
@@ -294,6 +295,14 @@ impl Smp for X86_64 {
 
     fn cpu(&self) -> CpuId {
         percpu::this().cpu()
+    }
+
+    /// # Safety
+    ///
+    /// As the trait says: `stack` is this core's alone from here on.
+    unsafe fn start(&mut self, cpu: CpuId, stack: Stack, entry: Entry) -> Result<(), SmpError> {
+        // SAFETY: forwarded, and this crate reserved the frame it starts from.
+        unsafe { ap::start(cpu, stack, entry) }
     }
 
     /// Rings the doorbell, and only sends the interrupt when it was not already

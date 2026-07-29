@@ -29,6 +29,9 @@ const TIMER_MASKED: u32 = 1 << 16;
 /// Fixed delivery, physical destination, edge triggered — everything else zero.
 const ICR_ASSERT: u32 = 1 << 14;
 const ICR_DESTINATION_SHIFT: u32 = 24;
+/// Delivery modes that reset a core rather than interrupt it.
+const ICR_INIT: u32 = 0b101 << 8;
+const ICR_STARTUP: u32 = 0b110 << 8;
 
 static APIC_VIRTUAL_BASE: AtomicU64 = AtomicU64::new(0);
 
@@ -80,12 +83,30 @@ pub fn boot_id() -> u8 {
 }
 
 /// Sends `vector` to the core with local APIC identifier `apic`.
-///
+pub fn ipi(apic: u8, vector: u8) -> Result<(), PlatformError> {
+    command(apic, u32::from(vector))
+}
+
+/// Resets the core with local APIC identifier `apic`, leaving it waiting.
+pub fn init_ipi(apic: u8) -> Result<(), PlatformError> {
+    command(apic, ICR_INIT)
+}
+
+/// Starts a reset core at `vector << 12`, in real mode.
+pub fn startup_ipi(apic: u8, vector: u8) -> Result<(), PlatformError> {
+    command(apic, ICR_STARTUP | u32::from(vector))
+}
+
+/// The window [`init`] was given, for a core coming up on the same one.
+pub fn window() -> u64 {
+    APIC_VIRTUAL_BASE.load(Ordering::Acquire)
+}
+
 /// The high half is written first: the write to the low half is what sends,
 /// so a destination set after it would address the previous interrupt.
-pub fn ipi(apic: u8, vector: u8) -> Result<(), PlatformError> {
+fn command(apic: u8, low: u32) -> Result<(), PlatformError> {
     write(REG_ICR_HIGH, u32::from(apic) << ICR_DESTINATION_SHIFT)?;
-    write(REG_ICR_LOW, ICR_ASSERT | u32::from(vector))
+    write(REG_ICR_LOW, ICR_ASSERT | low)
 }
 
 /// Signals end-of-interrupt to the local APIC.

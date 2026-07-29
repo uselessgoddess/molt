@@ -35,6 +35,8 @@ pub struct Percpu {
     apic: AtomicU8,
     /// A wake that arrived before the core parked.
     doorbell: AtomicBool,
+    /// Set by the core itself, in [`attach`]: nothing else can tell.
+    up: AtomicBool,
     /// Timer interrupts taken here.
     ticks: AtomicU64,
 }
@@ -49,6 +51,7 @@ impl Percpu {
             cpu: AtomicU16::new(0),
             apic: AtomicU8::new(0),
             doorbell: AtomicBool::new(false),
+            up: AtomicBool::new(false),
             ticks: AtomicU64::new(0),
         }
     }
@@ -59,6 +62,11 @@ impl Percpu {
 
     pub fn apic(&self) -> u8 {
         self.apic.load(Ordering::Relaxed)
+    }
+
+    /// Whether the core reached [`attach`], which is how a start is answered.
+    pub fn up(&self) -> bool {
+        self.up.load(Ordering::Acquire)
     }
 
     pub fn block(&self) -> *mut () {
@@ -120,6 +128,8 @@ pub unsafe fn attach(cpu: CpuId) {
     slot.cpu.store(cpu.get(), Ordering::Relaxed);
     // SAFETY: IA32_GS_BASE takes any canonical address; this one is a static.
     unsafe { apic::write_msr(IA32_GS_BASE, ptr::from_ref(slot) as u64) };
+    // Last, so that whoever started this core sees a block already filled in.
+    slot.up.store(true, Ordering::Release);
 }
 
 /// Numbers the cores ACPI listed, boot core first.

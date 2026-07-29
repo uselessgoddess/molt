@@ -10,19 +10,25 @@ use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::structures::tss::TaskStateSegment;
 
-use crate::{apic, emergency_write, msi};
+use crate::{apic, emergency_write, msi, percpu};
 
 const DOUBLE_FAULT_IST_INDEX: u16 = 0;
+const EXCEPTION_STACK: usize = 4096 * 5;
 
 #[repr(align(16))]
-struct ExceptionStack(UnsafeCell<[u8; 4096 * 5]>);
+struct ExceptionStack(UnsafeCell<[u8; EXCEPTION_STACK]>);
 
 // SAFETY: the TSS-selected CPU exclusively uses this storage as its double-fault stack.
 unsafe impl Sync for ExceptionStack {}
 
-static DOUBLE_FAULT_STACK: ExceptionStack = ExceptionStack(UnsafeCell::new([0; 4096 * 5]));
-static TSS: Once<TaskStateSegment> = Once::new();
-static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
+/// Per-core, all three of them: a task segment names one stack, and loading one
+/// twice sets a busy bit the second `ltr` faults on. The interrupt table is the
+/// exception — its handlers say nothing about which core took the interrupt.
+static DOUBLE_FAULT_STACK: [ExceptionStack; percpu::MAX] =
+    [const { ExceptionStack(UnsafeCell::new([0; EXCEPTION_STACK])) }; percpu::MAX];
+static TSS: [Once<TaskStateSegment>; percpu::MAX] = [const { Once::new() }; percpu::MAX];
+static GDT: [Once<(GlobalDescriptorTable, Selectors)>; percpu::MAX] =
+    [const { Once::new() }; percpu::MAX];
 static IDT: Once<InterruptDescriptorTable> = Once::new();
 static BREAKPOINT_SEEN: AtomicBool = AtomicBool::new(false);
 
@@ -32,15 +38,16 @@ struct Selectors {
     tss: SegmentSelector,
 }
 
+/// Gives the running core its tables. Called once per core, on that core.
 pub fn init() {
-    let tss = TSS.call_once(|| {
+    let own = percpu::this().cpu().index();
+    let tss = TSS[own].call_once(|| {
         let mut tss = TaskStateSegment::new();
-        let stack_start = VirtAddr::from_ptr(DOUBLE_FAULT_STACK.0.get());
-        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
-            stack_start + size_of::<[u8; 4096 * 5]>() as u64;
+        let stack = VirtAddr::from_ptr(DOUBLE_FAULT_STACK[own].0.get());
+        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = stack + EXCEPTION_STACK as u64;
         tss
     });
-    let (gdt, selectors) = GDT.call_once(|| {
+    let (gdt, selectors) = GDT[own].call_once(|| {
         let mut gdt = GlobalDescriptorTable::new();
         let code = gdt.append(Descriptor::kernel_code_segment());
         let data = gdt.append(Descriptor::kernel_data_segment());

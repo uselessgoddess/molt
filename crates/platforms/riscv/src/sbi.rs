@@ -9,6 +9,7 @@ use crate::error::SbiError;
 const EXT_CONSOLE_PUTCHAR: usize = 0x01;
 const EXT_BASE: usize = 0x10;
 const EXT_DEBUG_CONSOLE: usize = 0x4442_434e;
+const EXT_HART_STATE: usize = 0x0048_534d;
 const EXT_IPI: usize = 0x0073_5049;
 const EXT_TIMER: usize = 0x5449_4d45;
 const EXT_SYSTEM_RESET: usize = 0x5352_5354;
@@ -69,6 +70,23 @@ pub fn set_timer(deadline: u64) {
     unsafe {
         call(EXT_TIMER, 0, deadline as usize, 0, 0);
     }
+}
+
+/// Whether firmware can start harts at all.
+pub fn has_hart_state() -> bool {
+    probe(EXT_HART_STATE)
+}
+
+/// Starts `hart` at `entry`, in supervisor mode, with `opaque` in `a1`.
+///
+/// The hart comes up with address translation off, which on molt's RISC-V
+/// costs nothing: the kernel is identity-mapped, so `entry` is already the
+/// physical address firmware jumps to.
+pub fn hart_start(hart: u64, entry: usize, opaque: usize) -> Result<(), SbiError> {
+    // SAFETY: the HSM extension takes the hart in a0, the entry in a1, and the
+    // opaque word in a2; `entry` is kernel text, live for the machine's life.
+    let started = unsafe { call(EXT_HART_STATE, 0, hart as usize, entry, opaque) };
+    started.into_result().map(drop)
 }
 
 /// Raises a supervisor software interrupt on `hart`.
