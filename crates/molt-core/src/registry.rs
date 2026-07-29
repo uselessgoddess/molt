@@ -14,8 +14,14 @@
 //! it restarted. The scheme is a type rather than a string, so a lease on
 //! storage cannot be passed where one on the network belongs, and a typo is a
 //! compile error instead of a lookup that finds nothing.
+//!
+//! A publication also names the core that answers it. Cores share nothing, so
+//! reaching a service is reaching the core that owns it, and a client that
+//! learns the name without the core would have to ask somebody else where to
+//! send — which is the shared table this design is spent avoiding.
 
 use crate::capability::{Capability, CapabilityError, CapabilityRights, CapabilityTable, CellId};
+use crate::cpu::CpuId;
 
 /// A kind of service, named by a type rather than by a path.
 ///
@@ -46,7 +52,13 @@ pub enum RegistryError {
 /// is [`CapabilityTable::delegate`], which the generation check that ends a
 /// lease already backs.
 pub struct Registry<S: Scheme, const N: usize> {
-    published: CapabilityTable<S::Endpoint, N>,
+    published: CapabilityTable<Published<S::Endpoint>, N>,
+}
+
+/// An endpoint and the core it is served on.
+struct Published<E> {
+    cpu: CpuId,
+    endpoint: E,
 }
 
 impl<S: Scheme, const N: usize> Registry<S, N> {
@@ -54,16 +66,19 @@ impl<S: Scheme, const N: usize> Registry<S, N> {
         Self { published: CapabilityTable::new() }
     }
 
-    /// Offers `endpoint` on `provider`'s behalf.
+    /// Offers `endpoint`, served on `cpu`, on `provider`'s behalf.
     ///
     /// The capability returned is the publication itself, so a provider that
     /// keeps it can reach its own endpoint without acquiring one.
     pub fn publish(
         &mut self,
         provider: CellId,
+        cpu: CpuId,
         endpoint: S::Endpoint,
     ) -> Result<Capability<S>, RegistryError> {
-        self.published.insert::<S>(provider, endpoint).map_err(|_| RegistryError::Full)
+        self.published
+            .insert::<S>(provider, Published { cpu, endpoint })
+            .map_err(|_| RegistryError::Full)
     }
 
     /// Names the endpoint that answers for this scheme.
@@ -77,7 +92,15 @@ impl<S: Scheme, const N: usize> Registry<S, N> {
 
     /// What a lease names, while it still names anything.
     pub fn endpoint(&self, lease: Capability<S>) -> Result<&S::Endpoint, CapabilityError> {
-        self.published.get(lease)
+        self.published.get(lease).map(|published| &published.endpoint)
+    }
+
+    /// Which core answers this lease.
+    ///
+    /// The client sends there instead of calling: the endpoint belongs to that
+    /// core's executor, and reaching it from another one is a message.
+    pub fn home(&self, lease: Capability<S>) -> Result<CpuId, CapabilityError> {
+        self.published.get(lease).map(|published| published.cpu)
     }
 
     /// Withdraws what `provider` published, leaving every lease on it stale.
