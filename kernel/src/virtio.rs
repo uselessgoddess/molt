@@ -6,6 +6,8 @@ use molt_kernel::report;
 use molt_pci::{Bus, Command, bus_span};
 use molt_virtio::{Block, Transport};
 
+use crate::device;
+
 /// QEMU's modern virtio-blk-pci function (`disable-legacy=on`).
 const VIRTIO_VENDOR: u16 = 0x1af4;
 const VIRTIO_BLOCK: u16 = 0x1042;
@@ -48,27 +50,23 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
         transport.notify().bar() == bar_index && transport.device().bar() == bar_index,
         "virtio structures split across BARs",
     );
+    let capability = function.msix().expect("virtio-blk exposes MSI-X");
+    let table_bar = capability.table_bar();
+    let (bar, registers) = device::map_bar(platform, &inventory, &mut function, bar_index);
+    let (table_bar, table_mapping) = if table_bar == bar_index {
+        (bar, None)
+    } else {
+        let (table_bar, mapping) = device::map_bar(platform, &inventory, &mut function, table_bar);
+        (table_bar, Some(mapping))
+    };
 
-    let bar =
-        function.bar(bar_index).expect("a readable BAR").expect("the BAR the transport named");
-    let span = bar.span().expect("a frame-aligned BAR span");
-    let device = inventory.device(span).expect("a BAR outside the kernel's RAM");
-    let registers = platform.map_device(device, Rights::READ_WRITE).expect("a mappable BAR");
-    let delta = bar.base() - span.start();
-
-    let common = registers
-        .subwindow(delta + transport.common().offset() as u64, transport.common().length() as u64)
-        .expect("the common structure inside the BAR");
-    let notify = registers
-        .subwindow(delta + transport.notify().offset() as u64, transport.notify().length() as u64)
-        .expect("the notify structure inside the BAR");
-    let config = registers
-        .subwindow(delta + transport.device().offset() as u64, transport.device().length() as u64)
-        .expect("the device-configuration structure inside the BAR");
-
+    // `INTX_DISABLE` goes on with the rest: a function left free to assert a
+    // pin interrupt as well would deliver the same queue twice.
     let command = function.command().expect("the command register");
     function
-        .set_command(command.with(Command::MEMORY).with(Command::BUS_MASTER))
+        .set_command(
+            command.with(Command::MEMORY).with(Command::BUS_MASTER).with(Command::INTX_DISABLE),
+        )
         .expect("a writable command register");
     report!(
         platform,
@@ -79,18 +77,36 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
         bar.base(),
     );
 
+    let table = table_mapping.as_ref().unwrap_or(&registers);
+    let vectored = device::route(platform, &function, capability, table, device::delta(table_bar));
+    let delta = device::delta(bar);
+    let common = device::subwindow(&registers, delta, transport.common());
+    let notify = device::subwindow(&registers, delta, transport.notify());
+    let config = device::subwindow(&registers, delta, transport.device());
+
     let mut allocator = FrameAllocator::resume(boot_info.memory_map(), cursor);
     let mut slots: [Option<Owner>; DMA_FRAMES] = [None; DMA_FRAMES];
     let arena = Arena::claim(&mut allocator, offset, BLOCK_TAG, &mut slots)
         .expect("contiguous device frames past the kernel's own");
 
-    let mut block = Block::start(common, notify, config, transport.notify_multiplier(), arena)
-        .expect("the device completes its handshake");
+    let mut block = Block::start(
+        common,
+        notify,
+        config,
+        transport.notify_multiplier(),
+        vectored.index(),
+        vectored.line(),
+        arena,
+    )
+    .expect("the device completes its handshake");
 
     let mut sector = [0u8; SECTOR];
     block.read(0, &mut sector).expect("sector zero reads back");
     assert_eq!(&sector[..SIGNATURE.len()], &SIGNATURE, "sector zero holds no volume signature");
     report!(platform, "MOLT_BLOCK_OK: sector zero carries the volume signature");
+    // The driver has no used-ring poll left: a read that returned at all
+    // returned because the queue's vector fired and the line counted it.
+    report!(platform, "MOLT_BLK_IRQ_OK: queue zero answered on vector {}", vectored.index());
 
     // The cells init starts borrow the driver, so the device is still this
     // function's to stop afterwards.
@@ -98,4 +114,5 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
 
     block.reset().expect("the device stops and its frames return");
     report!(platform, "MOLT_VIRTIO_RESET_OK: device stopped and frames reclaimed");
+    vectored.stop(platform);
 }

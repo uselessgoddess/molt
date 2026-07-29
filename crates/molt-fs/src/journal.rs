@@ -640,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn power_loss_mounts_old_or_new() {
+    fn power_loss_mounts_old_or_new() -> Result<(), FsError> {
         let mut baseline = image();
         assert_eq!(commit_file(&mut baseline, "first", b"first"), 2);
 
@@ -649,8 +649,8 @@ mod tests {
             let mut stable = baseline.clone();
             let mut volatile = alloc::vec![0; stable.len()];
             let outcome = {
-                let device = Fault::new(&mut stable, &mut volatile).unwrap().cut_after(cut);
-                let mut journal = Journal::mount(device).unwrap();
+                let device = Fault::new(&mut stable, &mut volatile)?.cut_after(cut);
+                let mut journal = Journal::mount(device)?;
                 (|| {
                     let object = journal.create(journal.root(), name("second"), Kind::File)?;
                     journal.write(object, 0, b"second")?;
@@ -676,34 +676,37 @@ mod tests {
             Some(11),
             "copy, records, COW paths, log/tree flush, root swing, checkpoint flush"
         );
+        Ok(())
     }
 
     #[test]
-    fn bad_log_falls_back() {
+    fn bad_log_falls_back() -> Result<(), FsError> {
         let mut bytes = image();
         assert_eq!(commit_file(&mut bytes, "first", b"first"), 2);
 
-        let active = crate::layout::Super::parse(&bytes[BLOCK..2 * BLOCK]).unwrap();
+        let active = crate::layout::Super::parse(&bytes[BLOCK..2 * BLOCK])?;
         let log = active.region(crate::layout::Area::Log);
         bytes[log.at as usize * BLOCK] ^= 1;
-        let mut journal = Journal::mount(Loopback::new(&bytes).unwrap()).unwrap();
+        let mut journal = Journal::mount(Loopback::new(&bytes)?)?;
 
         assert_eq!(journal.generation(), 1);
         assert_eq!(journal.lookup(journal.root(), &name("first")), Err(FsError::Missing));
+        Ok(())
     }
 
     #[test]
-    fn bad_tree_falls_back() {
+    fn bad_tree_falls_back() -> Result<(), FsError> {
         let mut bytes = image();
         assert_eq!(commit_file(&mut bytes, "first", b"first"), 2);
         assert_eq!(commit_file(&mut bytes, "second", b"second"), 3);
 
-        let left = crate::layout::Super::parse(&bytes[..BLOCK]).unwrap();
-        let right = crate::layout::Super::parse(&bytes[BLOCK..2 * BLOCK]).unwrap();
+        let left = crate::layout::Super::parse(&bytes[..BLOCK])?;
+        let right = crate::layout::Super::parse(&bytes[BLOCK..2 * BLOCK])?;
         let active = if left.generation > right.generation { left } else { right };
         bytes[active.tree_root as usize * BLOCK] ^= 1;
 
         assert_checkpoint(&bytes, 2);
+        Ok(())
     }
 
     #[test]

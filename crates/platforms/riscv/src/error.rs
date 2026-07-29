@@ -39,7 +39,7 @@ mod tests {
     use super::SbiError;
 
     #[test]
-    fn success_is_not_an_error() {
+    fn success_is_not_error() {
         assert_eq!(SbiError::from_code(0), None);
     }
 

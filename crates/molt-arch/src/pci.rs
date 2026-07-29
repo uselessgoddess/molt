@@ -55,13 +55,14 @@ mod tests {
     use crate::memory::Error;
 
     #[test]
-    fn span_covers_every_reported_bus() {
-        let space = ConfigSpace::new(0xb000_0000, 0, 0, 0xff).expect("firmware bus range");
+    fn span_covers_every_reported_bus() -> Result<(), Error> {
+        let space = ConfigSpace::new(0xb000_0000, 0, 0, 0xff)?;
 
-        let span = space.span().expect("aligned ECAM span");
+        let span = space.span()?;
 
         assert_eq!(span.start(), 0xb000_0000);
         assert_eq!(span.bytes(), 256 * BUS_STRIDE);
+        Ok(())
     }
 
     #[test]

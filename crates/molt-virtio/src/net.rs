@@ -4,6 +4,9 @@
 //! the platform routes its MSI-X entry, an interrupt consumer drains
 //! [`receive`](Net::receive); each used buffer is republished before its frame
 //! is returned. No receive path polls the device.
+//!
+//! Both directions stage a queue's worth of frames, so a sender does not wait
+//! on the device to retire the frame before it.
 
 use molt_arch::Mmio;
 use molt_arch::dma::{Arena, Region};
@@ -29,7 +32,8 @@ const REQUIRED_FEATURES: u64 = VIRTIO_NET_F_MAC | VIRTIO_NET_F_MRG_RXBUF;
 /// The modern VirtIO network header includes `num_buffers`.
 const HEADER: usize = 12;
 const FRAME: usize = 1514;
-const RECEIVE_BUFFER: usize = HEADER + FRAME;
+/// One staged frame in either direction: a header and the frame behind it.
+const BUFFER: usize = HEADER + FRAME;
 const CONFIG_SPINS: u32 = 16;
 
 struct Receive {
@@ -40,7 +44,7 @@ struct Receive {
 
 impl Receive {
     fn new(queue: Queue, buffers: Region) -> Result<Self, VirtioError> {
-        if buffers.len() < queue.size() as u64 * RECEIVE_BUFFER as u64 {
+        if buffers.len() < queue.size() as u64 * BUFFER as u64 {
             return Err(VirtioError::Device);
         }
         let mut receive = Self { queue, buffers, heads: [None; MAX_SIZE as usize] };
@@ -51,8 +55,8 @@ impl Receive {
     }
 
     fn post(&mut self, slot: u16) -> Result<(), VirtioError> {
-        let offset = slot as u64 * RECEIVE_BUFFER as u64;
-        let segment = Segment::writable(self.buffers.physical() + offset, RECEIVE_BUFFER as u32);
+        let offset = slot as u64 * BUFFER as u64;
+        let segment = Segment::writable(self.buffers.physical() + offset, BUFFER as u32);
         let head = self.queue.push(&[segment])?;
         let mapped = self.heads.get_mut(head as usize).ok_or(VirtioError::Device)?;
         if mapped.replace(slot).is_some() {
@@ -72,14 +76,14 @@ impl Receive {
             .ok_or(VirtioError::Device)?;
         let written = used.written() as usize;
         let result = (|| {
-            if !(HEADER..=RECEIVE_BUFFER).contains(&written) {
+            if !(HEADER..=BUFFER).contains(&written) {
                 return Err(VirtioError::Device);
             }
             let len = written - HEADER;
             if len > frame.len() {
                 return Err(VirtioError::Full);
             }
-            let offset = slot as u64 * RECEIVE_BUFFER as u64;
+            let offset = slot as u64 * BUFFER as u64;
             self.validate_header(offset)?;
             self.buffers.read_into(offset + HEADER as u64, &mut frame[..len])?;
             Ok(Some(len))
@@ -105,14 +109,67 @@ impl Receive {
     }
 }
 
-/// A VirtIO network device with preposted RX buffers and one in-flight TX.
+struct Transmit {
+    queue: Queue,
+    buffers: Region,
+    heads: [Option<u16>; MAX_SIZE as usize],
+    /// The staging slots no frame is in flight from, one bit each.
+    free: u16,
+}
+
+impl Transmit {
+    fn new(queue: Queue, buffers: Region) -> Result<Self, VirtioError> {
+        if buffers.len() < queue.size() as u64 * BUFFER as u64 {
+            return Err(VirtioError::Device);
+        }
+        let free = (1 << queue.size()) - 1;
+        Ok(Self { queue, buffers, heads: [None; MAX_SIZE as usize], free })
+    }
+
+    /// Copies `frame` into a free slot and hands the device the slot.
+    fn stage(&mut self, frame: &[u8]) -> Result<(), VirtioError> {
+        self.reap()?;
+        let slot = self.free.trailing_zeros() as u16;
+        if slot >= self.queue.size() {
+            return Err(VirtioError::Full);
+        }
+        let offset = slot as u64 * BUFFER as u64;
+        self.buffers.write_from(offset, &[0; HEADER])?;
+        self.buffers.write_from(offset + HEADER as u64, frame)?;
+        let len = u32::try_from(HEADER + frame.len()).map_err(|_| VirtioError::Device)?;
+        let head = self.queue.push(&[Segment::readable(self.buffers.physical() + offset, len)])?;
+        let mapped = self.heads.get_mut(head as usize).ok_or(VirtioError::Device)?;
+        if mapped.replace(slot).is_some() {
+            return Err(VirtioError::Device);
+        }
+        self.free &= !(1 << slot);
+        Ok(())
+    }
+
+    /// Frees every slot the device has finished reading.
+    fn reap(&mut self) -> Result<(), VirtioError> {
+        while let Some(used) = self.queue.pop()? {
+            let slot = self
+                .heads
+                .get_mut(used.head() as usize)
+                .and_then(Option::take)
+                .ok_or(VirtioError::Device)?;
+            self.free |= 1 << slot;
+        }
+        Ok(())
+    }
+
+    fn regions(self) -> impl Iterator<Item = Region> {
+        self.queue.regions().into_iter().chain([self.buffers])
+    }
+}
+
+/// A VirtIO network device with preposted RX buffers and a staged TX ring.
 pub struct Net<'slots, 'window> {
     common: Common<'window>,
     notify: Notify<'window>,
     receive: Receive,
-    transmit: Queue,
-    transmit_buffer: Region,
-    transmit_head: Option<u16>,
+    transmit: Transmit,
     arena: Arena<'slots>,
     receive_notify: u16,
     transmit_notify: u16,
@@ -142,29 +199,20 @@ impl<'slots, 'window> Net<'slots, 'window> {
 
         let (receive_queue, receive_notify) =
             queue(&mut common, &mut arena, RECEIVE_QUEUE, vector)?;
-        let receive_buffers = arena.region(receive_queue.size() as u64 * RECEIVE_BUFFER as u64)?;
+        let receive_buffers = arena.region(receive_queue.size() as u64 * BUFFER as u64)?;
         let receive = Receive::new(receive_queue, receive_buffers)?;
 
-        let (transmit, transmit_notify) = queue(&mut common, &mut arena, TRANSMIT_QUEUE, vector)?;
-        let transmit_buffer = arena.region(RECEIVE_BUFFER as u64)?;
+        let (transmit_queue, transmit_notify) =
+            queue(&mut common, &mut arena, TRANSMIT_QUEUE, vector)?;
+        let transmit_buffers = arena.region(transmit_queue.size() as u64 * BUFFER as u64)?;
+        let transmit = Transmit::new(transmit_queue, transmit_buffers)?;
 
         // RX descriptors are visible before the device begins running.
         common.add_status(status::DRIVER_OK)?;
         let notify = Notify::new(notify, notify_multiplier);
         notify.signal(RECEIVE_QUEUE, receive_notify)?;
 
-        Ok(Self {
-            common,
-            notify,
-            receive,
-            transmit,
-            transmit_buffer,
-            transmit_head: None,
-            arena,
-            receive_notify,
-            transmit_notify,
-            mac,
-        })
+        Ok(Self { common, notify, receive, transmit, arena, receive_notify, transmit_notify, mac })
     }
 
     /// The device-provided Ethernet address negotiated at startup.
@@ -181,25 +229,13 @@ impl<'slots, 'window> Net<'slots, 'window> {
         received
     }
 
-    fn reap_transmit(&mut self) -> Result<(), VirtioError> {
-        let Some(used) = self.transmit.pop()? else {
-            return Ok(());
-        };
-        if self.transmit_head != Some(used.head()) {
-            return Err(VirtioError::Device);
-        }
-        self.transmit_head = None;
-        Ok(())
-    }
-
     /// Stops DMA before returning every queue and buffer frame to its arena.
     pub fn reset(self) -> Result<(), VirtioError> {
-        let Self { mut common, receive, transmit, transmit_buffer, mut arena, .. } = self;
+        let Self { mut common, receive, transmit, mut arena, .. } = self;
         common.reset()?;
         let released = receive
             .regions()
             .chain(transmit.regions())
-            .chain([transmit_buffer])
             .try_for_each(|region| arena.release(region));
         arena.reset();
         Ok(released?)
@@ -208,23 +244,18 @@ impl<'slots, 'window> Net<'slots, 'window> {
 
 impl Link for Net<'_, '_> {
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
-        self.reap_transmit().map_err(|_| LinkError::Device)?;
-        if self.transmit_head.is_some() {
-            return Err(LinkError::Busy);
-        }
         if frame.len() > FRAME {
             return Err(LinkError::Device);
         }
-        self.transmit_buffer.write_from(0, &[0; HEADER]).map_err(|_| LinkError::Device)?;
-        self.transmit_buffer.write_from(HEADER as u64, frame).map_err(|_| LinkError::Device)?;
-        let len = u32::try_from(HEADER + frame.len()).map_err(|_| LinkError::Device)?;
-        let segment = Segment::readable(self.transmit_buffer.physical(), len);
-        let head = self.transmit.push(&[segment]).map_err(|error| match error {
+        self.transmit.stage(frame).map_err(|error| match error {
             VirtioError::Full => LinkError::Busy,
             _ => LinkError::Device,
         })?;
-        self.transmit_head = Some(head);
         self.notify.signal(TRANSMIT_QUEUE, self.transmit_notify).map_err(|_| LinkError::Device)
+    }
+
+    fn receive(&mut self, frame: &mut [u8]) -> Result<Option<usize>, LinkError> {
+        Net::receive(self, frame).map_err(|_| LinkError::Device)
     }
 }
 
@@ -288,7 +319,7 @@ mod tests {
     use molt_arch::dma::Region;
 
     use super::{
-        HEADER, RECEIVE_BUFFER, REQUIRED_FEATURES, Receive, VIRTIO_NET_F_MAC, require_features,
+        BUFFER, HEADER, REQUIRED_FEATURES, Receive, Transmit, VIRTIO_NET_F_MAC, require_features,
     };
     use crate::VirtioError;
     use crate::queue::{Queue, device_bytes, driver_bytes};
@@ -298,21 +329,25 @@ mod tests {
         unsafe { Region::new(bytes.as_mut_ptr(), physical, bytes.len() as u64) }
     }
 
-    #[test]
-    fn receive_reposts_completed_buffer() {
-        let mut descriptors = [0u8; 128];
-        let mut driver = [0u8; 32];
-        let mut device = [0u8; 72];
-        let queue = Queue::new(
+    fn queue(descriptors: &mut [u8; 128], driver: &mut [u8; 32], device: &mut [u8; 72]) -> Queue {
+        Queue::new(
             8,
-            region(&mut descriptors, 0x1000),
+            region(descriptors, 0x1000),
             region(&mut driver[..driver_bytes(8) as usize], 0x2000),
             region(&mut device[..device_bytes(8) as usize], 0x3000),
         )
-        .expect("an eight-slot receive queue");
-        let mut storage = [0u8; RECEIVE_BUFFER * 8];
+        .unwrap()
+    }
+
+    #[test]
+    fn receive_reposts_completed_buffer() -> Result<(), VirtioError> {
+        let mut descriptors = [0u8; 128];
+        let mut driver = [0u8; 32];
+        let mut device = [0u8; 72];
+        let queue = queue(&mut descriptors, &mut driver, &mut device);
+        let mut storage = [0u8; BUFFER * 8];
         let buffers = region(&mut storage, 0x4000);
-        let mut receive = Receive::new(queue, buffers).expect("eight preposted buffers");
+        let mut receive = Receive::new(queue, buffers)?;
         storage[10..12].copy_from_slice(&1u16.to_le_bytes());
         storage[HEADER..HEADER + 4].copy_from_slice(b"ping");
         device[4..8].copy_from_slice(&0u32.to_le_bytes());
@@ -324,6 +359,29 @@ mod tests {
         assert_eq!(&frame[..4], b"ping");
         assert_eq!(&driver[2..4], &9u16.to_le_bytes(), "RX buffer was not republished");
         assert_eq!(receive.queue.available(), 0, "RX queue lost a descriptor");
+        Ok(())
+    }
+
+    /// A stream writes back to back, so a frame must not wait on the one
+    /// before it: staging the whole queue may not drop any of it.
+    #[test]
+    fn transmit_stages_whole_queue() -> Result<(), VirtioError> {
+        let mut descriptors = [0u8; 128];
+        let mut driver = [0u8; 32];
+        let mut device = [0u8; 72];
+        let queue = queue(&mut descriptors, &mut driver, &mut device);
+        let mut storage = [0u8; BUFFER * 8];
+        let mut transmit = Transmit::new(queue, region(&mut storage, 0x4000))?;
+
+        for slot in 0..8u8 {
+            transmit.stage(&[slot; 4])?;
+        }
+        assert_eq!(transmit.stage(b"molt"), Err(VirtioError::Full), "a ninth frame fit");
+        for slot in 0..8usize {
+            let at = slot * BUFFER + HEADER;
+            assert_eq!(&storage[at..at + 4], &[slot as u8; 4], "slot {slot} was not staged");
+        }
+        Ok(())
     }
 
     #[test]

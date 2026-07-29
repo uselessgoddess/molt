@@ -226,19 +226,20 @@ mod tests {
     }
 
     #[test]
-    fn arrival_before_the_wait_is_not_lost() {
+    fn arrival_before_wait_is_kept() -> Result<(), InterruptError> {
         let slab = InterruptSlab::<2>::new();
-        let token = slab.bind(0).expect("a free line");
+        let token = slab.bind(0)?;
 
         slab.raise(0);
 
         assert_eq!(pin!(slab.wait(token)).poll(&mut context()), Poll::Ready(Ok(1)));
+        Ok(())
     }
 
     #[test]
-    fn arrivals_coalesce_into_one_wakeup() {
+    fn arrivals_coalesce_into_one_wakeup() -> Result<(), InterruptError> {
         let slab = InterruptSlab::<2>::new();
-        let token = slab.bind(1).expect("a free line");
+        let token = slab.bind(1)?;
 
         slab.raise(1);
         slab.raise(1);
@@ -246,42 +247,46 @@ mod tests {
 
         assert_eq!(slab.arrivals(token), Ok(3));
         assert_eq!(slab.arrivals(token), Ok(0), "arrivals were reported twice");
+        Ok(())
     }
 
     #[test]
-    fn line_one_owner() {
+    fn line_one_owner() -> Result<(), InterruptError> {
         let slab = InterruptSlab::<1>::new();
-        let token = slab.bind(0).expect("a free line");
+        let token = slab.bind(0)?;
 
         assert_eq!(slab.bind(0), Err(InterruptError::Bound));
 
-        slab.release(token).expect("the line this token bound");
+        slab.release(token)?;
         assert!(slab.bind(0).is_ok(), "a released line stayed bound");
+        Ok(())
     }
 
     #[test]
-    fn released_token_reads_nothing() {
+    fn released_token_reads_nothing() -> Result<(), InterruptError> {
         let slab = InterruptSlab::<1>::new();
-        let token = slab.bind(0).expect("a free line");
-        slab.release(token).expect("the line this token bound");
+        let token = slab.bind(0)?;
+        slab.release(token)?;
 
         slab.raise(0);
 
         assert_eq!(slab.arrivals(token), Err(InterruptError::Stale));
         assert_eq!(slab.release(token), Err(InterruptError::Stale));
+        Ok(())
     }
 
     #[test]
-    fn rebound_line_starts_level() {
+    fn rebound_line_starts_level() -> Result<(), InterruptError> {
         let slab = InterruptSlab::<1>::new();
-        let stale = slab.bind(0).expect("a free line");
+        let stale = slab.bind(0)?;
         slab.raise(0);
-        slab.release(stale).expect("the line this token bound");
+        slab.release(stale)?;
 
-        let token = slab.bind(0).expect("the released line");
+        let token = slab.bind(0)?;
 
         assert_eq!(slab.arrivals(token), Ok(0), "the new owner inherited a backlog");
         assert_eq!(pin!(slab.wait(token)).poll(&mut context()), Poll::Pending);
+        Ok(())
     }
 
     #[test]
@@ -310,7 +315,7 @@ mod loom_tests {
     fn race_delivers_arrival() {
         loom::model(|| {
             let slab = Arc::new(InterruptSlab::<1>::new());
-            let token = slab.bind(0).expect("a free line");
+            let token = slab.bind(0).unwrap();
             let flag = Flag::new();
             let waker = Waker::from(flag.clone());
 

@@ -8,8 +8,10 @@ mod op;
 mod service;
 mod wire;
 
+pub use molt_net::addr::Endpoint;
+
 pub use crate::cell::{UdpCell, UdpState};
 pub use crate::error::UdpError;
 pub use crate::op::{Socket, UdpDone, UdpOp};
 pub use crate::service::{Scratch, Udp};
-pub use crate::wire::{Datagram, Endpoint};
+pub use crate::wire::{Datagram, PROTOCOL};

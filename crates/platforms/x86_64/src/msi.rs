@@ -133,8 +133,8 @@ mod tests {
 
     #[test]
     fn hands_out_each_vector_once_reuses_released() {
-        let first = claim().expect("an empty bank");
-        let second = claim().expect("a bank with room");
+        let first = claim().unwrap();
+        let second = claim().unwrap();
         assert_ne!(first, second, "one vector was handed to two owners");
 
         assert_eq!(release(first), Ok(()));

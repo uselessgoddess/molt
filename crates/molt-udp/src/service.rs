@@ -392,7 +392,13 @@ impl<const N: usize, const Q: usize> Udp<N, Q> {
 
     fn arm_ip<const I: usize>(&mut self, ip: &mut IoClient<'_, IpOp, Result<IpDone, IpError>, I>) {
         if self.endpoint.is_none() && !self.bind_inflight {
-            if ip.try_submit(Submission::new(BIND_ID, IpOp::Bind { protocol: 17 })).is_ok() {
+            if ip
+                .try_submit(Submission::new(
+                    BIND_ID,
+                    IpOp::Bind { protocol: crate::wire::PROTOCOL },
+                ))
+                .is_ok()
+            {
                 self.bind_inflight = true;
             }
             return;

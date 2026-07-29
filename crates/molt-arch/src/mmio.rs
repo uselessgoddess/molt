@@ -175,17 +175,18 @@ mod tests {
     }
 
     #[test]
-    fn write_reaches_the_register() {
+    fn write_reaches_register() -> Result<(), MmioError> {
         let mut registers = [0u8; 16];
         let mmio = window(&mut registers);
 
-        mmio.write_u32(4, 0xdead_beef).expect("aligned write inside the window");
+        mmio.write_u32(4, 0xdead_beef)?;
 
         assert_eq!(mmio.read_u32(4), Ok(0xdead_beef));
+        Ok(())
     }
 
     #[test]
-    fn access_past_the_end_is_refused() {
+    fn access_past_end_refused() {
         let mut registers = [0u8; 16];
         let mmio = window(&mut registers);
 
@@ -203,16 +204,17 @@ mod tests {
     }
 
     #[test]
-    fn subwindow_rebases_offsets() {
+    fn subwindow_rebases_offsets() -> Result<(), MmioError> {
         let mut registers = [0u8; 16];
         let mmio = window(&mut registers);
-        let inner = mmio.subwindow(8, 8).expect("the upper half of the window");
+        let inner = mmio.subwindow(8, 8)?;
 
-        inner.write_u32(0, 0x0102_0304).expect("aligned write inside the subwindow");
+        inner.write_u32(0, 0x0102_0304)?;
 
         assert_eq!(mmio.read_u32(8), Ok(0x0102_0304));
         assert_eq!(inner.len(), 8);
         assert_eq!(inner.read_u32(8), Err(MmioError::Range));
+        Ok(())
     }
 
     #[test]

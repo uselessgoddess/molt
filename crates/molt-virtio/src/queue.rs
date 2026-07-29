@@ -278,6 +278,7 @@ mod tests {
     use molt_arch::dma::Region;
 
     use super::{Queue, Segment, Used, device_bytes, driver_bytes};
+    use crate::VirtioError;
 
     /// A region over a plain buffer, addressed at a fake physical base.
     fn region(bytes: &mut [u8], physical: u64) -> Region {
@@ -288,50 +289,49 @@ mod tests {
 
     fn queue(descriptors: &mut [u8], driver: &mut [u8], device: &mut [u8]) -> Queue {
         Queue::new(4, region(descriptors, 0x1000), region(driver, 0x2000), region(device, 0x3000))
-            .expect("a legal four-slot queue")
+            .unwrap()
     }
 
     #[test]
-    fn push_chain_segments_and_publish_head() {
+    fn push_chain_segments_and_publish_head() -> Result<(), VirtioError> {
         let (mut d, mut a, mut u) = ([0u8; 64], [0u8; 16], [0u8; 64]);
         let mut queue = queue(&mut d, &mut a, &mut u);
 
-        let head = queue
-            .push(&[Segment::readable(0xaa00, 16), Segment::writable(0xbb00, 512)])
-            .expect("room for a two-segment chain");
+        let head = queue.push(&[Segment::readable(0xaa00, 16), Segment::writable(0xbb00, 512)])?;
 
         assert_eq!(head, 0);
         assert_eq!(&d[12..14], &1u16.to_le_bytes(), "head lacked the NEXT flag");
         assert_eq!(&d[16 + 12..16 + 14], &2u16.to_le_bytes(), "tail was not device-writable");
         assert_eq!(&a[2..4], &1u16.to_le_bytes(), "available index did not advance");
+        Ok(())
     }
 
     #[test]
-    fn full_queue_refuses_next_chain() {
+    fn full_queue_refuses_next_chain() -> Result<(), VirtioError> {
         let (mut d, mut a, mut u) = ([0u8; 64], [0u8; 16], [0u8; 64]);
         let mut queue = queue(&mut d, &mut a, &mut u);
 
         for _ in 0..4 {
-            queue.push(&[Segment::readable(0, 8)]).expect("a free descriptor");
+            queue.push(&[Segment::readable(0, 8)])?;
         }
 
         assert_eq!(queue.push(&[Segment::readable(0, 8)]).err(), Some(super::VirtioError::Full));
+        Ok(())
     }
 
     #[test]
-    fn pop_free_descriptors() {
+    fn pop_free_descriptors() -> Result<(), VirtioError> {
         let (mut d, mut a, mut u) = ([0u8; 64], [0u8; 16], [0u8; 64]);
         let mut queue = queue(&mut d, &mut a, &mut u);
-        let head = queue
-            .push(&[Segment::readable(0xaa00, 16), Segment::writable(0xbb00, 512)])
-            .expect("room for a two-segment chain");
+        let head = queue.push(&[Segment::readable(0xaa00, 16), Segment::writable(0xbb00, 512)])?;
 
-        queue.device.write_u32(4, head as u32).expect("the used ring's first element");
-        queue.device.write_u32(8, 512).expect("the element's written length");
-        queue.device.write_u16(2, 1).expect("the used index");
+        queue.device.write_u32(4, head as u32)?;
+        queue.device.write_u32(8, 512)?;
+        queue.device.write_u16(2, 1)?;
 
         assert_eq!(queue.pop(), Ok(Some(Used { head: 0, len: 512 })));
         assert_eq!(queue.available(), 4, "the completed chain was not reclaimed");
+        Ok(())
     }
 
     #[test]
