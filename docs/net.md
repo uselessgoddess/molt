@@ -105,7 +105,9 @@ MSI-X -> InterruptSlab -> VirtIO RX queue -> molt-net IP ring -> molt-udp ring
    modern transport, a stable MAC address, and the complete receive-header
    format. It gives RX queue zero and TX queue one a shared MSI-X table entry,
    fills every receive descriptor before `DRIVER_OK`, and reposts a used
-   receive buffer before returning its frame.
+   receive buffer before returning its frame. Both queues stage a queue's worth
+   of frames: a single TX slot would refuse the segment a stream writes right
+   after the acknowledgement before it, and a refused frame is a lost one.
    No checksum or segmentation offload is negotiated. The merged-buffer format
    is required only to make the modern 12-byte header explicit; because no
    guest segmentation feature is accepted, each 1526-byte buffer holds one
@@ -149,8 +151,10 @@ MSI-X -> InterruptSlab -> VirtIO RX queue -> molt-net IP ring -> molt-udp ring
    sends a v6 datagram whose completion cannot arrive until a solicitation is
    answered and the cache learns the next hop — `MOLT_NDP_OK`. Finally it
    connects to `10.0.2.100:80`, which slirp forwards to `cat`, and requires its
-   own bytes back before `MOLT_TCP_OK`. The clock in all three is counted in
-   polls, since nothing here has a calibrated timer yet.
+   own bytes back before `MOLT_TCP_OK`. Nothing here has a free-running timer
+   yet, so the stream's milliseconds are counted in busy-wait spins: a
+   retransmission timer needs a clock that tracks real time, not one that only
+   moves forward.
 
 ## What is deliberately not here
 

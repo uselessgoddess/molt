@@ -18,7 +18,7 @@ use crate::device::{self, Line};
 
 const VIRTIO_VENDOR: u16 = 0x1af4;
 const VIRTIO_NET: u16 = 0x1041;
-const DMA_FRAMES: usize = 10;
+const DMA_FRAMES: usize = 12;
 const NET_TAG: u32 = 0x6e65_7400;
 const OWNER: CellId = CellId::new(3);
 const LOCAL: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
@@ -30,13 +30,17 @@ const GATEWAY_V6: Ipv6Addr = Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 2);
 const DNS_V6: Ipv6Addr = Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 3);
 const DNS_PORT: u16 = 53;
 const LOCAL_PORT: u16 = 49_152;
-const DELIVERY_SPINS: u32 = 50_000_000;
+/// A busy-wait rate measured under TCG, close enough to time a retransmission.
+const SPINS_PER_MILLI: u32 = 3_000;
+/// How long a round trip is given before the smoke calls it lost.
+const DELIVERY_MILLIS: u32 = 5_000;
+const DELIVERY_SPINS: u32 = DELIVERY_MILLIS * SPINS_PER_MILLI;
+/// How often a stream is driven with nothing arriving, so its timers still run.
+const IDLE_SPINS: u32 = 10 * SPINS_PER_MILLI;
 // Where xtask points slirp's forwarder, which answers with what it was sent.
 const ECHO: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 100);
 const ECHO_PORT: u16 = 80;
 const ECHO_PAYLOAD: [u8; 4] = *b"molt";
-/// How often a stream is driven with nothing arriving, so its timers still run.
-const IDLE_SPINS: u32 = 100_000;
 
 const DNS_QUERY: [u8; 29] = [
     0x4d, 0x4f, // transaction ID
@@ -106,7 +110,7 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let mut allocator = FrameAllocator::resume(boot_info.memory_map(), cursor);
     let mut slots: [Option<Owner>; DMA_FRAMES] = [None; DMA_FRAMES];
     let arena = Arena::claim(&mut allocator, offset, NET_TAG, &mut slots)
-        .expect("ten contiguous network DMA frames");
+        .expect("a contiguous network DMA span");
     let net =
         Net::start(common, notify, config, transport.notify_multiplier(), vectored.index(), arena)
             .expect("the network device completes its handshake");
@@ -236,9 +240,9 @@ fn udp_round_trip(line: &Line, ip: &mut Ip<Net<'_, '_>, 4>, dns: IpAddr) -> Opti
 
 /// Opens a stream to slirp's forwarder, writes to it, and reads the echo back.
 ///
-/// Time is counted in polls rather than milliseconds: nothing here has a
-/// calibrated timer yet, and smoltcp asks only that the clock move forward.
-/// Idle polls keep it moving so a delayed acknowledgement still leaves.
+/// Milliseconds are counted in spins: nothing here has a free-running timer
+/// yet, and a retransmission timer only needs a clock tracking real time
+/// closely enough to fire once. Idle polls keep it moving.
 fn tcp_echo<L: Link>(line: &Line, link: L, config: Config) -> (L, usize) {
     let mut source = ECHO_PAYLOAD;
     let mut target = [0u8; 16];
@@ -257,7 +261,7 @@ fn tcp_echo<L: Link>(line: &Line, link: L, config: Config) -> (L, usize) {
         .expect("room for a TCP connect");
 
     let mut stream = None;
-    let (mut seen, mut spins, mut clock, mut submitted) = (line.arrivals(), 0, 0, true);
+    let (mut seen, mut spins, mut submitted) = (line.arrivals(), 0u32, true);
     loop {
         spins += 1;
         assert!(spins < DELIVERY_SPINS, "the echo stream never came back");
@@ -266,8 +270,8 @@ fn tcp_echo<L: Link>(line: &Line, link: L, config: Config) -> (L, usize) {
             core::hint::spin_loop();
             continue;
         }
-        (seen, submitted, clock) = (arrivals, false, clock + 1);
-        tcp.serve(OWNER, clock, &mut driver, &mut buffers);
+        (seen, submitted) = (arrivals, false);
+        tcp.serve(OWNER, (spins / SPINS_PER_MILLI) as u64, &mut driver, &mut buffers);
 
         while let Some(completion) = client.try_completion() {
             match completion.into_result() {
