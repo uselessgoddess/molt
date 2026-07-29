@@ -179,6 +179,7 @@ mod tests {
     use molt_core::buffer::BufferRegistry;
     use molt_core::capability::{CapabilityError, CellId};
     use molt_core::cell::{RestartHooks, Supervisor};
+    use molt_core::cpu::CpuId;
     use molt_core::registry::Registry;
     use molt_core::ring::{IoRing, RequestId, Submission};
 
@@ -206,7 +207,7 @@ mod tests {
         let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes)?)?;
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
         let (mut client, mut driver) = ring.split();
-        let root = fs.publish(&mut names.borrow_mut(), SERVICE)?;
+        let root = fs.publish(&mut names.borrow_mut(), SERVICE, CpuId::BOOT)?;
         let root = names.borrow().endpoint(root)?.root();
         let op = FsOp::Entry { dir: root, index: 0 };
         client.try_submit(Submission::new(RequestId::new(7), op)).unwrap();
@@ -230,7 +231,7 @@ mod tests {
         let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes)?)?;
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
         let (_client, mut driver) = ring.split();
-        fs.publish(&mut names.borrow_mut(), SERVICE)?;
+        fs.publish(&mut names.borrow_mut(), SERVICE, CpuId::BOOT)?;
         let lease = names.borrow().acquire().unwrap();
 
         let mut hooks = Teardown::new(&mut driver, &names, SERVICE);
@@ -248,11 +249,11 @@ mod tests {
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
         let (_client, mut driver) = ring.split();
         let mut service = Supervisor::<FsCell<_, 4>>::new(Loopback::new(&bytes)?)?;
-        service.cell_mut().fs()?.publish(&mut names.borrow_mut(), SERVICE)?;
+        service.cell_mut().fs()?.publish(&mut names.borrow_mut(), SERVICE, CpuId::BOOT)?;
         let lease = names.borrow().acquire().unwrap();
 
         service.restart(&mut Teardown::new(&mut driver, &names, SERVICE))?;
-        service.cell_mut().fs()?.publish(&mut names.borrow_mut(), SERVICE)?;
+        service.cell_mut().fs()?.publish(&mut names.borrow_mut(), SERVICE, CpuId::BOOT)?;
 
         assert_eq!(names.borrow().endpoint(lease), Err(CapabilityError::Stale), "a lease survived");
         let fresh = names.borrow().acquire().unwrap();
@@ -268,7 +269,7 @@ mod tests {
         let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes)?)?;
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
         let (_client, mut driver) = ring.split();
-        let publication = fs.publish(&mut names.borrow_mut(), SERVICE)?;
+        let publication = fs.publish(&mut names.borrow_mut(), SERVICE, CpuId::BOOT)?;
         let root = names.borrow().endpoint(publication)?.root();
         let name = Name::try_from("docs")?;
         fs.apply(CLIENT, FsOp::Open { dir: root, name }, &mut buffers)?;

@@ -37,6 +37,10 @@ const DEVICE_REGION_END: u64 = DEVICE_REGION + (1 << 30);
 /// How many page-table frames are set aside for device mappings.
 const DEVICE_TABLE_FRAMES: usize = 32;
 
+/// How far up an application processor's first instruction may live: a core
+/// coming out of reset starts at `vector << 12`, and the vector is one byte.
+const TRAMPOLINE_LIMIT: u64 = 1 << 20;
+
 type TableFrames = molt_arch::FramePool<DEVICE_TABLE_FRAMES>;
 
 /// Declared ranges: the image, two boot windows, the APIC, and one entry per
@@ -53,6 +57,50 @@ struct Space {
     /// The next free device address; bumps forward and never back, so a window
     /// is never re-issued at an address a previous one used to hold.
     devices: u64,
+    /// The low frame reserved for starting the other cores, if there was one.
+    trampoline: Option<u64>,
+}
+
+/// The frame an application processor's first instruction runs from.
+///
+/// Identity-mapped as well as direct-mapped, because the core reaches it twice:
+/// once in real mode by physical address, and once more with paging on, in the
+/// instruction between loading `CR3` and jumping into the kernel's half of the
+/// address space.
+#[derive(Clone, Copy, Debug)]
+pub struct Trampoline {
+    physical: u64,
+    page: *mut u8,
+    root: u64,
+}
+
+impl Trampoline {
+    /// What a startup interrupt names, which is this frame's number.
+    pub fn physical(&self) -> u64 {
+        self.physical
+    }
+
+    /// Where the boot core writes the frame, through the direct map.
+    pub fn page(&self) -> *mut u8 {
+        self.page
+    }
+
+    /// The tables the core comes up on, already built and live.
+    pub fn root(&self) -> u64 {
+        self.root
+    }
+}
+
+/// The frame set aside for starting cores, or `None` on a machine that left no
+/// usable memory under a megabyte.
+pub fn trampoline() -> Option<Trampoline> {
+    let state = active().ok()?;
+    let physical = state.trampoline?;
+    Some(Trampoline {
+        physical,
+        page: (state.offset + physical) as *mut u8,
+        root: state.root.start_address().as_u64(),
+    })
 }
 
 struct Active(UnsafeCell<Option<Space>>);
@@ -100,7 +148,16 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<u64, PlatformError> {
     let map = boot_info.memory_map();
     let mut frames = X86Frames(BootFrameAllocator::new(map));
 
-    let root = frames.allocate_frame().ok_or(out_of_frames())?;
+    // The lowest usable frame is the only candidate for the trampoline, and it
+    // is taken first so nothing else can be handed it. A machine that left none
+    // under a megabyte keeps the frame as a table instead and boots one core.
+    let first = frames.allocate_frame().ok_or(out_of_frames())?;
+    let low = first.start_address().as_u64() < TRAMPOLINE_LIMIT;
+    let root = match low {
+        true => frames.allocate_frame().ok_or(out_of_frames())?,
+        false => first,
+    };
+    let trampoline = low.then(|| first.start_address().as_u64());
     // SAFETY: the loader's direct map is still live and covers every physical
     // frame, so the fresh root is writable at `offset + root`.
     let table = unsafe { &mut *table_pointer(offset, root) };
@@ -126,6 +183,15 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<u64, PlatformError> {
     let boot_info_end = BOOT_INFO_BASE + BOOT_INFO_WINDOW;
     clone(&mut space, &mut frames, &mut log, &live, BOOT_INFO_BASE, boot_info_end, Contents::Ram)?;
     device_window(&mut space, &mut frames, &mut log, map, crate::apic::APIC_MMIO, APIC_WINDOW)?;
+    if let Some(physical) = trampoline {
+        // Identity, because a core that has just loaded `CR3` is still fetching
+        // by physical address. Executable and not writable: the boot core writes
+        // the code through the direct map, the starting core only runs it.
+        let flags = leaf_flags(Rights::READ_EXECUTE, Cache::WriteBack);
+        map_4k(&mut space, &mut frames, physical, physical, flags)?;
+        log.push(MappedRange::image(physical, physical + Size4KiB::SIZE))
+            .map_err(PlatformError::Mapping)?;
+    }
 
     // SAFETY: every x86_64 CPU has PAT, and the reset layout preserves active entries.
     unsafe { write_pat() };
@@ -144,7 +210,8 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<u64, PlatformError> {
     unsafe { Cr3::write(root, Cr3Flags::empty()) };
     // SAFETY: same reasoning as `active`; this runs once on the boot CPU.
     unsafe {
-        *ACTIVE.0.get() = Some(Space { root, offset, cursor, log, pool, devices: DEVICE_REGION })
+        *ACTIVE.0.get() =
+            Some(Space { root, offset, cursor, log, pool, devices: DEVICE_REGION, trampoline })
     };
     Ok(APIC_WINDOW)
 }

@@ -3,18 +3,24 @@
 //! Hardware-independent contracts shared by the kernel and architecture crates.
 
 pub mod audit;
+pub mod cpu;
 pub mod dma;
 pub mod irq;
 pub mod memory;
 pub mod mmio;
 pub mod pci;
+pub mod smp;
 
 use core::fmt;
 
+pub use molt_core::cpu::CpuId;
+
+pub use crate::cpu::Local;
 pub use crate::irq::{FabricError, InterruptFabric, MsiMessage, Sink};
 pub use crate::memory::Cache;
 pub use crate::mmio::{DeviceMapper, Mmio, MmioError};
 pub use crate::pci::ConfigSpace;
+pub use crate::smp::{Entry, Smp, SmpError, Stack, number};
 
 /// Architecture-neutral information passed from a platform boot adapter.
 #[derive(Clone, Copy)]
@@ -550,7 +556,7 @@ impl From<FabricError> for PlatformError {
 }
 
 /// Hardware services used directly by architecture-independent kernel code.
-pub trait Platform: DeviceMapper + InterruptFabric {
+pub trait Platform: DeviceMapper + InterruptFabric + Local + Smp {
     type Serial: SerialPort;
 
     fn serial(&mut self) -> &mut Self::Serial;
@@ -586,20 +592,6 @@ pub trait Platform: DeviceMapper + InterruptFabric {
     /// Sends every interrupt line this platform raises to `sink`.
     fn route_interrupts(&mut self, _sink: &'static dyn Sink) -> Result<(), PlatformError> {
         Err(PlatformError::Unsupported)
-    }
-
-    fn arm_timer(&mut self, _initial_count: u32) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported)
-    }
-
-    fn monotonic_ticks(&self) -> u64 {
-        0
-    }
-
-    fn wait_for_timer_change(&mut self, previous: u64) {
-        while self.monotonic_ticks() == previous {
-            core::hint::spin_loop();
-        }
     }
 
     /// A cursor past the RAM the kernel's own tables and image already own.

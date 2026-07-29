@@ -16,6 +16,7 @@ use molt_block::Disk;
 use molt_core::buffer::{BufferOperation, BufferRegistry};
 use molt_core::capability::{Capability, CellId, ReadWrite};
 use molt_core::cell::Supervisor;
+use molt_core::cpu::CpuId;
 use molt_core::registry::{Registry, Scheme};
 use molt_core::ring::{IoDriver, IoRing};
 use molt_fs::{
@@ -128,7 +129,7 @@ fn run<P: Platform, D: Disk>(
     let names = RefCell::new(Registry::<Storage, NAMES>::new());
     let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, RING>::new();
     let (client, mut driver) = ring.split();
-    service.cell_mut().fs()?.publish(&mut names.borrow_mut(), FS)?;
+    service.cell_mut().fs()?.publish(&mut names.borrow_mut(), FS, CpuId::BOOT)?;
 
     let session = Session::new(client, &buffers, &names, scratch, WINDOW)?;
     let mut shell = Supervisor::<Shell<'_, '_, '_, RING, 1, NAMES>>::new(session)?;
@@ -138,7 +139,7 @@ fn run<P: Platform, D: Disk>(
     // The script is over and the ring is empty, but the hooks are the ones a
     // restart under load runs, so the epoch ends the same way either way.
     service.restart(&mut Teardown::new(&mut driver, &names, FS))?;
-    let published = service.cell_mut().fs()?.publish(&mut names.borrow_mut(), FS)?;
+    let published = service.cell_mut().fs()?.publish(&mut names.borrow_mut(), FS, CpuId::BOOT)?;
     let root = names.borrow().endpoint(published).map_err(FsError::Handle)?.root();
     let open = FsOp::Open { dir: root, name: Name::try_from("runtime.txt")? };
     let opened = service.cell_mut().fs()?.apply(FS, open, &mut buffers.borrow_mut())?;
@@ -173,7 +174,8 @@ fn script<P: Platform, D: Disk>(
         if event == Event::Republish {
             let stale = names.borrow().acquire().map_err(FsError::from)?;
             service.restart(&mut Teardown::new(driver, names, FS))?;
-            let published = service.cell_mut().fs()?.publish(&mut names.borrow_mut(), FS)?;
+            let published =
+                service.cell_mut().fs()?.publish(&mut names.borrow_mut(), FS, CpuId::BOOT)?;
             if names.borrow().endpoint(stale).is_ok() {
                 // A lease that outlived its publication would make every later
                 // restart invisible to whoever holds one.

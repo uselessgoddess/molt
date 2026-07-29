@@ -1,13 +1,16 @@
-use core::pin::pin;
-use core::task::{Context, Poll, Waker};
+use core::sync::atomic::{AtomicU16, Ordering};
 
 use molt_arch::memory::{Inventory, Rights};
-use molt_arch::{BootInfo, Mmio, MsiMessage, Platform, SerialWriter, Sink};
+use molt_arch::{BootInfo, CpuId, Mmio, MsiMessage, Platform, SerialWriter, Sink};
 use molt_core::interrupt::{InterruptSlab, InterruptToken};
+use molt_exec::Handle;
 use molt_kernel::report;
 use molt_pci::{Bus, Command, Function, bus_span, preferred};
 
 const LINES: usize = 16;
+
+/// Stands for a line no interrupt has arrived on yet.
+const NOBODY: u16 = u16::MAX;
 
 /// The QEMU teaching device: a PCI function that exists to be poked.
 const EDU_VENDOR: u16 = 0x1234;
@@ -16,24 +19,45 @@ const EDU_RAISE: u64 = 0x60;
 const EDU_ACKNOWLEDGE: u64 = 0x64;
 const EDU_PATTERN: u32 = 1 << 8;
 
-/// How long to spin for the arrival before calling the path broken.
-const DELIVERY_SPINS: u32 = 10_000_000;
+/// How long to wait for the arrival before calling the path broken.
+const DELIVERY_TICKS: u64 = 64;
 
-struct Interrupts(InterruptSlab<LINES>);
+/// The device lines, and which core each one was last delivered to.
+///
+/// A vector aimed at one core and taken by another is the failure the affinity
+/// is meant to rule out, so the core writes down that it was here.
+struct Interrupts {
+    slab: InterruptSlab<LINES>,
+    served: [AtomicU16; LINES],
+}
 
 impl Sink for Interrupts {
     fn raise(&self, line: u16) {
         let _heap = crate::heap::interrupt();
-        self.0.raise(line);
+        if let Some(served) = self.served.get(line as usize) {
+            served.store(crate::smp::here() as u16, Ordering::Release);
+        }
+        self.slab.raise(line);
     }
 }
 
-static INTERRUPTS: Interrupts = Interrupts(InterruptSlab::new());
+static INTERRUPTS: Interrupts =
+    Interrupts { slab: InterruptSlab::new(), served: [const { AtomicU16::new(NOBODY) }; LINES] };
 
-/// Reserves one device line and connects the platform entry path to the slab.
-pub(crate) fn bind<P: Platform>(platform: &mut P) -> Option<(InterruptToken, MsiMessage)> {
-    let (line, message) = platform.allocate().ok()?;
-    let token = match INTERRUPTS.0.bind(line) {
+/// Which core took the last interrupt on `line`.
+fn served(line: u16) -> Option<CpuId> {
+    let served = INTERRUPTS.served.get(line as usize)?.load(Ordering::Acquire);
+    (served != NOBODY).then(|| CpuId::new(served))
+}
+
+/// Reserves one device line on the core that will serve it, and connects the
+/// platform entry path to the slab.
+pub(crate) fn bind<P: Platform>(
+    platform: &mut P,
+    cpu: CpuId,
+) -> Option<(InterruptToken, MsiMessage)> {
+    let (line, message) = platform.allocate(cpu).ok()?;
+    let token = match INTERRUPTS.slab.bind(line) {
         Ok(token) => token,
         Err(_) => {
             let _ = platform.release(line);
@@ -41,7 +65,7 @@ pub(crate) fn bind<P: Platform>(platform: &mut P) -> Option<(InterruptToken, Msi
         }
     };
     if platform.route_interrupts(&INTERRUPTS).is_err() {
-        let _ = INTERRUPTS.0.release(token);
+        let _ = INTERRUPTS.slab.release(token);
         let _ = platform.release(line);
         return None;
     }
@@ -50,30 +74,25 @@ pub(crate) fn bind<P: Platform>(platform: &mut P) -> Option<(InterruptToken, Msi
 
 /// Takes the arrivals recorded since this owner last drained its line.
 pub(crate) fn arrivals(token: InterruptToken) -> u64 {
-    INTERRUPTS.0.arrivals(token).expect("a live device interrupt token")
+    INTERRUPTS.slab.arrivals(token).expect("a live device interrupt token")
 }
 
-/// Awaits the next arrival on `token`, giving up after `spins` polls.
+/// Awaits the next arrival on `token`, giving up after `ticks`.
 ///
-/// The future is the real one — the counter and waker a task will park on once
-/// there is an executor to park it — so what a driver above this sees is
-/// already the interrupt-driven shape. Only the scheduler is missing, and
-/// until Stage 4 brings one the loop below stands in for it.
-pub(crate) fn wait(token: InterruptToken, spins: u32) -> u64 {
-    let mut future = pin!(INTERRUPTS.0.wait(token));
-    let mut context = Context::from_waker(Waker::noop());
-    for _ in 0..spins {
-        if let Poll::Ready(arrivals) = future.as_mut().poll(&mut context) {
-            return arrivals.expect("a live device interrupt token");
-        }
-        core::hint::spin_loop();
+/// Nothing spins: the core parks, the interrupt wakes it, and the wheel is what
+/// says when to stop believing in the device. A deadline reads as no arrivals,
+/// which is what the caller already treats as a wedged line.
+pub(crate) fn wait(token: InterruptToken, ticks: u64) -> u64 {
+    let exec = crate::smp::current();
+    match exec.block_on(exec.timers().timeout(ticks, INTERRUPTS.slab.wait(token))) {
+        Some(arrivals) => arrivals.expect("a live device interrupt token"),
+        None => 0,
     }
-    0
 }
 
 /// Returns a stopped device's line to both the slab and the platform fabric.
 pub(crate) fn release<P: Platform>(platform: &mut P, token: InterruptToken) {
-    INTERRUPTS.0.release(token).expect("the line this device bound");
+    INTERRUPTS.slab.release(token).expect("the line this device bound");
     platform.release(token.line()).expect("a line this platform allocated");
 }
 
@@ -81,6 +100,8 @@ pub(crate) fn release<P: Platform>(platform: &mut P, token: InterruptToken) {
 struct Routed {
     registers: Mmio<'static>,
     token: InterruptToken,
+    /// The core the vector was aimed at, when it is not this one.
+    home: Option<Handle>,
 }
 
 pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
@@ -175,9 +196,15 @@ fn route<P: Platform>(
     function: &mut Function<'_>,
 ) -> Option<Routed> {
     let capability = preferred(function).ok()?;
+    // The vector goes to the core that will serve it, and the driver's wait
+    // goes with it. A peer is picked when one is up so the affinity is a claim
+    // the smoke can fail on, rather than one every message satisfies by being
+    // aimed at the only core there is.
+    let home = crate::smp::peers().next().map(|(_, handle)| handle);
+    let cpu = home.as_ref().map_or_else(|| platform.cpu(), Handle::cpu);
     // The line is bound before the device is programmed, never after: a device
     // able to deliver into a line nobody owns is a dropped interrupt at best.
-    let (token, message) = bind(platform)?;
+    let (token, message) = bind(platform, cpu)?;
     let line = token.line();
 
     // `edu` implements MSI, not MSI-X: its table would need a BAR mapping of
@@ -217,35 +244,54 @@ fn route<P: Platform>(
     let command = function.command().ok()?;
     function.set_command(command.with(Command::MEMORY).with(Command::BUS_MASTER)).ok()?;
 
-    Some(Routed { registers, token })
+    Some(Routed { registers, token, home })
 }
 
 /// Raises the device's interrupt and waits for the slab to count it.
 ///
-/// Polling rather than awaiting: this runs before there is an executor, and
-/// what is being proven is that the arrival reaches the slab at all. The future
-/// on top of the same counter is what the driver will use.
+/// The wait is the driver's: the same future on the same counter, parked on the
+/// executor this core is already running.
 fn deliver<P: Platform>(platform: &mut P, routed: &Routed) {
-    let before = INTERRUPTS.0.arrivals(routed.token).expect("a line this kernel bound");
+    let before = INTERRUPTS.slab.arrivals(routed.token).expect("a line this kernel bound");
     assert_eq!(before, 0, "an arrival before anything raised one");
 
     routed.registers.write_u32(EDU_RAISE, EDU_PATTERN).expect("the device's raise register");
 
-    let mut spins = 0;
-    let arrivals = loop {
-        match INTERRUPTS.0.arrivals(routed.token) {
-            Ok(0) => {}
-            Ok(arrivals) => break arrivals,
-            Err(error) => panic!("the bound line went stale: {error:?}"),
-        }
-        spins += 1;
-        assert!(spins < DELIVERY_SPINS, "the device raised an interrupt that never arrived");
-        core::hint::spin_loop();
+    let arrivals = match &routed.home {
+        Some(home) => away(platform, home, routed.token),
+        None => wait(routed.token, DELIVERY_TICKS),
     };
+    assert_ne!(arrivals, 0, "the device raised an interrupt that never arrived");
 
     routed
         .registers
         .write_u32(EDU_ACKNOWLEDGE, EDU_PATTERN)
         .expect("the device's acknowledge register");
-    report!(platform, "MOLT_INTERRUPT_OK: {arrivals} arrival after {spins} spins");
+    report!(platform, "MOLT_INTERRUPT_OK: {arrivals} arrival");
+}
+
+/// Waits for the arrival on the core the vector was aimed at, not on this one.
+///
+/// The wait is spawned there and the count comes back over the ring that pair
+/// alone shares. Both halves are checked: the core that answered is the one the
+/// line was homed on, and the core that took the interrupt is the same again.
+fn away<P: Platform>(platform: &mut P, home: &Handle, token: InterruptToken) -> u64 {
+    let cpu = home.cpu();
+    let exec = crate::smp::current();
+    let (answers, asked) = crate::smp::ask(
+        exec,
+        core::iter::once((cpu.index(), home.clone())),
+        DELIVERY_TICKS,
+        move || async move {
+            let arrivals = INTERRUPTS.slab.wait(token).await;
+            (crate::smp::here(), arrivals.expect("a live device interrupt token"))
+        },
+    );
+    assert_eq!(asked, 1, "the core the line was homed on took no task");
+    let Some(&(awaited, arrivals)) = answers.first() else { return 0 };
+
+    assert_eq!(awaited, cpu.index(), "the wait ran off the core the line was homed on");
+    assert_eq!(served(token.line()), Some(cpu), "the vector landed on another core");
+    report!(platform, "MOLT_AFFINITY_OK: line {} on core {}", token.line(), cpu.index());
+    arrivals
 }

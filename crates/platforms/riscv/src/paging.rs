@@ -168,6 +168,11 @@ fn map_section(
         .map_err(PlatformError::Mapping)
 }
 
+/// The `satp` the boot hart runs on, for a hart coming up beside it.
+pub fn satp() -> Option<u64> {
+    active().ok().map(|state| SATP_MODE_SV39 | (state.root as u64 >> 12))
+}
+
 /// A cursor past the RAM the boot address space is already built out of.
 pub fn free_frames() -> Option<FrameCursor> {
     active().ok().map(|state| state.cursor)

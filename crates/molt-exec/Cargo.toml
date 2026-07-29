@@ -1,12 +1,12 @@
 [package]
-name = "molt-arch"
+name = "molt-exec"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
 
-[dependencies]
-molt-core.workspace = true
-
 [lints]
 workspace = true
+
+[dependencies]
+molt-core.workspace = true

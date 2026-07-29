@@ -4,6 +4,7 @@
 use alloc::boxed::Box;
 use core::convert::Infallible;
 use core::pin::pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use molt_arch::memory::{Error, FrameTable, Inventory, Kind, Owner, Span};
@@ -14,6 +15,7 @@ use molt_core::capability::{CapabilityError, CapabilityTable, ReadWrite};
 use molt_core::cell::{Cell, CellId, Handler, RestartHooks, Supervisor};
 use molt_core::completion::{CompletionError, CompletionSlab};
 use molt_core::ring::{Completion, IoRing, Submission};
+use molt_exec::Executor;
 
 extern crate alloc;
 
@@ -22,6 +24,7 @@ mod heap;
 mod init;
 mod network;
 mod pci;
+mod smp;
 mod virtio;
 
 use molt_kernel::report;
@@ -34,7 +37,7 @@ molt_riscv::entry_point!(kernel_main);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KernelOp {
-    TimerWait { initial_count: u32 },
+    TimerWait { ticks: u64 },
 }
 
 fn kernel_main<P: Platform>(boot_info: BootInfo<'_>, platform: &mut P) -> ! {
@@ -67,7 +70,13 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     platform.verify_device_window(boot_info).expect("device window mapped and reachable");
     report!(platform, "MOLT_DEVICE_WINDOW_OK");
 
-    run_timer_future(platform);
+    let exec = verify_exec(platform);
+    report!(platform, "MOLT_EXEC_OK");
+
+    let (running, answered) = verify_smp(platform, exec);
+    report!(platform, "MOLT_SMP_OK: cores={running} answered={answered}");
+
+    run_timer_future(exec);
     report!(platform, "MOLT_TIMER_OK");
 
     let slab = CompletionSlab::<u32, 2>::new();
@@ -153,7 +162,30 @@ fn verify_heap<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     report!(platform, "MOLT_HEAP_OK: {bytes} bytes");
 }
 
-fn run_timer_future<P: Platform>(platform: &mut P) {
+/// Starts this core's tick and its executor, and proves a task runs on it.
+fn verify_exec<P: Platform>(platform: &mut P) -> &'static Executor {
+    static RAN: AtomicBool = AtomicBool::new(false);
+
+    platform.ticking().expect("this core's tick");
+    let exec = smp::attach();
+    exec.spawn(async { RAN.store(true, Ordering::Release) }).expect("a free task slot");
+
+    assert_eq!(exec.run_until_idle(), 1, "the spawned task was never polled");
+    assert!(RAN.load(Ordering::Acquire), "the polled task did not run");
+    exec
+}
+
+/// Starts the other cores, and proves work crosses to every one that came up.
+fn verify_smp<P: Platform>(platform: &mut P, exec: &Executor) -> (u16, u16) {
+    let running = smp::start(platform);
+    let (answered, asked) = smp::crossing(exec);
+
+    assert_eq!(asked, running - 1, "a running core left no handle to reach it by");
+    assert_eq!(answered, asked, "a core took work and never answered");
+    (running, answered)
+}
+
+fn run_timer_future(exec: &Executor) {
     let slab = CompletionSlab::<u64, 2>::new();
     let token = slab.reserve().expect("free timer completion slot");
     let mut future = pin!(slab.wait(token));
@@ -163,20 +195,17 @@ fn run_timer_future<P: Platform>(platform: &mut P) {
     let mut ring = IoRing::<KernelOp, u64, 2>::new();
     let (mut client, mut timer_driver) = ring.split();
     client
-        .try_submit(Submission::new(
-            token.request_id(),
-            KernelOp::TimerWait { initial_count: 1_000_000 },
-        ))
+        .try_submit(Submission::new(token.request_id(), KernelOp::TimerWait { ticks: 2 }))
         .expect("empty timer submission queue");
 
     let request = timer_driver.try_next().expect("submitted timer request");
-    let KernelOp::TimerWait { initial_count } = *request.operation();
-    let previous = platform.monotonic_ticks();
-    platform.arm_timer(initial_count).expect("arm one-shot timer");
-    while platform.monotonic_ticks() == previous {
-        platform.wait_for_timer_change(previous);
-    }
-    let elapsed = platform.monotonic_ticks();
+    let KernelOp::TimerWait { ticks } = *request.operation();
+    // The wait is the executor's: the core parks, its tick brings it back, and
+    // the wheel is what says the deadline arrived.
+    let elapsed = exec.block_on(async {
+        exec.timers().after(ticks).await;
+        exec.timers().now()
+    });
     timer_driver
         .try_complete(Completion::new(request.id(), elapsed))
         .expect("empty timer completion queue");

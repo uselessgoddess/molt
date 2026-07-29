@@ -1,18 +1,22 @@
-//! Supervisor trap handling: exception path probe and one-shot timer ticks.
+//! Supervisor trap handling: exception path probe, doorbells, and the tick.
 //!
 //! The direct-mode vector preserves caller-saved registers around
 //! [`molt_trap_handler`], which handles `ebreak` and supervisor timer interrupts.
 
 use core::arch::{asm, global_asm};
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use molt_arch::{SerialPort, SerialWriter};
 
-use crate::{SbiSerial, csr, sbi};
+use crate::{SbiSerial, csr, percpu, sbi};
 
 static BREAKPOINT_SEEN: AtomicBool = AtomicBool::new(false);
-static TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// `time` counts between ticks: ten milliseconds where the timebase is ten
+/// megahertz. The quantum is a scheduling one, not a clock — nothing reads it
+/// as a duration.
+const INTERVAL: u64 = 100_000;
 
 global_asm!(
     r#"
@@ -81,8 +85,24 @@ pub fn verify_breakpoint() -> bool {
     BREAKPOINT_SEEN.load(Ordering::Acquire)
 }
 
+/// Timer interrupts this core has taken.
+///
+/// Per-core, because the timer is: each hart arms its own deadline, and a
+/// machine-wide number would be a lie assembled from cores that never agreed.
 pub fn ticks() -> u64 {
-    TICKS.load(Ordering::Acquire)
+    percpu::this().ticks()
+}
+
+/// Starts this core's tick. SBI arms one deadline at a time, so the handler
+/// arms the next — periodic is a loop, not a mode.
+pub fn ticking() {
+    arm();
+    // SAFETY: `init` installed the trap vector before any timer arms.
+    unsafe { csr::enable_timer_interrupts() };
+}
+
+fn arm() {
+    sbi::set_timer(csr::time().wrapping_add(INTERVAL));
 }
 
 #[unsafe(no_mangle)]
@@ -90,10 +110,18 @@ extern "C" fn molt_trap_handler() {
     let cause = csr::scause();
     if cause & csr::CAUSE_INTERRUPT != 0 {
         let code = cause & !csr::CAUSE_INTERRUPT;
+        if code == csr::INTERRUPT_SOFTWARE {
+            // A doorbell. The sender set the flag; arriving is the whole
+            // message, and what it is about is already in this core's inbox.
+            // SAFETY: this is the handler for the interrupt being acknowledged.
+            unsafe { csr::clear_software_interrupt() };
+            return;
+        }
         if code == csr::INTERRUPT_TIMER {
-            // Disarm the one-shot before publishing the tick.
-            sbi::set_timer(u64::MAX);
-            TICKS.fetch_add(1, Ordering::Release);
+            // Rearm before publishing the tick: the deadline that fired is the
+            // acknowledgement, and leaving it unset would stop the core's clock.
+            arm();
+            percpu::this().tick();
             return;
         }
         fatal("unexpected interrupt", cause);
