@@ -17,7 +17,7 @@ use molt_arch::{CpuId, Local, Platform, Smp, Stack};
 use molt_exec::{Executor, Handle, Machine};
 
 /// Blocks the platforms keep, which is the ceiling on cores molt numbers.
-const MAX: usize = 8;
+pub(crate) const MAX: usize = 8;
 
 /// Tasks one core can hold at once.
 const CAPACITY: usize = 32;
@@ -110,6 +110,14 @@ pub(crate) fn attach() -> &'static Executor {
     // Whoever started this core is waiting on that flag with its doorbell armed.
     CORES.wake(CpuId::BOOT);
     exec
+}
+
+/// Which core this is, out of its own block.
+///
+/// Answerable before anything is attached — the platform installs the block on
+/// its way in — which is what lets the heap route by it.
+pub(crate) fn here() -> usize {
+    CORES.cpu().index()
 }
 
 /// This core's executor.
