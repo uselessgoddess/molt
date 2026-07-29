@@ -20,6 +20,8 @@ const BOOT_MARKERS: &[&str] = &[
     "MOLT_MAPPING_OK",
     "MOLT_WX_OK",
     "MOLT_DEVICE_WINDOW_OK",
+    "MOLT_EXEC_OK",
+    "MOLT_SMP_OK",
     "MOLT_TIMER_OK",
     "MOLT_CANCELLATION_OK",
     "MOLT_STALE_COMPLETION_OK",
@@ -31,6 +33,9 @@ const BOOT_MARKERS: &[&str] = &[
 ];
 
 const PANIC_MARKER: &str = "MOLT_PANIC:";
+
+/// Cores QEMU is given, which is what the SMP marker counts.
+const CORES: &str = "4";
 
 const QEMU_X86_64_SUCCESS: i32 = (0x10 << 1) | 1;
 const QEMU_X86_64_FAILURE: i32 = (0x11 << 1) | 1;
@@ -349,6 +354,10 @@ fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
     command.args([
         "-machine",
         "q35",
+        // More cores than the smoke needs to prove one: a crossing that only
+        // ever runs on two is a crossing that never had to pick a target.
+        "-smp",
+        CORES,
         "-device",
         "edu",
         "-display",
@@ -392,7 +401,8 @@ fn qemu_riscv64_command(kernel: &Path) -> Command {
         env::var_os("MOLT_QEMU_RISCV64").unwrap_or_else(|| OsString::from("qemu-system-riscv64"));
     let mut command = Command::new(qemu);
     // OpenSBI loads the ELF at its S-mode payload address.
-    command.args(["-machine", "virt", "-display", "none", "-no-reboot", "-bios", "default"]);
+    command.args(["-machine", "virt", "-smp", CORES, "-display", "none"]);
+    command.args(["-no-reboot", "-bios", "default"]);
     command.arg("-kernel").arg(kernel);
     command
 }

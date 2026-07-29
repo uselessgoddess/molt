@@ -1,6 +1,3 @@
-use core::pin::pin;
-use core::task::{Context, Poll, Waker};
-
 use molt_arch::memory::{Inventory, Rights};
 use molt_arch::{BootInfo, CpuId, Mmio, MsiMessage, Platform, SerialWriter, Sink};
 use molt_core::interrupt::{InterruptSlab, InterruptToken};
@@ -16,8 +13,8 @@ const EDU_RAISE: u64 = 0x60;
 const EDU_ACKNOWLEDGE: u64 = 0x64;
 const EDU_PATTERN: u32 = 1 << 8;
 
-/// How long to spin for the arrival before calling the path broken.
-const DELIVERY_SPINS: u32 = 10_000_000;
+/// How long to wait for the arrival before calling the path broken.
+const DELIVERY_TICKS: u64 = 64;
 
 struct Interrupts(InterruptSlab<LINES>);
 
@@ -57,22 +54,17 @@ pub(crate) fn arrivals(token: InterruptToken) -> u64 {
     INTERRUPTS.0.arrivals(token).expect("a live device interrupt token")
 }
 
-/// Awaits the next arrival on `token`, giving up after `spins` polls.
+/// Awaits the next arrival on `token`, giving up after `ticks`.
 ///
-/// The future is the real one — the counter and waker a task will park on once
-/// there is an executor to park it — so what a driver above this sees is
-/// already the interrupt-driven shape. Only the scheduler is missing, and
-/// until Stage 4 brings one the loop below stands in for it.
-pub(crate) fn wait(token: InterruptToken, spins: u32) -> u64 {
-    let mut future = pin!(INTERRUPTS.0.wait(token));
-    let mut context = Context::from_waker(Waker::noop());
-    for _ in 0..spins {
-        if let Poll::Ready(arrivals) = future.as_mut().poll(&mut context) {
-            return arrivals.expect("a live device interrupt token");
-        }
-        core::hint::spin_loop();
+/// Nothing spins: the core parks, the interrupt wakes it, and the wheel is what
+/// says when to stop believing in the device. A deadline reads as no arrivals,
+/// which is what the caller already treats as a wedged line.
+pub(crate) fn wait(token: InterruptToken, ticks: u64) -> u64 {
+    let exec = crate::smp::current();
+    match exec.block_on(exec.timers().timeout(ticks, INTERRUPTS.0.wait(token))) {
+        Some(arrivals) => arrivals.expect("a live device interrupt token"),
+        None => 0,
     }
-    0
 }
 
 /// Returns a stopped device's line to both the slab and the platform fabric.
@@ -227,30 +219,20 @@ fn route<P: Platform>(
 
 /// Raises the device's interrupt and waits for the slab to count it.
 ///
-/// Polling rather than awaiting: this runs before there is an executor, and
-/// what is being proven is that the arrival reaches the slab at all. The future
-/// on top of the same counter is what the driver will use.
+/// The wait is the driver's: the same future on the same counter, parked on the
+/// executor this core is already running.
 fn deliver<P: Platform>(platform: &mut P, routed: &Routed) {
     let before = INTERRUPTS.0.arrivals(routed.token).expect("a line this kernel bound");
     assert_eq!(before, 0, "an arrival before anything raised one");
 
     routed.registers.write_u32(EDU_RAISE, EDU_PATTERN).expect("the device's raise register");
 
-    let mut spins = 0;
-    let arrivals = loop {
-        match INTERRUPTS.0.arrivals(routed.token) {
-            Ok(0) => {}
-            Ok(arrivals) => break arrivals,
-            Err(error) => panic!("the bound line went stale: {error:?}"),
-        }
-        spins += 1;
-        assert!(spins < DELIVERY_SPINS, "the device raised an interrupt that never arrived");
-        core::hint::spin_loop();
-    };
+    let arrivals = wait(routed.token, DELIVERY_TICKS);
+    assert_ne!(arrivals, 0, "the device raised an interrupt that never arrived");
 
     routed
         .registers
         .write_u32(EDU_ACKNOWLEDGE, EDU_PATTERN)
         .expect("the device's acknowledge register");
-    report!(platform, "MOLT_INTERRUPT_OK: {arrivals} arrival after {spins} spins");
+    report!(platform, "MOLT_INTERRUPT_OK: {arrivals} arrival");
 }

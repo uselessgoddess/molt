@@ -13,10 +13,9 @@ use molt_virtio::{Arrivals, Location};
 
 /// How long a driver waits on its line before calling the device wedged.
 ///
-/// A spin count rather than a duration: nothing here has a clock a driver may
-/// block on yet. It is generous because what it has to outlast is a slow disk,
-/// not a scheduler.
-const WAIT_SPINS: u32 = 50_000_000;
+/// Ticks of the core's own quantum, so a couple of seconds: generous, because
+/// what it has to outlast is a slow disk rather than a scheduler.
+const WAIT_TICKS: u64 = 256;
 
 /// Maps the BAR at `index` and reports where it landed.
 pub(crate) fn map_bar<P: Platform>(
@@ -59,7 +58,7 @@ impl Vectored<'_, '_> {
 
     /// The arrivals a driver waiting on this vector sees.
     pub(crate) const fn line(&self) -> Line {
-        Line { token: self.token, spins: WAIT_SPINS }
+        Line { token: self.token, ticks: WAIT_TICKS }
     }
 
     /// Masks the vector, disables the capability, and returns the line.
@@ -106,7 +105,7 @@ pub(crate) fn route<'control, 'table, P: Platform>(
 /// A driver's end of a routed line.
 pub(crate) struct Line {
     token: InterruptToken,
-    spins: u32,
+    ticks: u64,
 }
 
 impl Line {
@@ -118,6 +117,6 @@ impl Line {
 
 impl Arrivals for Line {
     fn wait(&mut self) -> u64 {
-        crate::pci::wait(self.token, self.spins)
+        crate::pci::wait(self.token, self.ticks)
     }
 }
