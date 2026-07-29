@@ -594,20 +594,6 @@ pub trait Platform: DeviceMapper + InterruptFabric + Local + Smp {
         Err(PlatformError::Unsupported)
     }
 
-    fn arm_timer(&mut self, _initial_count: u32) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported)
-    }
-
-    fn monotonic_ticks(&self) -> u64 {
-        0
-    }
-
-    fn wait_for_timer_change(&mut self, previous: u64) {
-        while self.monotonic_ticks() == previous {
-            core::hint::spin_loop();
-        }
-    }
-
     /// A cursor past the RAM the kernel's own tables and image already own.
     ///
     /// A driver resumes a [`FrameAllocator`] here to back DMA out of frames no

@@ -121,6 +121,22 @@ pub trait Smp {
         Err(SmpError::Unsupported)
     }
 
+    /// Starts this core's own tick, and keeps it running.
+    ///
+    /// A tick is what a slice is measured in and what a timer wheel walks on,
+    /// so it is per-core like everything else: a core counts its own and
+    /// compares them with nobody. The period is the platform's — a quantum, not
+    /// a clock — and rearming is too, so a core that took a tick is already
+    /// armed for the next.
+    fn ticking(&self) -> Result<(), SmpError> {
+        Err(SmpError::Unsupported)
+    }
+
+    /// Ticks this core has taken.
+    fn ticks(&self) -> u64 {
+        0
+    }
+
     /// Stops this core until an interrupt arrives, then returns.
     ///
     /// A spurious return is normal: the caller re-checks its work and parks

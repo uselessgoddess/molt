@@ -233,18 +233,6 @@ impl Platform for X86_64 {
         memory::verify_device_window(boot_info)
     }
 
-    fn arm_timer(&mut self, initial_count: u32) -> Result<(), PlatformError> {
-        apic::arm(initial_count)
-    }
-
-    fn monotonic_ticks(&self) -> u64 {
-        apic::ticks()
-    }
-
-    fn wait_for_timer_change(&mut self, previous: u64) {
-        apic::wait_for_change(previous);
-    }
-
     fn free_frames(&self) -> Option<FrameCursor> {
         memory::free_frames()
     }
@@ -308,12 +296,27 @@ impl Smp for X86_64 {
     /// Rings the doorbell, and only sends the interrupt when it was not already
     /// ringing: an unanswered wake is one the target has yet to look at, and a
     /// second one tells it nothing the first did not.
+    ///
+    /// Waking this core rings and stops there. The flag is what [`park`] reads,
+    /// so the ring is the point; an interrupt to oneself would only arrive
+    /// where the caller already is.
+    ///
+    /// [`park`]: Self::park
     fn wake(&self, cpu: CpuId) -> Result<(), SmpError> {
         let target = percpu::of(cpu).ok_or(SmpError::Unknown)?;
-        if target.ring() {
+        if target.ring() && cpu != self.cpu() {
             apic::ipi(target.apic(), apic::WAKE_VECTOR).map_err(|_| SmpError::Refused)?;
         }
         Ok(())
+    }
+
+    /// The local APIC timer, periodic: every core arms its own.
+    fn ticking(&self) -> Result<(), SmpError> {
+        apic::ticking().map_err(|_| SmpError::Refused)
+    }
+
+    fn ticks(&self) -> u64 {
+        apic::ticks()
     }
 
     /// Arms before halting: the doorbell is checked with interrupts off, so a

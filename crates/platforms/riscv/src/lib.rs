@@ -238,12 +238,28 @@ _start:
         /// Rings the doorbell, and only sends the interrupt when it was not
         /// already ringing: an unanswered wake is one the target has yet to
         /// look at, and a second one tells it nothing the first did not.
+        ///
+        /// Waking this hart rings and stops there. The flag is what [`park`]
+        /// reads, so the ring is the point; an interrupt to oneself would only
+        /// arrive where the caller already is.
+        ///
+        /// [`park`]: Self::park
         fn wake(&self, cpu: CpuId) -> Result<(), SmpError> {
             let target = percpu::of(cpu).ok_or(SmpError::Unknown)?;
-            if target.ring() {
+            if target.ring() && cpu != self.cpu() {
                 sbi::send_ipi(target.hart()).map_err(|_| SmpError::Refused)?;
             }
             Ok(())
+        }
+
+        /// The SBI timer, rearmed by its own handler: every hart arms its own.
+        fn ticking(&self) -> Result<(), SmpError> {
+            trap::ticking();
+            Ok(())
+        }
+
+        fn ticks(&self) -> u64 {
+            trap::ticks()
         }
 
         /// Arms before halting: the doorbell is checked with interrupts off, so
@@ -327,21 +343,6 @@ _start:
             Err(PlatformError::Fabric(FabricError::Unsupported))
         }
 
-        fn arm_timer(&mut self, initial_count: u32) -> Result<(), PlatformError> {
-            // Arm one absolute deadline before unmasking its interrupt.
-            let deadline = csr::time().wrapping_add(u64::from(initial_count));
-            sbi::set_timer(deadline);
-            // SAFETY: `initialize` installed the trap vector before any timer arms.
-            unsafe {
-                csr::enable_timer_interrupts();
-            }
-            Ok(())
-        }
-
-        fn monotonic_ticks(&self) -> u64 {
-            trap::ticks()
-        }
-
         fn free_frames(&self) -> Option<FrameCursor> {
             paging::free_frames()
         }
@@ -352,15 +353,6 @@ _start:
             count: u64,
         ) -> Result<Span, PlatformError> {
             paging::claim_ram(boot_info, count)
-        }
-
-        fn wait_for_timer_change(&mut self, previous: u64) {
-            while trap::ticks() == previous {
-                // SAFETY: with the timer interrupt unmasked, `wfi` resumes on the tick.
-                unsafe {
-                    asm!("wfi", options(nomem, nostack));
-                }
-            }
         }
 
         fn terminate(&mut self, status: ExitStatus) -> ! {

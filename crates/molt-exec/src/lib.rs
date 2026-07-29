@@ -27,4 +27,4 @@ mod timer;
 pub use crate::exec::{Executor, Handle, SpawnError};
 pub use crate::machine::{Machine, Solo};
 pub use crate::task::Priority;
-pub use crate::timer::{HORIZON, Sleep, Timers};
+pub use crate::timer::{HORIZON, Sleep, Timeout, Timers};

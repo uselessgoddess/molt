@@ -43,12 +43,10 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    /// Hands a task to its owner and rings, unless the owner is us.
+    /// Hands a task to its owner and rings.
     pub(crate) fn queue(&self, task: Arc<Task>) {
         self.inbox[task.priority().level()].push(task);
-        if self.machine.cpu() != self.owner {
-            self.machine.wake(self.owner);
-        }
+        self.machine.wake(self.owner);
     }
 
     fn claim(&self) -> Result<(), SpawnError> {
@@ -299,8 +297,8 @@ impl Drop for Executor {
     }
 }
 
-/// The waker [`Executor::block_on`] hands out: a flag, and a doorbell for when
-/// the wake comes from elsewhere.
+/// The waker [`Executor::block_on`] hands out: a flag, and the doorbell that
+/// keeps a park from sleeping through it.
 struct Blocker {
     rung: AtomicBool,
     owner: CpuId,
@@ -328,8 +326,6 @@ impl Wake for Blocker {
 
     fn wake_by_ref(self: &Arc<Self>) {
         self.rung.store(true, Ordering::Release);
-        if self.machine.cpu() != self.owner {
-            self.machine.wake(self.owner);
-        }
+        self.machine.wake(self.owner);
     }
 }

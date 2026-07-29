@@ -26,6 +26,12 @@ const REG_INITIAL_COUNT: u64 = 0x380;
 const REG_DIVIDE: u64 = 0x3e0;
 const APIC_SOFTWARE_ENABLE: u32 = 1 << 8;
 const TIMER_MASKED: u32 = 1 << 16;
+/// Reloads the initial count on expiry, so the tick needs no rearming.
+const TIMER_PERIODIC: u32 = 1 << 17;
+/// Counts between ticks, divided by sixteen. The quantum is a scheduling one:
+/// short enough that a slice is not the whole boot, long enough that the wheel
+/// is not the only thing a core does.
+const INTERVAL: u32 = 1_000_000;
 /// Fixed delivery, physical destination, edge triggered — everything else zero.
 const ICR_ASSERT: u32 = 1 << 14;
 const ICR_DESTINATION_SHIFT: u32 = 24;
@@ -65,12 +71,11 @@ pub fn init(window: u64) -> Result<(), PlatformError> {
     Ok(())
 }
 
-pub fn arm(initial_count: u32) -> Result<(), PlatformError> {
-    if initial_count == 0 {
-        return Err(PlatformError::InvalidHardware);
-    }
-    write(REG_LVT_TIMER, u32::from(TIMER_VECTOR))?;
-    write(REG_INITIAL_COUNT, initial_count)
+/// Starts this core's periodic tick. The local APIC reloads the count itself,
+/// so the handler counts and returns.
+pub fn ticking() -> Result<(), PlatformError> {
+    write(REG_LVT_TIMER, TIMER_PERIODIC | u32::from(TIMER_VECTOR))?;
+    write(REG_INITIAL_COUNT, INTERVAL)
 }
 
 /// This processor's local APIC identifier, before the APIC is mapped.
@@ -133,15 +138,6 @@ pub fn park() {
         interrupts::enable();
     } else {
         interrupts::enable_and_hlt();
-    }
-}
-
-pub fn wait_for_change(previous: u64) {
-    interrupts::disable();
-    if ticks() == previous {
-        interrupts::enable_and_hlt();
-    } else {
-        interrupts::enable();
     }
 }
 

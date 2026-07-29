@@ -14,6 +14,10 @@ pub trait Machine: Sync {
     }
 
     /// Rings `cpu`'s doorbell, parked or not.
+    ///
+    /// Ringing this core is not a waste: [`park`](Self::park) reads the same
+    /// flag, so a wake that races a park is what stops the core sleeping
+    /// through it. Only the interrupt is spared.
     fn wake(&self, cpu: CpuId) {
         let _ = cpu;
     }

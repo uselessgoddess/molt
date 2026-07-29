@@ -1,4 +1,4 @@
-//! Supervisor trap handling: exception path probe and one-shot timer ticks.
+//! Supervisor trap handling: exception path probe, doorbells, and the tick.
 //!
 //! The direct-mode vector preserves caller-saved registers around
 //! [`molt_trap_handler`], which handles `ebreak` and supervisor timer interrupts.
@@ -12,6 +12,11 @@ use molt_arch::{SerialPort, SerialWriter};
 use crate::{SbiSerial, csr, percpu, sbi};
 
 static BREAKPOINT_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// `time` counts between ticks: ten milliseconds where the timebase is ten
+/// megahertz. The quantum is a scheduling one, not a clock — nothing reads it
+/// as a duration.
+const INTERVAL: u64 = 100_000;
 
 global_asm!(
     r#"
@@ -88,6 +93,18 @@ pub fn ticks() -> u64 {
     percpu::this().ticks()
 }
 
+/// Starts this core's tick. SBI arms one deadline at a time, so the handler
+/// arms the next — periodic is a loop, not a mode.
+pub fn ticking() {
+    arm();
+    // SAFETY: `init` installed the trap vector before any timer arms.
+    unsafe { csr::enable_timer_interrupts() };
+}
+
+fn arm() {
+    sbi::set_timer(csr::time().wrapping_add(INTERVAL));
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn molt_trap_handler() {
     let cause = csr::scause();
@@ -101,8 +118,9 @@ extern "C" fn molt_trap_handler() {
             return;
         }
         if code == csr::INTERRUPT_TIMER {
-            // Disarm the one-shot before publishing the tick.
-            sbi::set_timer(u64::MAX);
+            // Rearm before publishing the tick: the deadline that fired is the
+            // acknowledgement, and leaving it unset would stop the core's clock.
+            arm();
             percpu::this().tick();
             return;
         }

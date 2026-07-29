@@ -148,6 +148,11 @@ impl Timers {
         Sleep { timer: self.0.wheel.borrow_mut().arm(deadline) }
     }
 
+    /// Runs `future` for at most `delay` ticks.
+    pub fn timeout<F: Future>(&self, delay: u64, future: F) -> Timeout<F> {
+        Timeout { future, sleep: self.after(delay) }
+    }
+
     /// Walks the wheel to `ticks` and wakes what expired, reporting how many.
     pub fn advance(&self, ticks: u64) -> usize {
         // The scratch leaves the cell for the walk, so a waker that comes back
@@ -192,5 +197,31 @@ impl Future for Sleep {
 impl Drop for Sleep {
     fn drop(&mut self) {
         self.timer.waker.take();
+    }
+}
+
+/// A future and a deadline: `None` is the deadline arriving first.
+///
+/// What a driver awaits is a device, and a device can be wedged. This is what
+/// gives up on one without a spin count — the wheel says when, and the core
+/// sleeps meanwhile.
+pub struct Timeout<F> {
+    future: F,
+    sleep: Sleep,
+}
+
+impl<F: Future> Future for Timeout<F> {
+    type Output = Option<F::Output>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: pinning reaches the future through this, and nothing here
+        // moves it. `Sleep` needs no such care, being `Unpin`.
+        let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: as above.
+        let future = unsafe { Pin::new_unchecked(&mut this.future) };
+        if let Poll::Ready(value) = future.poll(context) {
+            return Poll::Ready(Some(value));
+        }
+        Pin::new(&mut this.sleep).poll(context).map(|()| None)
     }
 }

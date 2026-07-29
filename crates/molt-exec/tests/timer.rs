@@ -1,5 +1,5 @@
-use std::future::Future;
-use std::pin::pin;
+use std::future::{Future, pending, ready};
+use std::pin::{Pin, pin};
 use std::task::{Context, Poll, Waker};
 
 use molt_exec::{HORIZON, Sleep, Timers};
@@ -77,6 +77,29 @@ fn drop_stops_wake() {
     assert_eq!(timers.advance(2), 0);
 }
 
-fn poll(sleep: std::pin::Pin<&mut Sleep>) -> Poll<()> {
+#[test]
+fn timeout_gives_up() {
+    let timers = Timers::new();
+    let mut wedged = pin!(timers.timeout(2, pending::<u32>()));
+    assert!(step(wedged.as_mut()).is_pending());
+
+    assert_eq!(timers.advance(2), 1);
+
+    assert_eq!(step(wedged.as_mut()), Poll::Ready(None));
+}
+
+#[test]
+fn timeout_keeps_value() {
+    let timers = Timers::new();
+    let mut answered = pin!(timers.timeout(2, ready(7)));
+
+    assert_eq!(step(answered.as_mut()), Poll::Ready(Some(7)));
+}
+
+fn poll(sleep: Pin<&mut Sleep>) -> Poll<()> {
     sleep.poll(&mut Context::from_waker(Waker::noop()))
+}
+
+fn step<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+    future.poll(&mut Context::from_waker(Waker::noop()))
 }
