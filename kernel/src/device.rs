@@ -93,7 +93,10 @@ pub(crate) fn route<'control, 'table, P: Platform>(
         .window()
         .subwindow(capability.offset(), capability.bytes())
         .expect("the MSI-X capability");
-    let (token, message) = crate::pci::bind(platform).expect("one device interrupt line");
+    // The line is homed on the core doing the routing, which is the core that
+    // will run the driver: an interrupt landing anywhere else buys a message.
+    let cpu = platform.cpu();
+    let (token, message) = crate::pci::bind(platform, cpu).expect("one device interrupt line");
     let mut msix = MsiX::new(capability, control, table).expect("a complete MSI-X table");
     let vector = msix.route(0, message).expect("vector zero");
     msix.enable().expect("MSI-X enabled");

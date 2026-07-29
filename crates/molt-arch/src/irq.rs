@@ -8,6 +8,12 @@
 //! [`Sink`] is the reverse direction: the interrupt entry path calls it with
 //! the line that fired. The line is a bare `u16` because `molt-arch` sits
 //! below `molt-core`; the kernel supplies the adapter.
+//!
+//! An identity is reserved for a core, not for the machine. Cores share
+//! nothing, so an interrupt that lands anywhere but on the core owning the
+//! service behind it buys a cross-core message the affinity could have saved.
+
+use molt_core::cpu::CpuId;
 
 /// The store a device performs to raise an interrupt.
 ///
@@ -45,9 +51,9 @@ pub enum FabricError {
 
 /// Hands out interrupt identities and describes how a device raises them.
 pub trait InterruptFabric {
-    /// Reserves one identity and returns the line it will arrive on, together
-    /// with the message a device must be programmed with to raise it.
-    fn allocate(&mut self) -> Result<(u16, MsiMessage), FabricError>;
+    /// Reserves one identity on `cpu` and returns the line it will arrive on,
+    /// together with the message a device must be programmed with to raise it.
+    fn allocate(&mut self, cpu: CpuId) -> Result<(u16, MsiMessage), FabricError>;
 
     /// Returns an identity to the fabric.
     ///

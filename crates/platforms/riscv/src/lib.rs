@@ -14,6 +14,8 @@ pub mod fdt;
 #[cfg(target_arch = "riscv64")]
 mod paging;
 #[cfg(target_arch = "riscv64")]
+mod percpu;
+#[cfg(target_arch = "riscv64")]
 mod sbi;
 #[cfg(target_arch = "riscv64")]
 mod trap;
@@ -41,12 +43,13 @@ mod imp {
 
     use molt_arch::memory::{Device, Rights, Span};
     use molt_arch::{
-        BootInfo, ConfigSpace, DeviceMapper, ExitStatus, FRAME_SIZE, FabricError, FrameCursor,
-        InterruptFabric, MappingError, MemoryMap, MemoryRegion, MemoryRegionKind, Mmio, MsiMessage,
-        Platform, PlatformError, SerialPort, SerialWriter, Sink,
+        BootInfo, ConfigSpace, CpuId, DeviceMapper, ExitStatus, FRAME_SIZE, FabricError,
+        FrameCursor, InterruptFabric, Local, MappingError, MemoryMap, MemoryRegion,
+        MemoryRegionKind, Mmio, MsiMessage, Platform, PlatformError, SerialPort, SerialWriter,
+        Sink, Smp, SmpError,
     };
 
-    use crate::{csr, fdt, paging, sbi, trap};
+    use crate::{csr, fdt, paging, percpu, sbi, trap};
 
     /// End of the QEMU `virt` board's default RAM.
     const RAM_END: u64 = 0x8800_0000;
@@ -77,10 +80,14 @@ _start:
     /// Builds the architecture-neutral boot state and starts the shared kernel.
     #[doc(hidden)]
     pub fn start(
-        _hartid: usize,
+        hartid: usize,
         device_tree: usize,
         kernel: fn(BootInfo<'_>, &mut RiscV) -> !,
     ) -> ! {
+        // The boot core takes its block before anything else runs on it: `tp` is
+        // how every layer above finds anything, including the panic path.
+        // SAFETY: this is the hart firmware entered, and this is its only call.
+        unsafe { percpu::attach(CpuId::BOOT, hartid as u64) };
         let memory_map = RiscVMemoryMap::new();
         // Sv39 identity-maps physical memory, so the physical offset is zero.
         let boot_info = BootInfo::new(&memory_map, Some(0));
@@ -145,6 +152,19 @@ _start:
             self.device_tree = address;
             self
         }
+
+        /// Numbers the harts the device tree listed.
+        ///
+        /// A blob that says nothing about `/cpus` describes one hart as far as
+        /// molt is concerned: [`percpu::declare`] always keeps the core already
+        /// running, so the failure costs parallelism and nothing else.
+        fn declare_cpus(&self) {
+            let mut listed = [0; percpu::MAX];
+            // SAFETY: as in `config_space` — firmware's pointer, still mapped,
+            // borrowed for this call only.
+            let found = unsafe { fdt::harts_at(self.device_tree, &mut listed) };
+            percpu::declare(&listed[..found.unwrap_or(0)], percpu::this().hart());
+        }
     }
 
     impl Default for RiscV {
@@ -175,12 +195,62 @@ _start:
     /// inventing a message would make it write into whatever sits at the
     /// address we invented.
     impl InterruptFabric for RiscV {
-        fn allocate(&mut self) -> Result<(u16, MsiMessage), FabricError> {
+        fn allocate(&mut self, _cpu: CpuId) -> Result<(u16, MsiMessage), FabricError> {
             Err(FabricError::Unsupported)
         }
 
         fn release(&mut self, _line: u16) -> Result<(), FabricError> {
             Err(FabricError::Unsupported)
+        }
+    }
+
+    // SAFETY: `attach` gave this core an element of a static array, which nothing
+    // else installs and which outlives every core.
+    unsafe impl Local for RiscV {
+        unsafe fn install(block: *mut ()) {
+            percpu::this().set_block(block);
+        }
+
+        fn block() -> *mut () {
+            percpu::this().block()
+        }
+    }
+
+    impl Smp for RiscV {
+        fn cpus(&self) -> u16 {
+            percpu::count()
+        }
+
+        fn cpu(&self) -> CpuId {
+            percpu::this().cpu()
+        }
+
+        /// Rings the doorbell, and only sends the interrupt when it was not
+        /// already ringing: an unanswered wake is one the target has yet to
+        /// look at, and a second one tells it nothing the first did not.
+        fn wake(&self, cpu: CpuId) -> Result<(), SmpError> {
+            let target = percpu::of(cpu).ok_or(SmpError::Unknown)?;
+            if target.ring() {
+                sbi::send_ipi(target.hart()).map_err(|_| SmpError::Refused)?;
+            }
+            Ok(())
+        }
+
+        /// Arms before halting: the doorbell is checked with interrupts off, so
+        /// a wake that arrived while the caller decided it had no work is taken
+        /// here rather than slept through.
+        fn park(&self) {
+            // SAFETY: clearing `sstatus.SIE` around the check only delays traps;
+            // `wfi` resumes on a pending interrupt whether or not they are on.
+            unsafe {
+                csr::disable_interrupts();
+                if percpu::this().answered() {
+                    csr::enable_interrupts();
+                } else {
+                    csr::enable_interrupts();
+                    asm!("wfi", options(nomem, nostack));
+                }
+            }
         }
     }
 
@@ -197,6 +267,10 @@ _start:
             let _ = writeln!(SerialWriter::new(&mut self.serial), "MOLT_SBI_CONSOLE: {console:?}");
 
             trap::init();
+            // SAFETY: the trap vector is installed, so a doorbell has somewhere
+            // to land.
+            unsafe { csr::enable_software_interrupts() };
+            self.declare_cpus();
             paging::init(boot_info)
         }
 

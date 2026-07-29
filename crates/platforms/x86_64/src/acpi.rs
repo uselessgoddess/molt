@@ -21,7 +21,7 @@ pub enum AcpiError {
     Signature,
     /// Implausible or out-of-bounds `length`.
     Truncated,
-    /// No MCFG table or no allocation in it.
+    /// No table of the signature asked for, or nothing usable in it.
     Missing,
     /// Bus range `ConfigSpace` refuses.
     Range,
@@ -36,7 +36,7 @@ pub const fn reason(error: AcpiError) -> &'static str {
         AcpiError::Absent => "firmware reported no RSDP, or no direct map to read it through",
         AcpiError::Signature => "a table carries the wrong signature",
         AcpiError::Truncated => "a table's length is implausible",
-        AcpiError::Missing => "no MCFG table, so no memory-mapped configuration space",
+        AcpiError::Missing => "ACPI lists no table of the signature molt asked for",
         AcpiError::Range => "the MCFG allocation names a bus range molt refuses",
     }
 }
@@ -110,12 +110,68 @@ pub fn mcfg(bytes: &[u8]) -> Result<ConfigSpace, AcpiError> {
     ConfigSpace::new(base, segment, allocation[10], allocation[11]).map_err(|_| AcpiError::Range)
 }
 
+/// The local APIC identifier of every processor a MADT reports usable.
+///
+/// Only the 8-bit entries are read. A machine that needs the 32-bit ones has
+/// more processors than molt has per-core blocks, so the ones it would find
+/// there are ones it would drop anyway.
+pub fn madt(bytes: &[u8], into: &mut [u8]) -> Result<usize, AcpiError> {
+    let body = table(bytes, b"APIC")?;
+    // The header is followed by the legacy APIC address and flags, then by
+    // length-prefixed records: type 0 is a processor's local APIC, and the low
+    // two flag bits are "enabled" and "may be started later".
+    let mut at = HEADER + 8;
+    let mut count = 0;
+    while at + 2 <= body.len() {
+        let length = body[at + 1] as usize;
+        // A record shorter than its own header would never end the walk.
+        let Some(record) = body.get(at..at + length).filter(|_| length >= 2) else {
+            break;
+        };
+        if record[0] == 0 && length >= 8 && le(&record[4..8]) & 0b11 != 0 {
+            if count == into.len() {
+                break;
+            }
+            into[count] = record[3];
+            count += 1;
+        }
+        at += length;
+    }
+    Ok(count)
+}
+
 /// Finds the PCI configuration space described by ACPI.
 ///
 /// # Safety
 /// `rsdp_physical` must be the address firmware reported, and `offset` must be
 /// a complete direct map of physical memory that stays valid for the call.
 pub unsafe fn config_space(rsdp_physical: u64, offset: u64) -> Result<ConfigSpace, AcpiError> {
+    // SAFETY: the caller's promise about the direct map is this function's.
+    mcfg(unsafe { find(rsdp_physical, offset, b"MCFG") }?)
+}
+
+/// Finds the processors ACPI listed.
+///
+/// # Safety
+/// As [`config_space`].
+pub unsafe fn processors(
+    rsdp_physical: u64,
+    offset: u64,
+    into: &mut [u8],
+) -> Result<usize, AcpiError> {
+    // SAFETY: the caller's promise about the direct map is this function's.
+    madt(unsafe { find(rsdp_physical, offset, b"APIC") }?, into)
+}
+
+/// The image of the one table carrying `signature`.
+///
+/// # Safety
+/// As [`config_space`].
+unsafe fn find<'map>(
+    rsdp_physical: u64,
+    offset: u64,
+    signature: &[u8; 4],
+) -> Result<&'map [u8], AcpiError> {
     // SAFETY: the caller promises the direct map covers the RSDP, whose
     // extended form is 36 bytes.
     let pointer = unsafe { image(offset, rsdp_physical, HEADER) };
@@ -132,14 +188,14 @@ pub unsafe fn config_space(rsdp_physical: u64, offset: u64) -> Result<ConfigSpac
 
     for entry in entries(root, listing)? {
         // SAFETY: as above; a listed table starts with its 4-byte signature.
-        if unsafe { image(offset, entry, 4) } != b"MCFG" {
+        if unsafe { image(offset, entry, 4) } != signature {
             continue;
         }
         // SAFETY: as above, for the header and then the whole table.
         let header = unsafe { image(offset, entry, HEADER) };
-        let mcfg_length = length(header)?;
+        let table_length = length(header)?;
         // SAFETY: as above.
-        return mcfg(unsafe { image(offset, entry, mcfg_length) });
+        return Ok(unsafe { image(offset, entry, table_length) });
     }
 
     Err(AcpiError::Missing)
@@ -195,7 +251,7 @@ mod tests {
 
     use std::vec::Vec;
 
-    use super::{AcpiError, Root, entries, mcfg, rsdp};
+    use super::{AcpiError, Root, entries, madt, mcfg, rsdp};
 
     /// Writes the byte that makes `covered` bytes sum to zero.
     fn checksum(bytes: &mut [u8], index: usize, covered: usize) {
@@ -246,6 +302,43 @@ mod tests {
         bytes[55] = last_bus;
         checksum(&mut bytes, 9, 60);
         bytes
+    }
+
+    /// A MADT of one processor record per `(apic, flags)` pair, plus an I/O
+    /// APIC record between them that the walk must step over.
+    fn madt_image(processors: &[(u8, u32)]) -> Vec<u8> {
+        let mut bytes = std::vec![0u8; 44];
+        bytes[..4].copy_from_slice(b"APIC");
+        for &(apic, flags) in processors {
+            bytes.extend_from_slice(&[0, 8, apic, apic]);
+            bytes.extend_from_slice(&flags.to_le_bytes());
+            bytes.extend_from_slice(&[1, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        let length = bytes.len() as u32;
+        bytes[4..8].copy_from_slice(&length.to_le_bytes());
+        let covered = bytes.len();
+        checksum(&mut bytes, 9, covered);
+        bytes
+    }
+
+    #[test]
+    fn madt_reports_startable_processors() -> Result<(), AcpiError> {
+        let bytes = madt_image(&[(0, 1), (2, 0), (4, 2)]);
+        let mut ids = [0; 4];
+
+        let count = madt(&bytes, &mut ids)?;
+
+        assert_eq!(&ids[..count], &[0, 4], "a processor firmware called unusable");
+        Ok(())
+    }
+
+    #[test]
+    fn madt_stops_at_the_room_given() -> Result<(), AcpiError> {
+        let bytes = madt_image(&[(0, 1), (1, 1), (2, 1)]);
+        let mut ids = [0; 2];
+
+        assert_eq!(madt(&bytes, &mut ids)?, 2);
+        Ok(())
     }
 
     #[test]

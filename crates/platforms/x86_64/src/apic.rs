@@ -4,7 +4,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use molt_arch::PlatformError;
 use x86_64::instructions::interrupts;
 
+use crate::percpu;
+
 pub const TIMER_VECTOR: u8 = 0x40;
+/// What one core sends another to say "look at your inbox". It carries nothing.
+pub const WAKE_VECTOR: u8 = 0x41;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 
 /// The architectural local APIC MMIO base, which the kernel maps a window for.
@@ -13,17 +17,20 @@ pub const APIC_MMIO: u64 = 0xfee0_0000;
 const IA32_APIC_BASE: u32 = 0x1b;
 const APIC_ENABLE: u64 = 1 << 11;
 const APIC_BASE_MASK: u64 = 0xffff_f000;
-const REG_ID: u64 = 0x020;
 const REG_EOI: u64 = 0x0b0;
 const REG_SPURIOUS: u64 = 0x0f0;
+const REG_ICR_LOW: u64 = 0x300;
+const REG_ICR_HIGH: u64 = 0x310;
 const REG_LVT_TIMER: u64 = 0x320;
 const REG_INITIAL_COUNT: u64 = 0x380;
 const REG_DIVIDE: u64 = 0x3e0;
 const APIC_SOFTWARE_ENABLE: u32 = 1 << 8;
 const TIMER_MASKED: u32 = 1 << 16;
+/// Fixed delivery, physical destination, edge triggered — everything else zero.
+const ICR_ASSERT: u32 = 1 << 14;
+const ICR_DESTINATION_SHIFT: u32 = 24;
 
 static APIC_VIRTUAL_BASE: AtomicU64 = AtomicU64::new(0);
-static TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Initializes the local APIC through an uncacheable kernel-owned window.
 pub fn init(window: u64) -> Result<(), PlatformError> {
@@ -46,7 +53,6 @@ pub fn init(window: u64) -> Result<(), PlatformError> {
     write(REG_SPURIOUS, APIC_SOFTWARE_ENABLE | u32::from(SPURIOUS_VECTOR))?;
     write(REG_LVT_TIMER, TIMER_MASKED | u32::from(TIMER_VECTOR))?;
     write(REG_DIVIDE, 0b0011)?; // divide by 16
-    TICKS.store(0, Ordering::Release);
     // SAFETY: masking both legacy PICs prevents their vectors from colliding with CPU exceptions.
     unsafe {
         super::out_u8(0x21, 0xff);
@@ -64,20 +70,22 @@ pub fn arm(initial_count: u32) -> Result<(), PlatformError> {
     write(REG_INITIAL_COUNT, initial_count)
 }
 
-/// This processor's local APIC identifier, or zero before [`init`] ran.
+/// This processor's local APIC identifier, before the APIC is mapped.
 ///
-/// Zero is also a legal APIC ID, and that is deliberately not distinguished:
-/// molt starts one processor, so an MSI addressed to destination zero reaches
-/// it either way.
-pub fn id() -> u8 {
-    let base = APIC_VIRTUAL_BASE.load(Ordering::Acquire);
-    if base == 0 {
-        return 0;
-    }
-    // SAFETY: `init` derived this direct-mapped base from IA32_APIC_BASE; the
-    // ID register is a naturally aligned 32-bit MMIO location.
-    let raw = unsafe { core::ptr::read_volatile((base + REG_ID) as *const u32) };
-    (raw >> 24) as u8
+/// CPUID answers on any core at any time, which the ID register does not: the
+/// window it lives in only exists once the kernel's tables are up, and core
+/// numbering has to happen before that.
+pub fn boot_id() -> u8 {
+    (core::arch::x86_64::__cpuid(1).ebx >> 24) as u8
+}
+
+/// Sends `vector` to the core with local APIC identifier `apic`.
+///
+/// The high half is written first: the write to the low half is what sends,
+/// so a destination set after it would address the previous interrupt.
+pub fn ipi(apic: u8, vector: u8) -> Result<(), PlatformError> {
+    write(REG_ICR_HIGH, u32::from(apic) << ICR_DESTINATION_SHIFT)?;
+    write(REG_ICR_LOW, ICR_ASSERT | u32::from(vector))
 }
 
 /// Signals end-of-interrupt to the local APIC.
@@ -85,8 +93,26 @@ pub fn eoi() {
     let _ = write(REG_EOI, 0);
 }
 
+/// Timer interrupts this core has taken.
+///
+/// Per-core, because the timer is: each local APIC counts its own, and a
+/// machine-wide number would be a lie assembled from cores that never agreed.
 pub fn ticks() -> u64 {
-    TICKS.load(Ordering::Acquire)
+    percpu::this().ticks()
+}
+
+/// Stops this core until an interrupt arrives, then returns.
+///
+/// The doorbell is read with interrupts off and the halt is entered with them
+/// on in the same instruction: a wake that arrived while the caller was
+/// deciding it had no work is taken here rather than slept through.
+pub fn park() {
+    interrupts::disable();
+    if percpu::this().answered() {
+        interrupts::enable();
+    } else {
+        interrupts::enable_and_hlt();
+    }
 }
 
 pub fn wait_for_change(previous: u64) {
@@ -101,7 +127,13 @@ pub fn wait_for_change(previous: u64) {
 pub extern "x86-interrupt" fn timer_interrupt(
     _frame: x86_64::structures::idt::InterruptStackFrame,
 ) {
-    TICKS.fetch_add(1, Ordering::Release);
+    percpu::this().tick();
+    eoi();
+}
+
+/// A doorbell. The sender set the flag; arriving is the whole message, and
+/// what it is about is already in this core's inbox.
+pub extern "x86-interrupt" fn wake_interrupt(_frame: x86_64::structures::idt::InterruptStackFrame) {
     eoi();
 }
 

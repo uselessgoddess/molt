@@ -9,6 +9,7 @@ mod apic;
 mod interrupts;
 mod memory;
 mod msi;
+mod percpu;
 
 use core::arch::asm;
 
@@ -22,9 +23,9 @@ pub use bootloader_api::{
 };
 use molt_arch::memory::{Device, Rights, Span};
 use molt_arch::{
-    BootInfo, ConfigSpace, DeviceMapper, ExitStatus, FabricError, FrameCursor, ImageRange,
-    InterruptFabric, MappingError, MemoryMap, MemoryRegion, MemoryRegionKind, Mmio, MsiMessage,
-    Platform, PlatformError, SerialPort, Sink,
+    BootInfo, ConfigSpace, CpuId, DeviceMapper, ExitStatus, FabricError, FrameCursor, ImageRange,
+    InterruptFabric, Local, MappingError, MemoryMap, MemoryRegion, MemoryRegionKind, Mmio,
+    MsiMessage, Platform, PlatformError, SerialPort, Sink, Smp, SmpError,
 };
 
 /// Fixed boot-stack window cloned into kernel-owned page tables.
@@ -63,6 +64,10 @@ pub fn start(raw: &'static mut BootloaderInfo, kernel: fn(BootInfo<'_>, &mut X86
     let kernel_image = ImageRange::new(raw.kernel_image_offset, raw.kernel_len);
     let boot_info =
         BootInfo::new(&memory_map, physical_memory_offset).with_kernel_image(kernel_image);
+    // The boot core takes its block before anything else runs on it: `gs` is
+    // how every layer above finds anything, including the panic path.
+    // SAFETY: this is the boot core, and this is the only call for it.
+    unsafe { percpu::attach(CpuId::BOOT) };
     // The RSDP is captured here because this is the only place it exists: it is
     // a field of the bootloader's structure, not of the memory map, and there
     // is no way to find it again later that is not a guess.
@@ -157,6 +162,22 @@ impl X86_64 {
             }
         }
     }
+
+    /// Numbers the cores ACPI listed, through the same direct map.
+    ///
+    /// A machine whose tables say nothing about its cores is a machine with one
+    /// core as far as molt is concerned: [`percpu::declare`] always keeps the
+    /// core already running, so the failure costs parallelism and nothing else.
+    fn declare_cpus(&self, boot_info: &BootInfo<'_>) {
+        let mut listed = [0; percpu::MAX];
+        let found = match (self.rsdp, boot_info.physical_offset()) {
+            // SAFETY: as in `acpi_config_space` — firmware's address, and the
+            // loader's map, both still live.
+            (Some(rsdp), Some(offset)) => unsafe { acpi::processors(rsdp, offset, &mut listed) },
+            _ => Err(AcpiError::Absent),
+        };
+        percpu::declare(&listed[..found.unwrap_or(0)], apic::boot_id());
+    }
 }
 
 impl Default for X86_64 {
@@ -177,6 +198,7 @@ impl Platform for X86_64 {
         // ACPI is read before the switch: firmware tables sit in reserved memory,
         // and the loader's direct map stops being live once `CR3` is written.
         self.space = self.acpi_config_space(boot_info);
+        self.declare_cpus(boot_info);
 
         // The kernel's tables come up before the APIC: the loader's direct map is
         // the only way to reach MMIO until they exist.
@@ -253,9 +275,50 @@ impl DeviceMapper for X86_64 {
     }
 }
 
+// SAFETY: `attach` gave this core an element of a static array, which nothing
+// else installs and which outlives every core.
+unsafe impl Local for X86_64 {
+    unsafe fn install(block: *mut ()) {
+        percpu::this().set_block(block);
+    }
+
+    fn block() -> *mut () {
+        percpu::this().block()
+    }
+}
+
+impl Smp for X86_64 {
+    fn cpus(&self) -> u16 {
+        percpu::count()
+    }
+
+    fn cpu(&self) -> CpuId {
+        percpu::this().cpu()
+    }
+
+    /// Rings the doorbell, and only sends the interrupt when it was not already
+    /// ringing: an unanswered wake is one the target has yet to look at, and a
+    /// second one tells it nothing the first did not.
+    fn wake(&self, cpu: CpuId) -> Result<(), SmpError> {
+        let target = percpu::of(cpu).ok_or(SmpError::Unknown)?;
+        if target.ring() {
+            apic::ipi(target.apic(), apic::WAKE_VECTOR).map_err(|_| SmpError::Refused)?;
+        }
+        Ok(())
+    }
+
+    /// Arms before halting: the doorbell is checked with interrupts off, so a
+    /// wake that arrived while the caller decided it had no work is taken here
+    /// rather than slept through.
+    fn park(&self) {
+        apic::park();
+    }
+}
+
 impl InterruptFabric for X86_64 {
-    fn allocate(&mut self) -> Result<(u16, MsiMessage), FabricError> {
-        msi::allocate()
+    fn allocate(&mut self, cpu: CpuId) -> Result<(u16, MsiMessage), FabricError> {
+        let apic = percpu::of(cpu).ok_or(FabricError::Unknown)?.apic();
+        msi::allocate(apic)
     }
 
     fn release(&mut self, line: u16) -> Result<(), FabricError> {

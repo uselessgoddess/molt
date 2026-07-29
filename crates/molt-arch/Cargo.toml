@@ -5,5 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[dependencies]
+molt-core.workspace = true
+
 [lints]
 workspace = true

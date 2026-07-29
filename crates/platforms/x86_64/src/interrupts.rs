@@ -68,6 +68,7 @@ pub fn init() {
                 .set_stack_index(DOUBLE_FAULT_IST_INDEX);
         }
         idt[apic::TIMER_VECTOR].set_handler_fn(apic::timer_interrupt);
+        idt[apic::WAKE_VECTOR].set_handler_fn(apic::wake_interrupt);
         idt[apic::SPURIOUS_VECTOR].set_handler_fn(apic::spurious_interrupt);
 
         msi::install(&mut idt);

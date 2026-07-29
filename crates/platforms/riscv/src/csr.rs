@@ -3,9 +3,12 @@
 use core::arch::asm;
 
 pub const SSTATUS_SIE: usize = 1 << 1;
+pub const SIE_SSIE: usize = 1 << 1;
 pub const SIE_STIE: usize = 1 << 5;
+pub const SIP_SSIP: usize = 1 << 1;
 
 pub const CAUSE_INTERRUPT: usize = 1 << (usize::BITS as usize - 1);
+pub const INTERRUPT_SOFTWARE: usize = 1;
 pub const INTERRUPT_TIMER: usize = 5;
 pub const EXCEPTION_BREAKPOINT: usize = 3;
 
@@ -73,4 +76,42 @@ pub unsafe fn enable_timer_interrupts() {
             options(nomem, nostack),
         );
     }
+}
+
+/// Lets doorbells in, and clears one that is pending.
+///
+/// # Safety
+///
+/// A valid trap vector must be installed before software interrupts arrive.
+pub unsafe fn enable_software_interrupts() {
+    // SAFETY: set only the software-enable bit, leaving other sources as configured.
+    unsafe { asm!("csrs sie, {ssie}", ssie = in(reg) SIE_SSIE, options(nomem, nostack)) }
+}
+
+/// Acknowledges the software interrupt being handled.
+///
+/// # Safety
+///
+/// Only for the handler: clearing it anywhere else drops a doorbell.
+pub unsafe fn clear_software_interrupt() {
+    // SAFETY: clearing only `sip.SSIP` leaves every other pending bit alone.
+    unsafe { asm!("csrc sip, {ssip}", ssip = in(reg) SIP_SSIP, options(nomem, nostack)) }
+}
+
+/// Blocks supervisor traps until [`enable_interrupts`].
+///
+/// # Safety
+///
+/// The window must be short and must not block: nothing arrives inside it.
+pub unsafe fn disable_interrupts() {
+    // SAFETY: clearing only `sstatus.SIE` leaves every source as configured.
+    unsafe { asm!("csrc sstatus, {sie}", sie = in(reg) SSTATUS_SIE, options(nomem, nostack)) }
+}
+
+/// # Safety
+///
+/// A valid trap vector must be installed before traps are let in.
+pub unsafe fn enable_interrupts() {
+    // SAFETY: setting only `sstatus.SIE` leaves every source as configured.
+    unsafe { asm!("csrs sstatus, {sie}", sie = in(reg) SSTATUS_SIE, options(nomem, nostack)) }
 }

@@ -3,18 +3,24 @@
 //! Hardware-independent contracts shared by the kernel and architecture crates.
 
 pub mod audit;
+pub mod cpu;
 pub mod dma;
 pub mod irq;
 pub mod memory;
 pub mod mmio;
 pub mod pci;
+pub mod smp;
 
 use core::fmt;
 
+pub use molt_core::cpu::CpuId;
+
+pub use crate::cpu::Local;
 pub use crate::irq::{FabricError, InterruptFabric, MsiMessage, Sink};
 pub use crate::memory::Cache;
 pub use crate::mmio::{DeviceMapper, Mmio, MmioError};
 pub use crate::pci::ConfigSpace;
+pub use crate::smp::{Entry, Smp, SmpError, Stack, number};
 
 /// Architecture-neutral information passed from a platform boot adapter.
 #[derive(Clone, Copy)]
@@ -550,7 +556,7 @@ impl From<FabricError> for PlatformError {
 }
 
 /// Hardware services used directly by architecture-independent kernel code.
-pub trait Platform: DeviceMapper + InterruptFabric {
+pub trait Platform: DeviceMapper + InterruptFabric + Local + Smp {
     type Serial: SerialPort;
 
     fn serial(&mut self) -> &mut Self::Serial;

@@ -2,7 +2,7 @@ use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 
 use molt_arch::memory::{Inventory, Rights};
-use molt_arch::{BootInfo, Mmio, MsiMessage, Platform, SerialWriter, Sink};
+use molt_arch::{BootInfo, CpuId, Mmio, MsiMessage, Platform, SerialWriter, Sink};
 use molt_core::interrupt::{InterruptSlab, InterruptToken};
 use molt_kernel::report;
 use molt_pci::{Bus, Command, Function, bus_span, preferred};
@@ -30,9 +30,13 @@ impl Sink for Interrupts {
 
 static INTERRUPTS: Interrupts = Interrupts(InterruptSlab::new());
 
-/// Reserves one device line and connects the platform entry path to the slab.
-pub(crate) fn bind<P: Platform>(platform: &mut P) -> Option<(InterruptToken, MsiMessage)> {
-    let (line, message) = platform.allocate().ok()?;
+/// Reserves one device line on the core that will serve it, and connects the
+/// platform entry path to the slab.
+pub(crate) fn bind<P: Platform>(
+    platform: &mut P,
+    cpu: CpuId,
+) -> Option<(InterruptToken, MsiMessage)> {
+    let (line, message) = platform.allocate(cpu).ok()?;
     let token = match INTERRUPTS.0.bind(line) {
         Ok(token) => token,
         Err(_) => {
@@ -177,7 +181,8 @@ fn route<P: Platform>(
     let capability = preferred(function).ok()?;
     // The line is bound before the device is programmed, never after: a device
     // able to deliver into a line nobody owns is a dropped interrupt at best.
-    let (token, message) = bind(platform)?;
+    let cpu = platform.cpu();
+    let (token, message) = bind(platform, cpu)?;
     let line = token.line();
 
     // `edu` implements MSI, not MSI-X: its table would need a BAR mapping of

@@ -9,6 +9,7 @@ use crate::error::SbiError;
 const EXT_CONSOLE_PUTCHAR: usize = 0x01;
 const EXT_BASE: usize = 0x10;
 const EXT_DEBUG_CONSOLE: usize = 0x4442_434e;
+const EXT_IPI: usize = 0x0073_5049;
 const EXT_TIMER: usize = 0x5449_4d45;
 const EXT_SYSTEM_RESET: usize = 0x5352_5354;
 
@@ -68,6 +69,15 @@ pub fn set_timer(deadline: u64) {
     unsafe {
         call(EXT_TIMER, 0, deadline as usize, 0, 0);
     }
+}
+
+/// Raises a supervisor software interrupt on `hart`.
+pub fn send_ipi(hart: u64) -> Result<(), SbiError> {
+    // The mask is one hart wide and based at that hart, which is the whole of
+    // what a doorbell needs: cores are woken one at a time, by name.
+    // SAFETY: the IPI extension takes a hart mask in a0 and its base in a1.
+    let sent = unsafe { call(EXT_IPI, 0, 1, hart as usize, 0) };
+    sent.into_result().map(drop)
 }
 
 pub fn shutdown(success: bool) -> ! {
