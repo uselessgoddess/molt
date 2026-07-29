@@ -143,10 +143,10 @@ pub(crate) fn start<P: Platform>(platform: &mut P) -> u16 {
     let mut running = 1;
     for index in 1..platform.cpus().min(MAX as u16) {
         let cpu = CpuId::new(index);
-        let stack = stack();
         // SAFETY: the stack is leaked and handed to this core alone, and
         // `enter` is what every other core is already running.
-        if unsafe { platform.start(cpu, stack, enter) }.is_ok() && settle(cpu) {
+        let started = unsafe { platform.start(cpu, stack(), enter) };
+        if started.is_ok() && settle(cpu) {
             running += 1;
         }
     }

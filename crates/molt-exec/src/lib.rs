@@ -7,7 +7,7 @@
 //! doorbell it rings. That is where `Send` is asked for, and the only place —
 //! a task that never leaves its core is never made to prove it could.
 //!
-//! Three pieces make that work. [`Task`](task) is an `Arc` whose future is
+//! Three pieces make that work. A task is an `Arc` whose future is
 //! touched by one core only, so a waker may cross cores while the future does
 //! not. The inbox is a stack pushed by anyone and drained by its owner, which
 //! is one atomic swap per turn rather than a lock per wake. And [`Timers`] is

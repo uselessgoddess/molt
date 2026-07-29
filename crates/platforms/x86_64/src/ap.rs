@@ -52,11 +52,13 @@ __molt_ap_start:
     shll $4, %eax
     movl %eax, %ebp
 
-    // The table's own address, and the base the 32-bit code runs at.
-    movl %eax, (__molt_ap_gdtr - __molt_ap_start + 2)
+    // The base the 32-bit code runs at, and the table's own linear address —
+    // which is the frame plus where the table sits in it, not the frame.
     movw %ax, (__molt_ap_gdt - __molt_ap_start + 10)
     shrl $16, %eax
     movb %al, (__molt_ap_gdt - __molt_ap_start + 12)
+    leal (__molt_ap_gdt - __molt_ap_start)(%ebp), %eax
+    movl %eax, (__molt_ap_gdtr - __molt_ap_start + 2)
 
     lgdtl (__molt_ap_gdtr - __molt_ap_start)
     movl %cr0, %eax
@@ -79,7 +81,9 @@ __molt_ap_protected:
     movl %eax, %cr3
     movl $0xc0000080, %ecx            // extended feature enable
     rdmsr
-    orl $(1 << 8), %eax               // long mode
+    // No-execute goes on with long mode, not after it: the kernel's tables mark
+    // every data page, and to a core that never enabled it that bit is reserved.
+    orl $(1 << 8 | 1 << 11), %eax
     wrmsr
 
     // Pushed before paging, which is the last write this frame takes: with the
