@@ -540,6 +540,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "molt-exec"
+version = "0.1.0"
+dependencies = [
+ "molt-core",
+]
+
+[[package]]
 name = "molt-fs"
 version = "0.1.0"
 dependencies = [
