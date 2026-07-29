@@ -2,11 +2,10 @@ use molt_core::buffer::{BufferOperation, BufferRegistry};
 use molt_core::capability::CellId;
 use molt_core::cell::Cell;
 use molt_core::ring::{IoRing, RequestId, Submission};
-use molt_net::addr::{IpAddr, Ipv4Addr, MacAddr};
 use molt_net::arp::{Operation, Packet as Arp};
-use molt_net::ethernet::{EtherType, Frame};
+use molt_net::eth::{EtherType, Frame};
 use molt_net::ipv4::Packet as Ipv4;
-use molt_net::{Config, Ip, IpDone, IpError, IpOp, Link, LinkError};
+use molt_net::{Config, Ip, IpAddr, IpDone, IpError, IpOp, Ipv4Addr, Link, LinkError, MacAddr};
 use molt_udp::{Datagram, Endpoint, Scratch, Udp, UdpCell, UdpDone, UdpError, UdpOp, UdpState};
 
 const OWNER: CellId = CellId::new(7);
@@ -24,6 +23,10 @@ impl Link for Capture {
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
         self.frames.push(frame.to_vec());
         Ok(())
+    }
+
+    fn receive(&mut self, _frame: &mut [u8]) -> Result<Option<usize>, LinkError> {
+        Ok(None)
     }
 }
 

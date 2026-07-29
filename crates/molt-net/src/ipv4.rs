@@ -1,7 +1,6 @@
 //! IPv4 packets without options or fragmentation.
 
-use crate::addr::Ipv4Addr;
-use crate::{NetError, checksum};
+use crate::{Ipv4Addr, NetError, checksum};
 
 /// An IPv4 header and borrowed protocol payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

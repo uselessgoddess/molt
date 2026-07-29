@@ -186,27 +186,29 @@ mod tests {
     use crate::fake::Space;
 
     #[test]
-    fn ecam_offset_matches_the_specified_encoding() {
-        let address = Address::new(3, 31, 7).expect("a legal function number");
+    fn ecam_offset_matches_encoding() -> Result<(), PciError> {
+        let address = Address::new(3, 31, 7)?;
 
         assert_eq!(address.offset(), 31 << 15 | 7 << 12);
         assert_eq!(Address::new(0, 32, 0), Err(PciError::Address));
         assert_eq!(Address::new(0, 0, 8), Err(PciError::Address));
+        Ok(())
     }
 
     #[test]
-    fn a_bus_window_covers_one_bus() {
-        let space = ConfigSpace::new(0xb000_0000, 0, 0, 0xff).expect("firmware bus range");
+    fn bus_window_covers_one_bus() -> Result<(), PciError> {
+        let space = ConfigSpace::new(0xb000_0000, 0, 0, 0xff).unwrap();
 
-        let span = bus_span(space, 2).expect("a bus inside the reported range");
+        let span = bus_span(space, 2)?;
 
         assert_eq!(span.start(), 0xb020_0000);
         assert_eq!(span.bytes(), 1 << 20);
+        Ok(())
     }
 
     #[test]
-    fn a_bus_outside_the_reported_range_is_refused() {
-        let space = ConfigSpace::new(0xb000_0000, 0, 0, 3).expect("firmware bus range");
+    fn bus_outside_range_refused() {
+        let space = ConfigSpace::new(0xb000_0000, 0, 0, 3).unwrap();
 
         assert_eq!(bus_span(space, 4).err(), Some(PciError::Address));
     }
@@ -220,15 +222,15 @@ mod tests {
 
         let mut bus = Bus::new(&window, 0);
 
-        let first = bus.function().expect("the function at 00:00.0");
+        let first = bus.function().unwrap();
         assert_eq!((first.vendor(), first.device()), (0x1234, 0x0001));
-        let second = bus.function().expect("the function at 00:05.0");
+        let second = bus.function().unwrap();
         assert_eq!(second.address().device(), 5);
         assert!(bus.function().is_none(), "the scan invented a function");
     }
 
     #[test]
-    fn a_single_function_device_is_probed_once() {
+    fn single_function_probed_once() {
         let mut space = Space::new();
         // Function 0 is single-function, so 00:00.1 must never be read even
         // though this fixture answers there.
@@ -238,12 +240,12 @@ mod tests {
 
         let mut bus = Bus::new(&window, 0);
 
-        assert_eq!(bus.function().expect("00:00.0").device(), 0x0001);
+        assert_eq!(bus.function().unwrap().device(), 0x0001);
         assert!(bus.function().is_none(), "a single-function device answered twice");
     }
 
     #[test]
-    fn a_multifunction_device_reports_its_other_functions() {
+    fn multifunction_device_reports_rest() {
         let mut space = Space::new();
         space.function(0, 0).header(0x1234, 0x0001).multifunction();
         space.function(0, 3).header(0x1234, 0x0004);
@@ -251,8 +253,8 @@ mod tests {
 
         let mut bus = Bus::new(&window, 0);
 
-        assert_eq!(bus.function().expect("00:00.0").device(), 0x0001);
-        assert_eq!(bus.function().expect("00:00.3").device(), 0x0004);
+        assert_eq!(bus.function().unwrap().device(), 0x0001);
+        assert_eq!(bus.function().unwrap().device(), 0x0004);
         assert!(bus.function().is_none());
     }
 }

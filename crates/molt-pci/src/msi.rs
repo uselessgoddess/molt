@@ -299,9 +299,7 @@ mod tests {
     use crate::{Address, PciError};
 
     fn function(space: &mut Space) -> Function<'_> {
-        Function::probe(space.config(0, 0), Address::new(0, 0, 0).expect("00:00.0"))
-            .expect("a legal read")
-            .expect("present")
+        Function::probe(space.config(0, 0), Address::new(0, 0, 0).unwrap()).unwrap().unwrap()
     }
 
     fn table(bytes: &mut [u8]) -> Mmio<'_> {
@@ -310,121 +308,123 @@ mod tests {
     }
 
     #[test]
-    fn the_msix_capability_reports_its_table() {
+    fn msix_capability_reports_table() -> Result<(), PciError> {
         let mut space = Space::new();
         space.function(0, 0).header(0x1af4, 0x1041).msix(0x40, 4, 1, 0x2000);
         let function = function(&mut space);
 
-        let capability = function.msix().expect("an MSI-X capability");
+        let capability = function.msix()?;
 
         assert_eq!(capability.vectors(), 4);
         assert_eq!(capability.table_bar(), 1);
         assert_eq!(capability.table_offset(), 0x2000);
         assert_eq!(capability.table_bytes(), 64);
+        Ok(())
     }
 
     #[test]
-    fn routing_writes_the_platform_message_verbatim() {
+    fn routing_writes_message_verbatim() -> Result<(), PciError> {
         let mut space = Space::new();
         space.function(0, 0).header(0x1af4, 0x1041).msix(0x40, 2, 0, 0);
         let mut entries = [0u8; 32];
-        let capability = function(&mut space).msix().expect("an MSI-X capability");
+        let capability = function(&mut space).msix()?;
         let control = space.window();
-        let control = control.subwindow(0x40, capability.bytes()).expect("the capability");
-        let mut msix =
-            MsiX::new(capability, control, table(&mut entries)).expect("a table large enough");
+        let control = control.subwindow(0x40, capability.bytes())?;
+        let mut msix = MsiX::new(capability, control, table(&mut entries))?;
 
-        let vector =
-            msix.route(1, MsiMessage::new(0xfee0_0000, 0x0051)).expect("a vector the device has");
+        let vector = msix.route(1, MsiMessage::new(0xfee0_0000, 0x0051))?;
 
         assert_eq!(vector.index(), 1);
         assert_eq!(msix.is_masked(vector), Ok(false));
         assert_eq!(&entries[16..28], &[0x00, 0x00, 0xe0, 0xfe, 0, 0, 0, 0, 0x51, 0, 0, 0]);
+        Ok(())
     }
 
     #[test]
-    fn enabling_clears_the_function_mask() {
+    fn enabling_clears_function_mask() -> Result<(), PciError> {
         let mut space = Space::new();
         space.function(0, 0).header(0x1af4, 0x1041).msix(0x40, 1, 0, 0);
         let mut entries = [0u8; 16];
-        let capability = function(&mut space).msix().expect("an MSI-X capability");
+        let capability = function(&mut space).msix()?;
         let control = space.window();
-        let control = control.subwindow(0x40, capability.bytes()).expect("the capability");
-        control.write_u16(2, 1 << 14).expect("the function mask");
-        let mut msix =
-            MsiX::new(capability, control, table(&mut entries)).expect("one table entry");
+        let control = control.subwindow(0x40, capability.bytes())?;
+        control.write_u16(2, 1 << 14)?;
+        let mut msix = MsiX::new(capability, control, table(&mut entries))?;
 
-        msix.enable().expect("the capability enables");
+        msix.enable()?;
 
-        let control = space.window().read_u16(0x42).expect("the capability control");
+        let control = space.window().read_u16(0x42)?;
         assert_ne!(control & 1 << 15, 0);
         assert_eq!(control & 1 << 14, 0);
+        Ok(())
     }
 
     #[test]
-    fn a_vector_the_device_does_not_have_is_refused() {
+    fn absent_vector_refused() -> Result<(), PciError> {
         let mut space = Space::new();
         space.function(0, 0).header(0x1af4, 0x1041).msix(0x40, 2, 0, 0);
         let mut entries = [0u8; 32];
-        let capability = function(&mut space).msix().expect("an MSI-X capability");
+        let capability = function(&mut space).msix()?;
         let control = space.window();
-        let control = control.subwindow(0x40, capability.bytes()).expect("the capability");
-        let mut msix =
-            MsiX::new(capability, control, table(&mut entries)).expect("a table large enough");
+        let control = control.subwindow(0x40, capability.bytes())?;
+        let mut msix = MsiX::new(capability, control, table(&mut entries))?;
 
         assert_eq!(msix.route(2, MsiMessage::new(0xfee0_0000, 0x51)), Err(PciError::Vector));
+        Ok(())
     }
 
     #[test]
-    fn a_table_window_too_small_is_refused() {
+    fn small_table_window_refused() -> Result<(), PciError> {
         let mut space = Space::new();
         space.function(0, 0).header(0x1af4, 0x1041).msix(0x40, 4, 0, 0);
         let mut entries = [0u8; 32];
-        let capability = function(&mut space).msix().expect("an MSI-X capability");
+        let capability = function(&mut space).msix()?;
         let control = space.window();
-        let control = control.subwindow(0x40, capability.bytes()).expect("the capability");
+        let control = control.subwindow(0x40, capability.bytes())?;
 
         assert!(MsiX::new(capability, control, table(&mut entries)).is_err());
+        Ok(())
     }
 
     #[test]
-    fn msi_is_programmed_with_the_message_and_enabled() {
+    fn msi_programmed_with_message() -> Result<(), PciError> {
         let mut space = Space::new();
         space.function(0, 0).header(0x1234, 0x11e8).msi(0x40, true);
         let mut function = function(&mut space);
-        let capability = function.msi().expect("an MSI capability");
+        let capability = function.msi()?;
 
-        function
-            .route_msi(capability, MsiMessage::new(0xfee0_0000, 0x0052))
-            .expect("a device with one vector");
+        function.route_msi(capability, MsiMessage::new(0xfee0_0000, 0x0052))?;
 
         let window = function.window();
         assert_eq!(window.read_u32(0x44), Ok(0xfee0_0000));
         assert_eq!(window.read_u32(0x48), Ok(0));
         assert_eq!(window.read_u16(0x4c), Ok(0x0052));
         assert_eq!(window.read_u16(0x42).map(|c| c & 1), Ok(1), "MSI was left disabled");
-        assert!(function.command().expect("readable").contains(Command::INTX_DISABLE));
+        assert!(function.command()?.contains(Command::INTX_DISABLE));
+        Ok(())
     }
 
     #[test]
-    fn a_narrow_device_refuses_a_wide_message() {
+    fn narrow_device_refuses_wide_message() -> Result<(), PciError> {
         let mut space = Space::new();
         space.function(0, 0).header(0x1234, 0x11e8).msi(0x40, false);
         let mut function = function(&mut space);
-        let capability = function.msi().expect("an MSI capability");
+        let capability = function.msi()?;
 
         let routed = function.route_msi(capability, MsiMessage::new(0x1_0000_0000, 0x52));
 
         assert_eq!(routed, Err(PciError::Layout));
+        Ok(())
     }
 
     #[test]
-    fn msix_is_preferred_over_msi() {
+    fn msix_is_preferred_over_msi() -> Result<(), PciError> {
         let mut space = Space::new();
         space.function(0, 0).header(0x1af4, 0x1041).msi(0x40, true).msix(0x60, 1, 0, 0);
         let function = function(&mut space);
 
-        assert_eq!(super::preferred(&function).expect("a capability").id(), MSIX);
-        assert_eq!(function.capability(MSI).expect("an MSI capability").offset(), 0x40);
+        assert_eq!(super::preferred(&function)?.id(), MSIX);
+        assert_eq!(function.capability(MSI)?.offset(), 0x40);
+        Ok(())
     }
 }

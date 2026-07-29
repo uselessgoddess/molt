@@ -3,7 +3,7 @@
 use molt_core::buffer::BufferOperation;
 use molt_core::capability::{Capability, CapabilityRights, Read, Rights, Write};
 
-use crate::addr::IpAddr;
+use crate::IpAddr;
 
 /// Authority to send and receive one IP protocol number.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

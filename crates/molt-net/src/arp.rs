@@ -1,7 +1,6 @@
 //! Ethernet/IPv4 address resolution packets.
 
-use crate::NetError;
-use crate::addr::{Ipv4Addr, MacAddr};
+use crate::{Ipv4Addr, MacAddr, NetError};
 
 /// An ARP request or reply.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

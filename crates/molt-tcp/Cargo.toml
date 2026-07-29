@@ -1,0 +1,14 @@
+[package]
+name = "molt-tcp"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.91"
+publish = false
+
+[dependencies]
+molt-core.workspace = true
+molt-net.workspace = true
+smoltcp.workspace = true
+
+[lib]
+bench = false

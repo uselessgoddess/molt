@@ -1,4 +1,4 @@
-use molt_net::addr::{IpAddr, Ipv4Addr, Ipv6Addr};
+use molt_net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use molt_udp::{Datagram, Endpoint, UdpError};
 
 const LOCAL: Endpoint = Endpoint::new(IpAddr::V4(Ipv4Addr::new(10, 0, 2, 15)), 49152);

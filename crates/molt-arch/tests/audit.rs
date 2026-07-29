@@ -41,7 +41,7 @@ fn image_ranges() -> [MappedRange; 2] {
 }
 
 #[test]
-fn correct_image_passes_the_audit() {
+fn correct_image_passes_audit() {
     let ranges = image_ranges();
     let audit = Audit::new(&ranges);
     let table = Table(image());
@@ -153,42 +153,46 @@ fn executable_device_window_is_caught() {
 }
 
 #[test]
-fn declarations_merge_into_one() {
+fn declarations_merge_into_one() -> Result<(), MappingError> {
     let mut declared = Declared::<4>::new();
 
-    declared.push(MappedRange::ram(RAM, RAM + FRAME_SIZE)).unwrap();
-    declared.push(MappedRange::ram(RAM + FRAME_SIZE, RAM + 2 * FRAME_SIZE)).unwrap();
+    declared.push(MappedRange::ram(RAM, RAM + FRAME_SIZE))?;
+    declared.push(MappedRange::ram(RAM + FRAME_SIZE, RAM + 2 * FRAME_SIZE))?;
 
     assert_eq!(declared.as_slice(), &[MappedRange::ram(RAM, RAM + 2 * FRAME_SIZE)]);
+    Ok(())
 }
 
 #[test]
-fn declarations_stay_apart() {
+fn declarations_stay_apart() -> Result<(), MappingError> {
     let mut declared = Declared::<4>::new();
 
-    declared.push(MappedRange::ram(RAM, RAM + FRAME_SIZE)).unwrap();
-    declared.push(MappedRange::device(RAM + FRAME_SIZE, RAM + 2 * FRAME_SIZE)).unwrap();
+    declared.push(MappedRange::ram(RAM, RAM + FRAME_SIZE))?;
+    declared.push(MappedRange::device(RAM + FRAME_SIZE, RAM + 2 * FRAME_SIZE))?;
 
     assert_eq!(declared.as_slice().len(), 2);
+    Ok(())
 }
 
 #[test]
-fn empty_declarations_dropped() {
+fn empty_declarations_dropped() -> Result<(), MappingError> {
     let mut declared = Declared::<1>::new();
 
-    declared.push(MappedRange::ram(RAM, RAM)).unwrap();
+    declared.push(MappedRange::ram(RAM, RAM))?;
 
     assert!(declared.as_slice().is_empty());
+    Ok(())
 }
 
 #[test]
-fn overflowing_declaration_error() {
+fn overflowing_declaration_error() -> Result<(), MappingError> {
     let mut declared = Declared::<1>::new();
 
-    declared.push(MappedRange::ram(RAM, RAM + FRAME_SIZE)).unwrap();
+    declared.push(MappedRange::ram(RAM, RAM + FRAME_SIZE))?;
 
     assert_eq!(
         declared.push(MappedRange::ram(RAM + 2 * FRAME_SIZE, RAM + 3 * FRAME_SIZE)),
         Err(MappingError::Backend)
     );
+    Ok(())
 }

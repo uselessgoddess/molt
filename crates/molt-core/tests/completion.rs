@@ -16,9 +16,9 @@ impl Wake for CountWake {
 }
 
 #[test]
-fn completion_wakes_once() {
+fn completion_wakes_once() -> Result<(), CompletionError> {
     let slab = CompletionSlab::<u32, 2>::new();
-    let token = slab.reserve().unwrap();
+    let token = slab.reserve()?;
     let wake = Arc::new(CountWake(AtomicUsize::new(0)));
     let waker = Waker::from(wake.clone());
     let mut cx = Context::from_waker(&waker);
@@ -28,27 +28,29 @@ fn completion_wakes_once() {
     assert_eq!(slab.complete(token.request_id(), 42), Ok(()));
     assert_eq!(wake.0.load(Ordering::Relaxed), 1);
     assert_eq!(future.as_mut().poll(&mut cx), Poll::Ready(Ok(42)));
+    Ok(())
 }
 
 #[test]
-fn restart_rejects_stale() {
+fn restart_rejects_stale() -> Result<(), CompletionError> {
     let slab = CompletionSlab::<u32, 2>::new();
-    let cancelled = slab.reserve().unwrap();
+    let cancelled = slab.reserve()?;
     assert_eq!(slab.cancel(cancelled), Ok(()));
     assert_eq!(slab.complete(cancelled.request_id(), 1), Err(CompletionError::Stale));
 
-    let outstanding = slab.reserve().unwrap();
+    let outstanding = slab.reserve()?;
     assert_eq!(slab.cancel_all(), 1);
     assert_eq!(slab.complete(outstanding.request_id(), 2), Err(CompletionError::Stale));
+    Ok(())
 }
 
 #[test]
-fn poll_race_keeps_wake() {
+fn poll_race_keeps_wake() -> Result<(), CompletionError> {
     let limit = if cfg!(miri) { 16 } else { 256 };
 
     for expected in 0..limit {
         let slab = Arc::new(CompletionSlab::<usize, 1>::new());
-        let token = slab.reserve().unwrap();
+        let token = slab.reserve()?;
         let publisher = slab.clone();
         let completion = thread::spawn(move || {
             thread::yield_now();
@@ -69,15 +71,16 @@ fn poll_race_keeps_wake() {
             assert_eq!(first_poll, Poll::Ready(Ok(expected)));
         }
     }
+    Ok(())
 }
 
 #[test]
-fn cancel_race_reuses_slot() {
+fn cancel_race_reuses_slot() -> Result<(), CompletionError> {
     let limit = if cfg!(miri) { 16 } else { 1024 };
 
     for _ in 0..limit {
         let slab = Arc::new(CompletionSlab::<usize, 1>::new());
-        let token = slab.reserve().unwrap();
+        let token = slab.reserve()?;
 
         let completer = slab.clone();
         let complete = thread::spawn(move || {
@@ -103,10 +106,11 @@ fn cancel_race_reuses_slot() {
             other => panic!("unexpected terminal outcome: {other:?}"),
         }
 
-        let reused = slab.reserve().unwrap();
+        let reused = slab.reserve()?;
         assert_ne!(reused.request_id(), token.request_id());
         assert_eq!(slab.complete(token.request_id(), 9), Err(CompletionError::Stale));
     }
+    Ok(())
 }
 
 #[test]
@@ -141,11 +145,12 @@ fn producers_keep_slots() {
 }
 
 #[test]
-fn padded_layout_completes() {
+fn padded_layout_completes() -> Result<(), CompletionError> {
     let slab = CompletionSlab::<u32, 1, Padded>::new();
-    let token = slab.reserve().unwrap();
+    let token = slab.reserve()?;
 
-    slab.complete(token.request_id(), 7).unwrap();
+    slab.complete(token.request_id(), 7)?;
 
     assert_eq!(slab.reserve(), Err(CompletionError::Full));
+    Ok(())
 }

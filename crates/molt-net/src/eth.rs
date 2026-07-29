@@ -1,7 +1,6 @@
 //! Ethernet II frame encoding.
 
-use crate::NetError;
-use crate::addr::MacAddr;
+use crate::{MacAddr, NetError};
 
 /// A supported Ethernet protocol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

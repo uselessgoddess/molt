@@ -1,6 +1,6 @@
 //! Protocol-neutral neighbor discovery cache.
 
-use crate::addr::{IpAddr, MacAddr};
+use crate::{IpAddr, MacAddr};
 
 #[derive(Clone, Copy)]
 struct Neighbor {

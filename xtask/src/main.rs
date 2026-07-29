@@ -158,6 +158,7 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
             "MOLT_INTERRUPT_OK:",
             "MOLT_VIRTIO_OK:",
             "MOLT_BLOCK_OK:",
+            "MOLT_BLK_IRQ_OK:",
             "MOLT_FS_OK:",
             "MOLT_FS_WRITE_OK:",
             "MOLT_REGISTRY_OK:",
@@ -169,6 +170,8 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
             "MOLT_VIRTIO_RESET_OK:",
             "MOLT_NET_OK:",
             "MOLT_UDP_OK:",
+            "MOLT_NDP_OK:",
+            "MOLT_TCP_OK:",
         ],
         _ => &[],
     }
@@ -357,7 +360,10 @@ fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
     command.arg("-drive").arg(format!("format=raw,file={}", image.display()));
     command.arg("-drive").arg(format!("if=none,id=molt-disk,format=raw,file={}", disk.display()));
     command.arg("-device").arg("virtio-blk-pci,drive=molt-disk,disable-legacy=on");
-    command.args(["-netdev", "user,id=molt-net"]);
+    // `cat` behind the forwarder is the TCP smoke's peer: slirp runs one per
+    // connection and pipes the stream through it, so it answers with the bytes
+    // it was sent without the host having to listen anywhere.
+    command.args(["-netdev", "user,id=molt-net,guestfwd=tcp:10.0.2.100:80-cmd:cat"]);
     command
         .arg("-device")
         .arg("virtio-net-pci,netdev=molt-net,disable-legacy=on,mac=52:54:00:12:34:56");
@@ -464,8 +470,8 @@ mod tests {
     #[test]
     fn smoke_disk_mounts_reads_and_writes() {
         let tree = workspace_root().join(DISK_TREE);
-        let on_disk = fs::read(tree.join("hello.txt")).expect("file the image was built from");
-        let mut image = lay_out(&tree).expect("image of the smoke tree");
+        let on_disk = fs::read(tree.join("hello.txt")).unwrap();
+        let mut image = lay_out(&tree).unwrap();
         {
             let mut fs = Fs::<_, 4>::mount(Loopback::writable(&mut image).unwrap()).unwrap();
 

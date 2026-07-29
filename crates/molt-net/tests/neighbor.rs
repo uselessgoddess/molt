@@ -1,5 +1,5 @@
-use molt_net::addr::{IpAddr, Ipv4Addr, Ipv6Addr, MacAddr};
 use molt_net::neighbor::Cache;
+use molt_net::{IpAddr, Ipv4Addr, Ipv6Addr, MacAddr};
 
 const V4: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2));
 const V6: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);

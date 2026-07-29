@@ -4,10 +4,10 @@
 //! finds the device's structures in its PCI BARs; [`Common`] drives the
 //! initialization handshake and programs a queue; [`Queue`] is one split
 //! virtqueue laid over [`Region`](molt_arch::dma::Region)s the device reads and
-//! writes; [`Notify`] kicks the device; and [`Block`] ties them together to
-//! read and write sectors, flush them durably, and, on [`reset`](Block::reset),
-//! return every region to the arena only after the device has been told to
-//! stop.
+//! writes; [`Notify`] kicks the device and [`Arrivals`] is the vector it
+//! answers on; and [`Block`] ties them together to read and write sectors,
+//! flush them durably, and, on [`reset`](Block::reset), return every region to
+//! the arena only after the device has been told to stop.
 //!
 //! Above the driver there are only [`molt_block::Device`] and
 //! [`molt_block::Disk`], which [`Block`] implements: sectors in, sectors
@@ -20,6 +20,7 @@ extern crate std;
 
 mod block;
 mod config;
+mod interrupt;
 mod net;
 mod notify;
 mod queue;
@@ -33,6 +34,7 @@ use molt_pci::PciError;
 
 pub use crate::block::Block;
 pub use crate::config::Common;
+pub use crate::interrupt::Arrivals;
 pub use crate::net::Net;
 pub use crate::notify::Notify;
 pub use crate::queue::{Queue, Segment, Used};

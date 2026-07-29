@@ -117,23 +117,25 @@ fn put_u64(bytes: &mut [u8], at: usize, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::{HEADER, Record};
-    use crate::{Kind, Name};
+    use crate::{FsError, Kind, Name};
 
     #[test]
-    fn create_header_survives_round_trip() {
-        let name = Name::try_from("note").unwrap();
+    fn create_header_survives_round_trip() -> Result<(), FsError> {
+        let name = Name::try_from("note")?;
         let record = Record::create(4, 1, Kind::File, name);
         let mut header = [0; HEADER];
 
         record.encode(&mut header);
 
         assert_eq!(Record::parse(&header), Ok(record));
+        Ok(())
     }
 
     #[test]
-    fn write_span_covers_padding() {
-        let record = Record::write(3, 7, 600).unwrap();
+    fn write_span_covers_padding() -> Result<(), FsError> {
+        let record = Record::write(3, 7, 600)?;
 
         assert_eq!(record.span(), Ok(1024));
+        Ok(())
     }
 }

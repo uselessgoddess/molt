@@ -265,7 +265,7 @@ mod tests {
         tree.file("hello.txt", b"hello, molt".to_vec()).unwrap();
         tree.file("note.txt", b"one\ntwo\n".to_vec()).unwrap();
         tree.dir("docs").unwrap().file("readme", b"read me\n".to_vec()).unwrap();
-        build(&tree, 1).expect("image that fits")
+        build(&tree, 1).unwrap()
     }
 
     /// Runs `script` against a fresh volume and returns everything printed.
@@ -293,7 +293,7 @@ mod tests {
                 fs.serve(CLIENT, &mut driver, &mut buffers.borrow_mut());
             },
         )
-        .expect("shell that only meets errors it can print");
+        .unwrap();
         out.text()
     }
 

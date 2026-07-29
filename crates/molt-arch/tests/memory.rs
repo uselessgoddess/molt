@@ -61,7 +61,7 @@ fn usable_ranges_are_aligned_inward() {
 }
 
 #[test]
-fn usable_ranges_start_above_the_floor() {
+fn usable_ranges_start_above_floor() {
     let map = TestMap([
         MemoryRegion::new(0, 0x9000, MemoryRegionKind::Usable),
         MemoryRegion::new(0x9000, 0xa000, MemoryRegionKind::Reserved),
@@ -126,10 +126,11 @@ fn executable_data_is_rejected() {
 }
 
 #[test]
-fn write_exec_mappings_rejected() {
+fn write_exec_mappings_rejected() -> Result<(), MappingError> {
     assert_eq!(MapPermissions::new(true, true), Err(MappingError::WritableExecutable));
-    assert!(MapPermissions::new(true, false).unwrap().is_write());
-    assert!(MapPermissions::new(false, true).unwrap().is_execute());
+    assert!(MapPermissions::new(true, false)?.is_write());
+    assert!(MapPermissions::new(false, true)?.is_execute());
+    Ok(())
 }
 
 #[test]

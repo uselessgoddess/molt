@@ -1,21 +1,24 @@
-//! A capability-addressed IPv4 service over an Ethernet link.
+//! A capability-addressed IP service over an Ethernet link.
 
 use molt_core::buffer::{BufferError, BufferOperation, BufferRegistry};
 use molt_core::capability::{Capability, CapabilityError, CapabilityTable, CellId, Write};
-use molt_core::ring::{Completion, IoDriver, Submission};
+use molt_core::ring::{Completion, IoDriver, RequestId, Submission};
 
-use crate::NetError;
-use crate::addr::{IpAddr, Ipv4Addr, MacAddr};
 use crate::arp::{Operation as ArpOperation, Packet as Arp};
-use crate::ethernet::{EtherType, Frame};
+use crate::eth::{EtherType, Frame};
+use crate::icmpv6::{self, Message};
 use crate::ipv4::Packet as Ipv4;
+use crate::ipv6::Packet as Ipv6;
 use crate::link::{Link, LinkError};
 use crate::neighbor::Cache;
 use crate::op::{IpDone, IpOp, Protocol};
+use crate::{IpAddr, Ipv4Addr, Ipv6Addr, MacAddr, NetError, addr};
 
-const FRAME: usize = 1514;
-const IP_PACKET: usize = 1500;
-const IP_PAYLOAD: usize = 1480;
+pub const MTU: usize = 1500;
+pub const FRAME: usize = Frame::HEADER + MTU;
+
+/// Every host on the link (RFC 4291 §2.7.1).
+const ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
 
 /// Static addressing for one IP link.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +40,19 @@ impl Config {
 
     pub const fn addr(self) -> IpAddr {
         self.addr
+    }
+
+    pub const fn prefix(self) -> u8 {
+        self.prefix
+    }
+
+    pub const fn gateway(self) -> IpAddr {
+        self.gateway
+    }
+
+    /// The address this host answers on before anything configures it.
+    pub const fn link_local(self) -> Ipv6Addr {
+        addr::link_local(self.mac)
     }
 }
 
@@ -74,7 +90,7 @@ impl From<BufferError> for IpError {
 
 #[derive(Clone, Copy)]
 struct Receive {
-    id: molt_core::ring::RequestId,
+    id: RequestId,
     endpoint: Capability<Protocol>,
     payload: BufferOperation<Write>,
 }
@@ -91,7 +107,12 @@ enum SendState {
     Retry,
 }
 
-/// An IPv4 endpoint table and frame path owned by one network cell.
+/// An IP endpoint table and frame path owned by one network cell.
+///
+/// The family is whichever one [`Config`] carries: v4 resolves neighbours with
+/// ARP, v6 with the two discovery messages of ICMPv6. Everything above the
+/// resolver — binding a protocol, waiting on a receive, retrying a send that
+/// stalled on an unknown neighbour — is the same code for both.
 pub struct Ip<L, const N: usize> {
     link: L,
     config: Config,
@@ -211,19 +232,21 @@ impl<L: Link, const N: usize> Ip<L, N> {
             return Err(IpError::Busy);
         }
         let frame = Frame::parse(bytes)?;
-        if frame.dst() != self.config.mac && frame.dst() != MacAddr::BROADCAST {
+        // Groups pass the link filter and are sorted out by address: discovery
+        // arrives at a solicited-node group no device filter knows about.
+        if frame.dst() != self.config.mac && !frame.dst().is_multicast() {
             return Ok(false);
         }
         match frame.ether_type() {
             EtherType::Arp => self.ingest_arp(frame.payload(), driver, buffers),
             EtherType::Ipv4 => self.ingest_ipv4(frame.payload(), driver, buffers),
-            EtherType::Ipv6 => Ok(false),
+            EtherType::Ipv6 => self.ingest_ipv6(frame.src(), frame.payload(), driver, buffers),
         }
     }
 
     fn wait(
         &mut self,
-        id: molt_core::ring::RequestId,
+        id: RequestId,
         endpoint: Capability<Protocol>,
         payload: BufferOperation<Write>,
     ) -> Result<(), IpError> {
@@ -262,27 +285,31 @@ impl<L: Link, const N: usize> Ip<L, N> {
         };
         let protocol = *self.protocols.get(endpoint)?;
         let payload = buffers.resolve_read(payload)?;
-        if payload.len() > IP_PAYLOAD {
-            return Err(IpError::TooLarge);
-        }
         let next = self.next_hop(to)?;
-        let Some(hardware) = self.neighbors.resolve(IpAddr::V4(next)) else {
-            return match self.arp_request(next) {
+        let Some(hardware) = self.resolve(next) else {
+            return match self.discover(next) {
                 Ok(()) => Ok(SendState::Waiting),
                 Err(LinkError::Busy) => Ok(SendState::Retry),
                 Err(LinkError::Device) => Err(IpError::Link),
             };
         };
-        let mut packet = [0u8; IP_PACKET];
-        let source = self.ipv4_addr()?;
-        let IpAddr::V4(to) = to else {
-            return Err(IpError::Unsupported);
+        let mut packet = [0u8; MTU];
+        let (ether_type, len) = match (self.config.addr, to) {
+            (IpAddr::V4(src), IpAddr::V4(dst)) => {
+                if payload.len() > MTU - Ipv4::HEADER {
+                    return Err(IpError::TooLarge);
+                }
+                (EtherType::Ipv4, Ipv4::new(src, dst, protocol, payload).emit(&mut packet)?)
+            }
+            (IpAddr::V6(src), IpAddr::V6(dst)) => {
+                if payload.len() > MTU - Ipv6::HEADER {
+                    return Err(IpError::TooLarge);
+                }
+                (EtherType::Ipv6, Ipv6::new(src, dst, protocol, payload).emit(&mut packet)?)
+            }
+            _ => return Err(IpError::Unsupported),
         };
-        let len = Ipv4::new(source, to, protocol, payload).emit(&mut packet)?;
-        let mut frame = [0u8; FRAME];
-        let len = Frame::new(hardware, self.config.mac, EtherType::Ipv4, &packet[..len])
-            .emit(&mut frame)?;
-        match self.link.transmit(&frame[..len]) {
+        match self.transmit(hardware, ether_type, &packet[..len]) {
             Ok(()) => Ok(SendState::Sent(payload.len())),
             Err(LinkError::Busy) => Ok(SendState::Retry),
             Err(LinkError::Device) => Err(IpError::Link),
@@ -318,6 +345,24 @@ impl<L: Link, const N: usize> Ip<L, N> {
         }
     }
 
+    /// Restarts a send that was parked on a neighbour now in the cache.
+    fn resume<const M: usize, const R: usize>(
+        &mut self,
+        driver: &mut IoDriver<'_, IpOp, Result<IpDone, IpError>, R>,
+        buffers: &BufferRegistry<'_, M>,
+    ) {
+        let Some(pending) = self.send else {
+            return;
+        };
+        let IpOp::Send { to, .. } = *pending.submission.operation() else {
+            return;
+        };
+        if self.next_hop(to).ok().and_then(|next| self.resolve(next)).is_some() {
+            self.send = Some(PendingSend { waiting: false, ..pending });
+            self.retry(driver, buffers);
+        }
+    }
+
     fn ingest_arp<const M: usize, const R: usize>(
         &mut self,
         bytes: &[u8],
@@ -332,20 +377,7 @@ impl<L: Link, const N: usize> Ip<L, N> {
             self.arp_reply(packet.tx_hardware(), packet.tx_protocol())
                 .map_err(|_| IpError::Link)?;
         }
-        if let Some(pending) = self.send {
-            let IpOp::Send { to, .. } = *pending.submission.operation() else {
-                return Err(IpError::Busy);
-            };
-            if self
-                .next_hop(to)
-                .ok()
-                .and_then(|next| self.neighbors.resolve(IpAddr::V4(next)))
-                .is_some()
-            {
-                self.send = Some(PendingSend { waiting: false, ..pending });
-                self.retry(driver, buffers);
-            }
-        }
+        self.resume(driver, buffers);
         Ok(true)
     }
 
@@ -359,59 +391,201 @@ impl<L: Link, const N: usize> Ip<L, N> {
         if IpAddr::V4(packet.dst()) != self.config.addr {
             return Ok(false);
         }
+        self.deliver(IpAddr::V4(packet.src()), packet.protocol(), packet.payload(), driver, buffers)
+    }
+
+    fn ingest_ipv6<const M: usize, const R: usize>(
+        &mut self,
+        hardware: MacAddr,
+        bytes: &[u8],
+        driver: &mut IoDriver<'_, IpOp, Result<IpDone, IpError>, R>,
+        buffers: &mut BufferRegistry<'_, M>,
+    ) -> Result<bool, IpError> {
+        let packet = Ipv6::parse(bytes)?;
+        if packet.next_header() == icmpv6::PROTOCOL {
+            return self.ingest_icmpv6(hardware, &packet, driver, buffers);
+        }
+        if !self.accepts(packet.dst()) {
+            return Ok(false);
+        }
+        self.deliver(
+            IpAddr::V6(packet.src()),
+            packet.next_header(),
+            packet.payload(),
+            driver,
+            buffers,
+        )
+    }
+
+    fn ingest_icmpv6<const M: usize, const R: usize>(
+        &mut self,
+        hardware: MacAddr,
+        packet: &Ipv6<'_>,
+        driver: &mut IoDriver<'_, IpOp, Result<IpDone, IpError>, R>,
+        buffers: &BufferRegistry<'_, M>,
+    ) -> Result<bool, IpError> {
+        let message = Message::parse(packet.src(), packet.dst(), packet.payload())?;
+        // Discovery is only believed at full hop limit, which no router can
+        // forge: anything less crossed a link and is not a neighbour.
+        let neighborly = packet.hop_limit() == icmpv6::HOPS;
+        match message {
+            Message::Solicitation { target, source } if neighborly => {
+                if !self.owns(target) {
+                    return Ok(false);
+                }
+                // A duplicate-address probe has no source to answer, so the
+                // advertisement goes to every host instead.
+                let (dst, to) = if packet.src().is_unspecified() {
+                    (MacAddr::multicast(ALL_NODES), ALL_NODES)
+                } else {
+                    let link = source.unwrap_or(hardware);
+                    self.neighbors.learn(IpAddr::V6(packet.src()), link);
+                    (link, packet.src())
+                };
+                self.advertise(dst, target, to).map_err(|_| IpError::Link)?;
+                self.resume(driver, buffers);
+            }
+            Message::Advertisement { target, hardware: link, .. } if neighborly => {
+                self.neighbors.learn(IpAddr::V6(target), link.unwrap_or(hardware));
+                self.resume(driver, buffers);
+            }
+            Message::EchoRequest { id, seq, data } if self.accepts(packet.dst()) => {
+                let reply = Message::EchoReply { id, seq, data };
+                self.icmpv6(hardware, self.ipv6_addr(), packet.src(), reply)
+                    .map_err(|_| IpError::Link)?;
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Hands a protocol payload to whichever receive is waiting for it.
+    fn deliver<const M: usize, const R: usize>(
+        &mut self,
+        from: IpAddr,
+        protocol: u8,
+        payload: &[u8],
+        driver: &mut IoDriver<'_, IpOp, Result<IpDone, IpError>, R>,
+        buffers: &mut BufferRegistry<'_, M>,
+    ) -> Result<bool, IpError> {
         let Some(index) = self.receives.iter().position(|slot| {
             slot.is_some_and(|wait| {
-                self.protocols.get(wait.endpoint).copied().ok() == Some(packet.protocol())
+                self.protocols.get(wait.endpoint).copied().ok() == Some(protocol)
             })
         }) else {
             return Ok(false);
         };
         let wait = self.receives[index].take().unwrap();
-        let result = if packet.payload().len() > wait.payload.len() {
+        let result = if payload.len() > wait.payload.len() {
             Err(IpError::TooLarge)
         } else {
             let target = buffers.resolve_write(wait.payload)?;
-            target[..packet.payload().len()].copy_from_slice(packet.payload());
-            Ok(IpDone::Received { from: IpAddr::V4(packet.src()), len: packet.payload().len() })
+            target[..payload.len()].copy_from_slice(payload);
+            Ok(IpDone::Received { from, len: payload.len() })
         };
         self.publish(driver, Completion::new(wait.id, result));
         Ok(true)
     }
 
     fn arp_request(&mut self, target: Ipv4Addr) -> Result<(), LinkError> {
-        let mut packet = [0u8; Arp::LEN];
-        Arp::new(
-            ArpOperation::Request,
-            self.config.mac,
-            self.ipv4_addr().map_err(|_| LinkError::Device)?,
-            MacAddr::new([0; 6]),
+        let source = self.ipv4_addr().map_err(|_| LinkError::Device)?;
+        let packet =
+            Arp::new(ArpOperation::Request, self.config.mac, source, MacAddr::new([0; 6]), target);
+        self.arp(MacAddr::BROADCAST, packet)
+    }
+
+    fn arp_reply(&mut self, hardware: MacAddr, target: Ipv4Addr) -> Result<(), LinkError> {
+        let source = self.ipv4_addr().map_err(|_| LinkError::Device)?;
+        let packet = Arp::new(ArpOperation::Reply, self.config.mac, source, hardware, target);
+        self.arp(hardware, packet)
+    }
+
+    fn arp(&mut self, dst: MacAddr, packet: Arp) -> Result<(), LinkError> {
+        let mut bytes = [0u8; Arp::LEN];
+        packet.emit(&mut bytes).map_err(|_| LinkError::Device)?;
+        self.transmit(dst, EtherType::Arp, &bytes)
+    }
+
+    /// Asks the link which station answers for `target`.
+    fn solicit(&mut self, target: Ipv6Addr) -> Result<(), LinkError> {
+        let group = addr::solicited_node(target);
+        let message = Message::Solicitation { target, source: Some(self.config.mac) };
+        self.icmpv6(MacAddr::multicast(group), self.ipv6_addr(), group, message)
+    }
+
+    /// Answers that this host owns `target`.
+    fn advertise(&mut self, dst: MacAddr, target: Ipv6Addr, to: Ipv6Addr) -> Result<(), LinkError> {
+        let message = Message::Advertisement {
             target,
-        )
-        .emit(&mut packet)
-        .map_err(|_| LinkError::Device)?;
-        let mut frame = [0u8; 64];
-        let len = Frame::new(MacAddr::BROADCAST, self.config.mac, EtherType::Arp, &packet)
+            hardware: Some(self.config.mac),
+            solicited: to != ALL_NODES,
+        };
+        self.icmpv6(dst, target, to, message)
+    }
+
+    fn icmpv6(
+        &mut self,
+        dst: MacAddr,
+        src: Ipv6Addr,
+        to: Ipv6Addr,
+        message: Message<'_>,
+    ) -> Result<(), LinkError> {
+        let mut payload = [0u8; MTU - Ipv6::HEADER];
+        let len = message.emit(src, to, &mut payload).map_err(|_| LinkError::Device)?;
+        let packet = Ipv6::new(src, to, icmpv6::PROTOCOL, &payload[..len]);
+        // Discovery goes out at the hop limit it is only trusted at; echo is
+        // ordinary traffic and takes the ordinary one.
+        let packet = match message {
+            Message::Solicitation { .. } | Message::Advertisement { .. } => {
+                packet.hops(icmpv6::HOPS)
+            }
+            _ => packet,
+        };
+        let mut bytes = [0u8; MTU];
+        let len = packet.emit(&mut bytes).map_err(|_| LinkError::Device)?;
+        self.transmit(dst, EtherType::Ipv6, &bytes[..len])
+    }
+
+    fn transmit(
+        &mut self,
+        dst: MacAddr,
+        ether_type: EtherType,
+        payload: &[u8],
+    ) -> Result<(), LinkError> {
+        let mut frame = [0u8; FRAME];
+        let len = Frame::new(dst, self.config.mac, ether_type, payload)
             .emit(&mut frame)
             .map_err(|_| LinkError::Device)?;
         self.link.transmit(&frame[..len])
     }
 
-    fn arp_reply(&mut self, hardware: MacAddr, target: Ipv4Addr) -> Result<(), LinkError> {
-        let mut packet = [0u8; Arp::LEN];
-        Arp::new(
-            ArpOperation::Reply,
-            self.config.mac,
-            self.ipv4_addr().map_err(|_| LinkError::Device)?,
-            hardware,
-            target,
-        )
-        .emit(&mut packet)
-        .map_err(|_| LinkError::Device)?;
-        let mut frame = [0u8; 64];
-        let len = Frame::new(hardware, self.config.mac, EtherType::Arp, &packet)
-            .emit(&mut frame)
-            .map_err(|_| LinkError::Device)?;
-        self.link.transmit(&frame[..len])
+    /// Sends whatever discovery the next hop's family calls for.
+    fn discover(&mut self, next: IpAddr) -> Result<(), LinkError> {
+        match next {
+            IpAddr::V4(next) => self.arp_request(next),
+            IpAddr::V6(next) => self.solicit(next),
+        }
+    }
+
+    /// The link address of a next hop, which a group already answers for.
+    fn resolve(&self, next: IpAddr) -> Option<MacAddr> {
+        match next {
+            IpAddr::V6(group) if group.is_multicast() => Some(MacAddr::multicast(group)),
+            next => self.neighbors.resolve(next),
+        }
+    }
+
+    /// Whether this host answers discovery for `addr` as one of its own.
+    fn owns(&self, addr: Ipv6Addr) -> bool {
+        self.config.addr == IpAddr::V6(addr) || self.config.link_local() == addr
+    }
+
+    /// Whether a packet addressed to `dst` is this host's to receive.
+    fn accepts(&self, dst: Ipv6Addr) -> bool {
+        self.owns(dst)
+            || dst == ALL_NODES
+            || dst == addr::solicited_node(self.config.link_local())
+            || matches!(self.config.addr, IpAddr::V6(addr) if dst == addr::solicited_node(addr))
     }
 
     fn ipv4_addr(&self) -> Result<Ipv4Addr, IpError> {
@@ -421,18 +595,34 @@ impl<L: Link, const N: usize> Ip<L, N> {
         }
     }
 
-    fn next_hop(&self, dst: IpAddr) -> Result<Ipv4Addr, IpError> {
-        let src = self.ipv4_addr()?;
-        let IpAddr::V4(dst) = dst else {
-            return Err(IpError::Unsupported);
-        };
-        if same_network(src, dst, self.config.prefix.min(32)) {
-            Ok(dst)
-        } else {
-            match self.config.gateway {
-                IpAddr::V4(gateway) => Ok(gateway),
-                IpAddr::V6(_) => Err(IpError::Unsupported),
+    /// The address v6 traffic leaves this host under, which every MAC has one
+    /// of whether or not anything configured a routable one.
+    fn ipv6_addr(&self) -> Ipv6Addr {
+        match self.config.addr {
+            IpAddr::V6(addr) => addr,
+            IpAddr::V4(_) => self.config.link_local(),
+        }
+    }
+
+    fn next_hop(&self, dst: IpAddr) -> Result<IpAddr, IpError> {
+        let on_link = match (self.config.addr, dst) {
+            (IpAddr::V4(src), IpAddr::V4(dst)) => {
+                same_prefix(&src.octets(), &dst.octets(), self.config.prefix.min(32))
             }
+            (IpAddr::V6(src), IpAddr::V6(dst)) => {
+                dst.is_multicast()
+                    || link_scoped(dst)
+                    || same_prefix(&src.octets(), &dst.octets(), self.config.prefix.min(128))
+            }
+            _ => return Err(IpError::Unsupported),
+        };
+        if on_link {
+            return Ok(dst);
+        }
+        match (self.config.addr, self.config.gateway) {
+            (IpAddr::V4(_), gateway @ IpAddr::V4(_)) => Ok(gateway),
+            (IpAddr::V6(_), gateway @ IpAddr::V6(_)) => Ok(gateway),
+            _ => Err(IpError::Unsupported),
         }
     }
 
@@ -467,9 +657,21 @@ impl<L: Link, const N: usize> Ip<L, N> {
     }
 }
 
-fn same_network(left: Ipv4Addr, right: Ipv4Addr, prefix: u8) -> bool {
-    let left = u32::from_be_bytes(left.octets());
-    let right = u32::from_be_bytes(right.octets());
-    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
-    left & mask == right & mask
+/// Whether two addresses of one family agree on their first `prefix` bits.
+fn same_prefix(left: &[u8], right: &[u8], prefix: u8) -> bool {
+    let whole = prefix as usize / 8;
+    let bits = prefix % 8;
+    if left[..whole] != right[..whole] {
+        return false;
+    }
+    if bits == 0 {
+        return true;
+    }
+    let mask = 0xffu8 << (8 - bits);
+    left[whole] & mask == right[whole] & mask
+}
+
+/// Whether an address never leaves the link it was formed on.
+fn link_scoped(addr: Ipv6Addr) -> bool {
+    addr.segments()[0] & 0xffc0 == 0xfe80
 }

@@ -203,7 +203,9 @@ Stage 3 supplies. Both are argued in `docs/fs.md`.
 - [x] a typed scheme/resource namespace inspired by Redox
 - [x] capability delegation and audit events
 - [x] interrupt-driven VirtIO network, Ethernet, ARP, IPv4, and capability-addressed UDP
-- [ ] TCP behind the same link and service boundary — see [`docs/net.md`](net.md)
+- [x] IPv6, ICMPv6 echo, and neighbor discovery through the same cache and routes
+- [x] TCP behind the same link and service boundary — see [`docs/net.md`](net.md)
+- [x] block completions awaited on MSI-X instead of a spin budget
 
 Writable filesystem includes sector writes, required virtio flush support,
 three rotating checkpoint-log banks, a checksummed copy-on-write metadata
@@ -214,11 +216,38 @@ Mount always selects a complete old or new generation and never depends on
 fsck. `MOLT_FS_WRITE_OK` proves the same path through QEMU's virtio-blk device.
 
 Networking follows the ring-first boundary rather than adding sockets to the
-kernel. `molt-net` owns Ethernet, ARP, IPv4, and protocol capabilities;
-`molt-udp` owns port demultiplexing and socket capabilities; and the kernel
+kernel. `molt-net` owns Ethernet, ARP, IPv4, IPv6, ICMPv6, neighbor discovery,
+and protocol capabilities; `molt-udp` owns port demultiplexing and socket
+capabilities; `molt-tcp` puts smoltcp behind the same `Link`; and the kernel
 only maps modern VirtIO-net and routes its MSI-X entry through
 `InterruptSlab`. `MOLT_UDP_OK` requires a checked DNS reply to cross the real
-device and both service rings.
+device and both service rings. `MOLT_NDP_OK` requires a v6 datagram that cannot
+leave until an advertisement resolves its next hop, so the marker proves
+solicitation, advertisement, and cache in one send. `MOLT_TCP_OK` requires a
+handshake, an echo, and a close through slirp's forwarder.
+
+IPv6 is one address family, not a second stack: the link dispatches on
+EtherType, `neighbor::Cache` is the one table ARP and NDP both fill, and `UdpOp`
+carries an `Endpoint` holding either address. Nothing above `addr` knows which
+it holds, which is what made the family cheap enough to add now rather than
+after Stage 4 had multiplied every path by a core count.
+
+TCP is where the stack stops being written here. Congestion control,
+retransmission, and reassembly are algorithms with decades of corrections in
+them, so [smoltcp](https://github.com/smoltcp-rs/smoltcp) supplies them behind a
+`phy::Device` that is a thin shim over `Link`. What Molt keeps is the part
+smoltcp has no opinion about: `TcpOp`/`TcpDone` on a ring, streams named by
+`Capability<Socket>`, and a `TcpCell` whose restart drops every stream a dead
+client held. The dependency ends at the segment; the boundary does not move.
+
+The block driver's used-ring poll is gone. Queue zero takes an MSI-X vector of
+its own, and each command waits on `Arrivals` — the trait whose kernel
+implementation is the same `InterruptSlab` future the network path uses — then
+drains every used entry the arrival covered, since one interrupt is not one
+completion. The spin that remains is in the kernel's stand-in for a scheduler,
+not in the driver: `wait` polls the real future because there is nothing to park
+a task on yet, which is Stage 4.1's job and no longer the driver's shape.
+`MOLT_BLK_IRQ_OK` names the vector that answered.
 
 The three items after it are what that filesystem then demanded. A B-tree whose
 nodes and paths lived in fixed arrays spent 78 KiB of a 128 KiB stack with no
@@ -262,28 +291,115 @@ so a full log is visibly lossy rather than silently short. Delegation is the one
 authority change a capability's value does not already reveal — a grant returns
 its handle, a revoke its count — so it is the one the log exists to catch.
 
-Asynchronous I/O below the ring is deliberately not on this list. `Volume` and
-`Journal` still call the block device and block; making them `await` a
-`BlockOp` ring is a change of its own, and doing it inside the one that moved
-the tree to the heap would have made both harder to review.
+Asynchronous I/O below the ring stays off this list, and now for a reason
+stronger than review size. `Volume` and `Journal` still call the block device
+and block. A `BlockOp` ring that only ever holds one request buys nothing over
+the call it replaces; what makes it worth its ordering rules is readahead and
+parallel extent fetch, and both are several submissions in flight at once,
+which is a scheduler. So it moves to Stage 4.4, behind the executors — see
+`docs/fs.md`.
+
+Fuzzing arrived as tests rather than as infrastructure. `molt-net`'s parsers
+were covered only by frames its own emitter wrote, so every length field they
+read was one they had produced; `crates/molt-net/tests/noise.rs` now shapes
+noise past the version and checksum checks and asserts nothing is read past the
+input, with the seed as the reproduction. That is the half that pays for itself
+today. A corpus, a CI time budget, and crash triage are the other half, and
+they are background infrastructure for whenever there is a parser worth that —
+see [`docs/testing.md`](testing.md).
 
 ## Stage 4 — SMP, hardware breadth, and performance
 
-- [ ] per-CPU executors and rings; explicit cross-core fan-in
-- [ ] allocator-backed executor stores and runtime capacity tuning
-- [ ] IOMMU and device isolation where available
+One decision shapes the rest: **cores share nothing**. A core owns its
+executor, the cells on it, and the rings between them; work does not migrate,
+and a wake that crosses a core is a message plus an IPI, not a stolen task.
+
+The alternative is the work-stealing pool tokio and Go run, and it is the
+better answer when the workload is many short tasks of wildly unequal cost. It
+charges `Send + 'static` on every future to get there — which here means on
+`Cell`, on the B-tree's `Rc`, on every service holding a borrowed device — and
+it buys load balancing Molt cannot yet spend, because the work is bounded by
+devices and there is one of each. Shared-nothing is also the cheap answer here
+rather than the austere one: a ring is already how two things that share no
+state talk, and a second core is only a further-away peer. Seastar and glommio
+take this position for throughput; seL4 and Theseus take it because the
+alternative crosses an isolation boundary. Stealing is worth revisiting when
+there is a workload with more runnable work than devices — that is a
+measurement, not a design.
+
+The sub-stages are ordered so that each one is the smallest thing the next one
+cannot proceed without.
+
+### Stage 4.0 — A core that can name itself
+
+- [ ] per-CPU blocks reached through `gs` on x86_64 and `tp` on RISC-V
+- [ ] application processors started — INIT-SIPI-SIPI, SBI HSM `hart_start` —
+      onto the page table the boot core already owns
+- [ ] a per-core tick, and an IPI minted by the platform the way an MSI is
+
+Nothing below is per-core until "which core am I" has an answer that costs a
+register read, and nothing parks until a core can be woken by another one.
+
+### Stage 4.1 — One executor per core
+
+- [ ] an `Executor` per core, allocator-backed, sized at runtime rather than by
+      a const generic chosen at compile time
+- [ ] halt on an empty ready queue, woken by the IPI instead of the spin that
+      stands in for a scheduler today
+- [ ] `Send` and `'static` on the handoff that moves a cell between cores, and
+      nowhere else
+
+The bounds go on the mover, not on `Cell`: a cell that never leaves its core
+should not have to prove it could. This is also the stage that deletes the last
+`wait(token, spins)` — the interrupt future is already the right shape, and
+what is missing is only somewhere to park.
+
+### Stage 4.2 — Rings and interrupts with an affinity
+
+- [ ] MSI-X vectors routed to the core that owns the service behind them
+- [ ] cross-core fan-in as an explicit ring per peer pair, with no shared queue
+- [ ] `Registry` publications naming which core answers
+
+Submission, interrupt, and completion on one core is what makes the ring a
+local data structure again — the cache line stays put and the wake is a poll,
+not an IPI. A vector landing on the wrong core is a correctness non-event and a
+performance disaster, which is why it is a checkbox.
+
+### Stage 4.3 — An allocator that is not one lock
+
+- [ ] per-core free lists over the address-ordered first-fit that exists, with
+      remote frees queued to the owning core rather than taken under its lock
+
+Sharding happens under the lock, not through the filesystem's types: `Rc` and
+`&mut` inside the B-tree stay, because a service reached only by ring is
+already the unit a core owns.
+
+### Stage 4.4 — Asynchronous `BlockOp`
+
+- [ ] `Volume` and `Journal` awaiting a `BlockOp` ring instead of calling the
+      device and blocking
+- [ ] readahead and parallel extent fetch as concurrent submissions
+
+The first workload that needs more than one request in flight, which is why it
+waits for a scheduler that can hold them.
+
+### Stage 4.5 — Device isolation
+
+- [ ] IOMMU where available, so bus mastering stops meaning the whole physical
+      address space — the trade Stage 2.2 recorded rather than made
+
+### Stage 4.6 — Hardware breadth
+
 - [ ] NVMe and selected real NIC/storage targets
+
+### Stage 4.7 — Numbers
+
 - [ ] reproducible bare-metal benchmark runner
 - [ ] matched Linux io_uring throughput/tail-latency comparisons
 
-The heap and the filesystem are both single-threaded today — one global
-spinlock over the free list, `Rc` and `&mut` inside the tree — and that is what
-this stage has to answer for. Neither shape is an obstacle: a service reached
-only by ring is already the unit a core owns, so the sharding happens under the
-lock and around the cell, not through the filesystem's types. `Send` and
-`'static` belong to this stage for the same reason — they are demands of moving
-a cell between cores, so they go on whatever does the moving, where the code
-that needs them can say so.
+Last, deliberately. A number measured before the shape settles is a number
+about the wrong program, and the io_uring comparison is only honest once
+submission, completion, and interrupt sit where they will stay.
 
 ## Stage 5 — Evolution experiments
 

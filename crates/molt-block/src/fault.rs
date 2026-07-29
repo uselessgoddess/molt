@@ -84,38 +84,40 @@ mod tests {
     use crate::{BlockError, Disk, SECTOR};
 
     #[test]
-    fn unflushed_write_is_not_durable() {
+    fn unflushed_write_is_not_durable() -> Result<(), BlockError> {
         let mut stable = [0u8; SECTOR];
         let mut volatile = [0u8; SECTOR];
         {
-            let mut device = Fault::new(&mut stable, &mut volatile).expect("matching storage");
-            device.write(0, &[0xa5; SECTOR]).expect("volatile write");
+            let mut device = Fault::new(&mut stable, &mut volatile)?;
+            device.write(0, &[0xa5; SECTOR])?;
         }
 
         assert_eq!(stable, [0; SECTOR]);
+        Ok(())
     }
 
     #[test]
-    fn flush_makes_write_durable() {
+    fn flush_makes_write_durable() -> Result<(), BlockError> {
         let mut stable = [0u8; SECTOR];
         let mut volatile = [0u8; SECTOR];
         {
-            let mut device = Fault::new(&mut stable, &mut volatile).expect("matching storage");
-            device.write(0, &[0xa5; SECTOR]).expect("volatile write");
-            device.flush().expect("durable write");
+            let mut device = Fault::new(&mut stable, &mut volatile)?;
+            device.write(0, &[0xa5; SECTOR])?;
+            device.flush()?;
         }
 
         assert_eq!(stable, [0xa5; SECTOR]);
+        Ok(())
     }
 
     #[test]
-    fn cut_refuses_selected_action() {
+    fn cut_refuses_selected_action() -> Result<(), BlockError> {
         let mut stable = [0u8; SECTOR];
         let mut volatile = [0u8; SECTOR];
-        let mut device =
-            Fault::new(&mut stable, &mut volatile).expect("matching storage").cut_after(1);
+        let mut device = Fault::new(&mut stable, &mut volatile)?.cut_after(1);
 
         assert_eq!(device.write(0, &[1; SECTOR]), Ok(()));
         assert_eq!(device.flush(), Err(BlockError::PowerLoss));
+        Ok(())
     }
 }

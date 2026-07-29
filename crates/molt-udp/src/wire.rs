@@ -1,30 +1,11 @@
 //! UDP wire format.
 
-use molt_net::addr::IpAddr;
-use molt_net::checksum;
+use molt_net::{Endpoint, IpAddr, checksum};
 
 use crate::UdpError;
 
-/// An IP address and UDP port.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Endpoint {
-    addr: IpAddr,
-    port: u16,
-}
-
-impl Endpoint {
-    pub const fn new(addr: IpAddr, port: u16) -> Self {
-        Self { addr, port }
-    }
-
-    pub const fn addr(self) -> IpAddr {
-        self.addr
-    }
-
-    pub const fn port(self) -> u16 {
-        self.port
-    }
-}
+/// The IP protocol number carrying datagrams.
+pub const PROTOCOL: u8 = 17;
 
 /// A UDP header and borrowed payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,12 +50,12 @@ impl<'a> Datagram<'a> {
         if bytes.len() < len as usize {
             return Err(UdpError::Buffer);
         }
-        bytes[0..2].copy_from_slice(&self.src.port.to_be_bytes());
-        bytes[2..4].copy_from_slice(&self.dst.port.to_be_bytes());
+        bytes[0..2].copy_from_slice(&self.src.port().to_be_bytes());
+        bytes[2..4].copy_from_slice(&self.dst.port().to_be_bytes());
         bytes[4..6].copy_from_slice(&len.to_be_bytes());
         bytes[6..8].fill(0);
         bytes[Self::HEADER..len as usize].copy_from_slice(self.payload);
-        let sum = checksum(self.src.addr, self.dst.addr, &bytes[..len as usize])?;
+        let sum = checksum(self.src.addr(), self.dst.addr(), &bytes[..len as usize])?;
         bytes[6..8].copy_from_slice(&if sum == 0 { u16::MAX } else { sum }.to_be_bytes());
         Ok(len as usize)
     }
@@ -94,25 +75,8 @@ impl<'a> Datagram<'a> {
 
 fn checksum(src: IpAddr, dst: IpAddr, bytes: &[u8]) -> Result<u16, UdpError> {
     match (src, dst) {
-        (IpAddr::V4(src), IpAddr::V4(dst)) => {
-            let len = (bytes.len() as u16).to_be_bytes();
-            let src = src.octets();
-            let dst = dst.octets();
-            let pseudo = [
-                src[0], src[1], src[2], src[3], dst[0], dst[1], dst[2], dst[3], 0, 17, len[0],
-                len[1],
-            ];
-            Ok(checksum::compute_parts(&[&pseudo, bytes]))
-        }
-        (IpAddr::V6(src), IpAddr::V6(dst)) => {
-            let len = (bytes.len() as u32).to_be_bytes();
-            let mut pseudo = [0u8; 40];
-            pseudo[..16].copy_from_slice(&src.octets());
-            pseudo[16..32].copy_from_slice(&dst.octets());
-            pseudo[32..36].copy_from_slice(&len);
-            pseudo[39] = 17;
-            Ok(checksum::compute_parts(&[&pseudo, bytes]))
-        }
+        (IpAddr::V4(src), IpAddr::V4(dst)) => Ok(checksum::over_ipv4(src, dst, PROTOCOL, bytes)),
+        (IpAddr::V6(src), IpAddr::V6(dst)) => Ok(checksum::over_ipv6(src, dst, PROTOCOL, bytes)),
         _ => Err(UdpError::Malformed),
     }
 }

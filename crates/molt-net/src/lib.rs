@@ -5,16 +5,19 @@
 pub mod addr;
 pub mod arp;
 pub mod checksum;
-pub mod ethernet;
+pub mod eth;
+pub mod icmpv6;
 pub mod ipv4;
+pub mod ipv6;
 mod link;
 pub mod neighbor;
 mod op;
 mod service;
 
+pub use crate::addr::{Endpoint, IpAddr, Ipv4Addr, Ipv6Addr, MacAddr};
 pub use crate::link::{Link, LinkError};
 pub use crate::op::{IpDone, IpOp, Protocol};
-pub use crate::service::{Config, Ip, IpError};
+pub use crate::service::{Config, FRAME, Ip, IpError, MTU};
 
 /// Why a network frame could not be read or written.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

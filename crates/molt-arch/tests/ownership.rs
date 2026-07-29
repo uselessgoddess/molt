@@ -6,106 +6,115 @@ fn table(slots: &mut [Option<Owner>]) -> FrameTable<'_> {
 }
 
 #[test]
-fn claimed_frames_are_not_claimed_twice() {
+fn claimed_frames_are_not_claimed_twice() -> Result<(), Error> {
     let mut slots = [None; 4];
     let mut table = table(&mut slots);
-    let span = Span::frames(0x4000, 2).unwrap();
+    let span = Span::frames(0x4000, 2)?;
 
-    let frames = table.claim(span, Owner::Kernel).unwrap();
+    let frames = table.claim(span, Owner::Kernel)?;
 
     assert_eq!(table.claim(span, Owner::Tables), Err(Error::Owned));
     assert_eq!(frames.owner(), Owner::Kernel);
+    Ok(())
 }
 
 #[test]
-fn overlapping_claim_takes_nothing() {
+fn overlapping_claim_takes_nothing() -> Result<(), Error> {
     let mut slots = [None; 4];
     let mut table = table(&mut slots);
-    let held = table.claim(Span::frames(0x5000, 1).unwrap(), Owner::Tables).unwrap();
+    let held = table.claim(Span::frames(0x5000, 1)?, Owner::Tables)?;
 
-    let overlap = table.claim(Span::frames(0x4000, 3).unwrap(), Owner::Kernel);
+    let overlap = table.claim(Span::frames(0x4000, 3)?, Owner::Kernel);
 
     assert_eq!(overlap, Err(Error::Owned));
     assert_eq!(table.owner(0x4000), Ok(None), "the free frames stayed free");
     assert_eq!(table.owner(0x5000), Ok(Some(Owner::Tables)));
-    table.release(held).unwrap();
+    table.release(held)?;
+    Ok(())
 }
 
 #[test]
-fn released_frames_return_to_pool() {
+fn released_frames_return_to_pool() -> Result<(), Error> {
     let mut slots = [None; 4];
     let mut table = table(&mut slots);
-    let span = Span::frames(0x4000, 2).unwrap();
+    let span = Span::frames(0x4000, 2)?;
 
-    let frames = table.claim(span, Owner::Device(3)).unwrap();
-    table.release(frames).unwrap();
+    let frames = table.claim(span, Owner::Device(3))?;
+    table.release(frames)?;
 
     assert_eq!(table.claimed(), 0);
     assert!(table.claim(span, Owner::Cell(1)).is_ok(), "the span is claimable again");
+    Ok(())
 }
 
 #[test]
-fn vacant_run_skips_claimed_frames() {
+fn vacant_run_skips_claimed_frames() -> Result<(), Error> {
     let mut slots = [None; 4];
     let mut table = table(&mut slots);
-    let held = table.claim(Span::frames(0x5000, 1).unwrap(), Owner::Kernel).unwrap();
+    let held = table.claim(Span::frames(0x5000, 1)?, Owner::Kernel)?;
 
-    assert_eq!(table.vacant(1), Some(Span::frames(0x4000, 1).unwrap()));
-    assert_eq!(table.vacant(2), Some(Span::frames(0x6000, 2).unwrap()));
+    assert_eq!(table.vacant(1), Some(Span::frames(0x4000, 1)?));
+    assert_eq!(table.vacant(2), Some(Span::frames(0x6000, 2)?));
     assert_eq!(table.vacant(4), None, "a run crossed a claimed frame");
-    table.release(held).unwrap();
+    table.release(held)?;
+    Ok(())
 }
 
 #[test]
-fn evict_releases_one_owner() {
+fn evict_releases_one_owner() -> Result<(), Error> {
     let mut slots = [None; 4];
     let mut table = table(&mut slots);
-    let kept = table.claim(Span::frames(0x4000, 1).unwrap(), Owner::Kernel).unwrap();
-    let stale = table.claim(Span::frames(0x5000, 2).unwrap(), Owner::Device(1)).unwrap();
+    let kept = table.claim(Span::frames(0x4000, 1)?, Owner::Kernel)?;
+    let stale = table.claim(Span::frames(0x5000, 2)?, Owner::Device(1))?;
 
     assert_eq!(table.evict(Owner::Device(1)), 2);
 
     assert_eq!(table.claimed(), 1, "eviction reached another owner");
     assert_eq!(table.release(stale), Err(Error::NotOwner), "a token outlived its eviction");
-    table.release(kept).unwrap();
+    table.release(kept)?;
+    Ok(())
 }
 
 #[test]
-fn frames_from_another_table_rejected() {
+fn frames_from_another_table_rejected() -> Result<(), Error> {
     let mut mine = [None; 4];
     let mut theirs = [None; 4];
     let mut mine = table(&mut mine);
     let mut theirs = table(&mut theirs);
-    let span = Span::frames(0x4000, 1).unwrap();
+    let span = Span::frames(0x4000, 1)?;
 
-    let frames = theirs.claim(span, Owner::Kernel).unwrap();
+    let frames = theirs.claim(span, Owner::Kernel)?;
 
     assert_eq!(mine.release(frames), Err(Error::NotOwner));
+    Ok(())
 }
 
 #[test]
-fn claim_outside_table_rejected() {
+fn claim_outside_table_rejected() -> Result<(), Error> {
     let mut slots = [None; 2];
     let mut table = table(&mut slots);
 
-    assert_eq!(table.claim(Span::frames(0x9000, 1).unwrap(), Owner::Kernel), Err(Error::Range));
+    assert_eq!(table.claim(Span::frames(0x9000, 1)?, Owner::Kernel), Err(Error::Range));
     assert_eq!(table.owner(0x9000), Err(Error::Range));
+    Ok(())
 }
 
 #[test]
-fn table_smaller_than_span_rejected() {
+fn table_smaller_than_span_rejected() -> Result<(), Error> {
     let mut slots = [None; 2];
 
-    let short = FrameTable::over(Span::frames(0x4000, 3).unwrap(), &mut slots);
+    let short = FrameTable::over(Span::frames(0x4000, 3)?, &mut slots);
     assert!(short.is_err());
+    Ok(())
 }
 
 #[test]
-fn spans_name_whole_frames() {
+fn spans_name_whole_frames() -> Result<(), Error> {
     assert_eq!(Span::new(0x4000, 0x4800), Err(Error::Misaligned));
     assert_eq!(Span::new(0x4000, 0x4000), Err(Error::Misaligned));
     assert_eq!(Span::new(0x5000, 0x4000), Err(Error::Misaligned));
-    assert_eq!(Span::frames(0x4000, 2).unwrap().bytes(), 2 * FRAME_SIZE);
+    assert_eq!(Span::frames(0x4000, 2)?.bytes(), 2 * FRAME_SIZE);
+    Ok(())
 }
 
 #[test]

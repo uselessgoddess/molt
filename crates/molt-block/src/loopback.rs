@@ -82,45 +82,49 @@ mod tests {
     use crate::{BlockError, Device, Disk, SECTOR};
 
     #[test]
-    fn sector_reads_back_what_image_holds() {
+    fn sector_reads_back_what_image_holds() -> Result<(), BlockError> {
         let mut image = [0u8; 2 * SECTOR];
         image[SECTOR] = 0xa5;
 
-        let mut device = Loopback::new(&image).expect("whole sectors");
+        let mut device = Loopback::new(&image)?;
         let mut sector = [0u8; SECTOR];
-        device.read(1, &mut sector).expect("second sector");
+        device.read(1, &mut sector)?;
 
         assert_eq!(sector[0], 0xa5, "the second sector read back as the first");
+        Ok(())
     }
 
     #[test]
-    fn sectors_count_image_length() {
+    fn sectors_count_image_length() -> Result<(), BlockError> {
         let image = [0u8; 4 * SECTOR];
 
-        assert_eq!(Loopback::new(&image).expect("whole sectors").sectors(), 4);
+        assert_eq!(Loopback::new(&image)?.sectors(), 4);
+        Ok(())
     }
 
     #[test]
-    fn read_past_end_refused() {
+    fn read_past_end_refused() -> Result<(), BlockError> {
         let image = [0u8; SECTOR];
-        let mut device = Loopback::new(&image).expect("whole sectors");
+        let mut device = Loopback::new(&image)?;
 
         assert_eq!(device.read(1, &mut [0; SECTOR]), Err(BlockError::Range));
+        Ok(())
     }
 
     #[test]
-    fn borrowed_device_reads_like_owned() {
+    fn borrowed_device_reads_like_owned() -> Result<(), BlockError> {
         fn first_sector(mut device: impl Device) -> [u8; SECTOR] {
             let mut sector = [0u8; SECTOR];
-            device.read(0, &mut sector).expect("first sector");
+            device.read(0, &mut sector).unwrap();
             sector
         }
 
         let image = [0xa5u8; SECTOR];
-        let mut device = Loopback::new(&image).expect("whole sectors");
+        let mut device = Loopback::new(&image)?;
 
         assert_eq!(first_sector(&mut device), image);
         assert_eq!(device.sectors(), 1, "lending it back does not consume it");
+        Ok(())
     }
 
     #[test]
@@ -129,16 +133,17 @@ mod tests {
     }
 
     #[test]
-    fn sector_write_survives_flush() {
+    fn sector_write_survives_flush() -> Result<(), BlockError> {
         let mut image = [0u8; 2 * SECTOR];
         let written = [0xa5; SECTOR];
-        let mut device = Loopback::writable(&mut image).expect("whole sectors");
+        let mut device = Loopback::writable(&mut image)?;
 
-        device.write(1, &written).expect("writable sector");
-        device.flush().expect("durable write");
+        device.write(1, &written)?;
+        device.flush()?;
         let mut read = [0u8; SECTOR];
-        device.read(1, &mut read).expect("same sector");
+        device.read(1, &mut read)?;
 
         assert_eq!(read, written);
+        Ok(())
     }
 }

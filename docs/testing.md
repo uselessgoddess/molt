@@ -151,6 +151,15 @@ external packet round trip, not a loopback marker; wire parsing, capability
 demultiplexing, restart invalidation, and RX reposting remain deterministic
 host tests beneath it.
 
+Two markers follow it, and both were chosen for what they cannot fake.
+`MOLT_NDP_OK` requires a v6 datagram over slirp's `fec0::/64` leg whose `Sent`
+completion cannot arrive until a solicitation is answered and the cache learns
+the next hop, so the marker covers solicitation, advertisement, and cache in one
+send rather than asserting that discovery code exists. `MOLT_TCP_OK` requires
+the guest's own bytes back from `10.0.2.100:80`, which slirp forwards to `cat`
+with no host listener involved, so a handshake, a segment out, a segment in, and
+a close all have to work for it to print.
+
 **Markers that only one machine can produce.** Stage 2.2 added the first ones.
 `MOLT_PCI_OK` is required everywhere, but `MOLT_BAR_OK`, `MOLT_MSI_OK`, and
 `MOLT_INTERRUPT_OK` are x86_64-only, because RISC-V mints no MSI vectors yet and
@@ -167,6 +176,12 @@ itself. And `edu` is the one function on the machine whose interrupt can be
 raised on demand from software, which is what makes asserting a *delivery*
 possible rather than just asserting that a capability was written. See
 [`docs/pci.md`](pci.md).
+
+**`MOLT_BLK_IRQ_OK` is a marker about an absence.** The block driver's used-ring
+poll is gone, so a sector read that returns at all returns because queue zero's
+MSI-X vector fired and the line counted it. The marker names the vector that
+answered, and its value is that removing the interrupt path — not just breaking
+it — now fails the smoke instead of falling back to a slower success.
 
 **The smoke disk is a filesystem, not a pattern.** Stage 2.4 replaced the signed
 sector the virtio smoke used to read with a real MoltFS image: `cargo xtask
@@ -225,6 +240,40 @@ buffers and tree nodes, not the harness's own — and only on the thread that
 asked for the refusal, so the tests still run in parallel. It shows a mount
 answering the error and a create rolling back to its snapshot with the journal
 still usable afterwards, which is the part a type signature cannot claim.
+
+## Fuzzing, and the half worth having now
+
+Stage 3 raised the question and answered half of it. `molt-net`'s parsers were
+covered only by frames its own emitter wrote, so every length field they read
+was one they had produced — the case that matters, a length field a peer chose,
+was the one case never tested.
+
+`crates/molt-net/tests/noise.rs` is that case, as an ordinary test rather than
+as infrastructure. A xorshift generator seeded by one constant sweeps 16384
+inputs per parser and asserts the invariant the parsers actually owe: nothing is
+read past the input the caller handed over. The seed is the reproduction, so a
+failure replays from a constant in the source with no checked-in corpus, no
+crash triage, and no time budget in CI.
+
+**The noise is shaped, because unshaped noise proves nothing.** Random bytes
+almost never satisfy an IPv4 header checksum, and a random 16-bit length field
+lands inside a 128-byte buffer about two times in a thousand — the first draft
+passed with the truncation check deleted. So the sweep forces the version
+nibble, zeroes the fragment field, repairs the checksum, and draws lengths from
+a range that straddles the buffer's end, and every test asserts a floor on how
+many inputs actually parsed. A sweep that proves nothing now says so.
+
+Validated the same way the loom tests were: each of the three truncation checks
+was reintroduced as a no-op in turn, and each time the sweep failed with an
+index past the slice. Two further tests flip one bit of a valid packet and
+require anything that still parses to re-emit to itself, which is the property a
+parse/emit pair owes and neither half can be asked about alone.
+
+**What is deliberately deferred.** A corpus, coverage-guided mutation, a CI time
+budget, and crash triage are the other half, and they are infrastructure with
+running costs. They earn those costs against a parser that takes input from
+somewhere less bounded than a 1514-byte frame, which is Stage 4's NVMe and real
+NIC work at the earliest. The cheap half runs on every push today.
 
 ## Conventions
 
