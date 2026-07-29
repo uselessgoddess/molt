@@ -7,13 +7,15 @@
 
 use alloc::boxed::Box;
 use alloc::vec;
+use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::future::poll_fn;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
 
 use molt_arch::{CpuId, Local, Platform, Smp, Stack};
+use molt_core::peers::Peers;
 use molt_exec::{Executor, Handle, Machine};
 
 /// Blocks the platforms keep, which is the ceiling on cores molt numbers.
@@ -30,6 +32,10 @@ const STARTUP: u64 = 64;
 
 /// Ticks the crossing probe waits for the cores it sent work to.
 const CROSSING: u64 = 64;
+
+/// Answers one ring holds, which is every answer one ask can bring: the rings
+/// are made per ask and a core asked once posts once.
+const DEPTH: usize = 1;
 
 #[cfg(target_arch = "x86_64")]
 type Arch = molt_x86_64::X86_64;
@@ -147,42 +153,80 @@ pub(crate) fn start<P: Platform>(platform: &mut P) -> u16 {
     running
 }
 
-/// Sends a task to every other running core and waits for them to answer.
+/// Asks `cores` for an answer each, and collects what comes back.
 ///
-/// The whole crossing in one probe: a future made here, run there, and a waker
-/// rung back over the doorbell. Returns how many answered, and how many were
-/// asked.
-pub(crate) fn crossing(exec: &Executor) -> (u16, u16) {
-    static ANSWERED: AtomicU16 = AtomicU16::new(0);
+/// The ask is a future spawned down that core's handle; the answer is a message
+/// on the ring that pair alone shares, and a waker rung over this core's
+/// doorbell. Nothing is shared between two cores that a third can touch, and
+/// nothing here is a queue every core takes turns at.
+///
+/// Returns what arrived before `ticks` ran out, and how many cores were asked.
+/// The rings outlive the call on purpose: a core that never reached its task
+/// still holds the end it would have posted on.
+pub(crate) fn ask<T, U, F>(
+    exec: &Executor,
+    cores: impl Iterator<Item = (usize, Handle)>,
+    ticks: u64,
+    answer: F,
+) -> (Vec<T>, u16)
+where
+    T: Send + 'static,
+    U: Future<Output = T> + Send + 'static,
+    F: Fn() -> U + Copy + Send + 'static,
+{
+    let rings: &'static mut Peers<T, DEPTH, MAX> = Box::leak(Box::new(Peers::new(exec.cpu())));
+    let (senders, mut inbox) = rings.split();
+    let mut senders = senders.map(Some);
+    let mut cores = Some(cores);
+    let mut asked = 0;
+    let mut answers = Vec::new();
 
-    let asked = peers().count() as u16;
-    let mut sent = false;
     let _ = exec.block_on(exec.timers().timeout(
-        CROSSING,
+        ticks,
         poll_fn(|context| {
-            if !sent {
-                sent = true;
-                for peer in peers() {
-                    let waker = context.waker().clone();
-                    let _ = peer.spawn(async move {
-                        ANSWERED.fetch_add(1, Ordering::Release);
-                        waker.wake();
-                    });
-                }
+            for (index, core) in cores.take().into_iter().flatten() {
+                let Some(mut sender) = senders[index].take() else { continue };
+                let waker = context.waker().clone();
+                let sent = core.spawn(async move {
+                    let answer = answer().await;
+                    let _ = sender.post(answer);
+                    // The ring is only half of it: what the ask is parked in
+                    // wakes on this, not on the doorbell the post would ring.
+                    waker.wake();
+                });
+                asked += u16::from(sent.is_ok());
             }
-            match ANSWERED.load(Ordering::Acquire) >= asked {
+            while let Some(answer) = inbox.take() {
+                answers.push(answer);
+            }
+            match answers.len() as u16 >= asked {
                 true => Poll::Ready(()),
                 false => Poll::Pending,
             }
         }),
     ));
-    (ANSWERED.load(Ordering::Acquire), asked)
+    (answers, asked)
+}
+
+/// Sends a task to every other running core and waits for them to answer.
+///
+/// Returns how many answered, and how many were asked. Each core answers with
+/// the identity its own block reports, so an answer is proof the task ran
+/// there rather than proof a counter moved.
+pub(crate) fn crossing(exec: &Executor) -> (u16, u16) {
+    let here = CORES.cpu();
+    let (answers, asked) = ask(exec, peers(), CROSSING, || async { CORES.cpu() });
+
+    assert!(answers.iter().all(|&cpu| cpu != here), "a core answered as another");
+    (answers.len() as u16, asked)
 }
 
 /// Every core that reported an executor, this one aside.
-fn peers() -> impl Iterator<Item = Handle> {
+pub(crate) fn peers() -> impl Iterator<Item = (usize, Handle)> {
     let here = CORES.cpu().index();
-    (0..MAX).filter(move |&index| index != here).filter_map(|index| HANDLES[index].get())
+    (0..MAX)
+        .filter(move |&index| index != here)
+        .filter_map(|index| Some((index, HANDLES[index].get()?)))
 }
 
 /// Where a started core lands: its own tick, its own executor, and whatever
