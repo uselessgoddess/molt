@@ -332,47 +332,65 @@ cannot proceed without.
 
 ### Stage 4.0 — A core that can name itself
 
-- [ ] per-CPU blocks reached through `gs` on x86_64 and `tp` on RISC-V
-- [ ] application processors started — INIT-SIPI-SIPI, SBI HSM `hart_start` —
+- [x] per-CPU blocks reached through `gs` on x86_64 and `tp` on RISC-V
+- [x] application processors started — INIT-SIPI-SIPI, SBI HSM `hart_start` —
       onto the page table the boot core already owns
-- [ ] a per-core tick, and an IPI minted by the platform the way an MSI is
+- [x] a per-core tick, and an IPI minted by the platform the way an MSI is
 
 Nothing below is per-core until "which core am I" has an answer that costs a
 register read, and nothing parks until a core can be woken by another one.
 
 ### Stage 4.1 — One executor per core
 
-- [ ] an `Executor` per core, allocator-backed, sized at runtime rather than by
+- [x] an `Executor` per core, allocator-backed, sized at runtime rather than by
       a const generic chosen at compile time
-- [ ] halt on an empty ready queue, woken by the IPI instead of the spin that
+- [x] halt on an empty ready queue, woken by the IPI instead of the spin that
       stands in for a scheduler today
-- [ ] `Send` and `'static` on the handoff that moves a cell between cores, and
+- [x] `Send` and `'static` on the handoff that moves a cell between cores, and
       nowhere else
+- [x] three priority levels with a slice each, and a hierarchical timer wheel
 
 The bounds go on the mover, not on `Cell`: a cell that never leaves its core
 should not have to prove it could. This is also the stage that deletes the last
 `wait(token, spins)` — the interrupt future is already the right shape, and
 what is missing is only somewhere to park.
 
+Priority and the wheel were built here rather than deferred, and that is the
+one place this stage spends more than the minimum. Added later, a priority is a
+second ready queue and a second inbox on a path two cores already share, and a
+wheel is a deadline representation every parked core has to agree on; neither
+change stays inside one file.
+
 ### Stage 4.2 — Rings and interrupts with an affinity
 
-- [ ] MSI-X vectors routed to the core that owns the service behind them
-- [ ] cross-core fan-in as an explicit ring per peer pair, with no shared queue
-- [ ] `Registry` publications naming which core answers
+- [x] MSI-X vectors routed to the core that owns the service behind them
+- [x] cross-core fan-in as an explicit ring per peer pair, with no shared queue
+- [x] `Registry` publications naming which core answers
 
 Submission, interrupt, and completion on one core is what makes the ring a
 local data structure again — the cache line stays put and the wake is a poll,
 not an IPI. A vector landing on the wrong core is a correctness non-event and a
 performance disaster, which is why it is a checkbox.
 
+The affinity is the fabric's and it routes MSI and MSI-X the same way; the
+device the smoke has implements MSI, so that is the one `MOLT_AFFINITY_OK`
+drives.
+
 ### Stage 4.3 — An allocator that is not one lock
 
-- [ ] per-core free lists over the address-ordered first-fit that exists, with
+- [x] per-core free lists over the address-ordered first-fit that exists, with
       remote frees queued to the owning core rather than taken under its lock
+- [x] `MOLT_SMP_OK` and `MOLT_AFFINITY_OK` on both platforms, where four cores
+      answer a crossing with the identity their own blocks report
+- [x] `docs/smp.md`
 
 Sharding happens under the lock, not through the filesystem's types: `Rc` and
 `&mut` inside the B-tree stay, because a service reached only by ring is
 already the unit a core owns.
+
+Work stealing is recorded rather than checked off, and so is a cell that
+actually moves: the bound is on the handoff and the handoff exists, but nothing
+calls it until a supervisor has a reason to. Both are argued in `docs/smp.md`.
 
 ### Stage 4.4 — Asynchronous `BlockOp`
 
