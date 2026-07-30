@@ -1,10 +1,17 @@
 //! Deadlines in a hierarchical wheel: four levels of sixty-four slots.
 //!
-//! Arming is a shift and a push, and a tick looks at one slot instead of every
+//! Arming is a shift and a link, and a tick looks at one slot instead of every
 //! deadline. What a level cannot express it hands upward — a deadline more than
 //! sixty-four ticks out waits in level one, which cascades into level zero when
 //! the lower wheel wraps, so a timer moves a bounded number of times no matter
 //! how far ahead it was set.
+//!
+//! The timers themselves live in a slab and are linked through it by index, so
+//! arming takes a slot off a free chain and cancelling is a handful of writes:
+//! no allocation, no scan, no reference count. A slot belongs to the one
+//! [`Sleep`] that armed it until that drops, which is also what frees it, so an
+//! index cannot go stale while anything can still use it — there is nothing
+//! here for a generation counter to catch.
 //!
 //! Ticks are the machine's, and the wheel walks one slot per tick: the unit
 //! should be the scheduling quantum, not a cycle counter. The clock is read
@@ -13,7 +20,7 @@
 
 use alloc::rc::Rc;
 use alloc::vec::Vec;
-use core::cell::{Cell, RefCell};
+use core::cell::RefCell;
 use core::mem;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
@@ -24,55 +31,121 @@ const BITS: usize = 6;
 const SLOTS: usize = 1 << BITS;
 const LEVELS: usize = 4;
 const MASK: u64 = SLOTS as u64 - 1;
+const BUCKETS: usize = SLOTS * LEVELS;
+
+/// No slot: an empty bucket, the end of a chain, a timer in neither.
+const NONE: u32 = u32::MAX;
 
 /// How far ahead a deadline is kept exactly. Anything beyond is clamped to it.
 pub const HORIZON: u64 = 1 << (BITS * LEVELS);
 
-struct Timer {
+/// A deadline, linked into a bucket or into the free chain.
+struct Node {
     deadline: u64,
-    expired: Cell<bool>,
-    waker: Cell<Option<Waker>>,
+    waker: Option<Waker>,
+    prev: u32,
+    next: u32,
+    /// Where it is filed, or `NONE` once it has fired.
+    bucket: u32,
 }
 
-impl Timer {
-    fn new(deadline: u64) -> Rc<Self> {
-        Rc::new(Self { deadline, expired: Cell::new(false), waker: Cell::new(None) })
-    }
-
-    fn expire(&self) -> Option<Waker> {
-        self.expired.set(true);
-        self.waker.take()
+impl Node {
+    fn fired(&self) -> bool {
+        self.bucket == NONE
     }
 }
 
 struct Wheel {
     now: u64,
-    slots: [[Vec<Rc<Timer>>; SLOTS]; LEVELS],
+    nodes: Vec<Node>,
+    /// Head of the chain of slots to reuse, through `next`.
+    free: u32,
+    heads: [u32; BUCKETS],
 }
 
 impl Wheel {
     fn new() -> Self {
-        Self { now: 0, slots: [const { [const { Vec::new() }; SLOTS] }; LEVELS] }
+        Self { now: 0, nodes: Vec::new(), free: NONE, heads: [NONE; BUCKETS] }
     }
 
-    fn arm(&mut self, deadline: u64) -> Rc<Timer> {
+    fn arm(&mut self, deadline: u64) -> u32 {
         let deadline = deadline.min(self.now + HORIZON - 1);
-        let timer = Timer::new(deadline);
-        if deadline <= self.now {
-            timer.expired.set(true);
-        } else {
-            self.place(timer.clone());
+        let slot = self.take(deadline);
+        if deadline > self.now {
+            self.place(slot);
         }
-        timer
+        slot
+    }
+
+    /// A slot off the free chain, or a fresh one when it is empty.
+    fn take(&mut self, deadline: u64) -> u32 {
+        let node = Node { deadline, waker: None, prev: NONE, next: NONE, bucket: NONE };
+        if self.free == NONE {
+            self.nodes.push(node);
+            return (self.nodes.len() - 1) as u32;
+        }
+        let slot = self.free;
+        self.free = self.nodes[slot as usize].next;
+        self.nodes[slot as usize] = node;
+        slot
+    }
+
+    /// Gives a slot back, whether it fired or was cancelled.
+    fn release(&mut self, slot: u32) {
+        if !self.nodes[slot as usize].fired() {
+            self.unlink(slot);
+        }
+        let node = &mut self.nodes[slot as usize];
+        node.waker = None;
+        node.next = self.free;
+        self.free = slot;
     }
 
     /// Files a timer by how far off it is: the coarser the wheel, the further.
-    fn place(&mut self, timer: Rc<Timer>) {
-        let delta = timer.deadline.saturating_sub(self.now);
+    fn place(&mut self, slot: u32) {
+        let deadline = self.nodes[slot as usize].deadline;
+        let delta = deadline.saturating_sub(self.now);
         let level =
             (0..LEVELS).find(|level| delta < 1 << (BITS * (level + 1))).unwrap_or(LEVELS - 1);
-        let slot = ((timer.deadline >> (BITS * level)) & MASK) as usize;
-        self.slots[level][slot].push(timer);
+        let bucket = level * SLOTS + ((deadline >> (BITS * level)) & MASK) as usize;
+        self.link(slot, bucket as u32);
+    }
+
+    fn link(&mut self, slot: u32, bucket: u32) {
+        let head = self.heads[bucket as usize];
+        let node = &mut self.nodes[slot as usize];
+        node.bucket = bucket;
+        node.prev = NONE;
+        node.next = head;
+        if head != NONE {
+            self.nodes[head as usize].prev = slot;
+        }
+        self.heads[bucket as usize] = slot;
+    }
+
+    fn unlink(&mut self, slot: u32) {
+        let node = &self.nodes[slot as usize];
+        let (bucket, prev, next) = (node.bucket, node.prev, node.next);
+        if prev == NONE {
+            self.heads[bucket as usize] = next;
+        } else {
+            self.nodes[prev as usize].next = next;
+        }
+        if next != NONE {
+            self.nodes[next as usize].prev = prev;
+        }
+        self.cut(slot);
+    }
+
+    /// Clears one node's links, reporting what followed it. The bucket is left
+    /// to the caller, which is why this is only for a chain taken whole.
+    fn cut(&mut self, slot: u32) -> u32 {
+        let node = &mut self.nodes[slot as usize];
+        let next = node.next;
+        node.bucket = NONE;
+        node.prev = NONE;
+        node.next = NONE;
+        next
     }
 
     fn upto(&mut self, ticks: u64, expired: &mut Vec<Waker>) {
@@ -94,26 +167,35 @@ impl Wheel {
             if (self.now >> (BITS * (level - 1))) & MASK != 0 {
                 break;
             }
-            let slot = ((self.now >> (BITS * level)) & MASK) as usize;
-            let mut due = mem::take(&mut self.slots[level][slot]);
-            for timer in due.drain(..) {
-                self.place(timer);
+            let bucket = level * SLOTS + ((self.now >> (BITS * level)) & MASK) as usize;
+            // The whole chain moves, so the bucket empties in one write and
+            // each node pays for its links and nothing else.
+            let mut slot = mem::replace(&mut self.heads[bucket], NONE);
+            while slot != NONE {
+                let next = self.cut(slot);
+                self.place(slot);
+                slot = next;
             }
-            self.slots[level][slot] = due;
         }
 
-        let slot = (self.now & MASK) as usize;
-        let mut due = mem::take(&mut self.slots[0][slot]);
-        expired.extend(due.drain(..).filter_map(|timer| timer.expire()));
-        self.slots[0][slot] = due;
+        self.expire((self.now & MASK) as usize, expired);
+    }
+
+    /// Empties a bucket, taking the wakers of everything that was in it. The
+    /// slots stay, because their sleepers still hold them.
+    fn expire(&mut self, bucket: usize, expired: &mut Vec<Waker>) {
+        let mut slot = mem::replace(&mut self.heads[bucket], NONE);
+        while slot != NONE {
+            let next = self.cut(slot);
+            expired.extend(self.nodes[slot as usize].waker.take());
+            slot = next;
+        }
     }
 
     /// Past the horizon nothing is still pending, so the wheel empties whole.
     fn flush(&mut self, expired: &mut Vec<Waker>) {
-        for level in &mut self.slots {
-            for slot in level {
-                expired.extend(slot.drain(..).filter_map(|timer| timer.expire()));
-            }
+        for bucket in 0..BUCKETS {
+            self.expire(bucket, expired);
         }
     }
 }
@@ -153,7 +235,8 @@ impl Timers {
 
     /// Sleeps until the tick `deadline`, or returns ready if it has passed.
     pub fn until(&self, deadline: u64) -> Sleep {
-        Sleep { timer: self.0.wheel.borrow_mut().arm(deadline) }
+        let slot = self.0.wheel.borrow_mut().arm(deadline);
+        Sleep { timers: self.clone(), slot }
     }
 
     /// Runs `future` for at most `delay` ticks.
@@ -178,27 +261,30 @@ impl Timers {
 
 /// A deadline, waiting.
 ///
-/// Dropping one stops the wake but leaves the slot: the wheel forgets it when
-/// the tick it was armed for comes round, and not before.
+/// Dropping one stops the wake and hands the slot back, so a timeout that was
+/// not needed costs the wheel nothing until the deadline it was armed for.
 pub struct Sleep {
-    timer: Rc<Timer>,
+    timers: Timers,
+    slot: u32,
 }
 
 impl Future for Sleep {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
-        if self.timer.expired.get() {
+        let mut wheel = self.timers.0.wheel.borrow_mut();
+        let node = &mut wheel.nodes[self.slot as usize];
+        if node.fired() {
             return Poll::Ready(());
         }
-        self.timer.waker.set(Some(context.waker().clone()));
+        node.waker = Some(context.waker().clone());
         Poll::Pending
     }
 }
 
 impl Drop for Sleep {
     fn drop(&mut self) {
-        self.timer.waker.take();
+        self.timers.0.wheel.borrow_mut().release(self.slot);
     }
 }
 

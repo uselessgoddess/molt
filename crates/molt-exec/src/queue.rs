@@ -21,14 +21,14 @@ impl Inbox {
         Self { head: AtomicPtr::new(ptr::null_mut()) }
     }
 
-    pub(crate) fn push(&self, task: Arc<Task>) {
+    pub(crate) fn push(&self, task: Arc<Task>) -> bool {
         let task = Arc::into_raw(task).cast_mut();
         let mut head = self.head.load(Ordering::Relaxed);
         loop {
             // SAFETY: the task is ours until the swap below publishes it.
             unsafe { (*task).link(head) };
             match self.head.compare_exchange_weak(head, task, Ordering::AcqRel, Ordering::Relaxed) {
-                Ok(_) => return,
+                Ok(_) => return head.is_null(),
                 Err(actual) => head = actual,
             }
         }
