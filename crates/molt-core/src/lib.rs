@@ -19,4 +19,5 @@ pub mod peers;
 pub mod registry;
 pub mod ring;
 pub(crate) mod sync;
+pub mod task;
 pub mod waker;

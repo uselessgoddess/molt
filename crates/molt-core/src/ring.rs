@@ -5,6 +5,7 @@
 //! remember.
 
 use core::mem::MaybeUninit;
+use core::ops::Deref;
 
 use crate::sync::UnsafeCell;
 use crate::sync::atomic::{AtomicUsize, Ordering};
@@ -250,6 +251,20 @@ impl<Op, C, const N: usize> IoRing<Op, C, N> {
         Self { submissions: SpscRing::new(), completions: SpscRing::new() }
     }
 
+    /// Creates client and driver views that keep the ring alive themselves.
+    ///
+    /// [`split`](Self::split) borrows and proves uniqueness by taking `&mut`,
+    /// which fits a ring on a frame below both halves. A service holding its
+    /// own client needs the other shape: `H` is whatever holds the queues — an
+    /// `Rc` where there is a heap — and one pair per ring becomes the holder's
+    /// to arrange rather than the type's.
+    pub fn held<H>(ring: H) -> (HeldClient<H>, HeldDriver<H>)
+    where
+        H: Clone + Deref<Target = Self>,
+    {
+        (HeldClient(ring.clone()), HeldDriver(ring))
+    }
+
     /// Creates the unique client and driver views of both queues.
     pub fn split(&mut self) -> (IoClient<'_, Op, C, N>, IoDriver<'_, Op, C, N>) {
         let (submission_tx, submission_rx) = self.submissions.split();
@@ -296,5 +311,58 @@ impl<Op, C, const N: usize> IoDriver<'_, Op, C, N> {
 
     pub fn try_complete(&mut self, completion: Completion<C>) -> Result<(), Completion<C>> {
         self.completions.try_push(completion)
+    }
+}
+
+/// The client half of an [`IoRing::held`] pair.
+pub struct HeldClient<H>(H);
+
+impl<H, Op, C, const N: usize> HeldClient<H>
+where
+    H: Deref<Target = IoRing<Op, C, N>>,
+{
+    pub fn try_submit(&mut self, submission: Submission<Op>) -> Result<(), Submission<Op>> {
+        self.0.submissions.try_push(submission)
+    }
+
+    pub fn try_completion(&mut self) -> Option<Completion<C>> {
+        self.0.completions.try_pop()
+    }
+}
+
+/// The driver half of an [`IoRing::held`] pair.
+pub struct HeldDriver<H>(H);
+
+impl<H, Op, C, const N: usize> HeldDriver<H>
+where
+    H: Deref<Target = IoRing<Op, C, N>>,
+{
+    pub fn try_next(&mut self) -> Option<Submission<Op>> {
+        self.0.submissions.try_pop()
+    }
+
+    pub fn try_complete(&mut self, completion: Completion<C>) -> Result<(), Completion<C>> {
+        self.0.completions.try_push(completion)
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::{Completion, IoRing, RequestId, Submission};
+
+    #[test]
+    fn held_pair_round_trips() {
+        let ring = IoRing::<u64, u64, 2>::new();
+        let (mut client, mut driver) = IoRing::held(&ring);
+
+        client.try_submit(Submission::new(RequestId::new(1), 7)).unwrap();
+        let submitted = driver.try_next().unwrap();
+        driver
+            .try_complete(Completion::new(submitted.id(), submitted.into_operation() * 2))
+            .unwrap();
+
+        let completion = client.try_completion().unwrap();
+        assert_eq!(completion.id(), RequestId::new(1));
+        assert_eq!(completion.into_result(), 14);
     }
 }
