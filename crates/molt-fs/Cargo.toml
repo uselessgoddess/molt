@@ -13,5 +13,12 @@ format = []
 molt-block.workspace = true
 molt-core.workspace = true
 
+[dev-dependencies]
+criterion = "0.7"
+
 [lib]
 bench = false
+
+[[bench]]
+name = "volume"
+harness = false

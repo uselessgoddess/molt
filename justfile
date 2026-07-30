@@ -34,7 +34,7 @@ riscv64gc-check:
     cargo clippy --package molt-kernel --target riscv64gc-unknown-none-elf -- -D warnings
 
 bench-check:
-    cargo bench --package molt-core --package molt-exec --no-run
+    cargo bench --package molt-core --package molt-exec --package molt-fs --no-run
 
 pre: fmt-check lint test doc x86_64-check riscv64gc-check bench-check loom
 

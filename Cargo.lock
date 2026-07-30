@@ -551,6 +551,7 @@ dependencies = [
 name = "molt-fs"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "molt-block",
  "molt-core",
 ]
