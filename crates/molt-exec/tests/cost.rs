@@ -7,6 +7,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::future::pending;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,6 +61,23 @@ fn expiry_is_free() {
     }
 
     assert_eq!(cost(|| round(&timers, &mut sleeps, (WARM as u64 + 1) * 8)), 0);
+}
+
+/// Room for `capacity` tasks is taken once, so no spawn pays for the next.
+#[test]
+fn spawn_is_flat() -> Result<(), SpawnError> {
+    let executor = Executor::new(&SOLO, WARM);
+    let mut costs = Vec::with_capacity(WARM);
+
+    for _ in 0..WARM {
+        costs.push(cost(|| {
+            executor.spawn(pending()).unwrap();
+            executor.run_until_idle();
+        }));
+    }
+
+    assert!(costs.windows(2).all(|pair| pair[0] == pair[1]), "{costs:?}");
+    Ok(())
 }
 
 /// Arms a batch, walks the clock past it, and drops what expired.

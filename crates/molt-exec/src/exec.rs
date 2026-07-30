@@ -10,6 +10,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::task::Wake;
 use alloc::vec::Vec;
+use core::array;
 use core::cell::RefCell;
 use core::pin::{Pin, pin};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -125,8 +126,14 @@ struct Local {
 }
 
 impl Local {
-    fn new() -> Self {
-        Self { ready: [const { VecDeque::new() }; Priority::LEVELS], level: 0, credit: SLICE[0] }
+    /// Room for every task at every level, taken once. A queue that grows is a
+    /// queue that allocates on the path an interrupt is waiting on.
+    fn new(capacity: usize) -> Self {
+        Self {
+            ready: array::from_fn(|_| VecDeque::with_capacity(capacity)),
+            level: 0,
+            credit: SLICE[0],
+        }
     }
 
     /// Round robin by weight: a level keeps the core until its slice or its
@@ -156,7 +163,8 @@ pub struct Executor {
 }
 
 impl Executor {
-    /// Sized at run time: `capacity` tasks, and the queues grow into the heap.
+    /// Sized at run time: room for `capacity` tasks, taken up front and never
+    /// again, so nothing after this asks the heap for a place to put one.
     pub fn new(machine: &'static dyn Machine, capacity: usize) -> Self {
         Self {
             shared: Arc::new(Shared {
@@ -166,8 +174,8 @@ impl Executor {
                 live: AtomicUsize::new(0),
                 inbox: [const { Inbox::new() }; Priority::LEVELS],
             }),
-            local: RefCell::new(Local::new()),
-            tasks: RefCell::new(Vec::new()),
+            local: RefCell::new(Local::new(capacity)),
+            tasks: RefCell::new(Vec::with_capacity(capacity)),
             timers: Timers::new(machine),
         }
     }
