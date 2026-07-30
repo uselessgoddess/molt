@@ -263,6 +263,8 @@ median and tail latency, CPU time, cache misses, and variance.
 
 QEMU boot time is a functional CI signal only. Real-hardware benchmarks begin
 after timer calibration, interrupt-driven I/O, and a production-capable driver.
+[The benchmark note](benchmarks.md) turns that into three tiers and says which
+of them exists.
 
 ## Primary references
 

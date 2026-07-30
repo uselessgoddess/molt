@@ -8,5 +8,19 @@ publish = false
 [lints]
 workspace = true
 
+[lib]
+bench = false
+
 [dependencies]
 molt-core.workspace = true
+
+[dev-dependencies]
+criterion = "0.7"
+
+[[bench]]
+name = "task"
+harness = false
+
+[[bench]]
+name = "timer"
+harness = false

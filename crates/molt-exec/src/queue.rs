@@ -21,14 +21,21 @@ impl Inbox {
         Self { head: AtomicPtr::new(ptr::null_mut()) }
     }
 
-    pub(crate) fn push(&self, task: Arc<Task>) {
+    /// Pushes, and reports whether the inbox had been empty.
+    ///
+    /// That is the doorbell's question. A push onto a chain somebody else
+    /// started is covered by the ring that started it: either the drain has not
+    /// happened, and takes this task with the rest, or it has — in which case
+    /// the swap emptied the head this exchange expected, and the exchange
+    /// failed. Only the push that finds the inbox empty owes a ring.
+    pub(crate) fn push(&self, task: Arc<Task>) -> bool {
         let task = Arc::into_raw(task).cast_mut();
         let mut head = self.head.load(Ordering::Relaxed);
         loop {
             // SAFETY: the task is ours until the swap below publishes it.
             unsafe { (*task).link(head) };
             match self.head.compare_exchange_weak(head, task, Ordering::AcqRel, Ordering::Relaxed) {
-                Ok(_) => return,
+                Ok(_) => return head.is_null(),
                 Err(actual) => head = actual,
             }
         }

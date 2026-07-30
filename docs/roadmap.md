@@ -412,12 +412,16 @@ waits for a scheduler that can hold them.
 
 ### Stage 4.7 — Numbers
 
+- [x] a record per commit, published, with a counted cost the tests can gate on
 - [ ] reproducible bare-metal benchmark runner
 - [ ] matched Linux io_uring throughput/tail-latency comparisons
 
 Last, deliberately. A number measured before the shape settles is a number
 about the wrong program, and the io_uring comparison is only honest once
-submission, completion, and interrupt sit where they will stay.
+submission, completion, and interrupt sit where they will stay. The series
+came first anyway, because the executor could not be made faster without it:
+[the benchmark note](benchmarks.md) records what is measured, what the five
+optimisation steps bought, and which hypotheses the numbers refused.
 
 ## Stage 5 — Evolution experiments
 

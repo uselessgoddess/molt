@@ -543,6 +543,7 @@ dependencies = [
 name = "molt-exec"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "molt-core",
 ]
 
@@ -1197,6 +1198,8 @@ dependencies = [
  "molt-block",
  "molt-core",
  "molt-fs",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
