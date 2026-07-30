@@ -5,32 +5,110 @@ on:
   push:
     branches: [main]
     paths:
-      - "crates/molt-core/**"
+      - "crates/**"
+      - "xtask/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "justfile"
+      - "rust-toolchain.toml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "xtask/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "justfile"
       - "rust-toolchain.toml"
 
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
+  # The history is the point: one record per main commit, on a branch nothing
+  # else writes, published as the page that draws it.
   track:
-    name: Measure and preserve a baseline
+    name: Measure, record, publish
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.pages.outputs.page_url }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
-      - uses: taiki-e/install-action@v2
+      - name: Check out the history
+        uses: actions/checkout@v7
+        continue-on-error: true
         with:
-          tool: just
-      - run: just bench-track
+          ref: benchmarks
+          path: history
+      - name: Start the history
+        run: |
+          if [ ! -d history/.git ]; then
+            git init -q -b benchmarks history
+            git -C history remote add origin \
+              "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          fi
+      - run: cargo xtask bench
+      - name: Record
+        run: |
+          cargo xtask bench record history/data
+          cd history
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          git diff --cached --quiet || git commit -m "bench: ${GITHUB_SHA:0:9}"
+          git push origin HEAD:benchmarks
+      - run: cargo xtask bench site history/data site
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: pages
+        uses: actions/deploy-pages@v4
+
+  # A pull request gets the table and nothing else: wall-clock numbers off a
+  # shared runner are evidence, not a gate.
+  compare:
+    name: Compare against main
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - name: Check out the history
+        uses: actions/checkout@v7
+        continue-on-error: true
+        with:
+          ref: benchmarks
+          path: history
+      - run: cargo xtask bench
+      - name: Summarise
+        run: |
+          base=$(ls history/data/*.json 2>/dev/null | tail -1)
+          if [ -z "$base" ]; then
+            echo "No run recorded on main yet." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "## Benchmarks" >> "$GITHUB_STEP_SUMMARY"
+          cargo xtask bench compare "$base" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
-          name: molt-core-bench-${{ github.sha }}
-          path: bench-output.txt
+          name: bench-${{ github.sha }}
+          path: target/molt/bench.json
           if-no-files-found: error
-          retention-days: 90

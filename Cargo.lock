@@ -1198,6 +1198,8 @@ dependencies = [
  "molt-block",
  "molt-core",
  "molt-fs",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
