@@ -72,7 +72,11 @@ jobs:
           git diff --cached --quiet || git commit -m "bench: ${GITHUB_SHA:0:9}"
           git push origin HEAD:benchmarks
       - run: cargo xtask bench site history/data site
+        # Creates the Pages site on the first run, so publishing needs nothing
+        # switched on by hand.
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
