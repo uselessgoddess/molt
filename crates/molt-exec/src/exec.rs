@@ -44,9 +44,14 @@ pub(crate) struct Shared {
 
 impl Shared {
     /// Hands a task to its owner and rings.
+    ///
+    /// The doorbell is read off the block first, because the task may be the
+    /// last thing holding the block: once it is in the inbox its owner is free
+    /// to finish it, and this reference with it.
     pub(crate) fn queue(&self, task: Arc<Task>) {
+        let (owner, machine) = (self.owner, self.machine);
         self.inbox[task.priority().level()].push(task);
-        self.machine.wake(self.owner);
+        machine.wake(owner);
     }
 
     fn claim(&self) -> Result<(), SpawnError> {

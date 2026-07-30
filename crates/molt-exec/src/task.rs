@@ -9,7 +9,6 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::cell::{Cell, UnsafeCell};
-use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::ptr;
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -88,7 +87,11 @@ impl Task {
     }
 
     /// Puts the task in its core's inbox, unless it is already there or running.
-    pub(crate) fn schedule(self: &Arc<Self>) {
+    ///
+    /// Takes the reference rather than borrowing one: a wake already owns one,
+    /// and raising the count only to drop it again is two atomics on the path
+    /// a device is waiting at the end of.
+    pub(crate) fn schedule(self: Arc<Self>) {
         let mut state = self.state.load(Ordering::Acquire);
         loop {
             if state & (DONE | SCHEDULED) != 0 {
@@ -99,7 +102,10 @@ impl Task {
             {
                 Ok(_) => {
                     if next & SCHEDULED != 0 {
-                        self.shared.queue(self.clone());
+                        let shared = Arc::as_ptr(&self.shared);
+                        // SAFETY: the block is the task's own, and the task is
+                        // what is handed on, so it outlives the call.
+                        unsafe { (*shared).queue(self) };
                     }
                     return;
                 }
@@ -229,18 +235,18 @@ unsafe fn clone(data: *const ()) -> RawWaker {
 ///
 /// `data` must be a strong reference to a [`Task`], as [`Task::waker`] makes.
 unsafe fn wake(data: *const ()) {
-    // SAFETY: the contract hands this reference over.
-    let task = unsafe { Arc::from_raw(data.cast::<Task>()) };
-    task.schedule();
+    // SAFETY: the contract hands this reference over, and `schedule` takes it.
+    unsafe { Arc::from_raw(data.cast::<Task>()) }.schedule();
 }
 
 /// # Safety
 ///
 /// `data` must be a strong reference to a [`Task`], as [`Task::waker`] makes.
 unsafe fn wake_by_ref(data: *const ()) {
-    // SAFETY: the contract lends this reference, so the count stays as it was.
-    let task = ManuallyDrop::new(unsafe { Arc::from_raw(data.cast::<Task>()) });
-    task.schedule();
+    // SAFETY: the contract only lends, so the one passed on is a new count.
+    unsafe { Arc::increment_strong_count(data.cast::<Task>()) };
+    // SAFETY: the count just raised.
+    unsafe { Arc::from_raw(data.cast::<Task>()) }.schedule();
 }
 
 /// # Safety
