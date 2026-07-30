@@ -11,10 +11,12 @@ use molt_block::{BlockError, Device, Disk, Loopback};
 use molt_core::buffer::BufferRegistry;
 use molt_core::capability::CellId;
 use molt_fs::format::{Tree, build};
-use molt_fs::{Fs, FsOp, Name};
+use molt_core::buffer::BufferOperation;
+use molt_fs::{Fs, FsDone, FsOp, Handle, Name};
 
 const OWNER: CellId = CellId::new(1);
 const FILE: usize = 256 * 1024;
+const WINDOW: usize = 4096;
 
 struct Counted<'a> {
     inner: Loopback<'a>,
@@ -52,11 +54,23 @@ fn main() {
     let mut fs = Fs::<_, 4>::mount(device).unwrap();
     println!("mount {}", reads.get());
 
+    let mut window = [0u8; WINDOW];
     let mut buffers = BufferRegistry::<1>::new();
+    let buffer = buffers.register_write(OWNER, &mut window).unwrap();
     let root = fs.root(OWNER).unwrap();
     reads.set(0);
     let op = FsOp::Open { dir: root, name: Name::try_from("big").unwrap() };
     let opened = fs.apply(OWNER, op, &mut buffers).unwrap();
     println!("open {}", reads.get());
-    drop(opened);
+    let Some(Handle::File(file)) = opened.handle() else { unreachable!() };
+
+    reads.set(0);
+    let mut offset = 0;
+    while offset < FILE as u64 {
+        let target = BufferOperation::new(buffer, 0, WINDOW);
+        let op = FsOp::Read { file, buffer: target, offset };
+        let FsDone::Read(read) = fs.apply(OWNER, op, &mut buffers).unwrap() else { unreachable!() };
+        offset += read as u64;
+    }
+    println!("stream {} for {} blocks", reads.get(), FILE / WINDOW);
 }

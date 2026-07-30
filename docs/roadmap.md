@@ -394,12 +394,24 @@ calls it until a supervisor has a reason to. Both are argued in `docs/smp.md`.
 
 ### Stage 4.4 — Asynchronous `BlockOp`
 
-- [ ] `Volume` and `Journal` awaiting a `BlockOp` ring instead of calling the
+- [x] `Volume` and `Journal` awaiting a `BlockOp` ring instead of calling the
       device and blocking
-- [ ] readahead and parallel extent fetch as concurrent submissions
+- [x] readahead and parallel extent fetch as concurrent submissions
 
 The first workload that needs more than one request in flight, which is why it
 waits for a scheduler that can hold them.
+
+The buffer travels with the request, so the queue owns no borrow and a
+completion hands the block back to whoever asked. Above it a volume keeps eight
+of them: a sequential read asks for the blocks after the one it waits on, and a
+region walk — a mount verifying a checkpoint, a commit summing what it wrote —
+spends every free slot on the blocks ahead of the one it is handing over.
+
+The numbers are in `docs/fs.md`. What counts the same on every machine is the
+fetches: a 256 KiB file through a 4 KiB window costs 97 of them where it cost
+255. What the benchmarks measure is the ring's own cost, because a loopback
+fetch is a memcpy and there is no device time to overlap — a read costs a
+submission and a poll where it used to cost a call.
 
 ### Stage 4.5 — Device isolation
 
