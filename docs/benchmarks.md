@@ -72,6 +72,13 @@ framework, no runtime dependency, no third-party action — which the workflow
 publishes to Pages. A pull request gets `cargo xtask bench compare` as a step
 summary table and nothing else.
 
+![The latest run against the previous one and the first, then a series per
+bench](bench-page.png)
+
+The page above is that command over the five records the executor work was
+measured against, which is also how it is read: what one commit did to every
+bench first, and one bench across every commit after.
+
 **Why not `benchmark-action`.** It stores a series and comments when a run
 exceeds a ratio, which is a gate on wall clock measured where wall clock is
 worth 10-20% of noise; the alert either fires on nothing or is set so loose it
