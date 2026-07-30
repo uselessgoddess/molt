@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>molt performance</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1><a href="https://github.com/uselessgoddess/molt">molt</a> performance</h1>
+  <p id="latest">no runs recorded yet</p>
+</header>
+
+<main>
+  <section id="summary">
+    <h2>Latest run</h2>
+    <table id="benches">
+      <thead>
+        <tr><th>bench</th><th>median</th><th>spread</th><th>previous</th><th>first</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section id="history">
+    <h2>History <label><input type="checkbox" id="zero" checked> axes from zero</label></h2>
+    <div id="charts"></div>
+  </section>
+</main>
+
+<footer>
+  <p>Medians of criterion samples, in nanoseconds per iteration. The band is
+  the 95% confidence interval of the median; the runner is a shared virtual
+  machine, so a step that one run makes and the next gives back is noise.</p>
+</footer>
+
+<script id="runs" type="application/json"><!--history--></script>
+<script src="app.js"></script>
+</body>
+</html>

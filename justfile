@@ -34,7 +34,7 @@ riscv64gc-check:
     cargo clippy --package molt-kernel --target riscv64gc-unknown-none-elf -- -D warnings
 
 bench-check:
-    cargo bench --package molt-core --no-run
+    cargo bench --package molt-core --package molt-exec --no-run
 
 pre: fmt-check lint test doc x86_64-check riscv64gc-check bench-check loom
 
@@ -50,7 +50,12 @@ smoke-riscv64:
 smoke: smoke-x86_64 smoke-riscv64
 
 bench:
-    cargo bench --package molt-core
+    cargo xtask bench
 
-bench-track:
-    cargo bench --package molt-core -- --output-format bencher | tee bench-output.txt
+# Compares the last run against a recorded one, as markdown.
+bench-compare base:
+    cargo xtask bench compare {{ base }}
+
+# Builds the published page from a directory of records.
+bench-site data out:
+    cargo xtask bench site {{ data }} {{ out }}

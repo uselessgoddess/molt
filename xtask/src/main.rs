@@ -8,6 +8,9 @@ use std::{env, fs, thread};
 use bootloader::{BiosBoot, UefiBoot};
 use molt_fs::format::{Tree, build};
 
+mod bench;
+mod site;
+
 const X86_64_TARGET: &str = "x86_64-unknown-none";
 const RISCV64_TARGET: &str = "riscv64gc-unknown-none-elf";
 
@@ -75,12 +78,15 @@ fn run() -> Result<(), String> {
             (Some(tree), Some(image), None) => mkfs(Path::new(&tree), Path::new(&image)),
             _ => Err(usage()),
         },
+        Some("bench") => bench::dispatch(&args.collect::<Vec<_>>()),
         _ => Err(usage()),
     }
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <image|boot|smoke [x86_64|riscv64|all]|mkfs <tree> <image>>".into()
+    "usage: cargo xtask <image|boot|smoke [x86_64|riscv64|all]|mkfs <tree> <image>\
+     |bench [compare <base> [head]|record <dir>|site <data> <out>]>"
+        .into()
 }
 
 /// Writes the tree at `tree` out as a mountable MoltFS image.

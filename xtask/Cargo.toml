@@ -11,6 +11,8 @@ workspace = true
 [dependencies]
 bootloader = "0.11.15"
 molt-fs = { workspace = true, features = ["format"] }
+serde = { version = "1", features = ["derive"] }
+json = { package = "serde_json", version = "1" }
 
 [dev-dependencies]
 molt-block.workspace = true

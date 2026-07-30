@@ -17,13 +17,15 @@ The short answers: yes, yes but not as a gate, and yes but tiered.
 | Miri | `just miri` | every push |
 | Concurrency model | `just loom` | main, or the `loom` label |
 | Boot | `just smoke` | every push |
-| Benchmarks | `just bench` | locally, on demand |
-| Benchmark snapshot | `just bench-track` | main only |
+| Counted cost | `just test` | every push |
+| Benchmarks | `just bench` | main, and on demand |
 
 Each layer catches a class the layer above cannot see. Unit tests catch logic.
 Miri catches undefined behaviour on the paths a test happens to execute. loom
 catches orderings the hardware happened not to produce. The smoke test catches
-everything that only exists once there is a real machine underneath.
+everything that only exists once there is a real machine underneath. The
+counted-cost tests catch a hot path that started asking the heap for something,
+which is a benchmark a runner cannot argue with.
 
 ## Why loom
 
@@ -85,17 +87,16 @@ later sits on, and because a baseline is only useful if it predates the change
 you want to compare against.
 
 **Keep a machine-readable history.** Criterion compares a run to one saved
-baseline. `just bench-track` emits libtest-format numbers and the `Benchmarks`
-workflow preserves one 90-day artifact per main commit. The repository is
-private and cannot publish GitHub Pages on its current plan, so a durable graph
-is deferred until there is a store that can actually retain the series.
-
+baseline, which is one comparison and no series. `just bench` writes a record
+per commit instead, and the `Benchmarks` workflow keeps them on a data branch
+and publishes the graph.
 **Performance never gates the build.** Criterion's own FAQ advises against
 gating CI on wall-clock numbers, and a shared GitHub runner is a virtualized
-noisy neighbour: 10-20% between identical commits is normal. The snapshots are
-there for manual comparison; the signal worth acting on is a change that
-persists across several runs, not one spike. sel4bench takes the same position
-— it keeps a JSON history and does not auto-fail on it.
+noisy neighbour: 10-20% between identical commits is normal. The records are
+there for comparison; the signal worth acting on is a change that persists
+across several runs, not one spike. sel4bench takes the same position — it
+keeps a JSON history and does not auto-fail on it. What does gate the build is
+the counted cost, because an allocation is the same number on every machine.
 
 ## Why multi-platform CI
 
