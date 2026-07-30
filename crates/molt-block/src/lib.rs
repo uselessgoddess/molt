@@ -4,8 +4,15 @@
 //! durability boundary. `molt-virtio` implements them over a virtqueue,
 //! [`Loopback`] over bytes already in memory, and a future NVMe or SD driver
 //! over whatever it likes — none of which the filesystem above has to know.
+//!
+//! Both traits block. [`channel`] puts a ring in front of one of them so the
+//! filesystem submits and awaits instead, and only [`Backing`] still calls a
+//! device directly.
 
 #![no_std]
+#![feature(allocator_api)]
+
+extern crate alloc;
 
 #[cfg(test)]
 extern crate std;
@@ -13,10 +20,14 @@ extern crate std;
 mod device;
 mod fault;
 mod loopback;
+mod ring;
 
 pub use crate::device::{Device, Disk, bounds};
 pub use crate::fault::Fault;
 pub use crate::loopback::Loopback;
+pub use crate::ring::{
+    BLOCK, Backing, BlockClient, BlockDone, BlockDriver, BlockOp, Buffer, channel,
+};
 
 /// A sector is 512 bytes, the unit every device address is counted in.
 pub const SECTOR: usize = 512;

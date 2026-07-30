@@ -8,7 +8,9 @@
 //! therefore leaves either the previous generation or the complete new
 //! generation mountable, without fsck.
 //!
-//! [`Volume`] is the reader, needing one block of buffer and nothing else.
+//! [`Volume`] is the reader. It never calls a device: [`attach`] puts a block
+//! ring under it, so a read submits and awaits, and a streaming read asks for
+//! the blocks ahead of the one it waits on.
 //! [`Journal`] adds replay and mutation, and [`Fs`] wraps it in the ring
 //! protocol every other cell talks: typed [`FsOp`] submissions in, [`FsDone`]
 //! completions out, with directories and files named by capability rather than
@@ -59,7 +61,7 @@ pub use crate::op::{Dir, File, FsDone, FsOp, Handle, Stat};
 pub use crate::restart::{Disconnect, Teardown};
 pub use crate::service::Fs;
 pub use crate::storage::{Mount, Storage};
-pub use crate::volume::Volume;
+pub use crate::volume::{Blocks, DEPTH, Volume, attach};
 
 /// Why a filesystem operation failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

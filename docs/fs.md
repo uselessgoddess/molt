@@ -1,6 +1,7 @@
 # MoltFS
 
-Status: Stage 3 COW B-tree filesystem, July 2026.
+Status: Stage 3 COW B-tree filesystem, on a block ring since Stage 4.4,
+July 2026.
 
 How the read-only Stage 2.4 image became a writable, crash-consistent
 filesystem; how the bounded journal and copy-on-write metadata tree divide the
@@ -66,9 +67,10 @@ that mounts is a volume whose metadata is intact, which is a much stronger
 statement than "the superblock parsed".
 
 The sums live in their own region rather than beside the blocks they cover.
-That costs a second block read per data block, which for a boot-time shell is
-nothing, and it buys a scrub that walks one contiguous region instead of
-seeking across the volume — the Stage 4 item this leaves room for.
+That costs a second block read per data block — or did, until `Volume` had
+enough slots to keep the sums block resident while the file it covers streams
+past — and it buys a scrub that walks one contiguous region instead of seeking
+across the volume, the Stage 4 item this leaves room for.
 
 **A generation in the superblock, and a checkpoint that swings it.** Below.
 
@@ -215,13 +217,13 @@ go stale), while page lifetime follows dirty state and writeback, which is a
 policy this filesystem does not have and does not want to inherit.
 
 A page cache still belongs in the system, one layer down and later: it is what
-makes readahead, data blocks, and a second filesystem cheap, and Stage 4 puts it
-behind `molt-block` with the `BlockOp` ring, where the SMP story can be settled
-once for every client. Two caches then is not duplication — the block cache
-holds bytes for whoever reads them, the metadata cache holds structure for the
-tree that owns it. Data reads keep the single-block window in `Volume` until
-that day, because a data cache without an eviction policy tied to writeback is
-the half of a page cache that only looks free.
+makes data blocks and a second filesystem cheap, and it goes behind
+`molt-block`, beside the `BlockOp` ring that is already there, where the SMP
+story can be settled once for every client. Two caches then is not duplication —
+the block cache holds bytes for whoever reads them, the metadata cache holds
+structure for the tree that owns it. Data reads keep `Volume`'s slots until that
+day, because a data cache without an eviction policy tied to writeback is the
+half of a page cache that only looks free.
 
 ## The stack budget
 
@@ -307,9 +309,10 @@ continues to the previous copy instead of treating a generation number as
 proof. It applies the same rule to the tree: every reachable node checksum,
 level, child address, and generation is verified before the checkpoint can win.
 
-There is deliberately one outstanding block request at a time. That makes
-ordering observable and deterministic; barriers separate durability epochs,
-while the queue cannot reorder requests within one. `molt-block::Fault` models
+There is deliberately one outstanding mutation at a time. Reads go several deep
+on the ring; a write, a flush, and a checkpoint each submit and await, so
+ordering stays observable and deterministic — barriers separate durability
+epochs, and nothing reorders requests within one. `molt-block::Fault` models
 volatile controller cache separately from stable storage. The crash test starts
 from generation 2, rotates into the third bank, and cuts power before every
 record, tree-node, flush, and superblock action until a full checkpoint
@@ -454,23 +457,26 @@ timer on purpose — nothing preempts a cell here, so between units of work is t
 only place a supervisor can honestly look at a clock, and a timer would report a
 cell as late while it was still holding the only core.
 
-**The block driver stays a call, deliberately.** A `BlockOp` ring under the
-filesystem is the sketch's second ring, and it is the one place the layering
-argument turns into a cost: a filesystem that awaits its device needs its own
-executor to await *on*, and this stage has one task and a `drive` loop. Worse,
-it would be a ring whose only client is synchronous — `Volume` reads one block
-and immediately needs it — so the ring would be a queue of depth one with an
-await around it. The interesting version of that ring is the one with
-readahead, concurrent extent fetches, and a cache behind it. That later scale
-stage gets `BlockOp`; direct traits keep this stage synchronous and make that
-change a substitution rather than a rewrite.
+**The block driver is a ring now.** It was a call for as long as the argument
+for one held: a ring whose only client reads a block and immediately needs it is
+a queue of depth one with an await around it, and the version worth building is
+the one with readahead and concurrent extent fetches. That is the version below.
+`Volume` and `Journal` are `async` over `BlockOp`, and `Fs::on` is where the
+awaiting stops — an `FsOp` gets an answer, not a future, so the service polls
+the request it is serving and gives the block driver its turn between polls. The
+executor question the call was avoiding never arrived: `drive` is twenty lines
+and the filesystem still has one task, which is enough because the concurrency
+that matters is between the block requests of a single operation, not between
+operations.
 
 **Naming.** `FsCell` is the one suffix in the crate, and it earns the exception:
 `Fs` is the protocol a client talks and `FsCell` is the service that owns one,
 and the two are exported side by side, where `Fs` and `Cell` alone would not say
 which is which. Everything else keeps the rule from
 [the style guide](style.md) — `molt_virtio::Block`, `molt_block::Loopback` — and
-nothing is called `VirtioCell`, because the driver is still a call.
+nothing is called `VirtioCell`, because a driver behind a ring is still a
+driver: `Backing` owns a device and answers submissions, and has no lifecycle
+for a supervisor to restart.
 
 ## Where the driver ends: `molt-block`
 
@@ -525,6 +531,96 @@ suite mounts real images out of `Vec<u8>` with no QEMU, no device, and nothing
 mocked — the same reader the kernel runs, over the same bytes the kernel would
 read. That is the practical payoff of the split, and it arrived the day the
 trait did.
+
+**A ring above the traits.** `Device::read` returns when the sectors are there,
+which is right for one reader and wrong for everyone else: nothing can be in
+flight while it waits, so a reader that already knows it wants the next extent
+has no way to say so. `molt_block::ring` is the queue that lets it:
+
+```rust
+pub enum BlockOp {
+    Read { sector: u64, bytes: usize, buffer: Buffer },
+    Write { sector: u64, bytes: usize, buffer: Buffer },
+    Flush,
+}
+```
+
+- **The buffer travels with the operation.** A read hands its buffer over and
+  gets it back on the completion, so the queue carries no borrow and no
+  lifetime, and there is nothing for the device to alias while the submitter is
+  somewhere else. That is the part `&mut [u8]` in a trait cannot do once the
+  read outlives the call.
+- **Answers come back in submission order.** `BlockClient::take` walks past the
+  ones it is not waiting for and parks them; a ring `N` deep parks at most
+  `N - 1`, so a caller awaiting the read it needs never loses the readahead it
+  does not. Order is also what keeps the crash tests meaningful — the driver
+  runs the queue one submission at a time, so a flush still separates
+  durability epochs.
+- **`Backing` is the bottom.** It owns the driver end and the device, and `run`
+  is `drive(future, || driver.pump(device))`: poll the task, serve what it
+  queued, repeat. Awaiting stops there, because something has to move sectors.
+
+`bytes` is on the operation because a checkpoint writes one sector out of a
+4 KiB buffer and a data read fills all eight; making the ring speak blocks would
+have meant a second path for the superblock.
+
+## Slots, readahead, and what the ring cost
+
+A queue is only worth its await if something puts more than one request in it.
+`Volume` is that something: up to `SLOTS = 8` block buffers, each `Here` with
+the block it holds, `Flight` at the device with a `RequestId`, or `Lent` to a
+submission not taken back yet, over a ring `2 * SLOTS` deep so the ring is never
+the reason a read waits.
+
+**A sequential read asks ahead.** `Volume::read` submits the next `AHEAD = 3`
+blocks of the extent it is on before awaiting the one it needs, so what a
+streaming `cat` is about to want is already at the device when it asks. The run
+is known by then, so this costs no metadata read — only a guess about where the
+caller goes next. Being a guess is what shapes the rest: it stops at the end of
+the run, because the block after a hole is not a block, and it declines when
+there is no free slot rather than waiting for one.
+
+**A region walk spends every slot.** Mount verifies six regions, and a commit
+sums what it wrote; both walk a range in order. `sweep` keeps starting reads on
+free slots ahead of the block it is handing over, and releases each block as it
+is taken: a walk reads a region through, and nothing behind it is coming back.
+That is what keeps the pool from being spent on blocks a mount will never look
+at again.
+
+**The pool fills as reads ask for it.** Slots are allocated lazily up to
+`SLOTS`, and `free` prefers an empty slot, then a fresh one, then the
+second-chance hand. Eight zeroed 4 KiB buffers is roughly 2 µs of allocation a
+mount does not need and cannot use — it ends up holding two, while a lookup and
+a stream reach eight.
+
+**What it fetched.** Fetches are the part of this that counts the same on every
+machine, so they are a test rather than a benchmark: a 256 KiB file read through
+a 4 KiB window costs 97 fetches where the single-block window cost 255, and half
+the windows fetch nothing at all, because what they wanted landed while the
+window before them was being filled. `crates/molt-fs/tests/reads.rs` asserts
+both, and both fail on the commit before the ring.
+
+**What it cost, over loopback.** Medians of three interleaved rounds against the
+commit before the ring:
+
+| Benchmark | Call | Ring |
+| --- | --- | --- |
+| `fs_mount` | 11.98 µs | 14.05 µs |
+| `fs_open` | 760 ns | 878 ns |
+| `fs_read_stream`, 256 KiB through a 4 KiB window | 1.903 ms | 1.990 ms |
+| `fs_commit`, per commit | 647 µs | 629 µs |
+
+Reads got slower, which is the honest result and the expected one. Every
+benchmark runs over `Loopback`, where a fetch is a `memcpy`: there is no device
+time to overlap, so what these measure is the ring's own cost, around 100 ns a
+block — a submission, a yield, a pump, and a re-poll of the coroutine where
+there used to be a call. `fs_commit` comes out slightly ahead, which is inside
+the band [a shared runner produces](testing.md) and is not claimed as a win. The
+read numbers turn over the day a fetch costs more than a `memcpy`, which is
+exactly what readahead is for and what a real device already does. Nothing here
+proves that, and a fake device with a latency loop would not either: `Device` is
+synchronous, so a spinning fake overlaps nothing. The number that proves it
+comes from virtio, and needs the driver's own queue depth to be worth taking.
 
 ## The protocol
 
@@ -628,7 +724,11 @@ call moves, the await does not.
 `drive` is the loop underneath: poll the future, run the driver, repeat. Twenty
 lines, one task, a noop waker, and no claim to be an executor. `molt-core` has
 one of those; a shell in a boot log does not need it, and using it here would
-have hidden how little machinery the ring protocol actually requires.
+have hidden how little machinery the ring protocol actually requires. It lives
+in `molt_core::task` rather than in the shell, because the block ring wants the
+same loop at the other end of the system — `Backing::run` is `drive` with a
+`pump` in it — and two copies of twenty lines is where the second one starts
+drifting.
 
 `ls`, `cat`, and `help` are what the roadmap asked for. `cat` reads through a
 window deliberately smaller than the files on the disk, so the loop, the offset
@@ -646,20 +746,28 @@ line editor away and needs a serial `read` before it is worth writing.
   the B-tree/free-space stage.
 - **No snapshots, no reflinks, no compression, no encryption.** Stage 4, and
   each one needs the writer first.
-- **No data cache.** Metadata nodes are cached; `Volume` keeps the last data
-  block it read and nothing else. A directory search re-reads a block only when
-  the binary search moves off it, and a data block costs a second read for the
-  sum that covers it. The rest is the page cache above, which waits for the
-  block ring.
+- **No data cache.** Metadata nodes are cached; `Volume` keeps eight block
+  buffers and nothing beyond them. That is enough for a directory search to
+  re-read a block only when the binary search moves off every slot, and for the
+  sums block covering a file to stay resident while the file streams past it —
+  and it is a window, not a cache: it holds what one mount is doing now, and
+  forgets it when the slot is worth more. A cache that outlives the operation is
+  the page cache below, which needs the writeback policy this stage does not
+  have.
 - **No scrub.** The sums region exists and is checked per block on read; walking
   it deliberately is a Stage 4 item, and the region layout is what makes it
   cheap when it comes.
-- **No `BlockOp` ring, so no asynchronous I/O below the ring.** Above. `Fs`
-  answers submissions from a queue, but the device read under it blocks, so a
-  submission's latency is a device's. This is the next thing the filesystem
-  needs and it is deliberately a separate change: it moves `Volume`, `Journal`,
-  and every caller to `async fn`, and doing it in the same breath as the heap
-  and the service would have made both unreviewable.
+- **The depth stops at the driver.** `Volume` holds eight reads in flight over
+  a ring twice that deep, but `Backing` serves them one at a time and
+  `Device::read` blocks until its interrupt, so readahead queues at the ring and
+  not at the device. Moving it further down is the virtio half of the same
+  change — several descriptors outstanding, and a used entry routed by request
+  id rather than by the one command in progress.
+- **One operation at a time above the ring.** `Fs::on` drives an `FsOp` to its
+  answer before taking the next, so the concurrency the block ring buys is
+  between the reads of a single operation. Overlapping two clients' requests
+  needs an executor in the cell and a `Journal` that can have two borrows out,
+  which is a scheduling change, not an I/O one.
 - **No SMP.** One core, one mount, no locks: the metadata cache is `Rc`, `Fs`
   is `&mut`, and neither is `Send`. That is a bound the type system states
   rather than a bug waiting — a second core cannot reach this filesystem by
@@ -683,6 +791,13 @@ extend it through a hole.
 A checksum-valid but impossible extent is still refused: physical block
 arithmetic is checked before a data read, so a malformed address cannot wrap
 into another region or panic the reader.
+
+Ring tests are about who gets which answer: a read lands through the ring, an
+answer parked while a later one is awaited comes back to whoever asked for it,
+a full ring refuses a submission rather than dropping one, and a write is
+visible on the disk only after its flush. Above them `tests/reads.rs` counts
+fetches per window, which is the counted cost of readahead and holds on every
+machine.
 
 Service tests cover protocol rather than format: create/write/sync survives a
 remount, dynamic `Stat` sees new size, a read lands only in its registered
@@ -780,12 +895,12 @@ but that is a reason to keep migration policy small, not to label incompatible
 layouts with the same version. Version 1 and 2 images are rejected rather than
 guessed at; `xtask mkfs` rebuilds development images as version 3.
 
-- **Stage 3, asynchronous I/O.** `Volume` and `Journal` go `async` over a
-  `BlockOp` ring, and `FsCell` is where the executor that awaits it lives.
+- **Stage 4.4, asynchronous I/O.** Done: `Volume` and `Journal` are `async` over
+  a `BlockOp` ring, with readahead and region sweeps above it.
 - **Stage 4, scale.** File payloads compact from the journal into extent keys;
   reference counts and bucket generations generalize the bounded tree arena;
-  sums become a scrub work list; block layer gains its ring, data cache, and
-  readahead behind the same traits.
+  sums become a scrub work list; the block layer gains a data cache and a driver
+  that keeps more than one request at the device, both behind the same traits.
 - **Stage 5, storage for cells.** A signed cell image is a file with a signature
   region, and the loader is a client of this protocol — which is the argument
   for the protocol being pleasant to write against, since a loader is the next

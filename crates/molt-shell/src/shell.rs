@@ -251,10 +251,9 @@ mod tests {
     use molt_fs::{Disconnect, Fs, FsDone, FsError, FsOp, Storage, Teardown};
 
     use super::Shell;
-    use crate::ShellError;
     use crate::capture::Capture;
-    use crate::drive::{drive, drive_bounded};
     use crate::session::Session;
+    use crate::{ShellError, drive, drive_bounded};
 
     const SERVICE: CellId = CellId::new(2);
     const CLIENT: CellId = CellId::new(7);
