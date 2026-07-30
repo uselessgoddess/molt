@@ -530,6 +530,9 @@ dependencies = [
 [[package]]
 name = "molt-block"
 version = "0.1.0"
+dependencies = [
+ "molt-core",
+]
 
 [[package]]
 name = "molt-core"
