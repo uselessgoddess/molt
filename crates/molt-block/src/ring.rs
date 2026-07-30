@@ -52,7 +52,7 @@ pub struct BlockDone {
 pub fn channel<const N: usize>() -> Result<(BlockClient<N>, BlockDriver<N>), AllocError> {
     let (client, driver) = IoRing::held(Rc::try_new(IoRing::new())?);
     Ok((
-        BlockClient { ring: client, parked: [const { None }; N], next: 0 },
+        BlockClient { ring: client, parked: Box::try_new([const { None }; N])?, next: 0 },
         BlockDriver { ring: driver, pending: None },
     ))
 }
@@ -60,7 +60,9 @@ pub fn channel<const N: usize>() -> Result<(BlockClient<N>, BlockDriver<N>), All
 /// The submitting end of a block ring.
 pub struct BlockClient<const N: usize> {
     ring: HeldClient<Rc<IoRing<BlockOp, BlockDone, N>>>,
-    parked: [Option<Completion<BlockDone>>; N],
+    /// Boxed: a client is carried inside whatever mounts on it, and moving that
+    /// should cost a pointer rather than `N` answers.
+    parked: Box<[Option<Completion<BlockDone>>; N]>,
     next: u64,
 }
 

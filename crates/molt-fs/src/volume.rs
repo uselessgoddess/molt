@@ -523,7 +523,10 @@ impl Volume {
         let mut filled = Err(FsError::Corrupt);
         self.fill(|buffer| {
             filled = match buffer.get_mut(..bytes.len()) {
-                Some(head) => Ok(head.copy_from_slice(bytes)),
+                Some(head) => {
+                    head.copy_from_slice(bytes);
+                    Ok(())
+                }
                 None => Err(FsError::Corrupt),
             };
         })?;
@@ -564,7 +567,11 @@ impl Volume {
         Ok(crc.finish())
     }
 
-    pub(crate) async fn write_checkpoint(&mut self, copy: u64, value: Super) -> Result<(), FsError> {
+    pub(crate) async fn write_checkpoint(
+        &mut self,
+        copy: u64,
+        value: Super,
+    ) -> Result<(), FsError> {
         if copy >= SUPERS {
             return Err(FsError::Corrupt);
         }
@@ -654,11 +661,11 @@ async fn survey(
         }
 
         let mut previous = None;
-        for copy in 0..SUPERS as usize {
+        for (copy, candidate) in copies.iter().enumerate() {
             if copy == active_copy {
                 continue;
             }
-            if let Some(parsed) = copies[copy]
+            if let Some(parsed) = *candidate
                 && parsed.blocks.saturating_mul(SECTORS) <= sectors
                 && verify_checkpoint(client, scratch, &parsed).await.is_ok()
             {

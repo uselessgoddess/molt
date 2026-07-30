@@ -77,8 +77,7 @@ fn refused_node_rolls_back() -> Result<(), FsError> {
             journal.sync().await
         })?;
 
-        let refused =
-            starved(|| backing.run(journal.create(root, name("lost"), Kind::File)));
+        let refused = starved(|| backing.run(journal.create(root, name("lost"), Kind::File)));
         assert_eq!(refused.err(), Some(FsError::Memory));
 
         // The mutation that could not allocate is the one that is gone: the

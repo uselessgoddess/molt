@@ -499,8 +499,7 @@ impl Journal {
         // Taken out and put back: the tree needs the volume the journal owns,
         // and a failed insert still leaves a transaction its caller rolls back.
         let mut transaction = self.transaction.take().ok_or(FsError::Corrupt)?;
-        let inserted =
-            self.tree.insert(&mut self.volume, &mut transaction.tree, &key, value).await;
+        let inserted = self.tree.insert(&mut self.volume, &mut transaction.tree, &key, value).await;
         self.transaction = Some(transaction);
         inserted
     }

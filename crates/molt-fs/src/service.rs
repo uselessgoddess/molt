@@ -38,13 +38,7 @@ impl<D: Disk, const N: usize> Fs<D, N> {
     pub fn mount(device: D) -> Result<Self, FsError> {
         let (blocks, mut backing) = attach(device)?;
         let journal = backing.run(Journal::mount(blocks))?;
-        Ok(Self {
-            journal,
-            backing,
-            open: CapabilityTable::new(),
-            pending: None,
-            sealed: false,
-        })
+        Ok(Self { journal, backing, open: CapabilityTable::new(), pending: None, sealed: false })
     }
 
     /// Runs `work` against the journal, serving the ring under it.

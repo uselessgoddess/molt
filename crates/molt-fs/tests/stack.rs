@@ -7,8 +7,12 @@ use molt_fs::format::{self, Tree};
 use molt_fs::{DEPTH, FsError, Journal, Kind, Name, attach};
 
 /// Painted window, and what one call may spend of it.
+///
+/// A debug build keeps every poll frame of an awaited chain whole, so there it
+/// is a whole core's stack (`kernel/src/smp.rs`). The kernel ships released,
+/// and that figure has to leave room for everything above the filesystem.
 const WINDOW: usize = 96 * 1024;
-const BUDGET: usize = 16 * 1024;
+const BUDGET: usize = if cfg!(debug_assertions) { 64 * 1024 } else { 16 * 1024 };
 const MARK: u8 = 0xa5;
 
 fn image() -> Vec<u8> {
