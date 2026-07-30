@@ -56,7 +56,7 @@ impl<T, const N: usize> SpscRing<T, N> {
         (Producer { ring: self }, Consumer { ring: self })
     }
 
-    fn try_push(&self, value: T) -> Result<(), T> {
+    pub(crate) fn try_push(&self, value: T) -> Result<(), T> {
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
         if tail.wrapping_sub(head) == N {
@@ -72,7 +72,7 @@ impl<T, const N: usize> SpscRing<T, N> {
         Ok(())
     }
 
-    fn try_pop(&self) -> Option<T> {
+    pub(crate) fn try_pop(&self) -> Option<T> {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
         if head == tail {

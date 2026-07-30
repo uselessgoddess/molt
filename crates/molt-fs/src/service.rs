@@ -8,6 +8,7 @@
 use molt_block::Disk;
 use molt_core::buffer::BufferRegistry;
 use molt_core::capability::{Capability, CapabilityTable, CellId};
+use molt_core::cpu::CpuId;
 use molt_core::registry::Registry;
 use molt_core::ring::{Completion, IoDriver};
 
@@ -67,7 +68,8 @@ impl<D: Disk, const N: usize> Fs<D, N> {
             .map_err(|_| FsError::Handles)
     }
 
-    /// Puts the mount under [`Storage`] and shuts the bootstrap behind it.
+    /// Puts the mount under [`Storage`], served on `cpu`, and shuts the
+    /// bootstrap behind it.
     ///
     /// The root is minted for `provider` — the filesystem's own cell — rather
     /// than for whoever acquires it later, so that a client restarting takes
@@ -78,10 +80,11 @@ impl<D: Disk, const N: usize> Fs<D, N> {
         &mut self,
         names: &mut Registry<Storage, M>,
         provider: CellId,
+        cpu: CpuId,
     ) -> Result<Capability<Storage>, FsError> {
         let mount = Mount::new(self.root(provider)?, self.generation());
         self.seal();
-        Ok(names.publish(provider, mount)?)
+        Ok(names.publish(provider, cpu, mount)?)
     }
 
     /// Closes the root bootstrap for good, so no later caller can grant one.

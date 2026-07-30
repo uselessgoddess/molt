@@ -41,6 +41,11 @@ pub struct DeviceTree<'dtb> {
 /// The `compatible` string of the ECAM host bridge the kernel drives.
 const ECAM: &[u8] = b"pci-host-ecam-generic";
 
+/// The `device_type` of a node describing a hart, and the `status` of one
+/// firmware will not run.
+const CPU: &[u8] = b"cpu";
+const DISABLED: &[u8] = b"disabled";
+
 /// Bytes of the header, through `size_dt_struct`.
 const HEADER: usize = 40;
 
@@ -139,6 +144,62 @@ impl<'dtb> DeviceTree<'dtb> {
         Err(FdtError::Malformed)
     }
 
+    /// The hart identifiers of the `cpu` nodes firmware says can run.
+    ///
+    /// Returns how many were written, which stops at the room `into` has.
+    pub fn harts(&self, into: &mut [u64]) -> Result<usize, FdtError> {
+        let structs = self.block(8, 36)?;
+        let strings = self.block(12, 32)?;
+
+        let mut cursor = 0;
+        let mut cells = [Cells::DEFAULT; MAX_DEPTH];
+        let mut depth = 0;
+        let mut node = Cpu::new(Cells::DEFAULT);
+        let mut count = 0;
+
+        for _ in 0..MAX_TOKENS {
+            let token = be32(structs, cursor)?;
+            cursor += 4;
+            match token {
+                BEGIN_NODE => {
+                    // A `cpu` node carries an interrupt controller of its own,
+                    // so it is taken when a child opens as well as when it ends.
+                    node.take(into, &mut count);
+                    cursor = skip_name(structs, cursor)?;
+                    if depth >= MAX_DEPTH {
+                        return Err(FdtError::Malformed);
+                    }
+                    let parent = if depth == 0 { Cells::DEFAULT } else { cells[depth - 1] };
+                    cells[depth] = Cells::DEFAULT;
+                    node = Cpu::new(parent);
+                    depth += 1;
+                }
+                PROP => {
+                    let len = be32(structs, cursor)? as usize;
+                    let nameoff = be32(structs, cursor + 4)? as usize;
+                    let start = cursor + 8;
+                    let end = start.checked_add(len).ok_or(FdtError::Truncated)?;
+                    let value = structs.get(start..end).ok_or(FdtError::Truncated)?;
+                    cursor = align(end)?;
+                    if depth == 0 {
+                        return Err(FdtError::Malformed);
+                    }
+                    node.property(name(strings, nameoff)?, value, &mut cells[depth - 1]);
+                }
+                END_NODE => {
+                    node.take(into, &mut count);
+                    depth = depth.checked_sub(1).ok_or(FdtError::Malformed)?;
+                    node = Cpu::new(Cells::DEFAULT);
+                }
+                NOP => {}
+                END => return Ok(count),
+                _ => return Err(FdtError::Malformed),
+            }
+        }
+
+        Err(FdtError::Malformed)
+    }
+
     /// One of the two blocks the header locates by offset and size.
     fn block(&self, offset_at: usize, size_at: usize) -> Result<&'dtb [u8], FdtError> {
         let offset = be32(self.bytes, offset_at)? as usize;
@@ -188,6 +249,21 @@ pub unsafe fn config_space_at(address: usize) -> Result<ConfigSpace, FdtError> {
     // and the tree is only borrowed for this call.
     let tree = unsafe { at(address)? };
     tree.config_space()
+}
+
+/// The harts of the device tree firmware left at `address`.
+///
+/// # Safety
+/// `address` must be zero, or the device tree pointer firmware passed, mapped
+/// and immutable for the duration of the call.
+pub unsafe fn harts_at(address: usize, into: &mut [u64]) -> Result<usize, FdtError> {
+    if address == 0 {
+        return Err(FdtError::Missing);
+    }
+    // SAFETY: the caller promises a mapped device tree at a non-zero address,
+    // and the tree is only borrowed for this call.
+    let tree = unsafe { at(address)? };
+    tree.harts(into)
 }
 
 /// The `totalsize` of a blob whose magic and version we accept.
@@ -290,6 +366,52 @@ impl<'dtb> Node<'dtb> {
     }
 }
 
+/// A `cpu` node, kept only until it closes.
+struct Cpu<'dtb> {
+    matched: bool,
+    disabled: bool,
+    cells: Cells,
+    reg: Option<&'dtb [u8]>,
+}
+
+impl<'dtb> Cpu<'dtb> {
+    fn new(cells: Cells) -> Self {
+        Self { matched: false, disabled: false, cells, reg: None }
+    }
+
+    fn property(&mut self, name: &[u8], value: &'dtb [u8], children: &mut Cells) {
+        match name {
+            b"device_type" => self.matched |= value.split(|&byte| byte == 0).any(|it| it == CPU),
+            // Firmware marks a hart it will not run `disabled`, and asking for
+            // one anyway is a start that refuses halfway through boot.
+            b"status" => {
+                self.disabled |= value.split(|&byte| byte == 0).any(|it| it == DISABLED);
+            }
+            b"reg" => self.reg = Some(value),
+            b"#address-cells" => children.address = cell(value).unwrap_or(children.address),
+            b"#size-cells" => children.size = cell(value).unwrap_or(children.size),
+            _ => {}
+        }
+    }
+
+    /// Writes this node's hart identifier, if it named one molt can start.
+    ///
+    /// A malformed node is skipped rather than fatal: the machine still has the
+    /// cores the rest of the tree described.
+    fn take(&self, into: &mut [u64], count: &mut usize) {
+        if !self.matched || self.disabled || !(1..=2).contains(&self.cells.address) {
+            return;
+        }
+        let width = self.cells.address as usize * 4;
+        if let (Some(slot), Some(reg)) =
+            (into.get_mut(*count), self.reg.and_then(|reg| reg.get(..width)))
+        {
+            *slot = cells(reg);
+            *count += 1;
+        }
+    }
+}
+
 /// Reads up to two big-endian cells as one number.
 fn cells(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0, |value, &byte| value << 8 | u64::from(byte))
@@ -359,28 +481,34 @@ mod tests {
     }
 
     /// A root with 2/2 cells holding one node carrying `properties`.
+    fn begin(structs: &mut Vec<u8>, name: &str) {
+        structs.extend_from_slice(&1u32.to_be_bytes());
+        structs.extend_from_slice(name.as_bytes());
+        structs.push(0);
+        while structs.len() % 4 != 0 {
+            structs.push(0);
+        }
+    }
+
+    fn end(structs: &mut Vec<u8>) {
+        structs.extend_from_slice(&2u32.to_be_bytes());
+    }
+
+    fn property(structs: &mut Vec<u8>, strings: &mut Vec<u8>, name: &str, value: &[u8]) {
+        structs.extend_from_slice(&3u32.to_be_bytes());
+        structs.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        structs.extend_from_slice(&(strings.len() as u32).to_be_bytes());
+        structs.extend_from_slice(value);
+        while structs.len() % 4 != 0 {
+            structs.push(0);
+        }
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+    }
+
     fn tree(properties: &[(&str, &[u8])]) -> Vec<u8> {
         let mut structs = Vec::new();
         let mut strings = Vec::new();
-        let begin = |structs: &mut Vec<u8>, name: &str| {
-            structs.extend_from_slice(&1u32.to_be_bytes());
-            structs.extend_from_slice(name.as_bytes());
-            structs.push(0);
-            while structs.len() % 4 != 0 {
-                structs.push(0);
-            }
-        };
-        let property = |structs: &mut Vec<u8>, strings: &mut Vec<u8>, name: &str, value: &[u8]| {
-            structs.extend_from_slice(&3u32.to_be_bytes());
-            structs.extend_from_slice(&(value.len() as u32).to_be_bytes());
-            structs.extend_from_slice(&(strings.len() as u32).to_be_bytes());
-            structs.extend_from_slice(value);
-            while structs.len() % 4 != 0 {
-                structs.push(0);
-            }
-            strings.extend_from_slice(name.as_bytes());
-            strings.push(0);
-        };
 
         begin(&mut structs, "");
         property(&mut structs, &mut strings, "#address-cells", &2u32.to_be_bytes());
@@ -391,6 +519,34 @@ mod tests {
         }
         structs.extend_from_slice(&2u32.to_be_bytes());
         structs.extend_from_slice(&2u32.to_be_bytes());
+        structs.extend_from_slice(&9u32.to_be_bytes());
+
+        blob(&structs, &strings)
+    }
+
+    /// A `/cpus` node of one-cell addresses holding one node per hart, each with
+    /// an interrupt controller child, as QEMU `virt` emits.
+    fn cpus(harts: &[(u32, &str)]) -> Vec<u8> {
+        let mut structs = Vec::new();
+        let mut strings = Vec::new();
+
+        begin(&mut structs, "");
+        property(&mut structs, &mut strings, "#address-cells", &2u32.to_be_bytes());
+        begin(&mut structs, "cpus");
+        property(&mut structs, &mut strings, "#address-cells", &1u32.to_be_bytes());
+        for &(hart, status) in harts {
+            begin(&mut structs, "cpu");
+            property(&mut structs, &mut strings, "device_type", b"cpu\0");
+            property(&mut structs, &mut strings, "reg", &hart.to_be_bytes());
+            if !status.is_empty() {
+                property(&mut structs, &mut strings, "status", status.as_bytes());
+            }
+            begin(&mut structs, "interrupt-controller");
+            end(&mut structs);
+            end(&mut structs);
+        }
+        end(&mut structs);
+        end(&mut structs);
         structs.extend_from_slice(&9u32.to_be_bytes());
 
         blob(&structs, &strings)
@@ -499,6 +655,26 @@ mod tests {
         let space = unsafe { super::config_space_at(bytes.as_ptr() as usize) };
 
         assert_eq!(space?.span().unwrap().start(), 0x3000_0000);
+        Ok(())
+    }
+
+    #[test]
+    fn harts_come_from_cpu_nodes() -> Result<(), FdtError> {
+        let bytes = cpus(&[(0, "okay\0"), (1, ""), (2, "disabled\0"), (3, "")]);
+        let mut harts = [0; 4];
+
+        let found = DeviceTree::new(&bytes)?.harts(&mut harts)?;
+
+        assert_eq!(&harts[..found], &[0, 1, 3], "a hart firmware will not run");
+        Ok(())
+    }
+
+    #[test]
+    fn harts_stop_at_room_given() -> Result<(), FdtError> {
+        let bytes = cpus(&[(0, ""), (1, ""), (2, "")]);
+        let mut harts = [0; 2];
+
+        assert_eq!(DeviceTree::new(&bytes)?.harts(&mut harts)?, 2);
         Ok(())
     }
 

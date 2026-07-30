@@ -7,6 +7,9 @@
 //! The bank is fixed because the IDT is built once at boot. Every handler does
 //! two things — raise the [`Sink`] and EOI — because anything longer runs with
 //! interrupts disabled on whatever stack was current.
+//!
+//! A vector is claimed for a core: the message names one local APIC, so the
+//! interrupt lands where the service behind it lives and stays there.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -44,8 +47,8 @@ pub fn route(sink: &'static dyn Sink) {
     SINK.call_once(|| sink);
 }
 
-/// Claims a free vector and the message that reaches it.
-pub fn allocate() -> Result<(u16, MsiMessage), FabricError> {
+/// Claims a free vector and the message that reaches `destination`.
+pub fn allocate(destination: u8) -> Result<(u16, MsiMessage), FabricError> {
     let mut taken = TAKEN.load(Ordering::Acquire);
     loop {
         let line = taken.trailing_ones();
@@ -56,7 +59,7 @@ pub fn allocate() -> Result<(u16, MsiMessage), FabricError> {
         match TAKEN.compare_exchange_weak(taken, claimed, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => {
                 let line = line as u16;
-                return Ok((line, message(line)));
+                return Ok((line, message(line, destination)));
             }
             Err(current) => taken = current,
         }
@@ -75,9 +78,8 @@ pub fn release(line: u16) -> Result<(), FabricError> {
 }
 
 /// Fixed delivery, physical destination, edge triggered — all zero fields.
-/// Every vector goes to the boot CPU; molt starts one.
-fn message(line: u16) -> MsiMessage {
-    let destination = u64::from(apic::id()) << DESTINATION_SHIFT;
+fn message(line: u16, apic: u8) -> MsiMessage {
+    let destination = u64::from(apic) << DESTINATION_SHIFT;
     let vector = u32::from(FIRST_VECTOR) + u32::from(line);
     MsiMessage::new(MESSAGE_BASE | destination, vector)
 }

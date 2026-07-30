@@ -244,6 +244,7 @@ mod tests {
     use molt_core::buffer::BufferRegistry;
     use molt_core::capability::CellId;
     use molt_core::cell::{Cell, RestartHooks, Supervisor};
+    use molt_core::cpu::CpuId;
     use molt_core::registry::Registry;
     use molt_core::ring::IoRing;
     use molt_fs::format::{Tree, build};
@@ -281,7 +282,7 @@ mod tests {
         let names = RefCell::new(Registry::<Storage, 1>::new());
         let (client, mut driver) = ring.split();
 
-        fs.publish(&mut names.borrow_mut(), SERVICE).unwrap();
+        fs.publish(&mut names.borrow_mut(), SERVICE, CpuId::BOOT).unwrap();
         let session = Session::new(client, &buffers, &names, scratch, WINDOW).unwrap();
         let mut out = Capture::new();
         drive(
@@ -395,7 +396,7 @@ mod tests {
         let buffers = RefCell::new(registry);
         let names = RefCell::new(Registry::<Storage, 1>::new());
         let (client, mut driver) = ring.split();
-        fs.publish(&mut names.borrow_mut(), SERVICE).unwrap();
+        fs.publish(&mut names.borrow_mut(), SERVICE, CpuId::BOOT).unwrap();
         let mut shell = Shell::spawn(Session::new(client, &buffers, &names, scratch, WINDOW)?)?;
         let mut out = Capture::new();
         drive(shell.run(b"ls docs", &mut out), || {
@@ -409,7 +410,7 @@ mod tests {
         fs.restart().unwrap();
 
         drive(shell.run(b"ls", &mut out), || panic!("a command that outlived its service"))?;
-        fs.publish(&mut names.borrow_mut(), SERVICE).unwrap();
+        fs.publish(&mut names.borrow_mut(), SERVICE, CpuId::BOOT).unwrap();
         drive(shell.run(b"ls docs", &mut out), || {
             fs.serve(CLIENT, &mut driver, &mut buffers.borrow_mut());
         })?;
@@ -429,7 +430,7 @@ mod tests {
         let buffers = RefCell::new(registry);
         let names = RefCell::new(Registry::<Storage, 1>::new());
         let (client, mut driver) = ring.split();
-        fs.publish(&mut names.borrow_mut(), SERVICE).unwrap();
+        fs.publish(&mut names.borrow_mut(), SERVICE, CpuId::BOOT).unwrap();
         let mut shell = Shell::spawn(Session::new(client, &buffers, &names, scratch, WINDOW)?)?;
         let mut out = Capture::new();
 
@@ -455,7 +456,7 @@ mod tests {
         let buffers = RefCell::new(registry);
         let names = RefCell::new(Registry::<Storage, 1>::new());
         let (client, mut driver) = ring.split();
-        fs.publish(&mut names.borrow_mut(), SERVICE).unwrap();
+        fs.publish(&mut names.borrow_mut(), SERVICE, CpuId::BOOT).unwrap();
         let session = Session::new(client, &buffers, &names, scratch, WINDOW)?;
         let mut shell = Supervisor::<Shell<'_, '_, '_, 4, 1, 1>>::new(session)?;
         let mut out = Capture::new();
@@ -491,7 +492,7 @@ mod tests {
         let buffers = RefCell::new(registry);
         let names = RefCell::new(Registry::<Storage, 1>::new());
         let (client, mut driver) = ring.split();
-        fs.publish(&mut names.borrow_mut(), SERVICE).unwrap();
+        fs.publish(&mut names.borrow_mut(), SERVICE, CpuId::BOOT).unwrap();
         let session = Session::new(client, &buffers, &names, scratch, WINDOW)?;
         let mut shell = Supervisor::<Shell<'_, '_, '_, 4, 1, 1>>::new(session)?;
         let mut out = Capture::new();

@@ -1,6 +1,5 @@
 //! Running one future when the only other work is the driver below it.
 
-use core::future::Future;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 

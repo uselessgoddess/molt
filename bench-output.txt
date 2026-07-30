@@ -1,0 +1,17 @@
+test spsc_ring_round_trip ... bench:           0 ns/iter (+/- 0)
+
+test io_ring_round_trip ... bench:           3 ns/iter (+/- 0)
+
+test cross_core_ping_pong ... bench:           4 ns/iter (+/- 1)
+
+test executor_wake_and_scan/compact ... bench:          11 ns/iter (+/- 0)
+test executor_wake_and_scan/padded ... bench:          11 ns/iter (+/- 0)
+
+test executor_contended_wake/compact ... bench:          48 ns/iter (+/- 4)
+test executor_contended_wake/padded ... bench:           3 ns/iter (+/- 0)
+
+test completion_round_trip/compact ... bench:          33 ns/iter (+/- 0)
+test completion_round_trip/padded ... bench:          33 ns/iter (+/- 0)
+
+test atomic_waker_register_and_wake ... bench:          16 ns/iter (+/- 0)
+

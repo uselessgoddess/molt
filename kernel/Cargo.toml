@@ -22,6 +22,7 @@ molt-alloc.workspace = true
 molt-arch.workspace = true
 molt-block.workspace = true
 molt-core.workspace = true
+molt-exec.workspace = true
 molt-fs.workspace = true
 molt-net.workspace = true
 molt-pci.workspace = true

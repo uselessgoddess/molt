@@ -3,9 +3,15 @@
 //! RAM claimed from the platform and handed to [`Global`]. It is never given
 //! back: the frames stay the heap's for the life of the kernel, and the free
 //! list inside recycles them.
+//!
+//! One heap per core, so allocating is not a place cores queue up. The claims
+//! are spread over them as they come in, and what one core runs out of it
+//! borrows from the next.
 
-use molt_alloc::{Global, Interrupt};
+use molt_alloc::{Global, Interrupt, Router};
 use molt_arch::{BootInfo, Platform, PlatformError};
+
+use crate::smp::MAX;
 
 /// Frames per claim, and how many claims. A heap needs no contiguous span, so
 /// it asks in chunks and takes what a usable region can still give: the
@@ -15,8 +21,17 @@ use molt_arch::{BootInfo, Platform, PlatformError};
 const CHUNK: u64 = 64;
 const CHUNKS: u64 = 16;
 
+/// Sends every request to the heap of the core that made it.
+struct Cores;
+
+impl Router for Cores {
+    fn shard() -> usize {
+        crate::smp::here()
+    }
+}
+
 #[global_allocator]
-static HEAP: Global = Global::new();
+static HEAP: Global<Cores, MAX> = Global::new();
 
 /// Donates boot RAM to the global allocator and reports the bytes it took.
 pub fn init<P: Platform>(

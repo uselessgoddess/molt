@@ -1,4 +1,5 @@
 use molt_core::capability::{CapabilityError, CapabilityRights, CellId, Rights};
+use molt_core::cpu::CpuId;
 use molt_core::registry::{Registry, RegistryError, Scheme};
 
 /// A service whose endpoint is the checkpoint it was published at.
@@ -15,6 +16,7 @@ impl Scheme for Storage {
 }
 
 const SERVICE: CellId = CellId::new(3);
+const HOME: CpuId = CpuId::new(1);
 
 #[test]
 fn empty_scheme_answers_nobody() {
@@ -26,18 +28,19 @@ fn empty_scheme_answers_nobody() {
 #[test]
 fn lease_reads_published_endpoint() -> Result<(), RegistryError> {
     let mut names = Registry::<Storage, 2>::new();
-    names.publish(SERVICE, 7)?;
+    names.publish(SERVICE, HOME, 7)?;
 
     let lease = names.acquire()?;
 
     assert_eq!(names.endpoint(lease), Ok(&7));
+    assert_eq!(names.home(lease), Ok(HOME), "a lease that does not say where to send");
     Ok(())
 }
 
 #[test]
 fn withdraw_leaves_lease_stale() -> Result<(), RegistryError> {
     let mut names = Registry::<Storage, 2>::new();
-    names.publish(SERVICE, 7)?;
+    names.publish(SERVICE, HOME, 7)?;
     let lease = names.acquire()?;
 
     assert_eq!(names.withdraw(SERVICE), 1);
@@ -50,11 +53,11 @@ fn withdraw_leaves_lease_stale() -> Result<(), RegistryError> {
 #[test]
 fn republished_needs_fresh_lease() -> Result<(), RegistryError> {
     let mut names = Registry::<Storage, 2>::new();
-    names.publish(SERVICE, 7)?;
+    names.publish(SERVICE, HOME, 7)?;
     let stale = names.acquire()?;
     names.withdraw(SERVICE);
 
-    names.publish(SERVICE, 9)?;
+    names.publish(SERVICE, HOME, 9)?;
 
     assert_eq!(names.endpoint(stale), Err(CapabilityError::Stale), "a lease outlived its epoch");
     assert_eq!(names.endpoint(names.acquire()?), Ok(&9));
@@ -64,8 +67,8 @@ fn republished_needs_fresh_lease() -> Result<(), RegistryError> {
 #[test]
 fn full_registry() -> Result<(), RegistryError> {
     let mut names = Registry::<Storage, 1>::new();
-    names.publish(SERVICE, 7)?;
+    names.publish(SERVICE, HOME, 7)?;
 
-    assert_eq!(names.publish(CellId::new(4), 9).err(), Some(RegistryError::Full));
+    assert_eq!(names.publish(CellId::new(4), HOME, 9).err(), Some(RegistryError::Full));
     Ok(())
 }

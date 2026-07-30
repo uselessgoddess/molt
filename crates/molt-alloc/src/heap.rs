@@ -11,6 +11,13 @@ use core::ptr::{NonNull, null_mut};
 /// Chunk granularity, and the header every chunk carries.
 const UNIT: usize = size_of::<Free>();
 
+/// Bits of `back` that name whose heap a chunk came out of.
+///
+/// Chunk starts and payloads are both `UNIT`-aligned, so the distance between
+/// them never uses them, and a release on another core needs no table to find
+/// the owner — the allocation says so itself.
+const TAG: usize = UNIT - 1;
+
 /// Smallest chunk worth keeping: a header plus one unit of payload. A shorter
 /// remainder stays with the allocation it was split from rather than becoming
 /// a fragment nothing fits in.
@@ -38,6 +45,7 @@ pub struct Heap {
     free: *mut Free,
     size: usize,
     used: usize,
+    owner: usize,
 }
 
 // SAFETY: the heap reaches its chunks only through `&mut self`, and the spans
@@ -46,7 +54,13 @@ unsafe impl Send for Heap {}
 
 impl Heap {
     pub const fn new() -> Self {
-        Self { free: null_mut(), size: 0, used: 0 }
+        Self { free: null_mut(), size: 0, used: 0, owner: 0 }
+    }
+
+    /// Stamps what this heap hands out, so a release anywhere names it.
+    pub fn own(&mut self, owner: usize) {
+        debug_assert!(owner <= TAG, "more heaps than a header can name");
+        self.owner = owner & TAG;
     }
 
     /// Donates the `len` bytes at `start`, rounded inward to whole chunks.
@@ -107,7 +121,7 @@ impl Heap {
         // returned, and `back` reaches the chunk that header describes.
         unsafe {
             let Live { size, back } = ptr.as_ptr().byte_sub(UNIT).cast::<Live>().read();
-            let block = ptr.as_ptr().byte_sub(back).cast::<Free>();
+            let block = ptr.as_ptr().byte_sub(back & !TAG).cast::<Free>();
             block.write(Free { size, next: null_mut() });
             self.used -= size;
             self.insert(block);
@@ -165,7 +179,8 @@ impl Heap {
 
             self.used += taken;
             let head = chunk.with_addr(payload - UNIT).cast::<Live>();
-            head.write(Live { size: taken, back: payload - start });
+            debug_assert!((payload - start) & TAG == 0, "a payload with no room for its owner");
+            head.write(Live { size: taken, back: (payload - start) | self.owner });
             NonNull::new_unchecked(chunk.with_addr(payload).cast::<u8>())
         }
     }
@@ -210,6 +225,16 @@ impl Default for Heap {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Which heap `ptr` came out of, read from the allocation itself.
+///
+/// # Safety
+///
+/// As [`Heap::deallocate`]: `ptr` must be a live allocation some heap carved.
+pub unsafe fn owner(ptr: NonNull<u8>) -> usize {
+    // SAFETY: `carve` wrote the header one unit below every payload.
+    unsafe { ptr.as_ptr().byte_sub(UNIT).cast::<Live>().read().back & TAG }
 }
 
 const fn align_up(value: usize, align: usize) -> usize {
