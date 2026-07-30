@@ -5,11 +5,12 @@
 //! it publishes their log and tree root, then flushes the superblock. Blocks
 //! reachable from the newest and previous checkpoints are never overwritten.
 
-use molt_block::{Disk, SECTOR};
+use molt_block::SECTOR;
 
 use crate::btree::{Key, MetadataTree, TreeStats, TreeTransaction, Value};
 use crate::layout::{Area, BLOCK, Kind, OBJECT_BYTES, Object, Region};
 use crate::log::{ALIGN, HEADER, Record};
+use crate::volume::Blocks;
 use crate::{FsError, Name, Volume};
 
 /// The unpublished half of a checkpoint: where the new log bank is, how far it
@@ -28,25 +29,25 @@ impl Transaction {
 }
 
 /// A mounted writable filesystem.
-pub struct Journal<D> {
-    volume: Volume<D>,
+pub struct Journal {
+    volume: Volume,
     transaction: Option<Transaction>,
     tree: MetadataTree,
     base_objects: u32,
     next_object: u32,
 }
 
-impl<D: Disk> Journal<D> {
+impl Journal {
     /// Mounts the newest valid checkpoint and replays its mutation log.
-    pub fn mount(device: D) -> Result<Self, FsError> {
+    pub async fn mount(blocks: Blocks) -> Result<Self, FsError> {
         let mut journal = Self {
-            volume: Volume::mount(device)?,
+            volume: Volume::mount(blocks).await?,
             transaction: None,
             tree: MetadataTree::new()?,
             base_objects: 0,
             next_object: 0,
         };
-        journal.replay()?;
+        journal.replay().await?;
         Ok(journal)
     }
 
@@ -54,15 +55,15 @@ impl<D: Disk> Journal<D> {
     ///
     /// What was never synced was never a checkpoint, so it does not come back:
     /// this is the state a power cut would have left, reached deliberately.
-    pub fn remount(&mut self) -> Result<(), FsError> {
-        self.volume.remount()?;
+    pub async fn remount(&mut self) -> Result<(), FsError> {
+        self.volume.remount().await?;
         self.transaction = None;
         self.tree = MetadataTree::new()?;
-        self.replay()
+        self.replay().await
     }
 
     /// Sizes the object space from the mounted checkpoint and replays its log.
-    fn replay(&mut self) -> Result<(), FsError> {
+    async fn replay(&mut self) -> Result<(), FsError> {
         let object_bytes = self.volume.checkpoint().region(Area::Objects).bytes;
         if object_bytes % OBJECT_BYTES as u64 != 0 {
             return Err(FsError::Corrupt);
@@ -70,7 +71,7 @@ impl<D: Disk> Journal<D> {
         self.base_objects =
             u32::try_from(object_bytes / OBJECT_BYTES as u64).map_err(|_| FsError::Corrupt)?;
         self.next_object = self.base_objects;
-        self.validate_log()
+        self.validate_log().await
     }
 
     /// The object id of the root directory.
@@ -84,35 +85,35 @@ impl<D: Disk> Journal<D> {
     }
 
     /// Returns the current COW tree shape and cache counters.
-    pub fn tree_stats(&mut self) -> Result<TreeStats, FsError> {
+    pub async fn tree_stats(&mut self) -> Result<TreeStats, FsError> {
         let root = self.tree_root();
-        self.tree.stats(&mut self.volume, root)
+        self.tree.stats(&mut self.volume, root).await
     }
 
     /// Returns the current object state after replaying every mutation.
-    pub fn object(&mut self, id: u32) -> Result<Object, FsError> {
+    pub async fn object(&mut self, id: u32) -> Result<Object, FsError> {
         if id >= self.next_object {
             return Err(FsError::Missing);
         }
         let root = self.tree_root();
-        if let Some(value) = self.tree.get(&mut self.volume, root, &Key::object(id))? {
+        if let Some(value) = self.tree.get(&mut self.volume, root, &Key::object(id)).await? {
             return value.as_object();
         }
         if id < self.base_objects {
-            return self.volume.object(id);
+            return self.volume.object(id).await;
         }
         Err(FsError::Corrupt)
     }
 
     /// Finds `name` in a directory, including objects created since mkfs.
-    pub fn lookup(&mut self, dir: u32, name: &Name) -> Result<u32, FsError> {
-        let object = self.object(dir)?;
+    pub async fn lookup(&mut self, dir: u32, name: &Name) -> Result<u32, FsError> {
+        let object = self.object(dir).await?;
         if object.kind != Kind::Dir {
             return Err(FsError::Kind);
         }
         if dir < self.base_objects {
-            let base = self.volume.object(dir)?;
-            match self.volume.lookup(&base, name.as_bytes()) {
+            let base = self.volume.object(dir).await?;
+            match self.volume.lookup(&base, name.as_bytes()).await {
                 Ok(object) => return Ok(object),
                 Err(FsError::Missing) => {}
                 Err(error) => return Err(error),
@@ -120,22 +121,26 @@ impl<D: Disk> Journal<D> {
         }
 
         let root = self.tree_root();
-        if let Some(value) = self.tree.get(&mut self.volume, root, &Key::dirent(dir, name))? {
+        let key = Key::dirent(dir, name);
+        if let Some(value) = self.tree.get(&mut self.volume, root, &key).await? {
             return Ok(value.as_dirent());
         }
         Err(FsError::Missing)
     }
 
     /// Reads `index` in bytewise name order.
-    pub fn entry(&mut self, dir: u32, index: u32) -> Result<(Name, u32), FsError> {
-        let object = self.object(dir)?;
+    pub async fn entry(&mut self, dir: u32, index: u32) -> Result<(Name, u32), FsError> {
+        let object = self.object(dir).await?;
         if object.kind != Kind::Dir {
             return Err(FsError::Kind);
         }
         if index >= object.count {
             return Err(FsError::Missing);
         }
-        let base = if dir < self.base_objects { Some(self.volume.object(dir)?) } else { None };
+        let base = match dir < self.base_objects {
+            true => Some(self.volume.object(dir).await?),
+            false => None,
+        };
         let mut previous = None;
         let mut selected = None;
 
@@ -143,7 +148,7 @@ impl<D: Disk> Journal<D> {
             let mut candidate = None;
             if let Some(base) = base {
                 for at in 0..base.count {
-                    let (name, object) = self.volume.entry(&base, at)?;
+                    let (name, object) = self.volume.entry(&base, at).await?;
                     choose(&mut candidate, previous, name, object);
                 }
             }
@@ -152,8 +157,8 @@ impl<D: Disk> Journal<D> {
                 Some(name) => Key::dirent(dir, &name),
                 None => Key::dirent_start(dir),
             };
-            if let Some((key, value)) =
-                self.tree.next(&mut self.volume, root, &key, previous.is_none())?
+            let found = self.tree.next(&mut self.volume, root, &key, previous.is_none()).await?;
+            if let Some((key, value)) = found
                 && key.is_dirent(dir)
             {
                 choose(&mut candidate, previous, key.name()?, value.as_dirent());
@@ -166,8 +171,8 @@ impl<D: Disk> Journal<D> {
 
     /// Reads the current file contents, overlaying later writes over earlier
     /// ones and the immutable image.
-    pub fn read(&mut self, file: u32, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        let object = self.object(file)?;
+    pub async fn read(&mut self, file: u32, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        let object = self.object(file).await?;
         if object.kind != Kind::File {
             return Err(FsError::Kind);
         }
@@ -178,10 +183,10 @@ impl<D: Disk> Journal<D> {
         buf[..want].fill(0);
 
         if file < self.base_objects {
-            let base = self.volume.object(file)?;
+            let base = self.volume.object(file).await?;
             if offset <= base.size {
                 let take = (base.size - offset).min(want as u64) as usize;
-                self.volume.read(&base, offset, &mut buf[..take])?;
+                self.volume.read(&base, offset, &mut buf[..take]).await?;
             }
         }
 
@@ -189,7 +194,9 @@ impl<D: Disk> Journal<D> {
         let root = self.tree_root();
         let mut key = Key::write_start(file);
         let mut inclusive = true;
-        while let Some((found, value)) = self.tree.next(&mut self.volume, root, &key, inclusive)? {
+        loop {
+            let next = self.tree.next(&mut self.volume, root, &key, inclusive).await?;
+            let Some((found, value)) = next else { break };
             if !found.is_write(file) {
                 break;
             }
@@ -204,7 +211,8 @@ impl<D: Disk> Journal<D> {
                     cursor,
                     start - written_at,
                     &mut buf[target..target + (end - start) as usize],
-                )?;
+                )
+                .await?;
             }
             key = found;
             inclusive = false;
@@ -213,12 +221,12 @@ impl<D: Disk> Journal<D> {
     }
 
     /// Creates and opens one empty object below `parent`.
-    pub fn create(&mut self, parent: u32, name: Name, kind: Kind) -> Result<u32, FsError> {
-        let mut parent_object = self.object(parent)?;
+    pub async fn create(&mut self, parent: u32, name: Name, kind: Kind) -> Result<u32, FsError> {
+        let mut parent_object = self.object(parent).await?;
         if parent_object.kind != Kind::Dir {
             return Err(FsError::Kind);
         }
-        match self.lookup(parent, &name) {
+        match self.lookup(parent, &name).await {
             Ok(_) => return Err(FsError::Exists),
             Err(FsError::Missing) => {}
             Err(error) => return Err(error),
@@ -226,18 +234,16 @@ impl<D: Disk> Journal<D> {
         let object = self.next_object;
         let next = object.checked_add(1).ok_or(FsError::Full)?;
         parent_object.count = parent_object.count.checked_add(1).ok_or(FsError::Full)?;
-        let before = self.snapshot()?;
-        if let Err(error) = self
-            .append(Record::create(object, parent, kind, name), name.as_bytes())
-            .and_then(|_| self.index(Key::object(parent), Value::object(parent_object)))
-            .and_then(|_| {
-                self.index(
-                    Key::object(object),
-                    Value::object(Object { kind, start: 0, count: 0, size: 0 }),
-                )
-            })
-            .and_then(|_| self.index(Key::dirent(parent, &name), Value::dirent(object)))
-        {
+        let before = self.snapshot().await?;
+        let linked = async {
+            self.append(Record::create(object, parent, kind, name), name.as_bytes()).await?;
+            self.index(Key::object(parent), Value::object(parent_object)).await?;
+            let empty = Object { kind, start: 0, count: 0, size: 0 };
+            self.index(Key::object(object), Value::object(empty)).await?;
+            self.index(Key::dirent(parent, &name), Value::dirent(object)).await
+        }
+        .await;
+        if let Err(error) = linked {
             self.transaction = Some(before);
             return Err(error);
         }
@@ -246,8 +252,8 @@ impl<D: Disk> Journal<D> {
     }
 
     /// Appends a file write and returns the number of accepted bytes.
-    pub fn write(&mut self, file: u32, offset: u64, bytes: &[u8]) -> Result<usize, FsError> {
-        let mut object = self.object(file)?;
+    pub async fn write(&mut self, file: u32, offset: u64, bytes: &[u8]) -> Result<usize, FsError> {
+        let mut object = self.object(file).await?;
         if object.kind != Kind::File {
             return Err(FsError::Kind);
         }
@@ -256,8 +262,8 @@ impl<D: Disk> Journal<D> {
             return Ok(0);
         }
         let record = Record::write(file, offset, bytes.len())?;
-        let before = self.snapshot()?;
-        let cursor = match self.append(record, bytes) {
+        let before = self.snapshot().await?;
+        let cursor = match self.append(record, bytes).await {
             Ok(cursor) => cursor,
             Err(error) => {
                 self.transaction = Some(before);
@@ -265,9 +271,12 @@ impl<D: Disk> Journal<D> {
             }
         };
         object.size = object.size.max(offset + bytes.len() as u64);
-        if let Err(error) = self.index(Key::object(file), Value::object(object)).and_then(|_| {
-            self.index(Key::write(file, cursor), Value::write(offset, bytes.len() as u32))
-        }) {
+        let indexed = async {
+            self.index(Key::object(file), Value::object(object)).await?;
+            self.index(Key::write(file, cursor), Value::write(offset, bytes.len() as u32)).await
+        }
+        .await;
+        if let Err(error) = indexed {
             self.transaction = Some(before);
             return Err(error);
         }
@@ -275,14 +284,14 @@ impl<D: Disk> Journal<D> {
     }
 
     /// Makes every pending record durable and publishes a new generation.
-    pub fn sync(&mut self) -> Result<u64, FsError> {
+    pub async fn sync(&mut self) -> Result<u64, FsError> {
         let Some(transaction) = self.transaction.as_ref() else {
-            self.volume.flush()?;
+            self.volume.flush().await?;
             return Ok(self.volume.generation());
         };
         let (at, bytes, root) = (transaction.at, transaction.bytes, transaction.tree.root);
 
-        let crc = self.volume.checksum(at, bytes)?;
+        let crc = self.volume.checksum(at, bytes).await?;
         let mut checkpoint = self.volume.checkpoint();
         checkpoint.generation = checkpoint.generation.checked_add(1).ok_or(FsError::Full)?;
         checkpoint.tree_root = root;
@@ -291,27 +300,28 @@ impl<D: Disk> Journal<D> {
 
         // The log must survive before any durable superblock is allowed to
         // name it. The second flush is the commit point.
-        self.volume.flush()?;
-        self.volume.write_checkpoint(copy, checkpoint)?;
-        self.volume.flush()?;
-        self.volume.commit(copy, checkpoint);
+        self.volume.flush().await?;
+        self.volume.write_checkpoint(copy, checkpoint).await?;
+        self.volume.flush().await?;
+        self.volume.commit(copy, checkpoint).await;
         self.transaction = None;
         Ok(checkpoint.generation)
     }
 
-    fn validate_log(&mut self) -> Result<(), FsError> {
+    async fn validate_log(&mut self) -> Result<(), FsError> {
         let mut next = self.base_objects;
         let mut cursor = 0;
         while cursor < self.log_region().bytes {
-            let record = self.record(cursor)?;
+            let record = self.record(cursor).await?;
             match record {
                 Record::Create { object, parent, .. } => {
                     if object != next || parent >= next {
                         return Err(FsError::Corrupt);
                     }
-                    let name = self.record_name(cursor, record).map_err(|_| FsError::Corrupt)?;
-                    if self.kind_before(parent, cursor)? != Kind::Dir
-                        || self.name_exists_before(parent, &name, cursor)?
+                    let name =
+                        self.record_name(cursor, record).await.map_err(|_| FsError::Corrupt)?;
+                    if self.kind_before(parent, cursor).await? != Kind::Dir
+                        || self.name_exists_before(parent, &name, cursor).await?
                     {
                         return Err(FsError::Corrupt);
                     }
@@ -319,7 +329,7 @@ impl<D: Disk> Journal<D> {
                 }
                 Record::Write { object, offset, bytes } => {
                     if object >= next
-                        || self.kind_before(object, cursor)? != Kind::File
+                        || self.kind_before(object, cursor).await? != Kind::File
                         || offset.checked_add(u64::from(bytes)).is_none()
                     {
                         return Err(FsError::Corrupt);
@@ -334,10 +344,10 @@ impl<D: Disk> Journal<D> {
             return Err(FsError::Corrupt);
         }
         self.next_object = next;
-        self.validate_index()
+        self.validate_index().await
     }
 
-    fn validate_index(&mut self) -> Result<(), FsError> {
+    async fn validate_index(&mut self) -> Result<(), FsError> {
         let region = self.log_region();
         let root = self.tree_root();
         if region.bytes > 0 && root == 0 {
@@ -345,18 +355,20 @@ impl<D: Disk> Journal<D> {
         }
         let mut cursor = 0;
         while cursor < region.bytes {
-            let record = self.record(cursor)?;
+            let record = self.record(cursor).await?;
             match record {
                 Record::Create { object, parent, kind, .. } => {
-                    let name = self.record_name(cursor, record)?;
+                    let name = self.record_name(cursor, record).await?;
                     let state = self
                         .tree
-                        .get(&mut self.volume, root, &Key::object(object))?
+                        .get(&mut self.volume, root, &Key::object(object))
+                        .await?
                         .ok_or(FsError::Corrupt)?
                         .as_object()?;
                     let linked = self
                         .tree
-                        .get(&mut self.volume, root, &Key::dirent(parent, &name))?
+                        .get(&mut self.volume, root, &Key::dirent(parent, &name))
+                        .await?
                         .ok_or(FsError::Corrupt)?
                         .as_dirent();
                     if state.kind != kind || linked != object {
@@ -366,7 +378,8 @@ impl<D: Disk> Journal<D> {
                 Record::Write { object, offset, bytes } => {
                     let indexed = self
                         .tree
-                        .get(&mut self.volume, root, &Key::write(object, cursor))?
+                        .get(&mut self.volume, root, &Key::write(object, cursor))
+                        .await?
                         .ok_or(FsError::Corrupt)?
                         .as_write();
                     if indexed != (offset, bytes) {
@@ -379,13 +392,13 @@ impl<D: Disk> Journal<D> {
         Ok(())
     }
 
-    fn kind_before(&mut self, object: u32, limit: u64) -> Result<Kind, FsError> {
+    async fn kind_before(&mut self, object: u32, limit: u64) -> Result<Kind, FsError> {
         if object < self.base_objects {
-            return Ok(self.volume.object(object)?.kind);
+            return Ok(self.volume.object(object).await?.kind);
         }
         let mut cursor = 0;
         while cursor < limit {
-            let record = self.record(cursor)?;
+            let record = self.record(cursor).await?;
             if let Record::Create { object: created, kind, .. } = record
                 && created == object
             {
@@ -396,15 +409,15 @@ impl<D: Disk> Journal<D> {
         Err(FsError::Corrupt)
     }
 
-    fn name_exists_before(
+    async fn name_exists_before(
         &mut self,
         parent: u32,
         name: &Name,
         limit: u64,
     ) -> Result<bool, FsError> {
         if parent < self.base_objects {
-            let base = self.volume.object(parent)?;
-            match self.volume.lookup(&base, name.as_bytes()) {
+            let base = self.volume.object(parent).await?;
+            match self.volume.lookup(&base, name.as_bytes()).await {
                 Ok(_) => return Ok(true),
                 Err(FsError::Missing) => {}
                 Err(error) => return Err(error),
@@ -412,10 +425,10 @@ impl<D: Disk> Journal<D> {
         }
         let mut cursor = 0;
         while cursor < limit {
-            let record = self.record(cursor)?;
+            let record = self.record(cursor).await?;
             if let Record::Create { parent: held, .. } = record
                 && held == parent
-                && self.record_name(cursor, record)? == *name
+                && self.record_name(cursor, record).await? == *name
             {
                 return Ok(true);
             }
@@ -425,7 +438,7 @@ impl<D: Disk> Journal<D> {
     }
 
     /// Opens a transaction unless one is already open.
-    fn begin(&mut self) -> Result<(), FsError> {
+    async fn begin(&mut self) -> Result<(), FsError> {
         if self.transaction.is_some() {
             return Ok(());
         }
@@ -435,17 +448,17 @@ impl<D: Disk> Journal<D> {
             .filter_map(|bank| checkpoint.log_bank(bank).ok())
             .find(|at| *at != active.at && Some(*at) != self.volume.previous_log())
             .ok_or(FsError::Corrupt)?;
-        let tree = self.tree.begin(&mut self.volume)?;
-        self.volume.copy_aligned(active.at, target, active.bytes)?;
+        let tree = self.tree.begin(&mut self.volume).await?;
+        self.volume.copy_aligned(active.at, target, active.bytes).await?;
         self.transaction = Some(Transaction { at: target, bytes: active.bytes, tree });
         Ok(())
     }
 
-    fn append(&mut self, record: Record, payload: &[u8]) -> Result<u64, FsError> {
+    async fn append(&mut self, record: Record, payload: &[u8]) -> Result<u64, FsError> {
         if payload.len() != record.payload() as usize {
             return Err(FsError::Corrupt);
         }
-        self.begin()?;
+        self.begin().await?;
         let (at, cursor) = self.bank()?;
         let span = record.span()?;
         let end = cursor.checked_add(span).ok_or(FsError::Full)?;
@@ -475,18 +488,19 @@ impl<D: Disk> Journal<D> {
                 sector[target..target + (end - start) as usize]
                     .copy_from_slice(&payload[source..source + (end - start) as usize]);
             }
-            self.volume.write_aligned(at, cursor + written, &sector)?;
+            self.volume.write_aligned(at, cursor + written, &sector).await?;
             written += ALIGN;
         }
         self.open()?.bytes = end;
         Ok(cursor)
     }
 
-    fn index(&mut self, key: Key, value: Value) -> Result<(), FsError> {
+    async fn index(&mut self, key: Key, value: Value) -> Result<(), FsError> {
         // Taken out and put back: the tree needs the volume the journal owns,
         // and a failed insert still leaves a transaction its caller rolls back.
         let mut transaction = self.transaction.take().ok_or(FsError::Corrupt)?;
-        let inserted = self.tree.insert(&mut self.volume, &mut transaction.tree, &key, value);
+        let inserted =
+            self.tree.insert(&mut self.volume, &mut transaction.tree, &key, value).await;
         self.transaction = Some(transaction);
         inserted
     }
@@ -497,8 +511,8 @@ impl<D: Disk> Journal<D> {
     /// caller puts this copy back so the transaction keeps only what it had
     /// before. Blocks the abandoned half wrote stay unreferenced in the arena
     /// until the next generation reuses them.
-    fn snapshot(&mut self) -> Result<Transaction, FsError> {
-        self.begin()?;
+    async fn snapshot(&mut self) -> Result<Transaction, FsError> {
+        self.begin().await?;
         self.transaction.as_ref().ok_or(FsError::Corrupt)?.try_clone()
     }
 
@@ -526,7 +540,7 @@ impl<D: Disk> Journal<D> {
         }
     }
 
-    fn record(&mut self, cursor: u64) -> Result<Record, FsError> {
+    async fn record(&mut self, cursor: u64) -> Result<Record, FsError> {
         let log = self.log_region();
         if cursor % ALIGN != 0
             || cursor.checked_add(HEADER as u64).ok_or(FsError::Corrupt)? > log.bytes
@@ -534,7 +548,7 @@ impl<D: Disk> Journal<D> {
             return Err(FsError::Corrupt);
         }
         let within = (cursor % BLOCK as u64) as usize;
-        let block = self.volume.block(log.at + cursor / BLOCK as u64)?;
+        let block = self.volume.block(log.at + cursor / BLOCK as u64).await?;
         let record = Record::parse(&block[within..within + HEADER])?;
         let end = cursor
             .checked_add(record.span().map_err(|_| FsError::Corrupt)?)
@@ -545,16 +559,16 @@ impl<D: Disk> Journal<D> {
         Ok(record)
     }
 
-    fn record_name(&mut self, cursor: u64, record: Record) -> Result<Name, FsError> {
+    async fn record_name(&mut self, cursor: u64, record: Record) -> Result<Name, FsError> {
         let Record::Create { name_len, .. } = record else {
             return Err(FsError::Corrupt);
         };
         let mut bytes = [0; crate::MAX_NAME];
-        self.copy_payload(cursor, 0, &mut bytes[..name_len as usize])?;
+        self.copy_payload(cursor, 0, &mut bytes[..name_len as usize]).await?;
         Name::new(&bytes[..name_len as usize])
     }
 
-    fn copy_payload(
+    async fn copy_payload(
         &mut self,
         cursor: u64,
         payload_offset: u64,
@@ -573,7 +587,7 @@ impl<D: Disk> Journal<D> {
         while done < target.len() {
             let within = (source % BLOCK as u64) as usize;
             let take = (target.len() - done).min(BLOCK - within);
-            let block = self.volume.block(log.at + source / BLOCK as u64)?;
+            let block = self.volume.block(log.at + source / BLOCK as u64).await?;
             target[done..done + take].copy_from_slice(&block[within..within + take]);
             done += take;
             source += take as u64;
@@ -596,11 +610,12 @@ const _: () = assert!(BLOCK % SECTOR == 0);
 
 #[cfg(all(test, feature = "format"))]
 mod tests {
-    use molt_block::{BlockError, Fault, Loopback};
+    use molt_block::{Backing, BlockError, Disk, Fault, Loopback};
 
     use super::Journal;
     use crate::format::{Tree, build};
-    use crate::{BLOCK, FsError, Kind, Name};
+    use crate::volume::DEPTH;
+    use crate::{BLOCK, FsError, Kind, Name, attach};
 
     fn name(text: &str) -> Name {
         Name::try_from(text).unwrap()
@@ -612,31 +627,47 @@ mod tests {
         build(&tree, 1).unwrap()
     }
 
+    fn mount<D: Disk>(device: D) -> Result<(Journal, Backing<D, DEPTH>), FsError> {
+        let (blocks, mut backing) = attach(device)?;
+        let journal = backing.run(Journal::mount(blocks))?;
+        Ok((journal, backing))
+    }
+
     fn commit_file(bytes: &mut [u8], file: &str, contents: &[u8]) -> u64 {
-        let mut journal = Journal::mount(Loopback::writable(bytes).unwrap()).unwrap();
-        let object = journal.create(journal.root(), name(file), Kind::File).unwrap();
-        journal.write(object, 0, contents).unwrap();
-        journal.sync().unwrap()
+        let (mut journal, mut backing) = mount(Loopback::writable(bytes).unwrap()).unwrap();
+        let root = journal.root();
+        backing
+            .run(async {
+                let object = journal.create(root, name(file), Kind::File).await?;
+                journal.write(object, 0, contents).await?;
+                journal.sync().await
+            })
+            .unwrap()
     }
 
     fn assert_checkpoint(bytes: &[u8], generation: u64) {
-        let mut journal = Journal::mount(Loopback::new(bytes).unwrap()).unwrap();
+        let (mut journal, mut backing) = mount(Loopback::new(bytes).unwrap()).unwrap();
         assert_eq!(journal.generation(), generation);
+        let root = journal.root();
 
-        let first = journal.lookup(journal.root(), &name("first")).unwrap();
-        let mut contents = [0; 8];
-        assert_eq!(journal.read(first, 0, &mut contents), Ok(5));
-        assert_eq!(&contents[..5], b"first");
+        backing.run(async {
+            let first = journal.lookup(root, &name("first")).await.unwrap();
+            let mut contents = [0; 8];
+            assert_eq!(journal.read(first, 0, &mut contents).await, Ok(5));
+            assert_eq!(&contents[..5], b"first");
 
-        match generation {
-            2 => assert_eq!(journal.lookup(journal.root(), &name("second")), Err(FsError::Missing)),
-            3 => {
-                let second = journal.lookup(journal.root(), &name("second")).unwrap();
-                assert_eq!(journal.read(second, 0, &mut contents), Ok(6));
-                assert_eq!(&contents[..6], b"second");
+            match generation {
+                2 => {
+                    assert_eq!(journal.lookup(root, &name("second")).await, Err(FsError::Missing));
+                }
+                3 => {
+                    let second = journal.lookup(root, &name("second")).await.unwrap();
+                    assert_eq!(journal.read(second, 0, &mut contents).await, Ok(6));
+                    assert_eq!(&contents[..6], b"second");
+                }
+                _ => panic!("unexpected generation {generation}"),
             }
-            _ => panic!("unexpected generation {generation}"),
-        }
+        });
     }
 
     #[test]
@@ -650,12 +681,13 @@ mod tests {
             let mut volatile = alloc::vec![0; stable.len()];
             let outcome = {
                 let device = Fault::new(&mut stable, &mut volatile)?.cut_after(cut);
-                let mut journal = Journal::mount(device)?;
-                (|| {
-                    let object = journal.create(journal.root(), name("second"), Kind::File)?;
-                    journal.write(object, 0, b"second")?;
-                    journal.sync()
-                })()
+                let (mut journal, mut backing) = mount(device)?;
+                let root = journal.root();
+                backing.run(async {
+                    let object = journal.create(root, name("second"), Kind::File).await?;
+                    journal.write(object, 0, b"second").await?;
+                    journal.sync().await
+                })
             };
 
             match outcome {
@@ -687,10 +719,11 @@ mod tests {
         let active = crate::layout::Super::parse(&bytes[BLOCK..2 * BLOCK])?;
         let log = active.region(crate::layout::Area::Log);
         bytes[log.at as usize * BLOCK] ^= 1;
-        let mut journal = Journal::mount(Loopback::new(&bytes)?)?;
+        let (mut journal, mut backing) = mount(Loopback::new(&bytes)?)?;
+        let root = journal.root();
 
         assert_eq!(journal.generation(), 1);
-        assert_eq!(journal.lookup(journal.root(), &name("first")), Err(FsError::Missing));
+        assert_eq!(backing.run(journal.lookup(root, &name("first"))), Err(FsError::Missing));
         Ok(())
     }
 
@@ -713,18 +746,26 @@ mod tests {
     fn arena_reuses_old_generations() -> Result<(), FsError> {
         let mut bytes = image();
         {
-            let mut journal = Journal::mount(Loopback::writable(&mut bytes)?)?;
-            let file = journal.create(journal.root(), name("rolling"), Kind::File)?;
-            for byte in 0..200u8 {
-                journal.write(file, 0, &[byte])?;
-                journal.sync()?;
-            }
+            let (mut journal, mut backing) = mount(Loopback::writable(&mut bytes)?)?;
+            let root = journal.root();
+            backing.run(async {
+                let file = journal.create(root, name("rolling"), Kind::File).await?;
+                for byte in 0..200u8 {
+                    journal.write(file, 0, &[byte]).await?;
+                    journal.sync().await?;
+                }
+                Ok::<_, FsError>(())
+            })?;
         }
-        let mut journal = Journal::mount(Loopback::new(&bytes)?)?;
-        let file = journal.lookup(journal.root(), &name("rolling"))?;
+        let (mut journal, mut backing) = mount(Loopback::new(&bytes)?)?;
+        let root = journal.root();
         let mut byte = [0];
 
-        assert_eq!(journal.read(file, 0, &mut byte), Ok(1));
+        backing.run(async {
+            let file = journal.lookup(root, &name("rolling")).await?;
+            assert_eq!(journal.read(file, 0, &mut byte).await, Ok(1));
+            Ok::<_, FsError>(())
+        })?;
         assert_eq!(byte, [199]);
         Ok(())
     }
@@ -732,13 +773,16 @@ mod tests {
     #[test]
     fn writes_overlay_base_and_extend() -> Result<(), FsError> {
         let mut bytes = image();
-        let mut journal = Journal::mount(Loopback::writable(&mut bytes)?)?;
-        let base = journal.lookup(journal.root(), &name("base"))?;
-
-        journal.write(base, 2, b"WRITE")?;
-        journal.write(base, 12, b"tail")?;
+        let (mut journal, mut backing) = mount(Loopback::writable(&mut bytes)?)?;
+        let root = journal.root();
         let mut contents = [0xa5; 20];
-        let read = journal.read(base, 0, &mut contents)?;
+
+        let read = backing.run(async {
+            let base = journal.lookup(root, &name("base")).await?;
+            journal.write(base, 2, b"WRITE").await?;
+            journal.write(base, 12, b"tail").await?;
+            journal.read(base, 0, &mut contents).await
+        })?;
 
         assert_eq!(read, 16);
         assert_eq!(&contents[..16], b"imWRITEle\0\0\0tail");

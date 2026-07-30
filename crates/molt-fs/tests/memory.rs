@@ -2,9 +2,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::ptr;
 
-use molt_block::Loopback;
+use molt_block::{Backing, Disk, Loopback};
 use molt_fs::format::{self, Tree};
-use molt_fs::{FsError, Journal, Kind, Name};
+use molt_fs::{DEPTH, FsError, Journal, Kind, Name, attach};
 
 const LARGE: usize = 1024;
 
@@ -49,14 +49,20 @@ fn name(text: &str) -> Name {
     Name::try_from(text).unwrap()
 }
 
+fn mount<D: Disk>(device: D) -> Result<(Journal, Backing<D, DEPTH>), FsError> {
+    let (blocks, mut backing) = attach(device)?;
+    let journal = backing.run(Journal::mount(blocks))?;
+    Ok((journal, backing))
+}
+
 #[test]
 fn mount_refused_without_buffer() -> Result<(), FsError> {
     let bytes = image();
 
-    let mounted = starved(|| Journal::mount(Loopback::new(&bytes)?));
+    let mounted = starved(|| mount(Loopback::new(&bytes)?));
 
     assert_eq!(mounted.err(), Some(FsError::Memory));
-    assert!(Journal::mount(Loopback::new(&bytes)?).is_ok(), "heap came back and mount did not");
+    assert!(mount(Loopback::new(&bytes)?).is_ok(), "heap came back and mount did not");
     Ok(())
 }
 
@@ -64,22 +70,31 @@ fn mount_refused_without_buffer() -> Result<(), FsError> {
 fn refused_node_rolls_back() -> Result<(), FsError> {
     let mut bytes = image();
     {
-        let mut journal = Journal::mount(Loopback::writable(&mut bytes)?)?;
-        journal.create(journal.root(), name("kept"), Kind::File)?;
-        journal.sync()?;
+        let (mut journal, mut backing) = mount(Loopback::writable(&mut bytes)?)?;
+        let root = journal.root();
+        backing.run(async {
+            journal.create(root, name("kept"), Kind::File).await?;
+            journal.sync().await
+        })?;
 
-        let refused = starved(|| journal.create(journal.root(), name("lost"), Kind::File));
+        let refused =
+            starved(|| backing.run(journal.create(root, name("lost"), Kind::File)));
         assert_eq!(refused.err(), Some(FsError::Memory));
 
         // The mutation that could not allocate is the one that is gone: the
         // transaction goes back to its snapshot, so the journal keeps taking work.
-        journal.create(journal.root(), name("later"), Kind::File)?;
-        journal.sync()?;
+        backing.run(async {
+            journal.create(root, name("later"), Kind::File).await?;
+            journal.sync().await
+        })?;
     }
-    let mut journal = Journal::mount(Loopback::new(&bytes)?)?;
+    let (mut journal, mut backing) = mount(Loopback::new(&bytes)?)?;
+    let root = journal.root();
 
-    assert!(journal.lookup(journal.root(), &name("kept")).is_ok());
-    assert!(journal.lookup(journal.root(), &name("later")).is_ok());
-    assert_eq!(journal.lookup(journal.root(), &name("lost")), Err(FsError::Missing));
+    backing.run(async {
+        assert!(journal.lookup(root, &name("kept")).await.is_ok());
+        assert!(journal.lookup(root, &name("later")).await.is_ok());
+        assert_eq!(journal.lookup(root, &name("lost")).await, Err(FsError::Missing));
+    });
     Ok(())
 }
