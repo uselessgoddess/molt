@@ -119,7 +119,7 @@ fn default_record() -> PathBuf {
 
 /// Files the run by date, so listing a history directory sorts it by time.
 fn record(run: &Path, dir: &Path) -> Result<(), String> {
-    let run: Run = read(run)?;
+    let run = load(run)?;
     fs::create_dir_all(dir)
         .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
 
@@ -131,10 +131,22 @@ fn record(run: &Path, dir: &Path) -> Result<(), String> {
 }
 
 fn compare(base: &Path, head: &Path) -> Result<(), String> {
-    let base: Run = read(base)?;
-    let head: Run = read(head)?;
-    println!("{}", table(&base, &head));
+    println!("{}", table(&load(base)?, &load(head)?));
     Ok(())
+}
+
+/// A record older than the schema is refused rather than drawn: a field whose
+/// meaning changed would otherwise become a line nobody can read back.
+pub fn load(path: &Path) -> Result<Run, String> {
+    let run: Run = read(path)?;
+    if run.schema != SCHEMA {
+        return Err(format!(
+            "{} is schema {}, and this is schema {SCHEMA}",
+            path.display(),
+            run.schema
+        ));
+    }
+    Ok(run)
 }
 
 /// Walks criterion's output for the estimates of the run that just finished.
@@ -357,11 +369,13 @@ fn time(ns: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bench, Commit, Machine, Run, table, time};
+    use std::env;
+
+    use super::{Bench, Commit, Machine, Run, SCHEMA, load, table, time, write};
 
     fn run(hash: &str, benches: &[(&str, f64, f64)]) -> Run {
         Run {
-            schema: 1,
+            schema: SCHEMA,
             commit: Commit {
                 hash: hash.into(),
                 subject: "subject".into(),
@@ -434,6 +448,19 @@ mod tests {
 
         assert!(table.contains("| `new` | — | 10.0 ns | new |"), "{table}");
         assert!(table.contains("| `gone` | 10.0 ns | — | gone |"), "{table}");
+    }
+
+    #[test]
+    fn other_schema_is_refused() -> Result<(), String> {
+        let path = env::temp_dir().join("molt-bench-schema.json");
+        let mut record = run("aaaaaaaaaa", &[("timer/arm", 10.0, 1.0)]);
+        record.schema = SCHEMA + 1;
+        write(&path, &record)?;
+
+        let error = load(&path).unwrap_err();
+
+        assert!(error.contains(&format!("is schema {}", SCHEMA + 1)), "{error}");
+        Ok(())
     }
 
     #[test]

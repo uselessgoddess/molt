@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use crate::bench::{Run, read};
+use crate::bench::{Run, load};
 
 const INDEX: &str = include_str!("../assets/index.html");
 const STYLE: &str = include_str!("../assets/style.css");
@@ -49,7 +49,7 @@ fn history(data: &Path) -> Result<Vec<Run>, String> {
     // drawing the same point twice.
     let mut runs = BTreeMap::new();
     for file in files {
-        let run: Run = read(&file)?;
+        let run: Run = load(&file)?;
         runs.insert((run.commit.date.clone(), run.commit.hash.clone()), run);
     }
     Ok(runs.into_values().collect())
