@@ -543,6 +543,7 @@ dependencies = [
 name = "molt-exec"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "molt-core",
 ]
 
