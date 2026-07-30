@@ -9,6 +9,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::cell::{Cell, UnsafeCell};
+use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::ptr;
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -212,11 +213,15 @@ impl Task {
         unsafe { self.next.get().replace(ptr::null()) }
     }
 
-    fn waker(self: &Arc<Self>) -> Waker {
-        let raw = Arc::into_raw(self.clone());
-        // SAFETY: a leaked strong reference, which is what every arm of
-        // `VTABLE` is written to expect.
-        unsafe { Waker::from_raw(RawWaker::new(raw.cast(), &VTABLE)) }
+    /// A waker for the length of one poll, standing on the reference the
+    /// caller already holds. No count is taken, so none may be given back —
+    /// which is what the [`ManuallyDrop`] is for. A future that keeps the
+    /// waker clones it, and `clone` takes a count like any other.
+    fn waker(self: &Arc<Self>) -> ManuallyDrop<Waker> {
+        let raw = RawWaker::new(Arc::as_ptr(self).cast(), &VTABLE);
+        // SAFETY: every arm expects a strong reference, and this is the
+        // caller's, held for the whole poll.
+        ManuallyDrop::new(unsafe { Waker::from_raw(raw) })
     }
 }
 
