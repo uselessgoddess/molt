@@ -16,13 +16,10 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
-use molt_block::{BlockClient, Buffer};
-
 use crate::bitmap::Bitmap;
 use crate::crc::Crc;
 use crate::layout::{BLOCK, Kind, MAX_NAME, Object, Super};
 use crate::mem::{Unique, Zeroed};
-use crate::volume::{DEPTH, fetch};
 use crate::{FsError, Name, Volume, mem};
 
 const MAGIC: [u8; 8] = *b"MOLTBTR3";
@@ -848,11 +845,7 @@ impl Path {
 }
 
 /// Checks every reachable node before a superblock can become the mounted one.
-pub(crate) async fn verify(
-    client: &mut BlockClient<DEPTH>,
-    scratch: &mut Option<Buffer>,
-    checkpoint: &Super,
-) -> Result<(), FsError> {
+pub(crate) async fn verify(volume: &mut Volume, checkpoint: &Super) -> Result<(), FsError> {
     if checkpoint.tree_root == 0 {
         return Ok(());
     }
@@ -866,7 +859,7 @@ pub(crate) async fn verify(
             return Err(FsError::Corrupt);
         }
         used.set(offset);
-        let node = Node::parse(fetch(client, scratch, at).await?)?;
+        let node = Node::parse(volume.raw(at).await?)?;
         if node.generation > checkpoint.generation
             || (at == checkpoint.tree_root && node.generation != checkpoint.generation)
         {

@@ -85,20 +85,21 @@ pub struct Volume {
 impl Volume {
     /// Mounts at the newest checkpoint that verifies.
     pub async fn mount(blocks: Blocks) -> Result<Self, FsError> {
-        let Blocks { mut client, sectors } = blocks;
-        let mut scratch = Some(buffer()?);
-        let checkpoint = survey(&mut client, &mut scratch, sectors).await?;
-        Ok(Self {
+        let Blocks { client, sectors } = blocks;
+        let mut volume = Self {
             client,
             sectors,
-            slots: slots()?,
+            slots: Vec::new(),
             hand: 0,
-            scratch,
-            superblock: checkpoint.superblock,
-            active_copy: checkpoint.active_copy,
-            previous_log: checkpoint.previous_log,
-            previous_tree: checkpoint.previous_tree,
-        })
+            scratch: Some(buffer()?),
+            superblock: unmounted(sectors),
+            active_copy: 0,
+            previous_log: None,
+            previous_tree: None,
+        };
+        let checkpoint = volume.survey().await?;
+        volume.adopt(checkpoint);
+        Ok(volume)
     }
 
     /// Re-reads the volume as a fresh mount would.
@@ -108,12 +109,87 @@ impl Volume {
     /// the last checkpoint that was made durable.
     pub async fn remount(&mut self) -> Result<(), FsError> {
         self.stale(0..u64::MAX).await;
-        let checkpoint = survey(&mut self.client, &mut self.scratch, self.sectors).await?;
+        self.superblock = unmounted(self.sectors);
+        let checkpoint = self.survey().await?;
+        self.adopt(checkpoint);
+        Ok(())
+    }
+
+    /// Takes the checkpoint a survey settled on as the mounted one.
+    fn adopt(&mut self, checkpoint: Checkpoint) {
         self.superblock = checkpoint.superblock;
         self.active_copy = checkpoint.active_copy;
         self.previous_log = checkpoint.previous_log;
         self.previous_tree = checkpoint.previous_tree;
-        Ok(())
+    }
+
+    /// Takes the newest superblock copy that verifies.
+    ///
+    /// Every metadata region is checked against the checksum the superblock
+    /// records, so a corrupt volume fails here rather than at the first lookup
+    /// that happens to touch the damaged block.
+    async fn survey(&mut self) -> Result<Checkpoint, FsError> {
+        let mut copies = [None; SUPERS as usize];
+        let mut last_error = FsError::Magic;
+        for copy in 0..SUPERS {
+            match Super::parse(self.raw(copy).await?) {
+                Ok(parsed) => copies[copy as usize] = Some(parsed),
+                Err(error) => last_error = error,
+            }
+        }
+
+        // Newest generation first, each candidate dropped if it fails to
+        // verify. Loops rather than iterator chains: every frame of one carries
+        // a superblock, and mount runs on whatever stack its caller has.
+        let mut rejected = [false; SUPERS as usize];
+        for _ in 0..SUPERS {
+            let Some(active_copy) = newest(&copies, &rejected) else {
+                break;
+            };
+            rejected[active_copy] = true;
+            let Some(superblock) = copies[active_copy] else {
+                break;
+            };
+            if superblock.blocks.saturating_mul(SECTORS) > self.sectors {
+                last_error = FsError::Corrupt;
+                continue;
+            }
+            if let Err(error) = self.verify_checkpoint(&superblock).await {
+                last_error = error;
+                continue;
+            }
+
+            let mut previous = None;
+            for (copy, candidate) in copies.iter().enumerate() {
+                if copy == active_copy {
+                    continue;
+                }
+                if let Some(parsed) = *candidate
+                    && parsed.blocks.saturating_mul(SECTORS) <= self.sectors
+                    && self.verify_checkpoint(&parsed).await.is_ok()
+                {
+                    previous = Some(parsed);
+                    break;
+                }
+            }
+            return Ok(Checkpoint {
+                superblock,
+                active_copy: active_copy as u64,
+                previous_log: previous.map(|parsed| parsed.region(Area::Log).at),
+                previous_tree: previous.map(|parsed| parsed.tree_root).filter(|root| *root != 0),
+            });
+        }
+        Err(last_error)
+    }
+
+    async fn verify_checkpoint(&mut self, superblock: &Super) -> Result<(), FsError> {
+        for area in Area::ALL {
+            let region = superblock.region(area);
+            if self.checksum(region.at, region.bytes).await? != region.crc {
+                return Err(FsError::Checksum);
+            }
+        }
+        crate::btree::verify(self, superblock).await
     }
 
     /// The object id of the root directory.
@@ -367,12 +443,42 @@ impl Volume {
         }
     }
 
+    /// Reads `blocks` in order, giving each to `take`.
+    ///
+    /// Every slot it can get is spent on the blocks ahead of the one being
+    /// handed over, so a sweep waits for the device once rather than once per
+    /// block. Each block is released as it is taken: a sweep reads a region
+    /// through, and nothing behind it is coming back.
+    async fn sweep(
+        &mut self,
+        blocks: Range<u64>,
+        mut take: impl FnMut(&[u8; BLOCK]),
+    ) -> Result<(), FsError> {
+        let mut next = blocks.start;
+        for index in blocks.clone() {
+            while next < blocks.end
+                && let Some(at) = self.free()
+            {
+                self.start(at, next).await?;
+                next += 1;
+            }
+            take(self.block(index).await?);
+            self.drop_block(index);
+        }
+        Ok(())
+    }
+
     /// Reads a block without keeping it, on the buffer kept aside.
     ///
     /// This is the way around the slots, for the walks that would sweep every
     /// one of them out for blocks nobody reads twice.
-    async fn raw(&mut self, index: u64) -> Result<&[u8; BLOCK], FsError> {
-        fetch(&mut self.client, &mut self.scratch, index).await
+    pub(crate) async fn raw(&mut self, index: u64) -> Result<&[u8; BLOCK], FsError> {
+        let sector = index.checked_mul(SECTORS).ok_or(FsError::Corrupt)?;
+        let buffer = self.scratch.take().ok_or(FsError::Corrupt)?;
+        let done = self.client.once(BlockOp::Read { sector, bytes: BLOCK, buffer }).await;
+        self.scratch = done.buffer;
+        done.result.map_err(FsError::Device)?;
+        self.scratch.as_deref().ok_or(FsError::Corrupt)
     }
 
     /// The slot holding or fetching `index`.
@@ -385,7 +491,19 @@ impl Volume {
     }
 
     /// A slot whose buffer is here, without waiting for one to come back.
+    ///
+    /// An empty one first, then a new one while the pool may still hold it: a
+    /// buffer costs less than the read that fetches back what it would have
+    /// evicted. Only when neither is there does the hand come round and take a
+    /// block somebody may still want.
     fn free(&mut self) -> Option<usize> {
+        let empty = |slot: &Slot| matches!(slot, Slot::Here { block: None, .. });
+        if let Some(at) = self.slots.iter().position(empty) {
+            return Some(at);
+        }
+        if let Some(at) = self.grow() {
+            return Some(at);
+        }
         for _ in 0..self.slots.len() {
             let at = self.hand;
             self.hand = (self.hand + 1) % self.slots.len();
@@ -396,10 +514,35 @@ impl Volume {
         None
     }
 
+    /// Adds a slot, while the pool may hold one and the heap agrees.
+    ///
+    /// The pool fills as reads ask for it: a mount touches a handful of blocks,
+    /// and a volume nobody streams from has no use for eight buffers. A refused
+    /// buffer is not an error here — the caller takes a resident one instead.
+    fn grow(&mut self) -> Option<usize> {
+        if self.slots.len() == SLOTS || self.slots.try_reserve(1).is_err() {
+            return None;
+        }
+        self.slots.push(Slot::Here { block: None, buffer: buffer().ok()? });
+        Some(self.slots.len() - 1)
+    }
+
+    /// Forgets `index`, whose slot is worth more than what it holds.
+    fn drop_block(&mut self, index: u64) {
+        if let Some(at) = self.find(index)
+            && let Slot::Here { block, .. } = &mut self.slots[at]
+        {
+            *block = None;
+        }
+    }
+
     /// A slot to read into, waiting for one if every buffer is at the device.
     async fn spare(&mut self) -> Result<usize, FsError> {
         if let Some(at) = self.free() {
             return Ok(at);
+        }
+        if self.slots.is_empty() {
+            return Err(FsError::Memory);
         }
         // The hand points at the oldest read outstanding. Whether it landed is
         // the next reader's problem: an empty slot is what is wanted here.
@@ -557,13 +700,12 @@ impl Volume {
     pub(crate) async fn checksum(&mut self, block: u64, bytes: u64) -> Result<u32, FsError> {
         let mut crc = Crc::new();
         let mut left = bytes;
-        let mut index = block;
-        while left > 0 {
+        self.sweep(block..block + bytes.div_ceil(BLOCK as u64), |whole| {
             let take = left.min(BLOCK as u64) as usize;
-            crc.update(&self.raw(index).await?[..take]);
+            crc.update(&whole[..take]);
             left -= take as u64;
-            index += 1;
-        }
+        })
+        .await?;
         Ok(crc.finish())
     }
 
@@ -588,28 +730,10 @@ impl Volume {
     }
 }
 
-/// The volume's buffers, one per slot.
-fn slots() -> Result<Vec<Slot>, FsError> {
-    let mut slots = Vec::new();
-    slots.try_reserve_exact(SLOTS)?;
-    for _ in 0..SLOTS {
-        slots.push(Slot::Here { block: None, buffer: buffer()? });
-    }
-    Ok(slots)
-}
-
-/// Reads `index` into `scratch` and borrows what landed.
-pub(crate) async fn fetch<'b>(
-    client: &mut BlockClient<DEPTH>,
-    scratch: &'b mut Option<Buffer>,
-    index: u64,
-) -> Result<&'b [u8; BLOCK], FsError> {
-    let sector = index.checked_mul(SECTORS).ok_or(FsError::Corrupt)?;
-    let buffer = scratch.take().ok_or(FsError::Corrupt)?;
-    let done = client.once(BlockOp::Read { sector, bytes: BLOCK, buffer }).await;
-    *scratch = done.buffer;
-    done.result.map_err(FsError::Device)?;
-    scratch.as_deref().ok_or(FsError::Corrupt)
+/// What is known of a volume before a survey: how far the device goes, which
+/// is all a read of a superblock copy has to stay inside.
+fn unmounted(sectors: u64) -> Super {
+    Super { blocks: sectors / SECTORS, ..Super::default() }
 }
 
 /// Which checkpoint a mount settled on, and what the one before it held.
@@ -618,69 +742,6 @@ struct Checkpoint {
     active_copy: u64,
     previous_log: Option<u64>,
     previous_tree: Option<u64>,
-}
-
-/// Takes the newest superblock copy that verifies.
-///
-/// Every metadata region is checked against the checksum the superblock
-/// records, so a corrupt volume fails here rather than at the first lookup that
-/// happens to touch the damaged block.
-async fn survey(
-    client: &mut BlockClient<DEPTH>,
-    scratch: &mut Option<Buffer>,
-    sectors: u64,
-) -> Result<Checkpoint, FsError> {
-    let mut copies = [None; SUPERS as usize];
-    let mut last_error = FsError::Magic;
-    for copy in 0..SUPERS {
-        match Super::parse(fetch(client, scratch, copy).await?) {
-            Ok(parsed) => copies[copy as usize] = Some(parsed),
-            Err(error) => last_error = error,
-        }
-    }
-
-    // Newest generation first, each candidate dropped if it fails to verify.
-    // Loops rather than iterator chains: every frame of one carries a
-    // superblock, and mount runs on whatever stack its caller has.
-    let mut rejected = [false; SUPERS as usize];
-    for _ in 0..SUPERS {
-        let Some(active_copy) = newest(&copies, &rejected) else {
-            break;
-        };
-        rejected[active_copy] = true;
-        let Some(superblock) = copies[active_copy] else {
-            break;
-        };
-        if superblock.blocks.saturating_mul(SECTORS) > sectors {
-            last_error = FsError::Corrupt;
-            continue;
-        }
-        if let Err(error) = verify_checkpoint(client, scratch, &superblock).await {
-            last_error = error;
-            continue;
-        }
-
-        let mut previous = None;
-        for (copy, candidate) in copies.iter().enumerate() {
-            if copy == active_copy {
-                continue;
-            }
-            if let Some(parsed) = *candidate
-                && parsed.blocks.saturating_mul(SECTORS) <= sectors
-                && verify_checkpoint(client, scratch, &parsed).await.is_ok()
-            {
-                previous = Some(parsed);
-                break;
-            }
-        }
-        return Ok(Checkpoint {
-            superblock,
-            active_copy: active_copy as u64,
-            previous_log: previous.map(|parsed| parsed.region(Area::Log).at),
-            previous_tree: previous.map(|parsed| parsed.tree_root).filter(|root| *root != 0),
-        });
-    }
-    Err(last_error)
 }
 
 /// The copy holding the newest generation, ties going to the lower copy.
@@ -695,29 +756,6 @@ fn newest(copies: &[Option<Super>], rejected: &[bool]) -> Option<usize> {
         }
     }
     best.map(|(copy, _)| copy)
-}
-
-async fn verify_checkpoint(
-    client: &mut BlockClient<DEPTH>,
-    scratch: &mut Option<Buffer>,
-    superblock: &Super,
-) -> Result<(), FsError> {
-    for area in Area::ALL {
-        let region = superblock.region(area);
-        let mut crc = Crc::new();
-        let mut left = region.bytes;
-        let mut index = region.at;
-        while left > 0 {
-            let take = left.min(BLOCK as u64) as usize;
-            crc.update(&fetch(client, scratch, index).await?[..take]);
-            left -= take as u64;
-            index += 1;
-        }
-        if crc.finish() != region.crc {
-            return Err(FsError::Checksum);
-        }
-    }
-    crate::btree::verify(client, scratch, superblock).await
 }
 
 #[cfg(all(test, feature = "format"))]
