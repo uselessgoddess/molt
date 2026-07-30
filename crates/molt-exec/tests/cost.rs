@@ -1,18 +1,19 @@
-//! What the hot paths ask of the heap, counted instead of timed.
+//! What the hot paths cost, counted instead of timed.
 //!
 //! A shared runner has opinions about nanoseconds; it has none about how many
-//! allocations a wake takes. These are the numbers a change may not quietly
-//! spend, so a regression fails here rather than showing up as a slower graph
-//! nobody trusts.
+//! allocations a wake takes, or how many doorbells a burst rings. These are the
+//! numbers a change may not quietly spend, so a regression fails here rather
+//! than showing up as a slower graph nobody trusts.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::future::pending;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
+use molt_core::cpu::CpuId;
 use molt_exec::{Executor, Machine, Sleep, Solo, SpawnError, Timers};
 
 #[global_allocator]
@@ -20,6 +21,7 @@ static ALLOC: Counter = Counter;
 
 static SOLO: Solo = Solo;
 static CLOCK: Clock = Clock(AtomicU64::new(0));
+static BELL: Bell = Bell(AtomicUsize::new(0));
 
 /// Steady state is what is measured, so the queues get their growth first.
 const WARM: usize = 64;
@@ -80,6 +82,23 @@ fn spawn_is_flat() -> Result<(), SpawnError> {
     Ok(())
 }
 
+/// The owner drains the inbox whole, so a burst filling it rings once.
+#[test]
+fn burst_rings_once() -> Result<(), SpawnError> {
+    let executor = Executor::new(&BELL, WARM + 1);
+    for _ in 0..WARM {
+        executor.spawn(pending())?;
+    }
+    assert_eq!(BELL.count(), 1);
+
+    // Emptied, so the next one owes a ring again.
+    executor.run_until_idle();
+    executor.spawn(pending())?;
+
+    assert_eq!(BELL.count(), 2);
+    Ok(())
+}
+
 /// Arms a batch, walks the clock past it, and drops what expired.
 fn round(timers: &Timers, sleeps: &mut Vec<Sleep>, tick: u64) {
     sleeps.extend((0..WARM).map(|_| timers.after(4)));
@@ -129,6 +148,21 @@ struct Clock(AtomicU64);
 impl Machine for Clock {
     fn ticks(&self) -> u64 {
         self.0.load(Ordering::Acquire)
+    }
+}
+
+/// A machine that counts its doorbell instead of ringing one.
+struct Bell(AtomicUsize);
+
+impl Bell {
+    fn count(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+impl Machine for Bell {
+    fn wake(&self, _: CpuId) {
+        self.0.fetch_add(1, Ordering::Release);
     }
 }
 

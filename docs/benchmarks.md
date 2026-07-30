@@ -17,8 +17,10 @@ The other metric is deterministic. `crates/molt-exec/tests/cost.rs` installs a
 counting `#[global_allocator]` and asserts what the hot paths ask of the heap:
 a wake allocates nothing, an arm reuses the slot a cancelled deadline gave
 back, an expiry allocates nothing, and every spawn costs the same as the last.
-Those are ordinary tests. They fail in `just test`, on any machine, with a
-number the runner cannot have an opinion about.
+A counting `Machine` does the same for doorbells, where the cost is an
+interrupt the host does not charge for. Those are ordinary tests. They fail in
+`just test`, on any machine, with a number the runner cannot have an opinion
+about.
 
 The split is the point. Nanoseconds say where to look; the count is what a
 change may not quietly spend. In a kernel the allocator is `molt-alloc` and the
@@ -97,7 +99,7 @@ own samples, which measures the sampling and not the runner's neighbours.
 ## The executor, measured
 
 Stage 4.1 shipped an executor written for shape, not for cost. With the
-records in place, four things were worth changing, each on its own commit with
+records in place, five things were worth changing, each on its own commit with
 its own numbers. AMD EPYC, one GitHub-class runner, medians:
 
 | Change | Before | After |
@@ -111,6 +113,7 @@ its own numbers. AMD EPYC, one GitHub-class runner, medians:
 | | `wake/burst` 4.92 µs | 4.05 µs |
 | a poll's waker stands on the poller's | `wake/one` 67.8 ns | 59.0 ns |
 | | `wake/burst` 3.79 µs | 3.07 µs |
+| one doorbell per burst | no wall-clock change | 64 wakes ring once |
 
 The timers were the hypothesis with the most in it: an `Rc<Timer>` per deadline
 and a `Vec<Rc<Timer>>` per bucket meant arming allocated, cancelling scanned,
@@ -132,6 +135,17 @@ out, whether the future kept the waker or not — the waker a poll is handed now
 points at the reference the poller holds and is never dropped. A future that
 keeps one still clones it, and the vtable is the same either way, so
 `Waker::will_wake` still recognises the two as one waker.
+
+**Batching completions.** A queue that drains sixty-four completions from one
+interrupt wakes sixty-four tasks, and each of those used to ring the owner's
+doorbell — sixty-four IPIs for work the owner does in one pass. The push now
+reports whether it found the inbox empty, and only that push rings. The rest are
+covered by it: a push onto a chain somebody else started either lands before the
+drain, and is taken with the rest, or after it, in which case the swap already
+emptied the head the exchange expected and the exchange failed. This is the one
+change in the table with no wall-clock number, because on the host an IPI is a
+function call that returns; what it costs is a cross-core interrupt, and what
+proves it is `burst_rings_once` counting doorbells.
 
 ## Hypotheses the numbers did not support
 
