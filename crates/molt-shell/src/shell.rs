@@ -240,7 +240,7 @@ mod tests {
     use std::string::String;
     use std::vec::Vec;
 
-    use molt_block::Loopback;
+    use molt_block::{Loopback, Serial};
     use molt_core::buffer::BufferRegistry;
     use molt_core::capability::CellId;
     use molt_core::cell::{Cell, RestartHooks, Supervisor};
@@ -275,7 +275,7 @@ mod tests {
         let mut scratch = [0u8; WINDOW];
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
 
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap();
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::new(&bytes).unwrap())).unwrap();
         let mut registry = BufferRegistry::<1>::new();
         let scratch = registry.register_read_write(CLIENT, &mut scratch).unwrap();
         let buffers = RefCell::new(registry);
@@ -392,7 +392,7 @@ mod tests {
         let bytes = image();
         let mut scratch = [0u8; WINDOW];
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap();
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::new(&bytes).unwrap())).unwrap();
         let mut registry = BufferRegistry::<1>::new();
         let scratch = registry.register_read_write(CLIENT, &mut scratch).unwrap();
         let buffers = RefCell::new(registry);
@@ -426,7 +426,7 @@ mod tests {
         let bytes = image();
         let mut scratch = [0u8; WINDOW];
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap();
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::new(&bytes).unwrap())).unwrap();
         let mut registry = BufferRegistry::<1>::new();
         let scratch = registry.register_read_write(CLIENT, &mut scratch).unwrap();
         let buffers = RefCell::new(registry);
@@ -452,7 +452,7 @@ mod tests {
         let bytes = image();
         let mut scratch = [0u8; WINDOW];
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap();
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::new(&bytes).unwrap())).unwrap();
         let mut registry = BufferRegistry::<1>::new();
         let scratch = registry.register_read_write(CLIENT, &mut scratch).unwrap();
         let buffers = RefCell::new(registry);
@@ -488,7 +488,7 @@ mod tests {
         let bytes = image();
         let mut scratch = [0u8; WINDOW];
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap();
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::new(&bytes).unwrap())).unwrap();
         let mut registry = BufferRegistry::<1>::new();
         let scratch = registry.register_read_write(CLIENT, &mut scratch).unwrap();
         let buffers = RefCell::new(registry);

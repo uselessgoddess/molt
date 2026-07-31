@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::ops::Range;
 
-use molt_block::{Backing, BlockClient, BlockOp, Buffer, Disk, SECTOR, channel};
+use molt_block::{Backing, BlockClient, BlockOp, Buffer, Queue, SECTOR, channel};
 use molt_core::ring::RequestId;
 use molt_core::task;
 
@@ -61,12 +61,12 @@ pub struct Blocks {
     sectors: u64,
 }
 
-/// Puts `device` behind a ring, returning the end a volume reads through and
+/// Puts `queue` behind a ring, returning the end a volume reads through and
 /// the end somebody has to pump for those reads to land.
-pub fn attach<D: Disk>(device: D) -> Result<(Blocks, Backing<D, DEPTH>), FsError> {
+pub fn attach<Q: Queue>(queue: Q) -> Result<(Blocks, Backing<Q, DEPTH>), FsError> {
     let (client, driver) = channel()?;
-    let sectors = device.sectors();
-    Ok((Blocks { client, sectors }, Backing::new(driver, device)))
+    let sectors = queue.sectors();
+    Ok((Blocks { client, sectors }, Backing::new(driver, queue)))
 }
 
 /// A mounted volume.
@@ -760,7 +760,7 @@ fn newest(copies: &[Option<Super>], rejected: &[bool]) -> Option<usize> {
 
 #[cfg(all(test, feature = "format"))]
 mod tests {
-    use molt_block::{Backing, Loopback};
+    use molt_block::{Backing, Loopback, Serial};
 
     use super::{Volume, attach};
     use crate::crc::crc32c;
@@ -776,8 +776,8 @@ mod tests {
         build(&tree, 1).unwrap()
     }
 
-    fn mount(bytes: &[u8]) -> (Volume, Backing<Loopback<'_>, DEPTH>) {
-        let (blocks, mut backing) = attach(Loopback::new(bytes).unwrap()).unwrap();
+    fn mount(bytes: &[u8]) -> (Volume, Backing<Serial<Loopback<'_>>, DEPTH>) {
+        let (blocks, mut backing) = attach(Serial::new(Loopback::new(bytes).unwrap())).unwrap();
         let volume = backing.run(Volume::mount(blocks)).unwrap();
         (volume, backing)
     }
@@ -944,7 +944,7 @@ mod tests {
         let superblock = Super::parse(&bytes[..BLOCK])?;
         let at = superblock.region(Area::Objects).at as usize * BLOCK;
         bytes[at] ^= 0xff;
-        let (blocks, mut backing) = attach(Loopback::new(&bytes)?)?;
+        let (blocks, mut backing) = attach(Serial::new(Loopback::new(&bytes)?))?;
 
         let mounted = backing.run(Volume::mount(blocks));
 

@@ -1,4 +1,4 @@
-use molt_block::{Backing, Disk, Loopback};
+use molt_block::{Backing, Disk, Loopback, Serial};
 use molt_fs::format::{self, Tree};
 use molt_fs::{DEPTH, FsError, Journal, Kind, Name, attach};
 
@@ -10,8 +10,8 @@ fn name(index: usize) -> Name {
     Name::try_from(format!("file-{index:02}").as_str()).unwrap()
 }
 
-fn mount<D: Disk>(device: D) -> Result<(Journal, Backing<D, DEPTH>), FsError> {
-    let (blocks, mut backing) = attach(device)?;
+fn mount<D: Disk>(device: D) -> Result<(Journal, Backing<Serial<D>, DEPTH>), FsError> {
+    let (blocks, mut backing) = attach(Serial::new(device))?;
     let journal = backing.run(Journal::mount(blocks))?;
     Ok((journal, backing))
 }

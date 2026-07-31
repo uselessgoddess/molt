@@ -16,7 +16,7 @@
 
 use core::cell::RefCell;
 
-use molt_block::Disk;
+use molt_block::Queue;
 use molt_core::capability::CellId;
 use molt_core::cell::RestartHooks;
 use molt_core::registry::Registry;
@@ -132,16 +132,16 @@ impl<const R: usize, const M: usize> RestartHooks for Teardown<'_, '_, R, M> {
 /// keeps serving: this is the hook that makes those two statements agree, by
 /// taking the handles back on the client's behalf, since the client is in no
 /// position to close them itself.
-pub struct Disconnect<'a, 'ring, D, const R: usize, const N: usize> {
+pub struct Disconnect<'a, 'ring, Q, const R: usize, const N: usize> {
     driver: &'a mut Ring<'ring, R>,
-    fs: &'a mut Fs<D, N>,
+    fs: &'a mut Fs<Q, N>,
     client: CellId,
     stopped: Stopped<R>,
     revoked: usize,
 }
 
-impl<'a, 'ring, D: Disk, const R: usize, const N: usize> Disconnect<'a, 'ring, D, R, N> {
-    pub const fn new(driver: &'a mut Ring<'ring, R>, fs: &'a mut Fs<D, N>, client: CellId) -> Self {
+impl<'a, 'ring, Q: Queue, const R: usize, const N: usize> Disconnect<'a, 'ring, Q, R, N> {
+    pub const fn new(driver: &'a mut Ring<'ring, R>, fs: &'a mut Fs<Q, N>, client: CellId) -> Self {
         Self { driver, fs, client, stopped: Stopped::new(), revoked: 0 }
     }
 
@@ -156,7 +156,7 @@ impl<'a, 'ring, D: Disk, const R: usize, const N: usize> Disconnect<'a, 'ring, D
     }
 }
 
-impl<D: Disk, const R: usize, const N: usize> RestartHooks for Disconnect<'_, '_, D, R, N> {
+impl<Q: Queue, const R: usize, const N: usize> RestartHooks for Disconnect<'_, '_, Q, R, N> {
     fn stop_submissions(&mut self) {
         self.stopped.stop(self.driver);
     }
@@ -175,7 +175,7 @@ mod tests {
     use alloc::vec::Vec;
     use core::cell::RefCell;
 
-    use molt_block::Loopback;
+    use molt_block::{Loopback, Serial};
     use molt_core::buffer::BufferRegistry;
     use molt_core::capability::{CapabilityError, CellId};
     use molt_core::cell::{RestartHooks, Supervisor};
@@ -204,7 +204,7 @@ mod tests {
     fn stopped_request_answers_cancelled() -> Result<(), FsError> {
         let bytes = image();
         let names = RefCell::new(Registry::<Storage, 1>::new());
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes)?)?;
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::new(&bytes)?))?;
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
         let (mut client, mut driver) = ring.split();
         let root = fs.publish(&mut names.borrow_mut(), SERVICE, CpuId::BOOT)?;
@@ -228,7 +228,7 @@ mod tests {
     fn teardown_leaves_every_lease_stale() -> Result<(), FsError> {
         let bytes = image();
         let names = RefCell::new(Registry::<Storage, 1>::new());
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes)?)?;
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::new(&bytes)?))?;
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
         let (_client, mut driver) = ring.split();
         fs.publish(&mut names.borrow_mut(), SERVICE, CpuId::BOOT)?;
@@ -248,7 +248,7 @@ mod tests {
         let names = RefCell::new(Registry::<Storage, 1>::new());
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
         let (_client, mut driver) = ring.split();
-        let mut service = Supervisor::<FsCell<_, 4>>::new(Loopback::new(&bytes)?)?;
+        let mut service = Supervisor::<FsCell<_, 4>>::new(Serial::new(Loopback::new(&bytes)?))?;
         service.cell_mut().fs()?.publish(&mut names.borrow_mut(), SERVICE, CpuId::BOOT)?;
         let lease = names.borrow().acquire().unwrap();
 
@@ -266,7 +266,7 @@ mod tests {
         let bytes = image();
         let names = RefCell::new(Registry::<Storage, 1>::new());
         let mut buffers = BufferRegistry::<1>::new();
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes)?)?;
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::new(&bytes)?))?;
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
         let (_client, mut driver) = ring.split();
         let publication = fs.publish(&mut names.borrow_mut(), SERVICE, CpuId::BOOT)?;

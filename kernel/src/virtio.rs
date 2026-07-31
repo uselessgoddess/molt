@@ -1,7 +1,7 @@
 use molt_arch::dma::Arena;
 use molt_arch::memory::{Inventory, Owner, Rights};
 use molt_arch::{BootInfo, FrameAllocator, Platform, SerialWriter};
-use molt_block::{Device, SECTOR};
+use molt_block::{Device, SECTOR, Serial};
 use molt_kernel::report;
 use molt_pci::{Bus, Command, bus_span};
 use molt_virtio::{Block, Transport};
@@ -110,7 +110,7 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
 
     // The cells init starts borrow the driver, so the device is still this
     // function's to stop afterwards.
-    crate::init::smoke(platform, &mut block);
+    crate::init::smoke(platform, Serial::new(&mut block));
 
     block.reset().expect("the device stops and its frames return");
     report!(platform, "MOLT_VIRTIO_RESET_OK: device stopped and frames reclaimed");

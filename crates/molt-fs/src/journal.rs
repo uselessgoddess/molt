@@ -609,7 +609,7 @@ const _: () = assert!(BLOCK % SECTOR == 0);
 
 #[cfg(all(test, feature = "format"))]
 mod tests {
-    use molt_block::{Backing, BlockError, Disk, Fault, Loopback};
+    use molt_block::{Backing, BlockError, Disk, Fault, Loopback, Serial};
 
     use super::Journal;
     use crate::format::{Tree, build};
@@ -626,8 +626,8 @@ mod tests {
         build(&tree, 1).unwrap()
     }
 
-    fn mount<D: Disk>(device: D) -> Result<(Journal, Backing<D, DEPTH>), FsError> {
-        let (blocks, mut backing) = attach(device)?;
+    fn mount<D: Disk>(device: D) -> Result<(Journal, Backing<Serial<D>, DEPTH>), FsError> {
+        let (blocks, mut backing) = attach(Serial::new(device))?;
         let journal = backing.run(Journal::mount(blocks))?;
         Ok((journal, backing))
     }

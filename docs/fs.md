@@ -550,19 +550,69 @@ pub enum BlockOp {
   lifetime, and there is nothing for the device to alias while the submitter is
   somewhere else. That is the part `&mut [u8]` in a trait cannot do once the
   read outlives the call.
-- **Answers come back in submission order.** `BlockClient::take` walks past the
-  ones it is not waiting for and parks them; a ring `N` deep parks at most
-  `N - 1`, so a caller awaiting the read it needs never loses the readahead it
-  does not. Order is also what keeps the crash tests meaningful — the driver
-  runs the queue one submission at a time, so a flush still separates
-  durability epochs.
+- **Answers come back in whatever order the device finished them.**
+  `BlockClient::take` walks past the ones it is not waiting for and parks them;
+  a ring `N` deep parks at most `N - 1`, so a caller awaiting the read it needs
+  never loses the readahead it does not. The one order that matters is stated
+  rather than assumed, and it is the flush below.
 - **`Backing` is the bottom.** It owns the driver end and the device, and `run`
-  is `drive(future, || driver.pump(device))`: poll the task, serve what it
+  is `drive(future, || driver.pump(queue))`: poll the task, serve what it
   queued, repeat. Awaiting stops there, because something has to move sectors.
 
 `bytes` is on the operation because a checkpoint writes one sector out of a
 4 KiB buffer and a data read fills all eight; making the ring speak blocks would
 have meant a second path for the superblock.
+
+**A queue below the ring.** The ring let eight reads be outstanding above the
+driver, and the driver then ran them one at a time, because a `Disk` answers one
+call before it hears the next. That is a device kept at a queue depth of one no
+matter how much the filesystem asks for, and it is the difference between a
+device working on four requests and a device idle for three of them. `Queue` is
+the depth stated where the device is:
+
+```rust
+pub trait Queue {
+    fn sectors(&self) -> u64;
+    fn depth(&self) -> usize;
+    fn start(&mut self, id: RequestId, op: BlockOp) -> Result<(), BlockOp>;
+    fn reap(&mut self) -> Option<(RequestId, BlockDone)>;
+}
+```
+
+- **`start` and `reap` are separate because in flight is a state.** A request
+  the device has taken and not answered is neither submitted nor complete, and
+  the trait that returns an answer from the call it was asked in has nowhere to
+  put it. `depth` is how many of those the device holds, and the driver fills to
+  it: `pump` drains what finished, feeds what fits, and repeats until neither
+  moves.
+- **The id travels down, not just the buffer.** A device that answers out of
+  order has to say what it is answering, and `RequestId` is what the ring
+  already routes by, so a driver with several descriptors outstanding maps them
+  to ids instead of to the one command in progress.
+- **A flush runs alone.** The journal's crash consistency is an ordering claim —
+  these writes are durable before that superblock — and a device free to reorder
+  would break it. So the driver holds a flush until everything outstanding has
+  answered and starts nothing beside it, which makes the boundary explicit
+  instead of a side effect of a depth of one.
+- **`Serial<D>` is `Queued<D, 1>`.** Any blocking `Disk` becomes a queue of a
+  depth the caller picks: the slots are a const-generic array in the struct, so
+  nothing allocates, and `Serial::new(device)` is what every mount that has no
+  real queue underneath writes. A driver whose hardware queues for itself
+  implements `Queue` and skips the adapter.
+
+`Queued` answers newest first on purpose. A host device that returns things in
+the order they were asked would let an ordering bug live in the tree until real
+hardware found it; the one that reorders is the one worth testing against, and
+`tests/reads.rs` mounts over a device eight deep to assert the fetch counts hold
+either way.
+
+**What the depth is worth.** `Loopback` has no flight time to hide, so the same
+test file attaches a `Slow` queue that holds every answer for sixteen turns and
+counts the turns the driver spends waiting. Streaming 256 KiB through a 4 KiB
+window costs **1792 turns at depth one and 847 at depth eight** — 2.1× — and
+that is with readahead three blocks ahead, which is what the volume asks for
+today. The number is a count rather than a clock, so it is the same on every
+machine and it fails when the depth stops reaching the device.
 
 ## Slots, readahead, and what the ring cost
 
@@ -757,12 +807,12 @@ line editor away and needs a serial `read` before it is worth writing.
 - **No scrub.** The sums region exists and is checked per block on read; walking
   it deliberately is a Stage 4 item, and the region layout is what makes it
   cheap when it comes.
-- **The depth stops at the driver.** `Volume` holds eight reads in flight over
-  a ring twice that deep, but `Backing` serves them one at a time and
-  `Device::read` blocks until its interrupt, so readahead queues at the ring and
-  not at the device. Moving it further down is the virtio half of the same
-  change — several descriptors outstanding, and a used entry routed by request
-  id rather than by the one command in progress.
+- **The depth stops at virtio.** `Backing` hands the device as many requests as
+  its `Queue` takes, so nothing above the driver limits what is in flight any
+  more — but `molt_virtio::Block` is still one command at a time behind a
+  `Serial`, which is a queue of depth one. The depth becomes real when the
+  driver keeps several descriptors outstanding and routes a used entry by
+  request id rather than by the one command in progress.
 - **One operation at a time above the ring.** `Fs::on` drives an `FsOp` to its
   answer before taking the next, so the concurrency the block ring buys is
   between the reads of a single operation. Overlapping two clients' requests
@@ -774,9 +824,10 @@ line editor away and needs a serial `read` before it is worth writing.
   accident. Stage 4 gives the block layer its own concurrency story, and the
   shape that survives it is a filesystem *cell* other cores talk to by ring,
   which is why the service exists now and the locks do not.
-- **crc32c uses a software fallback.** No `SSE4.2` or `Zbc` path. It is 75 lines and
-  the disk it runs against is a boot-time image; the moment it shows up in a
-  profile, the intrinsic is a one-file change.
+- **No `Zbc` crc32c.** x86_64 folds through the `crc32` instruction and
+  everything else through the table, which is 15× the bit-at-a-time loop it
+  replaced and enough that riscv64 is not the machine the checksum is measured
+  on. The Zbc path is the same one-file change the x86_64 one was.
 
 ## How it is tested
 
