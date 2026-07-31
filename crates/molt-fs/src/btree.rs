@@ -22,7 +22,7 @@ use crate::layout::{BLOCK, Kind, MAX_NAME, Object, Super};
 use crate::mem::{Unique, Zeroed};
 use crate::{FsError, Name, Volume, mem};
 
-const MAGIC: [u8; 8] = *b"MOLTBTR3";
+const MAGIC: [u8; 8] = *b"MOLTBTR4";
 const HEADER: usize = 64;
 const KEY_BYTES: usize = 272;
 const VALUE_BYTES: usize = 32;
@@ -35,7 +35,7 @@ const CACHE_SLOTS: usize = 16;
 
 const OBJECT: u8 = 1;
 const DIRENT: u8 = 2;
-const WRITE: u8 = 3;
+const EXTENT: u8 = 3;
 
 /// Activity counters for the bounded metadata-node cache.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -88,16 +88,14 @@ impl Key {
         key
     }
 
-    pub fn write(object: u32, cursor: u64) -> Self {
+    /// Keyed on the byte past the extent's last, so one descent finds the first
+    /// extent that can reach into a read and the walk from there is in order.
+    pub fn extent(object: u32, end: u64) -> Self {
         let mut key = Self::default();
-        key.bytes[0] = WRITE;
+        key.bytes[0] = EXTENT;
         key.bytes[1..5].copy_from_slice(&object.to_le_bytes());
-        key.bytes[8..16].copy_from_slice(&cursor.to_le_bytes());
+        key.bytes[8..16].copy_from_slice(&end.to_le_bytes());
         key
-    }
-
-    pub fn write_start(object: u32) -> Self {
-        Self::write(object, 0)
     }
 
     fn tag(&self) -> u8 {
@@ -112,11 +110,17 @@ impl Key {
         self.tag() == DIRENT && self.object_id() == parent
     }
 
-    pub fn is_write(&self, object: u32) -> bool {
-        self.tag() == WRITE && self.object_id() == object
+    /// The file an extent key belongs to, if it is one.
+    pub fn extent_object(&self) -> Option<u32> {
+        (self.tag() == EXTENT).then(|| self.object_id())
     }
 
-    pub fn cursor(&self) -> u64 {
+    pub fn is_extent(&self, object: u32) -> bool {
+        self.extent_object() == Some(object)
+    }
+
+    /// One past the last byte an extent key covers.
+    pub fn end(&self) -> u64 {
         u64::from_le_bytes(self.bytes[8..16].try_into().expect("fixed key field"))
     }
 
@@ -139,7 +143,7 @@ impl Key {
                 }
                 self.name().map(|_| ())
             }
-            WRITE
+            EXTENT
                 if self.bytes[5..8].iter().all(|byte| *byte == 0)
                     && self.bytes[16..].iter().all(|byte| *byte == 0) =>
             {
@@ -169,10 +173,9 @@ impl Ord for Key {
         self.tag().cmp(&other.tag()).then_with(|| match self.tag() {
             OBJECT => self.object_id().cmp(&other.object_id()),
             DIRENT => self.cmp_dirent(other),
-            WRITE => self
-                .object_id()
-                .cmp(&other.object_id())
-                .then_with(|| self.cursor().cmp(&other.cursor())),
+            EXTENT => {
+                self.object_id().cmp(&other.object_id()).then_with(|| self.end().cmp(&other.end()))
+            }
             _ => self.bytes.cmp(&other.bytes),
         })
     }
@@ -204,11 +207,20 @@ impl Value {
         value
     }
 
-    pub fn write(offset: u64, bytes: u32) -> Self {
+    /// A run of one write record's payload: where the record sits in the log,
+    /// how far into its payload the run starts, and how long it is.
+    pub fn extent(at: u64, skip: u32, len: u32) -> Self {
         let mut value = Self::default();
-        value.bytes[..8].copy_from_slice(&offset.to_le_bytes());
-        value.bytes[8..12].copy_from_slice(&bytes.to_le_bytes());
+        value.bytes[..8].copy_from_slice(&at.to_le_bytes());
+        value.bytes[8..12].copy_from_slice(&skip.to_le_bytes());
+        value.bytes[12..16].copy_from_slice(&len.to_le_bytes());
         value
+    }
+
+    /// An extent covering nothing, left behind where a later write swallowed
+    /// one whole and did not land on its key.
+    pub fn whiteout() -> Self {
+        Self::default()
     }
 
     pub fn as_object(self) -> Result<Object, FsError> {
@@ -229,10 +241,11 @@ impl Value {
         u32::from_le_bytes(self.bytes[..4].try_into().expect("fixed value field"))
     }
 
-    pub fn as_write(self) -> (u64, u32) {
+    pub fn as_extent(self) -> (u64, u32, u32) {
         (
             u64::from_le_bytes(self.bytes[..8].try_into().expect("fixed value field")),
             u32::from_le_bytes(self.bytes[8..12].try_into().expect("fixed value field")),
+            u32::from_le_bytes(self.bytes[12..16].try_into().expect("fixed value field")),
         )
     }
 }
@@ -301,7 +314,7 @@ impl Node {
     }
 
     fn parse(block: &[u8; BLOCK]) -> Result<Unique<Self>, FsError> {
-        if block[..MAGIC.len()] != MAGIC || u32_at(block, 8) != 3 {
+        if block[..MAGIC.len()] != MAGIC || u32_at(block, 8) != 4 {
             return Err(FsError::Corrupt);
         }
         if node_crc(block) != u32_at(block, 32) {
@@ -342,7 +355,7 @@ impl Node {
     fn encode(&self, block: &mut [u8; BLOCK]) {
         block.fill(0);
         block[..MAGIC.len()].copy_from_slice(&MAGIC);
-        block[8..12].copy_from_slice(&3u32.to_le_bytes());
+        block[8..12].copy_from_slice(&4u32.to_le_bytes());
         block[12] = self.level;
         block[13] = self.len;
         block[16..24].copy_from_slice(&self.generation.to_le_bytes());

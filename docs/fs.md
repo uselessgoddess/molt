@@ -83,13 +83,25 @@ tree with three key spaces:
 
 - `Object(id)` maps to current kind, entry count, and file size;
 - `Dirent(parent, name)` maps a directory leaf name to an object id;
-- `Write(object, cursor)` maps a file update to its journal payload.
+- `Extent(object, end)` maps a byte range of a file to the journal payload
+  holding it.
 
 This is the same useful boundary at smaller scale: namespace and object queries
 are tree lookups rather than mutation-log scans, while file payloads remain in
 the bounded log until extent allocation and compaction arrive. See bcachefs's
 [architecture overview](https://bcachefs.org/) and
 [transaction design](https://bcachefs.org/Transactions/).
+
+An extent key holds the byte *past* its last, not the byte it starts at, so one
+descent lands on the first extent that can reach into a read and everything the
+window needs follows it in order — a read costs the tree's height, not the
+number of writes the file has taken. That works only while the extents of a file
+do not overlap, which is what the write path buys with a trim: a range the new
+write covers is cut out of whatever was already there, keeping the piece to the
+left under a new key and the piece to the right under its old one. An extent
+swallowed whole leaves a whiteout, a zero-length record, because the tree is
+copy-on-write and has no `remove`; bcachefs does the same, and a walk skips
+whiteouts rather than stopping at one.
 
 **Extents, not block pointers.** A file is a run of
 `(logical, blocks, block, sums)` records, sorted by logical block and
@@ -165,8 +177,10 @@ The base image remains immutable. `Journal` appends two typed payload records:
 
 - `Create(object, parent, kind, name)` allocates the next object id and adds one
   directory entry.
-- `Write(object, offset, bytes)` overlays file data. Later records win, and a
-  write beyond end creates a zero-filled hole.
+- `Write(object, offset, bytes)` carries file data. The extent keys pointing at
+  it decide what a read sees, so a later write wins by trimming the extents it
+  lands on rather than by sitting after them in the log; a write beyond end
+  creates a zero-filled hole.
 
 Records start on 512-byte sector boundaries. One sector write can therefore
 tear only the record being appended, never an earlier record. The active
@@ -182,7 +196,7 @@ superblock. `Journal::sync` publishes that root only after the nodes and log
 have passed a durability barrier.
 
 The tree API is deliberately small: exact lookup, ordered successor, insert,
-and transaction root. Filesystem code builds object, directory, and write keys
+and transaction root. Filesystem code builds object, directory, and extent keys
 on top rather than teaching the tree about files. Nodes, the path a mutation
 walks, and the split scratch live on the heap — see [the stack budget](#the-stack-budget)
 for what that replaced.
@@ -948,7 +962,9 @@ version 3, the wider extent record and the region that stopped existing here.
 There is no published standard yet, but that is a reason to keep migration
 policy small, not to label incompatible layouts with the same version. Older
 images are rejected rather than guessed at; `xtask mkfs` rebuilds development
-images as version 4.
+images as version 4. Tree nodes carry their own magic and version, `MOLTBTR4`,
+because a node written under the old write keys parses cleanly under the extent
+ones and would answer reads with the wrong bytes.
 
 - **Stage 4.4, asynchronous I/O.** Done: `Volume` and `Journal` are `async` over
   a `BlockOp` ring, with readahead and region sweeps above it.

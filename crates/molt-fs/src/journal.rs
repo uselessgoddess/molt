@@ -192,30 +192,39 @@ impl Journal {
 
         let read_end = offset.checked_add(want as u64).ok_or(FsError::Corrupt)?;
         let root = self.tree_root();
-        let mut key = Key::write_start(file);
+        // One descent lands on the first extent whose end is past `offset`, and
+        // extents of a file never overlap, so the walk from there is in file
+        // order and the first one starting past the window ends it.
+        let mut key = Key::extent(file, offset.checked_add(1).ok_or(FsError::Corrupt)?);
         let mut inclusive = true;
         loop {
             let next = self.tree.next(&mut self.volume, root, &key, inclusive).await?;
             let Some((found, value)) = next else { break };
-            if !found.is_write(file) {
+            if !found.is_extent(file) {
                 break;
             }
-            let (written_at, bytes) = value.as_write();
-            let cursor = found.cursor();
-            let written_end = written_at.checked_add(u64::from(bytes)).ok_or(FsError::Corrupt)?;
-            let start = offset.max(written_at);
-            let end = read_end.min(written_end);
+            key = found;
+            inclusive = false;
+            let (at, skip, len) = value.as_extent();
+            if len == 0 {
+                continue;
+            }
+            let held_end = found.end();
+            let held = held_end.checked_sub(u64::from(len)).ok_or(FsError::Corrupt)?;
+            if held >= read_end {
+                break;
+            }
+            let start = offset.max(held);
+            let end = read_end.min(held_end);
             if start < end {
                 let target = (start - offset) as usize;
                 self.copy_payload(
-                    cursor,
-                    start - written_at,
+                    at,
+                    u64::from(skip) + (start - held),
                     &mut buf[target..target + (end - start) as usize],
                 )
                 .await?;
             }
-            key = found;
-            inclusive = false;
         }
         Ok(want)
     }
@@ -257,7 +266,7 @@ impl Journal {
         if object.kind != Kind::File {
             return Err(FsError::Kind);
         }
-        offset.checked_add(bytes.len() as u64).ok_or(FsError::Range)?;
+        let end = offset.checked_add(bytes.len() as u64).ok_or(FsError::Range)?;
         if bytes.is_empty() {
             return Ok(0);
         }
@@ -270,10 +279,11 @@ impl Journal {
                 return Err(error);
             }
         };
-        object.size = object.size.max(offset + bytes.len() as u64);
+        object.size = object.size.max(end);
         let indexed = async {
             self.index(Key::object(file), Value::object(object)).await?;
-            self.index(Key::write(file, cursor), Value::write(offset, bytes.len() as u32)).await
+            self.trim(file, offset, end).await?;
+            self.index(Key::extent(file, end), Value::extent(cursor, 0, bytes.len() as u32)).await
         }
         .await;
         if let Err(error) = indexed {
@@ -281,6 +291,48 @@ impl Journal {
             return Err(error);
         }
         Ok(bytes.len())
+    }
+
+    /// Cuts `[offset, end)` out of the extents already covering it.
+    ///
+    /// What a read relies on is that extents never overlap, and keeping that
+    /// true is the write's job. A piece left to the right of the new range
+    /// keeps its key, a piece left to the left takes a new one, and an extent
+    /// swallowed whole leaves a whiteout unless the new key is its own.
+    async fn trim(&mut self, file: u32, offset: u64, end: u64) -> Result<(), FsError> {
+        let mut key = Key::extent(file, offset.checked_add(1).ok_or(FsError::Range)?);
+        let mut inclusive = true;
+        loop {
+            let root = self.tree_root();
+            let next = self.tree.next(&mut self.volume, root, &key, inclusive).await?;
+            let Some((found, value)) = next else { break };
+            if !found.is_extent(file) {
+                break;
+            }
+            key = found;
+            inclusive = false;
+            let (at, skip, len) = value.as_extent();
+            if len == 0 {
+                continue;
+            }
+            let held_end = found.end();
+            let held = held_end.checked_sub(u64::from(len)).ok_or(FsError::Corrupt)?;
+            if held >= end {
+                break;
+            }
+            if held < offset {
+                let left = (offset - held) as u32;
+                self.index(Key::extent(file, offset), Value::extent(at, skip, left)).await?;
+            }
+            if held_end > end {
+                let cut = (end - held) as u32;
+                let skip = skip.checked_add(cut).ok_or(FsError::Corrupt)?;
+                self.index(found, Value::extent(at, skip, len - cut)).await?;
+            } else if held_end != end {
+                self.index(found, Value::whiteout()).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Makes every pending record durable and publishes a new generation.
@@ -356,38 +408,66 @@ impl Journal {
         let mut cursor = 0;
         while cursor < region.bytes {
             let record = self.record(cursor).await?;
-            match record {
-                Record::Create { object, parent, kind, .. } => {
-                    let name = self.record_name(cursor, record).await?;
-                    let state = self
-                        .tree
-                        .get(&mut self.volume, root, &Key::object(object))
-                        .await?
-                        .ok_or(FsError::Corrupt)?
-                        .as_object()?;
-                    let linked = self
-                        .tree
-                        .get(&mut self.volume, root, &Key::dirent(parent, &name))
-                        .await?
-                        .ok_or(FsError::Corrupt)?
-                        .as_dirent();
-                    if state.kind != kind || linked != object {
-                        return Err(FsError::Corrupt);
-                    }
-                }
-                Record::Write { object, offset, bytes } => {
-                    let indexed = self
-                        .tree
-                        .get(&mut self.volume, root, &Key::write(object, cursor))
-                        .await?
-                        .ok_or(FsError::Corrupt)?
-                        .as_write();
-                    if indexed != (offset, bytes) {
-                        return Err(FsError::Corrupt);
-                    }
+            if let Record::Create { object, parent, kind, .. } = record {
+                let name = self.record_name(cursor, record).await?;
+                let state = self
+                    .tree
+                    .get(&mut self.volume, root, &Key::object(object))
+                    .await?
+                    .ok_or(FsError::Corrupt)?
+                    .as_object()?;
+                let linked = self
+                    .tree
+                    .get(&mut self.volume, root, &Key::dirent(parent, &name))
+                    .await?
+                    .ok_or(FsError::Corrupt)?
+                    .as_dirent();
+                if state.kind != kind || linked != object {
+                    return Err(FsError::Corrupt);
                 }
             }
             cursor += record.span().map_err(|_| FsError::Corrupt)?;
+        }
+        self.validate_extents().await
+    }
+
+    /// Checks every extent against the write record it names, and against the
+    /// extent before it.
+    ///
+    /// A write record the tree no longer points at is a range something later
+    /// overwrote, so the log is not walked the other way. What a read needs is
+    /// that each extent reaches bytes a record really holds and that no two of
+    /// one file overlap, which a walk in key order sees directly.
+    async fn validate_extents(&mut self) -> Result<(), FsError> {
+        let root = self.tree_root();
+        let mut key = Key::extent(0, 0);
+        let mut inclusive = true;
+        let mut last: Option<(u32, u64)> = None;
+        loop {
+            let next = self.tree.next(&mut self.volume, root, &key, inclusive).await?;
+            let Some((found, value)) = next else { break };
+            let Some(object) = found.extent_object() else { break };
+            key = found;
+            inclusive = false;
+            let (at, skip, len) = value.as_extent();
+            if len == 0 {
+                continue;
+            }
+            let end = found.end();
+            let start = end.checked_sub(u64::from(len)).ok_or(FsError::Corrupt)?;
+            if last.is_some_and(|(held, held_end)| held == object && held_end > start) {
+                return Err(FsError::Corrupt);
+            }
+            let Record::Write { object: written, offset, bytes } = self.record(at).await? else {
+                return Err(FsError::Corrupt);
+            };
+            if written != object
+                || offset.checked_add(u64::from(skip)) != Some(start)
+                || u64::from(skip) + u64::from(len) > u64::from(bytes)
+            {
+                return Err(FsError::Corrupt);
+            }
+            last = Some((object, end));
         }
         Ok(())
     }
@@ -785,6 +865,67 @@ mod tests {
 
         assert_eq!(read, 16);
         assert_eq!(&contents[..16], b"imWRITEle\0\0\0tail");
+        Ok(())
+    }
+
+    #[test]
+    fn write_splits_what_it_lands_in() -> Result<(), FsError> {
+        let mut bytes = image();
+        let (mut journal, mut backing) = mount(Loopback::writable(&mut bytes)?)?;
+        let root = journal.root();
+        let mut contents = [0; 16];
+
+        let read = backing.run(async {
+            let file = journal.create(root, name("split"), Kind::File).await?;
+            journal.write(file, 0, b"aaaaaaaaaaaaaaaa").await?;
+            journal.write(file, 4, b"BBBB").await?;
+            journal.write(file, 2, b"cc").await?;
+            journal.read(file, 0, &mut contents).await
+        })?;
+
+        assert_eq!(read, 16);
+        assert_eq!(&contents, b"aaccBBBBaaaaaaaa");
+        Ok(())
+    }
+
+    #[test]
+    fn cover_hides_what_it_swallowed() -> Result<(), FsError> {
+        let mut bytes = image();
+        let (mut journal, mut backing) = mount(Loopback::writable(&mut bytes)?)?;
+        let root = journal.root();
+        let mut contents = [0; 4];
+
+        // The whiteout the second write leaves at four must not end the walk
+        // before the extent covering it.
+        let read = backing.run(async {
+            let file = journal.create(root, name("cover"), Kind::File).await?;
+            journal.write(file, 0, b"aaaa").await?;
+            journal.write(file, 0, b"bbbbbbbb").await?;
+            journal.read(file, 0, &mut contents).await
+        })?;
+
+        assert_eq!(read, 4);
+        assert_eq!(&contents, b"bbbb");
+        Ok(())
+    }
+
+    #[test]
+    fn overwrite_leaves_one_extent() -> Result<(), FsError> {
+        let mut bytes = image();
+        let (mut journal, mut backing) = mount(Loopback::writable(&mut bytes)?)?;
+        let root = journal.root();
+
+        let stats = backing.run(async {
+            let file = journal.create(root, name("hot"), Kind::File).await?;
+            for byte in 0..64u8 {
+                journal.write(file, 0, &[byte; 8]).await?;
+            }
+            journal.tree_stats().await
+        })?;
+
+        // Root object, file object, dirent, one extent: a single leaf. Keyed
+        // on the log cursor instead, the same writes left sixty-four keys.
+        assert_eq!(stats.nodes, 1);
         Ok(())
     }
 }
