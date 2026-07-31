@@ -247,13 +247,13 @@ mod tests {
     use molt_core::cpu::CpuId;
     use molt_core::registry::Registry;
     use molt_core::ring::IoRing;
+    use molt_core::task;
     use molt_fs::format::{Tree, build};
     use molt_fs::{Disconnect, Fs, FsDone, FsError, FsOp, Storage, Teardown};
 
     use super::Shell;
     use crate::ShellError;
     use crate::capture::Capture;
-    use crate::drive::{drive, drive_bounded};
     use crate::session::Session;
 
     const SERVICE: CellId = CellId::new(2);
@@ -285,7 +285,7 @@ mod tests {
         fs.publish(&mut names.borrow_mut(), SERVICE, CpuId::BOOT).unwrap();
         let session = Session::new(client, &buffers, &names, scratch, WINDOW).unwrap();
         let mut out = Capture::new();
-        drive(
+        task::drive(
             async {
                 let mut shell = Shell::spawn(session).unwrap();
                 shell.script(script, &mut out).await
@@ -379,7 +379,9 @@ mod tests {
         let mut shell = Shell::spawn(Session::new(client, &buffers, &names, scratch, WINDOW)?)?;
         let mut out = Capture::new();
 
-        drive(shell.run(b"ls", &mut out), || panic!("a command that asked a service nobody runs"))?;
+        task::drive(shell.run(b"ls", &mut out), || {
+            panic!("a command that asked a service nobody runs")
+        })?;
 
         assert_eq!(out.text(), "ls: no storage\n");
         Ok(())
@@ -399,7 +401,7 @@ mod tests {
         fs.publish(&mut names.borrow_mut(), SERVICE, CpuId::BOOT).unwrap();
         let mut shell = Shell::spawn(Session::new(client, &buffers, &names, scratch, WINDOW)?)?;
         let mut out = Capture::new();
-        drive(shell.run(b"ls docs", &mut out), || {
+        task::drive(shell.run(b"ls docs", &mut out), || {
             fs.serve(CLIENT, &mut driver, &mut buffers.borrow_mut());
         })?;
 
@@ -409,9 +411,9 @@ mod tests {
         hooks.revoke_capabilities();
         fs.restart().unwrap();
 
-        drive(shell.run(b"ls", &mut out), || panic!("a command that outlived its service"))?;
+        task::drive(shell.run(b"ls", &mut out), || panic!("a command that outlived its service"))?;
         fs.publish(&mut names.borrow_mut(), SERVICE, CpuId::BOOT).unwrap();
-        drive(shell.run(b"ls docs", &mut out), || {
+        task::drive(shell.run(b"ls docs", &mut out), || {
             fs.serve(CLIENT, &mut driver, &mut buffers.borrow_mut());
         })?;
 
@@ -434,10 +436,10 @@ mod tests {
         let mut shell = Shell::spawn(Session::new(client, &buffers, &names, scratch, WINDOW)?)?;
         let mut out = Capture::new();
 
-        let given_up = drive_bounded(shell.run(b"ls docs", &mut out), 2, || {});
+        let given_up = task::drive_bounded(shell.run(b"ls docs", &mut out), 2, || {});
 
         assert!(given_up.is_none(), "a command finished without anything answering it");
-        drive(shell.run(b"ls", &mut out), || {
+        task::drive(shell.run(b"ls", &mut out), || {
             fs.serve(CLIENT, &mut driver, &mut buffers.borrow_mut());
         })?;
         assert_eq!(out.text(), "docs/\nhello.txt  11\nnote.txt  8\n");
@@ -463,7 +465,7 @@ mod tests {
 
         let mut restarts = 0;
         for (tick, line) in [(1, b"ls".as_slice()), (2, b"ls docs")] {
-            assert!(drive_bounded(shell.cell_mut().run(line, &mut out), 4, || {}).is_none());
+            assert!(task::drive_bounded(shell.cell_mut().run(line, &mut out), 4, || {}).is_none());
             let mut hooks = Disconnect::new(&mut driver, &mut fs, CLIENT);
             if let Some(restarted) = shell.watch(tick, DEADLINE, &mut hooks) {
                 restarted?;
@@ -474,7 +476,7 @@ mod tests {
 
         assert_eq!(restarts, 1, "one late line is a fault, or two are not");
         assert_eq!(shell.generation(), 1);
-        drive(shell.cell_mut().run(b"ls", &mut out), || {
+        task::drive(shell.cell_mut().run(b"ls", &mut out), || {
             fs.serve(CLIENT, &mut driver, &mut buffers.borrow_mut());
         })?;
         assert_eq!(out.text(), "docs/\nhello.txt  11\nnote.txt  8\n");
@@ -497,7 +499,7 @@ mod tests {
         let mut shell = Supervisor::<Shell<'_, '_, '_, 4, 1, 1>>::new(session)?;
         let mut out = Capture::new();
 
-        drive_bounded(shell.cell_mut().run(b"ls docs", &mut out), 2, || {
+        task::drive_bounded(shell.cell_mut().run(b"ls docs", &mut out), 2, || {
             fs.serve(CLIENT, &mut driver, &mut buffers.borrow_mut());
         });
 
@@ -508,7 +510,7 @@ mod tests {
         assert_eq!(revoked, 1, "a stopped client kept a directory open");
         assert_eq!(shell.generation(), 1);
         assert_eq!(out.text(), "", "an unfinished listing printed half of itself");
-        drive(shell.cell_mut().run(b"ls", &mut out), || {
+        task::drive(shell.cell_mut().run(b"ls", &mut out), || {
             fs.serve(CLIENT, &mut driver, &mut buffers.borrow_mut());
         })?;
         assert_eq!(out.text(), "docs/\nhello.txt  11\nnote.txt  8\n");

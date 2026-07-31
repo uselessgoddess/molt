@@ -6,7 +6,8 @@ use crate::{BlockError, Device, Disk, SECTOR, bounds};
 ///
 /// This is what a filesystem test runs on, and what a kernel serves a built-in
 /// image from: the same [`Device`] the virtio driver offers, with none of the
-/// hardware. It borrows rather than owns, so `molt-block` needs no allocator.
+/// hardware. It borrows rather than owns, so the image stays wherever the
+/// caller put it — a static in the kernel, a slice on a test's stack.
 pub struct Loopback<'i> {
     image: Image<'i>,
 }

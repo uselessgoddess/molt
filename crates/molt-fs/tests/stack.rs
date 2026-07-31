@@ -2,13 +2,17 @@
 
 use std::hint::black_box;
 
-use molt_block::Loopback;
+use molt_block::{Backing, Disk, Loopback};
 use molt_fs::format::{self, Tree};
-use molt_fs::{FsError, Journal, Kind, Name};
+use molt_fs::{DEPTH, FsError, Journal, Kind, Name, attach};
 
 /// Painted window, and what one call may spend of it.
+///
+/// A debug build keeps every poll frame of an awaited chain whole, so there it
+/// is a whole core's stack (`kernel/src/smp.rs`). The kernel ships released,
+/// and that figure has to leave room for everything above the filesystem.
 const WINDOW: usize = 96 * 1024;
-const BUDGET: usize = 16 * 1024;
+const BUDGET: usize = if cfg!(debug_assertions) { 64 * 1024 } else { 16 * 1024 };
 const MARK: u8 = 0xa5;
 
 fn image() -> Vec<u8> {
@@ -17,6 +21,12 @@ fn image() -> Vec<u8> {
 
 fn name(index: usize) -> Name {
     Name::try_from(format!("file-{index:02}").as_str()).unwrap()
+}
+
+fn mount<D: Disk>(device: D) -> Result<(Journal, Backing<D, DEPTH>), FsError> {
+    let (blocks, mut backing) = attach(device)?;
+    let journal = backing.run(Journal::mount(blocks))?;
+    Ok((journal, backing))
 }
 
 /// Marks the frames a later call at this depth will occupy, top-down.
@@ -43,7 +53,7 @@ fn mount_fits_kernel_stack() -> Result<(), FsError> {
     let bytes = image();
 
     let base = paint();
-    let mounted = Journal::mount(Loopback::new(&bytes)?).is_ok();
+    let mounted = mount(Loopback::new(&bytes)?).is_ok();
     let spent = depth(base);
 
     assert!(mounted, "image did not mount");
@@ -54,14 +64,18 @@ fn mount_fits_kernel_stack() -> Result<(), FsError> {
 #[test]
 fn commit_fits_kernel_stack() -> Result<(), FsError> {
     let mut bytes = image();
-    let mut journal = Journal::mount(Loopback::writable(&mut bytes)?)?;
+    let (mut journal, mut backing) = mount(Loopback::writable(&mut bytes)?)?;
+    let root = journal.root();
     // A tree deep enough that one more key rewrites a root-to-leaf path.
-    for index in 0..40 {
-        journal.create(journal.root(), name(index), Kind::File)?;
-    }
+    backing.run(async {
+        for index in 0..40 {
+            journal.create(root, name(index), Kind::File).await?;
+        }
+        Ok::<_, FsError>(())
+    })?;
 
     let base = paint();
-    let created = journal.create(journal.root(), name(40), Kind::File).is_ok();
+    let created = backing.run(journal.create(root, name(40), Kind::File)).is_ok();
     let spent = depth(base);
 
     assert!(created, "create failed");

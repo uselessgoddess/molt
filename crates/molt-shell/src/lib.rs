@@ -21,12 +21,10 @@ use molt_fs::FsError;
 #[cfg(test)]
 mod capture;
 mod console;
-mod drive;
 mod session;
 mod shell;
 
 pub use crate::console::Console;
-pub use crate::drive::{drive, drive_bounded};
 pub use crate::session::Session;
 pub use crate::shell::{PROMPT, Shell};
 

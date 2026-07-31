@@ -5,7 +5,7 @@
 //! caches only an object id and kind; size and entry count are replayed when
 //! asked because writes can change them under an open handle.
 
-use molt_block::Disk;
+use molt_block::{Backing, Disk};
 use molt_core::buffer::BufferRegistry;
 use molt_core::capability::{Capability, CapabilityTable, CellId};
 use molt_core::cpu::CpuId;
@@ -15,6 +15,7 @@ use molt_core::ring::{Completion, IoDriver};
 use crate::layout::{Kind, Object};
 use crate::op::{Dir, File, FsDone, FsOp, Handle, Stat};
 use crate::storage::{Mount, Storage};
+use crate::volume::{DEPTH, attach};
 use crate::{FsError, Journal};
 
 #[derive(Clone, Copy)]
@@ -25,21 +26,28 @@ struct OpenObject {
 
 /// A mounted volume behind a capability table.
 pub struct Fs<D, const N: usize> {
-    journal: Journal<D>,
+    journal: Journal,
+    backing: Backing<D, DEPTH>,
     open: CapabilityTable<OpenObject, N>,
     pending: Option<Completion<Result<FsDone, FsError>>>,
     sealed: bool,
 }
 
 impl<D: Disk, const N: usize> Fs<D, N> {
-    /// Mounts `device`, using `block` as the volume's only buffer.
+    /// Mounts `device` behind a block ring of its own.
     pub fn mount(device: D) -> Result<Self, FsError> {
-        Ok(Self {
-            journal: Journal::mount(device)?,
-            open: CapabilityTable::new(),
-            pending: None,
-            sealed: false,
-        })
+        let (blocks, mut backing) = attach(device)?;
+        let journal = backing.run(Journal::mount(blocks))?;
+        Ok(Self { journal, backing, open: CapabilityTable::new(), pending: None, sealed: false })
+    }
+
+    /// Runs `work` against the journal, serving the ring under it.
+    ///
+    /// The ring ends here. Callers of an [`FsOp`] get an answer, not a future,
+    /// so this is where the block driver is given its turns.
+    fn on<T>(&mut self, work: impl AsyncFnOnce(&mut Journal) -> T) -> T {
+        let Self { journal, backing, .. } = self;
+        backing.run(work(journal))
     }
 
     /// The checkpoint the mounted volume carries.
@@ -59,7 +67,7 @@ impl<D: Disk, const N: usize> Fs<D, N> {
             return Err(FsError::Sealed);
         }
         let root = self.journal.root();
-        let object = self.journal.object(root)?;
+        let object = self.on(async |journal| journal.object(root).await)?;
         if object.kind != Kind::Dir {
             return Err(FsError::Kind);
         }
@@ -109,31 +117,38 @@ impl<D: Disk, const N: usize> Fs<D, N> {
         match op {
             FsOp::Open { dir, name } => {
                 let parent = *self.open.get(dir)?;
-                let id = self.journal.lookup(parent.id, &name)?;
-                let object = self.journal.object(id)?;
-                self.hold(owner, id, object.kind).map(FsDone::Opened)
+                let (id, kind) = self.on(async |journal| {
+                    let id = journal.lookup(parent.id, &name).await?;
+                    Ok::<_, FsError>((id, journal.object(id).await?.kind))
+                })?;
+                self.hold(owner, id, kind).map(FsDone::Opened)
             }
             FsOp::Entry { dir, index } => {
                 let parent = *self.open.get(dir)?;
-                let (name, object) = self.journal.entry(parent.id, index)?;
-                Ok(FsDone::Entry { name, stat: stat(&self.journal.object(object)?) })
+                self.on(async |journal| {
+                    let (name, object) = journal.entry(parent.id, index).await?;
+                    Ok(FsDone::Entry { name, stat: stat(&journal.object(object).await?) })
+                })
             }
             FsOp::Read { file, buffer, offset } => {
                 let object = *self.open.get(file)?;
                 let target = buffers.resolve_write(buffer)?;
-                self.journal.read(object.id, offset, target).map(FsDone::Read)
+                self.on(async |journal| journal.read(object.id, offset, target).await)
+                    .map(FsDone::Read)
             }
             FsOp::Create { dir, name, kind } => {
                 let parent = *self.open.get(dir)?;
-                let object = self.journal.create(parent.id, name, kind)?;
+                let object =
+                    self.on(async |journal| journal.create(parent.id, name, kind).await)?;
                 self.hold(owner, object, kind).map(FsDone::Opened)
             }
             FsOp::Write { file, buffer, offset } => {
                 let object = *self.open.get(file)?;
                 let source = buffers.resolve_read(buffer)?;
-                self.journal.write(object.id, offset, source).map(FsDone::Written)
+                self.on(async |journal| journal.write(object.id, offset, source).await)
+                    .map(FsDone::Written)
             }
-            FsOp::Sync => self.journal.sync().map(FsDone::Synced),
+            FsOp::Sync => self.on(async |journal| journal.sync().await).map(FsDone::Synced),
             FsOp::Stat(handle) => Ok(FsDone::Stat(stat(&self.object(handle)?))),
             FsOp::Close(handle) => {
                 match handle {
@@ -190,7 +205,7 @@ impl<D: Disk, const N: usize> Fs<D, N> {
     /// cells that held them are talking to a filesystem that no longer knows
     /// them — and the root bootstrap opens again for the new epoch.
     pub fn restart(&mut self) -> Result<(), FsError> {
-        self.journal.remount()?;
+        self.on(async |journal| journal.remount().await)?;
         self.open = CapabilityTable::new();
         self.pending = None;
         self.sealed = false;
@@ -211,7 +226,7 @@ impl<D: Disk, const N: usize> Fs<D, N> {
             Handle::Dir(dir) => *self.open.get(dir)?,
             Handle::File(file) => *self.open.get(file)?,
         };
-        let current = self.journal.object(object.id)?;
+        let current = self.on(async |journal| journal.object(object.id).await)?;
         if object.kind != current.kind {
             return Err(FsError::Corrupt);
         }
