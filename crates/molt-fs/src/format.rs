@@ -11,7 +11,7 @@ use crate::FsError;
 use crate::crc::crc32c;
 use crate::layout::{
     Area, BLOCK, DEFAULT_LOG_BLOCKS, DEFAULT_TREE_BLOCKS, ENTRY_BYTES, EXTENT_BYTES, Entry, Extent,
-    Kind, OBJECT_BYTES, Object, Region, SUPERS, Super,
+    Kind, OBJECT_BYTES, Object, RUN, Region, SUPERS, Super,
 };
 use crate::name::Name;
 
@@ -143,13 +143,22 @@ impl Image {
             let block = (self.data.len() / BLOCK) as u64;
             self.data.extend_from_slice(chunk);
             self.data.resize(self.data.len().next_multiple_of(BLOCK), 0);
+            let sum = crc32c(&self.data[block as usize * BLOCK..][..BLOCK]);
             match self.extents.last_mut() {
-                // Only extend a run this file started.
-                Some(last) if count > 0 && last.logical + last.blocks == logical => {
-                    last.blocks += 1
+                // Only extend a run this file started, and only while the
+                // record has a sum left to hold it.
+                Some(last)
+                    if count > 0
+                        && last.logical + last.blocks == logical
+                        && (last.blocks as usize) < RUN =>
+                {
+                    last.sums[last.blocks as usize] = sum;
+                    last.blocks += 1;
                 }
                 _ => {
-                    self.extents.push(Extent { logical, blocks: 1, block });
+                    let mut sums = [0; RUN];
+                    sums[0] = sum;
+                    self.extents.push(Extent { logical, blocks: 1, block, sums });
                     count += 1;
                 }
             }
@@ -182,7 +191,6 @@ impl Image {
             self.extents.len() * EXTENT_BYTES,
             self.entries.len() * ENTRY_BYTES,
             self.names.len(),
-            data_blocks as usize * 4,
         ];
 
         let mut superblock =
@@ -207,17 +215,11 @@ impl Image {
             extent.block += superblock.data_at;
         }
 
-        let mut sums = Vec::with_capacity(sizes[4]);
-        for block in self.data.chunks(BLOCK) {
-            sums.extend_from_slice(&crc32c(block).to_le_bytes());
-        }
-
         let regions = [
             records(&self.objects, OBJECT_BYTES, Object::encode),
             records(&self.extents, EXTENT_BYTES, Extent::encode),
             records(&self.entries, ENTRY_BYTES, Entry::encode),
             self.names,
-            sums,
         ];
 
         let mut image = vec![0; superblock.blocks as usize * BLOCK];

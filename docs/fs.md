@@ -58,19 +58,21 @@ The brief was btrfs's ideas without btrfs's legacy, leaning bcachefs. The ideas
 arrive here in the cheapest form that is still the real thing.
 
 **Checksums that cover data, not just metadata.** Every data block carries a
-crc32c in a region of its own, and every metadata region carries one in the
-superblock. This is bcachefs's position — checksums are not optional and not a
-mount flag — and it is why [`Volume::mount`](../crates/molt-fs/src/volume.rs)
-verifies all six regions before the first lookup rather than discovering
-corruption at whatever block a directory search happens to land on. A volume
-that mounts is a volume whose metadata is intact, which is a much stronger
-statement than "the superblock parsed".
+crc32c, and every metadata region carries one in the superblock. This is
+bcachefs's position — checksums are not optional and not a mount flag — and it
+is why [`Volume::mount`](../crates/molt-fs/src/volume.rs) verifies all five
+regions before the first lookup rather than discovering corruption at whatever
+block a directory search happens to land on. A volume that mounts is a volume
+whose metadata is intact, which is a much stronger statement than "the
+superblock parsed".
 
-The sums live in their own region rather than beside the blocks they cover.
-That costs a second block read per data block — or did, until `Volume` had
-enough slots to keep the sums block resident while the file it covers streams
-past — and it buys a scrub that walks one contiguous region instead of seeking
-across the volume, the Stage 4 item this leaves room for.
+The sums travel with the extents, as bcachefs's do, rather than in a region of
+their own: locating a block is already learning what it must hash to, so the
+check costs nothing beyond the record the read had to fetch anyway. A region
+apart cost a second lookup per block, which slots hid only while a file was
+streaming. The run is bounded at twelve blocks because that is how many sums a
+64-byte record holds, and a sum per block is what keeps a read of one block
+from hashing the run around it.
 
 **A generation in the superblock, and a checkpoint that swings it.** Below.
 
@@ -89,8 +91,9 @@ the bounded log until extent allocation and compaction arrive. See bcachefs's
 [architecture overview](https://bcachefs.org/) and
 [transaction design](https://bcachefs.org/Transactions/).
 
-**Extents, not block pointers.** A file is a run of `(logical, blocks, block)`
-records, sorted by logical block and binary-searched. Contiguous data costs one
+**Extents, not block pointers.** A file is a run of
+`(logical, blocks, block, sums)` records, sorted by logical block and
+binary-searched. Contiguous data costs one
 record however long it is, a logical block no extent covers is a hole that reads
 as zeros, and `xtask mkfs` drops every all-zero block on the floor — so a sparse
 file costs its content, not its length. Extents are also the only structure here
@@ -110,7 +113,7 @@ What was deliberately *not* taken:
 
 ## The base format
 
-Six regions, two superblocks, all little-endian, everything block-addressed.
+Five regions, two superblocks, all little-endian, everything block-addressed.
 [`layout.rs`](../crates/molt-fs/src/layout.rs) is the definition; both the
 reader and `xtask mkfs` compile against it, so there is no second copy of the
 format to drift.
@@ -119,10 +122,9 @@ format to drift.
 block 0   superblock copy 0
 block 1   superblock copy 1
           objects   one 32-byte record per object, indexed by id
-          extents   16-byte runs, sorted by logical block within a file
+          extents   64-byte runs with their sums, sorted by logical block
           entries   16-byte directory entries, sorted by name within a directory
           names     the byte arena every entry's name points into
-          sums      one crc32c per data block
           data      the blocks extents address
           tree      fixed arena of checksummed 4096-byte COW nodes
           log 0     active, previous, or free checkpoint bank
@@ -630,7 +632,7 @@ caller goes next. Being a guess is what shapes the rest: it stops at the end of
 the run, because the block after a hole is not a block, and it declines when
 there is no free slot rather than waiting for one.
 
-**A region walk spends every slot.** Mount verifies six regions, and a commit
+**A region walk spends every slot.** Mount verifies five regions, and a commit
 sums what it wrote; both walk a range in order. `sweep` keeps starting reads on
 free slots ahead of the block it is handing over, and releases each block as it
 is taken: a walk reads a region through, and nothing behind it is coming back.
@@ -799,14 +801,14 @@ line editor away and needs a serial `read` before it is worth writing.
 - **No data cache.** Metadata nodes are cached; `Volume` keeps eight block
   buffers and nothing beyond them. That is enough for a directory search to
   re-read a block only when the binary search moves off every slot, and for the
-  sums block covering a file to stay resident while the file streams past it —
+  extent record covering a run to stay resident while that run streams past —
   and it is a window, not a cache: it holds what one mount is doing now, and
   forgets it when the slot is worth more. A cache that outlives the operation is
   the page cache below, which needs the writeback policy this stage does not
   have.
-- **No scrub.** The sums region exists and is checked per block on read; walking
-  it deliberately is a Stage 4 item, and the region layout is what makes it
-  cheap when it comes.
+- **No scrub.** Sums are checked per block on read; walking every extent
+  deliberately is a Stage 4 item, and the extent region is the work list it
+  will walk.
 - **The depth stops at virtio.** `Backing` hands the device as many requests as
   its `Queue` takes, so nothing above the driver limits what is in flight any
   more — but `molt_virtio::Block` is still one command at a time behind a
@@ -940,18 +942,19 @@ the types.
 
 ## Version and growth path
 
-Writable COW layout is version 3. Adding the tree arena and root changes bytes
-and geometry an older reader interprets. There is no published standard yet,
-but that is a reason to keep migration policy small, not to label incompatible
-layouts with the same version. Version 1 and 2 images are rejected rather than
-guessed at; `xtask mkfs` rebuilds development images as version 3.
+Extents carrying their own sums are version 4. Every layout change so far has
+moved bytes and geometry an older reader interprets — the tree arena and root in
+version 3, the wider extent record and the region that stopped existing here.
+There is no published standard yet, but that is a reason to keep migration
+policy small, not to label incompatible layouts with the same version. Older
+images are rejected rather than guessed at; `xtask mkfs` rebuilds development
+images as version 4.
 
 - **Stage 4.4, asynchronous I/O.** Done: `Volume` and `Journal` are `async` over
   a `BlockOp` ring, with readahead and region sweeps above it.
 - **Stage 4, scale.** File payloads compact from the journal into extent keys;
   reference counts and bucket generations generalize the bounded tree arena;
-  sums become a scrub work list; the block layer gains a data cache and a driver
-  that keeps more than one request at the device, both behind the same traits.
+  extents become a scrub work list; the block layer gains a data cache.
 - **Stage 5, storage for cells.** A signed cell image is a file with a signature
   region, and the loader is a client of this protocol — which is the argument
   for the protocol being pleasant to write against, since a loader is the next

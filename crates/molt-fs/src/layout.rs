@@ -25,7 +25,7 @@ pub(crate) fn buffer() -> Result<Box<[u8; BLOCK]>, FsError> {
 pub const MAGIC: [u8; 8] = *b"MOLTROFS";
 
 /// The format this crate reads.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// Superblock copies at the start of the volume.
 ///
@@ -34,7 +34,7 @@ pub const VERSION: u32 = 3;
 pub const SUPERS: u64 = 2;
 
 /// How much of block zero the superblock occupies.
-pub const SUPER_BYTES: usize = 244;
+pub const SUPER_BYTES: usize = 220;
 
 /// Log banks kept so newest and previous checkpoints remain intact while a
 /// third bank receives the next generation.
@@ -66,11 +66,11 @@ mod field {
     pub const DATA_AT: usize = 40;
     pub const DATA_BLOCKS: usize = 48;
     pub const REGIONS: usize = 64;
-    pub const LOG_BLOCKS: usize = 208;
-    pub const TREE_AT: usize = 216;
-    pub const TREE_BLOCKS: usize = 224;
-    pub const TREE_ROOT: usize = 232;
-    pub const CRC: usize = 240;
+    pub const LOG_BLOCKS: usize = 184;
+    pub const TREE_AT: usize = 192;
+    pub const TREE_BLOCKS: usize = 200;
+    pub const TREE_ROOT: usize = 208;
+    pub const CRC: usize = 216;
 }
 
 /// One region descriptor: where it starts, how long it is, what it hashes to.
@@ -80,8 +80,15 @@ const REGION_BYTES: usize = 24;
 pub const MAX_NAME: usize = 255;
 
 pub const OBJECT_BYTES: usize = 32;
-pub const EXTENT_BYTES: usize = 16;
+pub const EXTENT_BYTES: usize = 64;
 pub const ENTRY_BYTES: usize = 16;
+
+/// Blocks one extent may run for, which is how many sums it carries.
+///
+/// An extent holds a sum per block rather than one over the whole run, so a
+/// read of one block checks one block. That is what bounds the run: the sums
+/// fill the record, and a longer run would need a second one.
+pub const RUN: usize = 12;
 
 const _: () = assert!(
     BLOCK % OBJECT_BYTES == 0 && BLOCK % EXTENT_BYTES == 0 && BLOCK % ENTRY_BYTES == 0,
@@ -99,18 +106,15 @@ pub enum Area {
     Entries,
     /// The bytes every entry's name points into.
     Names,
-    /// One crc32c per data block.
-    Sums,
     /// Typed create and write records committed by the active checkpoint.
     Log,
 }
 
 impl Area {
     #[cfg(feature = "format")]
-    pub const BASE: [Self; 5] =
-        [Self::Objects, Self::Extents, Self::Entries, Self::Names, Self::Sums];
-    pub const ALL: [Self; 6] =
-        [Self::Objects, Self::Extents, Self::Entries, Self::Names, Self::Sums, Self::Log];
+    pub const BASE: [Self; 4] = [Self::Objects, Self::Extents, Self::Entries, Self::Names];
+    pub const ALL: [Self; 5] =
+        [Self::Objects, Self::Extents, Self::Entries, Self::Names, Self::Log];
 
     const fn index(self) -> usize {
         match self {
@@ -118,8 +122,7 @@ impl Area {
             Self::Extents => 1,
             Self::Entries => 2,
             Self::Names => 3,
-            Self::Sums => 4,
-            Self::Log => 5,
+            Self::Log => 4,
         }
     }
 }
@@ -247,7 +250,6 @@ impl Super {
         let log_start = self.blocks.checked_sub(log_span).ok_or(FsError::Corrupt)?;
         let tree_end =
             self.tree_at.checked_add(u64::from(self.tree_blocks)).ok_or(FsError::Corrupt)?;
-        let sum_bytes = self.data_blocks.checked_mul(4).ok_or(FsError::Corrupt)?;
         if self.log_blocks == 0
             || self.tree_blocks == 0
             || self.tree_blocks > MAX_TREE_BLOCKS
@@ -257,9 +259,6 @@ impl Super {
             || (self.tree_root != 0
                 && (self.tree_root < self.tree_at || self.tree_root >= tree_end))
         {
-            return Err(FsError::Corrupt);
-        }
-        if self.region(Area::Sums).bytes != sum_bytes {
             return Err(FsError::Corrupt);
         }
         for (index, area) in Area::ALL.into_iter().enumerate() {
@@ -363,17 +362,33 @@ impl Object {
 }
 
 /// One run of a file's blocks, at a logical block offset within it.
+///
+/// The sums travel with the run rather than in a region of their own, so
+/// locating a block is also learning what it must hash to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Extent {
     pub logical: u32,
     pub blocks: u32,
     pub block: u64,
+    /// crc32c of each block of the run, in order; zero past `blocks`.
+    pub sums: [u32; RUN],
 }
 
 impl Extent {
     pub fn parse(record: &[u8]) -> Result<Self, FsError> {
         let record = record.get(..EXTENT_BYTES).ok_or(FsError::Corrupt)?;
-        Ok(Self { logical: u32_at(record, 0), blocks: u32_at(record, 4), block: u64_at(record, 8) })
+        let blocks = u32_at(record, 4);
+        if blocks as usize > RUN {
+            return Err(FsError::Corrupt);
+        }
+        let mut sums = [0; RUN];
+        for (at, sum) in sums.iter_mut().enumerate() {
+            *sum = u32_at(record, 16 + at * 4);
+        }
+        if sums[blocks as usize..].iter().any(|&sum| sum != 0) {
+            return Err(FsError::Corrupt);
+        }
+        Ok(Self { logical: u32_at(record, 0), blocks, block: u64_at(record, 8), sums })
     }
 
     #[cfg(any(feature = "format", test))]
@@ -383,15 +398,19 @@ impl Extent {
         put_u32(record, 0, self.logical);
         put_u32(record, 4, self.blocks);
         put_u64(record, 8, self.block);
+        for (at, &sum) in self.sums.iter().enumerate() {
+            put_u32(record, 16 + at * 4, sum);
+        }
     }
 
-    /// The physical block holding `logical`, if this extent covers it.
-    pub fn covers(&self, logical: u32) -> Result<Option<u64>, FsError> {
+    /// The block holding `logical` and what it hashes to, if covered.
+    pub fn covers(&self, logical: u32) -> Result<Option<(u64, u32)>, FsError> {
         if logical < self.logical || logical - self.logical >= self.blocks {
             return Ok(None);
         }
-        match self.block.checked_add((logical - self.logical) as u64) {
-            Some(block) => Ok(Some(block)),
+        let step = logical - self.logical;
+        match self.block.checked_add(step as u64) {
+            Some(block) => Ok(Some((block, self.sums[step as usize]))),
             None => Err(FsError::Corrupt),
         }
     }
@@ -477,7 +496,7 @@ mod tests {
             parsed.set_region(area, Region { at: 2, bytes: 0, crc: 0 });
         }
         parsed.set_region(Area::Objects, Region { at: 2, bytes: 32, crc: 1 });
-        parsed.set_region(Area::Sums, Region { at: 3, bytes: 8, crc: 2 });
+        parsed.set_region(Area::Entries, Region { at: 3, bytes: 8, crc: 2 });
         parsed.set_region(Area::Log, Region { at: 20, bytes: 0, crc: 0 });
         parsed
     }
@@ -559,18 +578,6 @@ mod tests {
     }
 
     #[test]
-    fn sum_length_overflow_refused() {
-        let mut block = [0u8; BLOCK];
-        let mut parsed = volume();
-        parsed.blocks = u64::MAX;
-        parsed.data_at = 4;
-        parsed.data_blocks = u64::MAX / 4 + 1;
-        parsed.encode(&mut block);
-
-        assert_eq!(Super::parse(&block), Err(FsError::Corrupt));
-    }
-
-    #[test]
     fn object_survives_round_trip() {
         let mut record = [0u8; super::OBJECT_BYTES];
         let written = Object { kind: Kind::File, start: 3, count: 2, size: 5000 };
@@ -580,12 +587,49 @@ mod tests {
         assert_eq!(Object::parse(&record), Ok(written));
     }
 
+    fn run(logical: u32, blocks: u32, block: u64) -> Extent {
+        let mut sums = [0; super::RUN];
+        for (at, sum) in sums.iter_mut().take(blocks as usize).enumerate() {
+            *sum = at as u32 + 1;
+        }
+        Extent { logical, blocks, block, sums }
+    }
+
     #[test]
     fn extent_covers_own_blocks_only() {
-        let extent = Extent { logical: 4, blocks: 2, block: 100 };
+        let extent = run(4, 2, 100);
 
-        assert_eq!(extent.covers(5), Ok(Some(101)));
+        assert_eq!(extent.covers(5), Ok(Some((101, 2))));
         assert_eq!(extent.covers(6), Ok(None), "extent claimed block past its end");
+    }
+
+    #[test]
+    fn extent_survives_round_trip() {
+        let mut record = [0u8; super::EXTENT_BYTES];
+        let written = run(0, super::RUN as u32, 64);
+
+        written.encode(&mut record);
+
+        assert_eq!(Extent::parse(&record), Ok(written));
+    }
+
+    #[test]
+    fn extent_past_run_refused() {
+        let mut record = [0u8; super::EXTENT_BYTES];
+        run(0, super::RUN as u32 + 1, 64).encode(&mut record);
+
+        assert_eq!(Extent::parse(&record), Err(FsError::Corrupt));
+    }
+
+    /// A sum nobody can reach is a record that means something else.
+    #[test]
+    fn extent_sum_past_run_refused() {
+        let mut record = [0u8; super::EXTENT_BYTES];
+        let mut written = run(0, 2, 64);
+        written.sums[2] = 9;
+        written.encode(&mut record);
+
+        assert_eq!(Extent::parse(&record), Err(FsError::Corrupt));
     }
 
     #[test]
