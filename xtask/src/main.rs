@@ -474,7 +474,7 @@ fn cargo() -> OsString {
 mod tests {
     use std::fs;
 
-    use molt_block::Loopback;
+    use molt_block::{Loopback, Serial};
     use molt_core::buffer::{BufferOperation, BufferRegistry};
     use molt_core::capability::CellId;
     use molt_fs::{Fs, FsDone, FsOp, Handle, Kind, Name};
@@ -490,7 +490,8 @@ mod tests {
         let on_disk = fs::read(tree.join("hello.txt")).unwrap();
         let mut image = lay_out(&tree).unwrap();
         {
-            let mut fs = Fs::<_, 4>::mount(Loopback::writable(&mut image).unwrap()).unwrap();
+            let mut fs =
+                Fs::<_, 4>::mount(Serial::new(Loopback::writable(&mut image).unwrap())).unwrap();
 
             let mut bytes = [0u8; WINDOW];
             let mut buffers = BufferRegistry::<1>::new();
@@ -533,7 +534,7 @@ mod tests {
             assert_eq!(fs.apply(OWNER, FsOp::Sync, &mut buffers), Ok(FsDone::Synced(2)));
         }
         let mut bytes = [0u8; WINDOW];
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&image).unwrap()).unwrap();
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::new(&image).unwrap())).unwrap();
         let mut buffers = BufferRegistry::<1>::new();
         let buffer = buffers.register_write(OWNER, &mut bytes).unwrap();
         let root = fs.root(OWNER).unwrap();

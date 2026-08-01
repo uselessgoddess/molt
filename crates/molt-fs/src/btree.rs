@@ -22,7 +22,7 @@ use crate::layout::{BLOCK, Kind, MAX_NAME, Object, Super};
 use crate::mem::{Unique, Zeroed};
 use crate::{FsError, Name, Volume, mem};
 
-const MAGIC: [u8; 8] = *b"MOLTBTR3";
+const MAGIC: [u8; 8] = *b"MOLTBTR4";
 const HEADER: usize = 64;
 const KEY_BYTES: usize = 272;
 const VALUE_BYTES: usize = 32;
@@ -33,9 +33,13 @@ const MAX_HEIGHT: usize = 8;
 /// the working set of a mutation plus the levels a neighbouring one reuses.
 const CACHE_SLOTS: usize = 16;
 
+/// Node allocations kept aside. One insert copies a path and may raise a root,
+/// so this is what it takes for a mutation to ask the heap for nothing.
+const SPARE_NODES: usize = MAX_HEIGHT + 1;
+
 const OBJECT: u8 = 1;
 const DIRENT: u8 = 2;
-const WRITE: u8 = 3;
+const EXTENT: u8 = 3;
 
 /// Activity counters for the bounded metadata-node cache.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -88,16 +92,14 @@ impl Key {
         key
     }
 
-    pub fn write(object: u32, cursor: u64) -> Self {
+    /// Keyed on the byte past the extent's last, so one descent finds the first
+    /// extent that can reach into a read and the walk from there is in order.
+    pub fn extent(object: u32, end: u64) -> Self {
         let mut key = Self::default();
-        key.bytes[0] = WRITE;
+        key.bytes[0] = EXTENT;
         key.bytes[1..5].copy_from_slice(&object.to_le_bytes());
-        key.bytes[8..16].copy_from_slice(&cursor.to_le_bytes());
+        key.bytes[8..16].copy_from_slice(&end.to_le_bytes());
         key
-    }
-
-    pub fn write_start(object: u32) -> Self {
-        Self::write(object, 0)
     }
 
     fn tag(&self) -> u8 {
@@ -112,11 +114,17 @@ impl Key {
         self.tag() == DIRENT && self.object_id() == parent
     }
 
-    pub fn is_write(&self, object: u32) -> bool {
-        self.tag() == WRITE && self.object_id() == object
+    /// The file an extent key belongs to, if it is one.
+    pub fn extent_object(&self) -> Option<u32> {
+        (self.tag() == EXTENT).then(|| self.object_id())
     }
 
-    pub fn cursor(&self) -> u64 {
+    pub fn is_extent(&self, object: u32) -> bool {
+        self.extent_object() == Some(object)
+    }
+
+    /// One past the last byte an extent key covers.
+    pub fn end(&self) -> u64 {
         u64::from_le_bytes(self.bytes[8..16].try_into().expect("fixed key field"))
     }
 
@@ -139,7 +147,7 @@ impl Key {
                 }
                 self.name().map(|_| ())
             }
-            WRITE
+            EXTENT
                 if self.bytes[5..8].iter().all(|byte| *byte == 0)
                     && self.bytes[16..].iter().all(|byte| *byte == 0) =>
             {
@@ -169,10 +177,9 @@ impl Ord for Key {
         self.tag().cmp(&other.tag()).then_with(|| match self.tag() {
             OBJECT => self.object_id().cmp(&other.object_id()),
             DIRENT => self.cmp_dirent(other),
-            WRITE => self
-                .object_id()
-                .cmp(&other.object_id())
-                .then_with(|| self.cursor().cmp(&other.cursor())),
+            EXTENT => {
+                self.object_id().cmp(&other.object_id()).then_with(|| self.end().cmp(&other.end()))
+            }
             _ => self.bytes.cmp(&other.bytes),
         })
     }
@@ -204,11 +211,20 @@ impl Value {
         value
     }
 
-    pub fn write(offset: u64, bytes: u32) -> Self {
+    /// A run of one write record's payload: where the record sits in the log,
+    /// how far into its payload the run starts, and how long it is.
+    pub fn extent(at: u64, skip: u32, len: u32) -> Self {
         let mut value = Self::default();
-        value.bytes[..8].copy_from_slice(&offset.to_le_bytes());
-        value.bytes[8..12].copy_from_slice(&bytes.to_le_bytes());
+        value.bytes[..8].copy_from_slice(&at.to_le_bytes());
+        value.bytes[8..12].copy_from_slice(&skip.to_le_bytes());
+        value.bytes[12..16].copy_from_slice(&len.to_le_bytes());
         value
+    }
+
+    /// An extent covering nothing, left behind where a later write swallowed
+    /// one whole and did not land on its key.
+    pub fn whiteout() -> Self {
+        Self::default()
     }
 
     pub fn as_object(self) -> Result<Object, FsError> {
@@ -229,10 +245,11 @@ impl Value {
         u32::from_le_bytes(self.bytes[..4].try_into().expect("fixed value field"))
     }
 
-    pub fn as_write(self) -> (u64, u32) {
+    pub fn as_extent(self) -> (u64, u32, u32) {
         (
             u64::from_le_bytes(self.bytes[..8].try_into().expect("fixed value field")),
             u32::from_le_bytes(self.bytes[8..12].try_into().expect("fixed value field")),
+            u32::from_le_bytes(self.bytes[12..16].try_into().expect("fixed value field")),
         )
     }
 }
@@ -250,26 +267,21 @@ struct Node {
 unsafe impl Zeroed for Node {}
 
 impl Node {
-    /// An empty node, allocated zeroed.
-    fn empty() -> Result<Unique<Self>, FsError> {
-        Unique::zeroed()
-    }
-
-    fn leaf(generation: u64) -> Result<Unique<Self>, FsError> {
-        let mut node = Self::empty()?;
+    fn leaf(spare: &mut Spare, generation: u64) -> Result<Unique<Self>, FsError> {
+        let mut node = spare.take()?;
         node.generation = generation;
         Ok(node)
     }
 
-    fn inner(level: u8, generation: u64) -> Result<Unique<Self>, FsError> {
-        let mut node = Self::leaf(generation)?;
+    fn inner(spare: &mut Spare, level: u8, generation: u64) -> Result<Unique<Self>, FsError> {
+        let mut node = Self::leaf(spare, generation)?;
         node.level = level;
         Ok(node)
     }
 
     /// A heap copy of a cached node, ready to be rewritten in place.
-    fn copy(&self) -> Result<Unique<Self>, FsError> {
-        let mut node = Self::inner(self.level, self.generation)?;
+    fn copy(&self, spare: &mut Spare) -> Result<Unique<Self>, FsError> {
+        let mut node = Self::inner(spare, self.level, self.generation)?;
         node.len = self.len;
         node.keys.copy_from_slice(&self.keys);
         node.values.copy_from_slice(&self.values);
@@ -300,8 +312,8 @@ impl Node {
         low
     }
 
-    fn parse(block: &[u8; BLOCK]) -> Result<Unique<Self>, FsError> {
-        if block[..MAGIC.len()] != MAGIC || u32_at(block, 8) != 3 {
+    fn parse(spare: &mut Spare, block: &[u8; BLOCK]) -> Result<Unique<Self>, FsError> {
+        if block[..MAGIC.len()] != MAGIC || u32_at(block, 8) != 4 {
             return Err(FsError::Corrupt);
         }
         if node_crc(block) != u32_at(block, 32) {
@@ -312,7 +324,7 @@ impl Node {
         if level as usize >= MAX_HEIGHT || len == 0 || len > CAPACITY {
             return Err(FsError::Corrupt);
         }
-        let mut node = Self::inner(level, u64_at(block, 16))?;
+        let mut node = Self::inner(spare, level, u64_at(block, 16))?;
         node.len = len as u8;
         for at in 0..len {
             let start = HEADER + at * KEY_BYTES;
@@ -342,7 +354,7 @@ impl Node {
     fn encode(&self, block: &mut [u8; BLOCK]) {
         block.fill(0);
         block[..MAGIC.len()].copy_from_slice(&MAGIC);
-        block[8..12].copy_from_slice(&3u32.to_le_bytes());
+        block[8..12].copy_from_slice(&4u32.to_le_bytes());
         block[12] = self.level;
         block[13] = self.len;
         block[16..24].copy_from_slice(&self.generation.to_le_bytes());
@@ -364,6 +376,41 @@ impl Node {
         }
         let checksum = node_crc(block);
         block[32..36].copy_from_slice(&checksum.to_le_bytes());
+    }
+}
+
+/// Node allocations nobody else holds, waiting to be the next node.
+///
+/// A mutation drops a node for every node it makes: the block it copied is
+/// handed back to the arena, and what it parsed there is dead the moment it is.
+/// Building the copy in that same allocation is what keeps a write off the heap,
+/// and it is four kilobytes the allocator never has to find twice.
+struct Spare {
+    nodes: Vec<Rc<Node>>,
+}
+
+impl Spare {
+    fn new() -> Result<Self, FsError> {
+        let mut nodes = Vec::new();
+        nodes.try_reserve_exact(SPARE_NODES)?;
+        Ok(Self { nodes })
+    }
+
+    /// A zeroed node, out of the pool unless it is empty.
+    fn take(&mut self) -> Result<Unique<Node>, FsError> {
+        while let Some(node) = self.nodes.pop() {
+            if let Some(node) = Unique::reclaim(node) {
+                return Ok(node);
+            }
+        }
+        Unique::zeroed()
+    }
+
+    /// Keeps `node`'s allocation, if nothing else still reads through it.
+    fn give(&mut self, node: Rc<Node>) {
+        if self.nodes.len() < SPARE_NODES && Rc::strong_count(&node) == 1 {
+            self.nodes.push(node);
+        }
     }
 }
 
@@ -403,15 +450,15 @@ impl Cache {
         None
     }
 
-    fn put(&mut self, block: u64, node: Rc<Node>) {
+    /// Caches `node`, returning whatever it took the slot of.
+    fn put(&mut self, block: u64, node: Rc<Node>) -> Option<Rc<Node>> {
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.block == block) {
-            entry.node = node;
             entry.visited = true;
-            return;
+            return Some(core::mem::replace(&mut entry.node, node));
         }
         if self.entries.len() < CACHE_SLOTS {
             self.entries.push(Entry { visited: false, block, node });
-            return;
+            return None;
         }
 
         // SIEVE's useful core: hits only set a bit, while eviction's hand
@@ -423,10 +470,17 @@ impl Cache {
                 self.entries[at].visited = false;
                 continue;
             }
-            self.entries[at] = Entry { visited: false, block, node };
+            let evicted =
+                core::mem::replace(&mut self.entries[at], Entry { visited: false, block, node });
             self.stats.evictions += 1;
-            return;
+            return Some(evicted.node);
         }
+    }
+
+    /// Drops what `block` parsed to, once the block itself is gone.
+    fn forget(&mut self, block: u64) -> Option<Rc<Node>> {
+        let at = self.entries.iter().position(|entry| entry.block == block)?;
+        Some(self.entries.swap_remove(at).node)
     }
 }
 
@@ -454,6 +508,7 @@ pub(crate) struct TreeTransaction {
 /// One bounded node cache shared by lookups and tree mutations.
 pub(crate) struct MetadataTree {
     cache: Cache,
+    spare: Spare,
 }
 
 impl TreeTransaction {
@@ -465,7 +520,7 @@ impl TreeTransaction {
 
 impl MetadataTree {
     pub fn new() -> Result<Self, FsError> {
-        Ok(Self { cache: Cache::new()? })
+        Ok(Self { cache: Cache::new()?, spare: Spare::new()? })
     }
 
     pub async fn begin(&mut self, volume: &mut Volume) -> Result<TreeTransaction, FsError> {
@@ -560,7 +615,7 @@ impl MetadataTree {
         value: Value,
     ) -> Result<(), FsError> {
         if transaction.root == 0 {
-            let mut leaf = Node::leaf(transaction.generation)?;
+            let mut leaf = Node::leaf(&mut self.spare, transaction.generation)?;
             leaf.keys[0] = *key;
             leaf.values[0] = value;
             leaf.len = 1;
@@ -599,7 +654,7 @@ impl MetadataTree {
             Branch::One(at) => at,
             Branch::Split { left, separator, right } => {
                 let level = self.read(volume, left).await?.level + 1;
-                let mut root = Node::inner(level, transaction.generation)?;
+                let mut root = Node::inner(&mut self.spare, level, transaction.generation)?;
                 root.len = 1;
                 root.keys[0] = *separator;
                 root.children[0] = left;
@@ -644,7 +699,7 @@ impl MetadataTree {
     ) -> Result<Branch, FsError> {
         let index = leaf.lower(key);
         if index < leaf.len as usize && leaf.keys[index] == *key {
-            let mut node = leaf.copy()?;
+            let mut node = leaf.copy(&mut self.spare)?;
             node.generation = transaction.generation;
             node.values[index] = value;
             return Ok(Branch::One(self.write_new(volume, transaction, node).await?));
@@ -669,15 +724,15 @@ impl MetadataTree {
         };
 
         if total <= CAPACITY {
-            let mut node = Node::leaf(transaction.generation)?;
+            let mut node = Node::leaf(&mut self.spare, transaction.generation)?;
             fill(&mut node, 0, total);
             return Ok(Branch::One(self.write_new(volume, transaction, node).await?));
         }
 
         let middle = total / 2;
-        let mut left = Node::leaf(transaction.generation)?;
+        let mut left = Node::leaf(&mut self.spare, transaction.generation)?;
         fill(&mut left, 0, middle);
-        let mut right = Node::leaf(transaction.generation)?;
+        let mut right = Node::leaf(&mut self.spare, transaction.generation)?;
         fill(&mut right, middle, total);
         let separator = Box::try_new(right.keys[0])?;
         let left_at = self.write_new(volume, transaction, left).await?;
@@ -695,7 +750,7 @@ impl MetadataTree {
     ) -> Result<Branch, FsError> {
         let (left, separator, right) = match branch {
             Branch::One(at) => {
-                let mut node = parent.copy()?;
+                let mut node = parent.copy(&mut self.spare)?;
                 node.generation = transaction.generation;
                 node.children[child] = at;
                 return Ok(Branch::One(self.write_new(volume, transaction, node).await?));
@@ -728,16 +783,16 @@ impl MetadataTree {
         };
 
         if total <= CAPACITY {
-            let mut node = Node::inner(parent.level, transaction.generation)?;
+            let mut node = Node::inner(&mut self.spare, parent.level, transaction.generation)?;
             fill(&mut node, 0, total);
             return Ok(Branch::One(self.write_new(volume, transaction, node).await?));
         }
 
         // The middle key rises to the parent instead of staying in either half.
         let middle = total / 2;
-        let mut left_node = Node::inner(parent.level, transaction.generation)?;
+        let mut left_node = Node::inner(&mut self.spare, parent.level, transaction.generation)?;
         fill(&mut left_node, 0, middle);
-        let mut right_node = Node::inner(parent.level, transaction.generation)?;
+        let mut right_node = Node::inner(&mut self.spare, parent.level, transaction.generation)?;
         fill(&mut right_node, middle + 1, total);
         let rising = Box::try_new(*key_at(middle))?;
         let left_at = self.write_new(volume, transaction, left_node).await?;
@@ -750,9 +805,16 @@ impl MetadataTree {
         if let Some(node) = self.cache.get(at) {
             return Ok(node);
         }
-        let node = Node::parse(volume.block(at).await?)?.into_shared();
-        self.cache.put(at, Rc::clone(&node));
+        let node = Node::parse(&mut self.spare, volume.block(at).await?)?.into_shared();
+        self.keep(at, Rc::clone(&node));
         Ok(node)
+    }
+
+    /// Caches `node`, keeping for the pool whatever it stood in the way of.
+    fn keep(&mut self, at: u64, node: Rc<Node>) {
+        if let Some(displaced) = self.cache.put(at, node) {
+            self.spare.give(displaced);
+        }
     }
 
     async fn write_new(
@@ -768,7 +830,7 @@ impl MetadataTree {
         // Encoded straight into the buffer the write leaves on, so a node
         // reaches the device without a block of it being copied twice.
         volume.write_tree_block(at, |block| node.encode(block)).await?;
-        self.cache.put(at, node.into_shared());
+        self.keep(at, node.into_shared());
         Ok(at)
     }
 
@@ -783,6 +845,11 @@ impl MetadataTree {
         };
         if !transaction.protected.get(offset) && transaction.used.get(offset) {
             transaction.used.clear(offset);
+            // What the block parsed to dies with it, and the copy that replaced
+            // it is the next node the pool is asked for.
+            if let Some(node) = self.cache.forget(at) {
+                self.spare.give(node);
+            }
         }
     }
 
@@ -851,6 +918,8 @@ pub(crate) async fn verify(volume: &mut Volume, checkpoint: &Super) -> Result<()
     }
     let mut used = Bitmap::new(checkpoint.tree_blocks)?;
     let mut pending = Vec::new();
+    // A walk of the whole tree, one node at a time, so one allocation does.
+    let mut spare = Spare::new()?;
     // No level is expected of the root; every child is expected one below it.
     mem::push(&mut pending, (checkpoint.tree_root, None))?;
     while let Some((at, expected)) = pending.pop() {
@@ -859,7 +928,7 @@ pub(crate) async fn verify(volume: &mut Volume, checkpoint: &Super) -> Result<()
             return Err(FsError::Corrupt);
         }
         used.set(offset);
-        let node = Node::parse(volume.raw(at).await?)?;
+        let node = Node::parse(&mut spare, volume.raw(at).await?)?;
         if node.generation > checkpoint.generation
             || (at == checkpoint.tree_root && node.generation != checkpoint.generation)
         {
@@ -876,6 +945,7 @@ pub(crate) async fn verify(volume: &mut Volume, checkpoint: &Super) -> Result<()
                 mem::push(&mut pending, (child, Some(node.level - 1)))?;
             }
         }
+        spare.give(node.into_shared());
     }
     Ok(())
 }

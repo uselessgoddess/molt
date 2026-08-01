@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::ops::Range;
 
-use molt_block::{Backing, BlockClient, BlockOp, Buffer, Disk, SECTOR, channel};
+use molt_block::{Backing, BlockClient, BlockOp, Buffer, Queue, SECTOR, channel};
 use molt_core::ring::RequestId;
 use molt_core::task;
 
@@ -19,7 +19,7 @@ use crate::FsError;
 use crate::crc::{Crc, crc32c};
 use crate::layout::{
     Area, BLOCK, ENTRY_BYTES, EXTENT_BYTES, Entry, Extent, Kind, MAX_NAME, OBJECT_BYTES, Object,
-    SUPERS, Super, buffer, u32_at,
+    SUPERS, Super, buffer,
 };
 use crate::name::Name;
 
@@ -61,12 +61,12 @@ pub struct Blocks {
     sectors: u64,
 }
 
-/// Puts `device` behind a ring, returning the end a volume reads through and
+/// Puts `queue` behind a ring, returning the end a volume reads through and
 /// the end somebody has to pump for those reads to land.
-pub fn attach<D: Disk>(device: D) -> Result<(Blocks, Backing<D, DEPTH>), FsError> {
+pub fn attach<Q: Queue>(queue: Q) -> Result<(Blocks, Backing<Q, DEPTH>), FsError> {
     let (client, driver) = channel()?;
-    let sectors = device.sectors();
-    Ok((Blocks { client, sectors }, Backing::new(driver, device)))
+    let sectors = queue.sectors();
+    Ok((Blocks { client, sectors }, Backing::new(driver, queue)))
 }
 
 /// A mounted volume.
@@ -287,9 +287,9 @@ impl Volume {
             let within = (at % BLOCK as u64) as usize;
             let take = (want - done).min(BLOCK - within);
             match self.follow(file, &mut run, logical).await? {
-                Some(block) => {
+                Some((block, sum)) => {
                     self.ahead(run, logical).await?;
-                    let source = self.data(block).await?;
+                    let source = self.data(block, sum).await?;
                     buf[done..done + take].copy_from_slice(&source[within..within + take]);
                 }
                 None => buf[done..done + take].fill(0),
@@ -305,11 +305,11 @@ impl Volume {
         file: &Object,
         run: &mut Option<Extent>,
         logical: u32,
-    ) -> Result<Option<u64>, FsError> {
+    ) -> Result<Option<(u64, u32)>, FsError> {
         if let Some(extent) = *run
-            && let Some(block) = extent.covers(logical)?
+            && let Some(found) = extent.covers(logical)?
         {
-            return Ok(Some(block));
+            return Ok(Some(found));
         }
         *run = self.locate(file, logical).await?;
         match *run {
@@ -328,7 +328,7 @@ impl Volume {
         let Some(run) = run else { return Ok(()) };
         for step in 1..=AHEAD {
             let Some(next) = logical.checked_add(step) else { break };
-            let Some(block) = run.covers(next)? else { break };
+            let Some((block, _)) = run.covers(next)? else { break };
             if block >= self.superblock.blocks || self.find(block).is_some() {
                 continue;
             }
@@ -404,20 +404,15 @@ impl Volume {
         Ok(&block[within..within + size])
     }
 
-    /// Reads a data block and checks it against the sum recorded for it.
-    async fn data(&mut self, index: u64) -> Result<&[u8; BLOCK], FsError> {
+    /// Reads a data block and checks it against the sum its extent carried.
+    async fn data(&mut self, index: u64, sum: u32) -> Result<&[u8; BLOCK], FsError> {
         let offset = index.checked_sub(self.superblock.data_at).ok_or(FsError::Corrupt)?;
         if offset >= self.superblock.data_blocks {
             return Err(FsError::Corrupt);
         }
 
-        let sums = self.superblock.region(Area::Sums);
-        let at = offset * 4;
-        let within = (at % BLOCK as u64) as usize;
-        let expected = u32_at(self.block(sums.at + at / BLOCK as u64).await?, within);
-
         let block = self.block(index).await?;
-        if crc32c(block) != expected {
+        if crc32c(block) != sum {
             return Err(FsError::Checksum);
         }
         Ok(block)
@@ -760,7 +755,7 @@ fn newest(copies: &[Option<Super>], rejected: &[bool]) -> Option<usize> {
 
 #[cfg(all(test, feature = "format"))]
 mod tests {
-    use molt_block::{Backing, Loopback};
+    use molt_block::{Backing, Loopback, Serial};
 
     use super::{Volume, attach};
     use crate::crc::crc32c;
@@ -776,8 +771,8 @@ mod tests {
         build(&tree, 1).unwrap()
     }
 
-    fn mount(bytes: &[u8]) -> (Volume, Backing<Loopback<'_>, DEPTH>) {
-        let (blocks, mut backing) = attach(Loopback::new(bytes).unwrap()).unwrap();
+    fn mount(bytes: &[u8]) -> (Volume, Backing<Serial<Loopback<'_>>, DEPTH>) {
+        let (blocks, mut backing) = attach(Serial::new(Loopback::new(bytes).unwrap())).unwrap();
         let volume = backing.run(Volume::mount(blocks)).unwrap();
         (volume, backing)
     }
@@ -944,7 +939,7 @@ mod tests {
         let superblock = Super::parse(&bytes[..BLOCK])?;
         let at = superblock.region(Area::Objects).at as usize * BLOCK;
         bytes[at] ^= 0xff;
-        let (blocks, mut backing) = attach(Loopback::new(&bytes)?)?;
+        let (blocks, mut backing) = attach(Serial::new(Loopback::new(&bytes)?))?;
 
         let mounted = backing.run(Volume::mount(blocks));
 

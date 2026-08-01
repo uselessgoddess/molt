@@ -8,7 +8,7 @@
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use molt_block::Loopback;
+use molt_block::{Loopback, Serial};
 use molt_core::buffer::{BufferOperation, BufferRegistry};
 use molt_core::capability::CellId;
 use molt_fs::format::{Tree, build};
@@ -35,13 +35,13 @@ fn mount(criterion: &mut Criterion) {
     let bytes = image();
 
     criterion.bench_function("fs_mount", |bencher| {
-        bencher.iter(|| Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap());
+        bencher.iter(|| Fs::<_, 4>::mount(Serial::new(Loopback::new(&bytes).unwrap())).unwrap());
     });
 }
 
 fn open(criterion: &mut Criterion) {
     let bytes = image();
-    let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap();
+    let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::new(&bytes).unwrap())).unwrap();
     let mut buffers = BufferRegistry::<1>::new();
     let root = fs.root(OWNER).unwrap();
 
@@ -58,7 +58,7 @@ fn open(criterion: &mut Criterion) {
 fn read(criterion: &mut Criterion) {
     let bytes = image();
     let mut window = [0u8; WINDOW];
-    let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap();
+    let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::new(&bytes).unwrap())).unwrap();
     let mut buffers = BufferRegistry::<1>::new();
     let buffer = buffers.register_write(OWNER, &mut window).unwrap();
     let root = fs.root(OWNER).unwrap();
@@ -99,7 +99,9 @@ fn commit(criterion: &mut Criterion) {
             let mut done = 0;
             while done < iters {
                 let mut bytes = image.clone();
-                let mut fs = Fs::<_, 4>::mount(Loopback::writable(&mut bytes).unwrap()).unwrap();
+                let mut fs =
+                    Fs::<_, 4>::mount(Serial::new(Loopback::writable(&mut bytes).unwrap()))
+                        .unwrap();
                 let root = fs.root(OWNER).unwrap();
                 let create = FsOp::Create { dir: root, name: name("written"), kind: Kind::File };
                 let opened = fs.apply(OWNER, create, &mut buffers).unwrap();

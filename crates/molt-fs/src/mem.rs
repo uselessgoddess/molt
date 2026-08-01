@@ -15,6 +15,7 @@ use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
+use core::ptr;
 
 use crate::FsError;
 
@@ -77,6 +78,19 @@ impl<T: Zeroed> Unique<T> {
         // SAFETY: `Zeroed` is the promise that zeroes are a `T`.
         Ok(Self(unsafe { value.assume_init() }))
     }
+
+    /// Takes the exclusive half back, if `value` is the last handle.
+    ///
+    /// The allocation is kept and zeroed where it lies, which is what makes a
+    /// pool of these worth having: nothing of the size of a node crosses the
+    /// stack, and the heap is not asked again.
+    pub fn reclaim(mut value: Rc<T>) -> Option<Self> {
+        let held = Rc::get_mut(&mut value)?;
+        // SAFETY: the handle is unique, so nothing else reads through it, and
+        // `Zeroed` is the promise that zeroes are a `T`.
+        unsafe { ptr::write_bytes(held, 0, 1) };
+        Some(Self(value))
+    }
 }
 
 impl<T> Unique<T> {
@@ -102,6 +116,7 @@ impl<T> DerefMut for Unique<T> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::rc::Rc;
     use alloc::vec::Vec;
 
     use super::{Unique, extend, push, zeroed, zeroed_slice};
@@ -120,6 +135,17 @@ mod tests {
         *value = 7;
 
         assert_eq!(*value.into_shared(), 7);
+        Ok(())
+    }
+
+    #[test]
+    fn reclaim_takes_only_the_last_handle() -> Result<(), FsError> {
+        let mut value = Unique::<u64>::zeroed()?;
+        *value = 7;
+        let shared = value.into_shared();
+
+        assert!(Unique::reclaim(Rc::clone(&shared)).is_none());
+        assert_eq!(*Unique::reclaim(shared).unwrap(), 0);
         Ok(())
     }
 
