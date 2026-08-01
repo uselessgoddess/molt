@@ -5,9 +5,11 @@
 //! [`Loopback`] over bytes already in memory, and a future NVMe or SD driver
 //! over whatever it likes — none of which the filesystem above has to know.
 //!
-//! Both traits block. [`channel`] puts a ring in front of one of them so the
-//! filesystem submits and awaits instead, and only [`Backing`] still calls a
-//! device directly.
+//! Both traits block. [`channel`] puts a ring in front of a [`Queue`] so the
+//! filesystem submits and awaits instead, and only [`Backing`] still touches
+//! the device. [`Queued`] is any blocking disk behind a queue of a depth the
+//! caller picks; a driver whose hardware queues for itself implements [`Queue`]
+//! directly.
 
 #![no_std]
 #![feature(allocator_api)]
@@ -20,11 +22,13 @@ extern crate std;
 mod device;
 mod fault;
 mod loopback;
+mod queue;
 mod ring;
 
 pub use crate::device::{Device, Disk, bounds};
 pub use crate::fault::Fault;
 pub use crate::loopback::Loopback;
+pub use crate::queue::{Queue, Queued, Serial};
 pub use crate::ring::{
     BLOCK, Backing, BlockClient, BlockDone, BlockDriver, BlockOp, Buffer, channel,
 };

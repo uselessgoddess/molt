@@ -1,6 +1,6 @@
-use molt_core::capability::{CapabilityError, CapabilityRights, CellId, Rights};
-use molt_core::cpu::CpuId;
+use molt_core::capability::{CapabilityError, CapabilityRights, Rights};
 use molt_core::registry::{Registry, RegistryError, Scheme};
+use molt_core::{CellId, CpuId};
 
 /// A service whose endpoint is the checkpoint it was published at.
 enum Storage {}

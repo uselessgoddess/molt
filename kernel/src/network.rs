@@ -3,8 +3,8 @@
 use molt_arch::dma::Arena;
 use molt_arch::memory::{Inventory, Owner, Rights};
 use molt_arch::{BootInfo, FrameAllocator, Platform, SerialWriter};
+use molt_core::CellId;
 use molt_core::buffer::{BufferOperation, BufferRegistry};
-use molt_core::capability::CellId;
 use molt_core::ring::{IoRing, RequestId, Submission};
 use molt_kernel::report;
 use molt_net::{Config, Ip, IpAddr, IpDone, IpError, IpOp, Ipv4Addr, Ipv6Addr, Link};

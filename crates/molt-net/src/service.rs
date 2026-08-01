@@ -1,7 +1,8 @@
 //! A capability-addressed IP service over an Ethernet link.
 
+use molt_core::CellId;
 use molt_core::buffer::{BufferError, BufferOperation, BufferRegistry};
-use molt_core::capability::{Capability, CapabilityError, CapabilityTable, CellId, Write};
+use molt_core::capability::{Capability, CapabilityError, CapabilityTable, Write};
 use molt_core::ring::{Completion, IoDriver, RequestId, Submission};
 
 use crate::arp::{Operation as ArpOperation, Packet as Arp};

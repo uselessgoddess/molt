@@ -12,18 +12,18 @@
 use core::cell::RefCell;
 
 use molt_arch::{Platform, SerialPort, SerialWriter};
-use molt_block::Disk;
+use molt_block::Queue;
 use molt_core::buffer::{BufferOperation, BufferRegistry};
-use molt_core::capability::{Capability, CellId, ReadWrite};
+use molt_core::capability::{Capability, ReadWrite};
 use molt_core::cell::Supervisor;
-use molt_core::cpu::CpuId;
 use molt_core::registry::{Registry, Scheme};
 use molt_core::ring::{IoDriver, IoRing};
+use molt_core::{CellId, CpuId, task};
 use molt_fs::{
     Disconnect, Fs, FsCell, FsDone, FsError, FsOp, Handle, Kind, Name, Storage, Teardown,
 };
 use molt_kernel::report;
-use molt_shell::{Console, PROMPT, Session, Shell, ShellError, drive_bounded};
+use molt_shell::{Console, PROMPT, Session, Shell, ShellError};
 
 /// Init, which owns the memory both sides of the ring look at.
 const INIT: CellId = CellId::new(1);
@@ -97,8 +97,8 @@ impl From<ShellError> for Trouble {
     }
 }
 
-pub fn smoke<P: Platform>(platform: &mut P, device: impl Disk) {
-    let mut service = match Supervisor::<FsCell<_, HANDLES>>::new(device) {
+pub fn smoke<P: Platform>(platform: &mut P, queue: impl Queue) {
+    let mut service = match Supervisor::<FsCell<_, HANDLES>>::new(queue) {
         Ok(started) => started,
         Err(error) => {
             report!(platform, "MOLT_FS_FAILED: {error:?}");
@@ -114,9 +114,9 @@ pub fn smoke<P: Platform>(platform: &mut P, device: impl Disk) {
 }
 
 /// Runs the write cycle, the script, and the restart that outlives both.
-fn run<P: Platform, D: Disk>(
+fn run<P: Platform, Q: Queue>(
     platform: &mut P,
-    service: &mut Supervisor<FsCell<D, HANDLES>>,
+    service: &mut Supervisor<FsCell<Q, HANDLES>>,
 ) -> Result<(), Trouble> {
     let mut bytes = [0u8; WINDOW];
     bytes[..WRITTEN.len()].copy_from_slice(WRITTEN);
@@ -160,9 +160,9 @@ fn run<P: Platform, D: Disk>(
 /// The tick is a line rather than a timer because a line is what this system
 /// counts as progress: nothing preempts a cell here, so the only place a
 /// supervisor can look at the clock is between the pieces of work it hands out.
-fn script<P: Platform, D: Disk>(
+fn script<P: Platform, Q: Queue>(
     platform: &mut P,
-    service: &mut Supervisor<FsCell<D, HANDLES>>,
+    service: &mut Supervisor<FsCell<Q, HANDLES>>,
     shell: &mut Supervisor<Shell<'_, '_, '_, RING, 1, NAMES>>,
     driver: &mut IoDriver<'_, FsOp, Result<FsDone, FsError>, RING>,
     buffers: &RefCell<BufferRegistry<'_, 1>>,
@@ -199,8 +199,8 @@ fn script<P: Platform, D: Disk>(
             out.line(line);
             let running = shell.cell_mut().run(line, &mut out);
             match event {
-                Event::Starve => drive_bounded(running, ROUNDS, || {}),
-                _ => drive_bounded(running, ROUNDS, || {
+                Event::Starve => task::drive_bounded(running, ROUNDS, || {}),
+                _ => task::drive_bounded(running, ROUNDS, || {
                     if let Ok(fs) = service.cell_mut().fs() {
                         fs.serve(SHELL, driver, &mut buffers.borrow_mut());
                     }
@@ -234,8 +234,8 @@ fn script<P: Platform, D: Disk>(
 /// one write the smoke test has to see land on a real disk, and no command the
 /// shell offers would make one. The bootstrap root is closed again afterwards,
 /// so the only root left when the script starts is the published one.
-fn commit<D: Disk>(
-    fs: &mut Fs<D, HANDLES>,
+fn commit<Q: Queue>(
+    fs: &mut Fs<Q, HANDLES>,
     buffers: &mut BufferRegistry<'_, 1>,
     scratch: Capability<ReadWrite>,
 ) -> Result<u64, FsError> {

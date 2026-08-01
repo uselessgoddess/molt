@@ -30,10 +30,10 @@ use crate::ShellError;
 /// than remembered. The name registry is shared for the same reason and one
 /// more: the service writes to it exactly when it publishes or withdraws, which
 /// are the two moments a client must not be holding it.
-pub struct Session<'ring, 'registry, 'buffer, const R: usize, const N: usize, const M: usize> {
-    client: IoClient<'ring, FsOp, Result<FsDone, FsError>, R>,
-    buffers: &'registry RefCell<BufferRegistry<'buffer, N>>,
-    names: &'registry RefCell<Registry<Storage, M>>,
+pub struct Session<'i, 'r, 'b, const R: usize, const N: usize, const M: usize> {
+    client: IoClient<'i, FsOp, Result<FsDone, FsError>, R>,
+    buffers: &'r RefCell<BufferRegistry<'b, N>>,
+    names: &'r RefCell<Registry<Storage, M>>,
     read: Capability<Read>,
     write: Capability<Write>,
     window: usize,
@@ -41,9 +41,7 @@ pub struct Session<'ring, 'registry, 'buffer, const R: usize, const N: usize, co
     lease: Option<Capability<Storage>>,
 }
 
-impl<'ring, 'registry, 'buffer, const R: usize, const N: usize, const M: usize>
-    Session<'ring, 'registry, 'buffer, R, N, M>
-{
+impl<'i, 'r, 'b, const R: usize, const N: usize, const M: usize> Session<'i, 'r, 'b, R, N, M> {
     /// Talks over `client`, reading into the first `window` bytes of `scratch`.
     ///
     /// `scratch` must already be registered in `buffers`; the two capabilities
@@ -52,9 +50,9 @@ impl<'ring, 'registry, 'buffer, const R: usize, const N: usize, const M: usize>
     /// No lease is taken here: a session that starts before anything publishes
     /// storage is ordinary, and the first command is where that shows.
     pub fn new(
-        client: IoClient<'ring, FsOp, Result<FsDone, FsError>, R>,
-        buffers: &'registry RefCell<BufferRegistry<'buffer, N>>,
-        names: &'registry RefCell<Registry<Storage, M>>,
+        client: IoClient<'i, FsOp, Result<FsDone, FsError>, R>,
+        buffers: &'r RefCell<BufferRegistry<'b, N>>,
+        names: &'r RefCell<Registry<Storage, M>>,
         scratch: Capability<ReadWrite>,
         window: usize,
     ) -> Result<Self, ShellError> {

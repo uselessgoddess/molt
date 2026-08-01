@@ -1,7 +1,8 @@
 //! A capability-addressed UDP service over an IP ring.
 
+use molt_core::CellId;
 use molt_core::buffer::{BufferOperation, BufferRegistry};
-use molt_core::capability::{Capability, CapabilityTable, CellId, Read, ReadWrite, Write};
+use molt_core::capability::{Capability, CapabilityTable, Read, ReadWrite, Write};
 use molt_core::ring::{Completion, IoClient, IoDriver, RequestId, Submission};
 use molt_net::addr::IpAddr;
 use molt_net::{IpDone, IpError, IpOp, Protocol};

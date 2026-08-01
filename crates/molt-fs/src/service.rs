@@ -5,12 +5,12 @@
 //! caches only an object id and kind; size and entry count are replayed when
 //! asked because writes can change them under an open handle.
 
-use molt_block::{Backing, Disk};
+use molt_block::{Backing, Queue};
 use molt_core::buffer::BufferRegistry;
-use molt_core::capability::{Capability, CapabilityTable, CellId};
-use molt_core::cpu::CpuId;
+use molt_core::capability::{Capability, CapabilityTable};
 use molt_core::registry::Registry;
 use molt_core::ring::{Completion, IoDriver};
+use molt_core::{CellId, CpuId};
 
 use crate::layout::{Kind, Object};
 use crate::op::{Dir, File, FsDone, FsOp, Handle, Stat};
@@ -25,18 +25,18 @@ struct OpenObject {
 }
 
 /// A mounted volume behind a capability table.
-pub struct Fs<D, const N: usize> {
+pub struct Fs<Q, const N: usize> {
     journal: Journal,
-    backing: Backing<D, DEPTH>,
+    backing: Backing<Q, DEPTH>,
     open: CapabilityTable<OpenObject, N>,
     pending: Option<Completion<Result<FsDone, FsError>>>,
     sealed: bool,
 }
 
-impl<D: Disk, const N: usize> Fs<D, N> {
-    /// Mounts `device` behind a block ring of its own.
-    pub fn mount(device: D) -> Result<Self, FsError> {
-        let (blocks, mut backing) = attach(device)?;
+impl<Q: Queue, const N: usize> Fs<Q, N> {
+    /// Mounts `queue` behind a block ring of its own.
+    pub fn mount(queue: Q) -> Result<Self, FsError> {
+        let (blocks, mut backing) = attach(queue)?;
         let journal = backing.run(Journal::mount(blocks))?;
         Ok(Self { journal, backing, open: CapabilityTable::new(), pending: None, sealed: false })
     }
@@ -244,9 +244,10 @@ fn stat(object: &Object) -> Stat {
 
 #[cfg(all(test, feature = "format"))]
 mod tests {
-    use molt_block::Loopback;
+    use molt_block::{Loopback, Serial};
+    use molt_core::CellId;
     use molt_core::buffer::{BufferOperation, BufferRegistry};
-    use molt_core::capability::{CapabilityError, CellId};
+    use molt_core::capability::CapabilityError;
     use molt_core::ring::{IoRing, RequestId, Submission};
 
     use super::Fs;
@@ -271,7 +272,7 @@ mod tests {
     #[test]
     fn open_walks_from_root_handle() -> Result<(), FsError> {
         let bytes = image();
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes)?)?;
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::read(&bytes)?))?;
         let mut buffers = BufferRegistry::<1>::new();
 
         let root = fs.root(OWNER)?;
@@ -290,7 +291,7 @@ mod tests {
     fn read_lands_in_registered_buffer() -> Result<(), FsError> {
         let bytes = image();
         let mut target = [0u8; 32];
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes)?)?;
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::read(&bytes)?))?;
         let mut buffers = BufferRegistry::<1>::new();
         let buffer = buffers.register_write(OWNER, &mut target).unwrap();
 
@@ -314,7 +315,7 @@ mod tests {
         let mut source = *b"durable molt";
         let source_len = source.len();
         {
-            let mut fs = Fs::<_, 4>::mount(Loopback::writable(&mut bytes)?)?;
+            let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::write(&mut bytes)?))?;
             let mut buffers = BufferRegistry::<1>::new();
             let buffer = buffers.register_read(OWNER, &mut source).unwrap();
             let root = fs.root(OWNER)?;
@@ -339,7 +340,7 @@ mod tests {
         }
         let mut target = [0u8; 16];
         let target_len = target.len();
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes)?)?;
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::read(&bytes)?))?;
         let mut buffers = BufferRegistry::<1>::new();
         let buffer = buffers.register_write(OWNER, &mut target).unwrap();
         let root = fs.root(OWNER)?;
@@ -360,7 +361,7 @@ mod tests {
     #[test]
     fn stat_counts_entries() -> Result<(), FsError> {
         let bytes = image();
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes)?)?;
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::read(&bytes)?))?;
         let mut buffers = BufferRegistry::<1>::new();
 
         let root = fs.root(OWNER)?;
@@ -373,7 +374,7 @@ mod tests {
     #[test]
     fn closed_handle_goes_stale() -> Result<(), FsError> {
         let bytes = image();
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes)?)?;
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::read(&bytes)?))?;
         let mut buffers = BufferRegistry::<1>::new();
 
         let root = fs.root(OWNER)?;
@@ -388,7 +389,7 @@ mod tests {
     #[test]
     fn revoked_owner_loses_every_handle() -> Result<(), FsError> {
         let bytes = image();
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes)?)?;
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::read(&bytes)?))?;
         let mut buffers = BufferRegistry::<1>::new();
 
         let root = fs.root(OWNER)?;
@@ -403,7 +404,7 @@ mod tests {
         let mut bytes = image();
         let mut source = [0xa5; 8];
         let source_len = source.len();
-        let mut fs = Fs::<_, 4>::mount(Loopback::writable(&mut bytes)?)?;
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::write(&mut bytes)?))?;
         let mut buffers = BufferRegistry::<1>::new();
         let buffer = buffers.register_read(OWNER, &mut source).unwrap();
         let root = fs.root(OWNER)?;
@@ -426,7 +427,7 @@ mod tests {
     #[test]
     fn handles_run_out_rather_than_overwrite() -> Result<(), FsError> {
         let bytes = image();
-        let mut fs = Fs::<_, 1>::mount(Loopback::new(&bytes)?)?;
+        let mut fs = Fs::<_, 1>::mount(Serial::new(Loopback::read(&bytes)?))?;
         let mut buffers = BufferRegistry::<1>::new();
 
         let root = fs.root(OWNER)?;
@@ -439,7 +440,7 @@ mod tests {
     #[test]
     fn seal_refuses_later_root() -> Result<(), FsError> {
         let bytes = image();
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes)?)?;
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::read(&bytes)?))?;
 
         let first = fs.root(OWNER);
         fs.seal();
@@ -453,7 +454,7 @@ mod tests {
     #[test]
     fn ring_answers_in_order_submitted() -> Result<(), FsError> {
         let bytes = image();
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes)?)?;
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::read(&bytes)?))?;
         let mut buffers = BufferRegistry::<1>::new();
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
         let (mut client, mut driver) = ring.split();
@@ -489,7 +490,7 @@ mod tests {
     #[test]
     fn full_completion_queue_keeps_next() -> Result<(), FsError> {
         let bytes = image();
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes)?)?;
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::read(&bytes)?))?;
         let mut buffers = BufferRegistry::<1>::new();
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 1>::new();
         let (mut client, mut driver) = ring.split();

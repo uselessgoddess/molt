@@ -22,19 +22,19 @@ const HELP: &[u8] = b"commands:\n\
     \x20 cat <name>  print a file\n";
 
 /// A shell holding a session, and nothing else.
-pub struct Shell<'ring, 'registry, 'buffer, const R: usize, const N: usize, const M: usize> {
-    session: Session<'ring, 'registry, 'buffer, R, N, M>,
+pub struct Shell<'i, 'r, 'b, const R: usize, const N: usize, const M: usize> {
+    session: Session<'i, 'r, 'b, R, N, M>,
 }
 
 /// The shell is a cell like any other: it starts from a session, and it comes
 /// back from a restart holding no lease, no handle, and no unanswered request.
 /// Its supervisor revokes what it opened on its behalf, because a cell that has
 /// stopped cannot close anything itself.
-impl<'ring, 'registry, 'buffer, const R: usize, const N: usize, const M: usize> Cell
-    for Shell<'ring, 'registry, 'buffer, R, N, M>
+impl<'i, 'r, 'b, const R: usize, const N: usize, const M: usize> Cell
+    for Shell<'i, 'r, 'b, R, N, M>
 {
     type Error = ShellError;
-    type State = Session<'ring, 'registry, 'buffer, R, N, M>;
+    type State = Session<'i, 'r, 'b, R, N, M>;
 
     fn spawn(session: Self::State) -> Result<Self, ShellError> {
         Ok(Self { session })
@@ -46,9 +46,7 @@ impl<'ring, 'registry, 'buffer, const R: usize, const N: usize, const M: usize> 
     }
 }
 
-impl<'ring, 'registry, 'buffer, const R: usize, const N: usize, const M: usize>
-    Shell<'ring, 'registry, 'buffer, R, N, M>
-{
+impl<'i, 'r, 'b, const R: usize, const N: usize, const M: usize> Shell<'i, 'r, 'b, R, N, M> {
     /// Runs every line of `text`, echoing each one behind a prompt.
     ///
     /// A canned script is how the shell is exercised until a platform reads
@@ -240,21 +238,16 @@ mod tests {
     use std::string::String;
     use std::vec::Vec;
 
-    use molt_block::Loopback;
+    use molt_block::{Loopback, Serial};
     use molt_core::buffer::BufferRegistry;
-    use molt_core::capability::CellId;
     use molt_core::cell::{Cell, RestartHooks, Supervisor};
-    use molt_core::cpu::CpuId;
     use molt_core::registry::Registry;
     use molt_core::ring::IoRing;
-    use molt_core::task;
-    use molt_fs::format::{Tree, build};
+    use molt_core::{CellId, CpuId, task};
+    use molt_fs::format::{self, Tree};
     use molt_fs::{Disconnect, Fs, FsDone, FsError, FsOp, Storage, Teardown};
 
-    use super::Shell;
-    use crate::ShellError;
-    use crate::capture::Capture;
-    use crate::session::Session;
+    use crate::{Capture, Session, Shell, ShellError};
 
     const SERVICE: CellId = CellId::new(2);
     const CLIENT: CellId = CellId::new(7);
@@ -266,7 +259,7 @@ mod tests {
         tree.file("hello.txt", b"hello, molt".to_vec()).unwrap();
         tree.file("note.txt", b"one\ntwo\n".to_vec()).unwrap();
         tree.dir("docs").unwrap().file("readme", b"read me\n".to_vec()).unwrap();
-        build(&tree, 1).unwrap()
+        format::build(&tree, 1).unwrap()
     }
 
     /// Runs `script` against a fresh volume and returns everything printed.
@@ -275,7 +268,7 @@ mod tests {
         let mut scratch = [0u8; WINDOW];
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
 
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap();
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::read(&bytes).unwrap())).unwrap();
         let mut registry = BufferRegistry::<1>::new();
         let scratch = registry.register_read_write(CLIENT, &mut scratch).unwrap();
         let buffers = RefCell::new(registry);
@@ -392,7 +385,7 @@ mod tests {
         let bytes = image();
         let mut scratch = [0u8; WINDOW];
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap();
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::read(&bytes).unwrap())).unwrap();
         let mut registry = BufferRegistry::<1>::new();
         let scratch = registry.register_read_write(CLIENT, &mut scratch).unwrap();
         let buffers = RefCell::new(registry);
@@ -426,7 +419,7 @@ mod tests {
         let bytes = image();
         let mut scratch = [0u8; WINDOW];
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap();
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::read(&bytes).unwrap())).unwrap();
         let mut registry = BufferRegistry::<1>::new();
         let scratch = registry.register_read_write(CLIENT, &mut scratch).unwrap();
         let buffers = RefCell::new(registry);
@@ -452,7 +445,7 @@ mod tests {
         let bytes = image();
         let mut scratch = [0u8; WINDOW];
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap();
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::read(&bytes).unwrap())).unwrap();
         let mut registry = BufferRegistry::<1>::new();
         let scratch = registry.register_read_write(CLIENT, &mut scratch).unwrap();
         let buffers = RefCell::new(registry);
@@ -488,7 +481,7 @@ mod tests {
         let bytes = image();
         let mut scratch = [0u8; WINDOW];
         let mut ring = IoRing::<FsOp, Result<FsDone, FsError>, 4>::new();
-        let mut fs = Fs::<_, 4>::mount(Loopback::new(&bytes).unwrap()).unwrap();
+        let mut fs = Fs::<_, 4>::mount(Serial::new(Loopback::read(&bytes).unwrap())).unwrap();
         let mut registry = BufferRegistry::<1>::new();
         let scratch = registry.register_read_write(CLIENT, &mut scratch).unwrap();
         let buffers = RefCell::new(registry);

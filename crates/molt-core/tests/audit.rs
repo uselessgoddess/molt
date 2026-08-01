@@ -1,5 +1,6 @@
+use molt_core::CellId;
 use molt_core::audit::{Action, Event, Log};
-use molt_core::capability::{CellId, Rights};
+use molt_core::capability::Rights;
 
 fn grant(owner: u32) -> Event {
     Event::grant(CellId::new(owner), owner, Rights::READ)

@@ -24,6 +24,8 @@ mod console;
 mod session;
 mod shell;
 
+#[cfg(test)]
+use crate::capture::Capture;
 pub use crate::console::Console;
 pub use crate::session::Session;
 pub use crate::shell::{PROMPT, Shell};

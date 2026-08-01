@@ -13,41 +13,41 @@ pub struct Loopback<'i> {
 }
 
 enum Image<'i> {
-    ReadOnly(&'i [u8]),
-    Writable(&'i mut [u8]),
+    Read(&'i [u8]),
+    Write(&'i mut [u8]),
 }
 
 impl Image<'_> {
     fn bytes(&self) -> &[u8] {
         match self {
-            Self::ReadOnly(bytes) => bytes,
-            Self::Writable(bytes) => bytes,
+            Self::Read(bytes) => bytes,
+            Self::Write(bytes) => bytes,
         }
     }
 
     fn bytes_mut(&mut self) -> Result<&mut [u8], BlockError> {
         match self {
-            Self::ReadOnly(_) => Err(BlockError::ReadOnly),
-            Self::Writable(bytes) => Ok(bytes),
+            Self::Read(_) => Err(BlockError::ReadOnly),
+            Self::Write(bytes) => Ok(bytes),
         }
     }
 }
 
 impl<'i> Loopback<'i> {
     /// Wraps `image`, which must be a whole number of sectors.
-    pub fn new(image: &'i [u8]) -> Result<Self, BlockError> {
+    pub fn read(image: &'i [u8]) -> Result<Self, BlockError> {
         if image.len() % SECTOR != 0 {
             return Err(BlockError::Unaligned);
         }
-        Ok(Self { image: Image::ReadOnly(image) })
+        Ok(Self { image: Image::Read(image) })
     }
 
     /// Wraps mutable storage, which must be a whole number of sectors.
-    pub fn writable(image: &'i mut [u8]) -> Result<Self, BlockError> {
+    pub fn write(image: &'i mut [u8]) -> Result<Self, BlockError> {
         if image.len() % SECTOR != 0 {
             return Err(BlockError::Unaligned);
         }
-        Ok(Self { image: Image::Writable(image) })
+        Ok(Self { image: Image::Write(image) })
     }
 }
 
@@ -87,7 +87,7 @@ mod tests {
         let mut image = [0u8; 2 * SECTOR];
         image[SECTOR] = 0xa5;
 
-        let mut device = Loopback::new(&image)?;
+        let mut device = Loopback::read(&image)?;
         let mut sector = [0u8; SECTOR];
         device.read(1, &mut sector)?;
 
@@ -99,14 +99,14 @@ mod tests {
     fn sectors_count_image_length() -> Result<(), BlockError> {
         let image = [0u8; 4 * SECTOR];
 
-        assert_eq!(Loopback::new(&image)?.sectors(), 4);
+        assert_eq!(Loopback::read(&image)?.sectors(), 4);
         Ok(())
     }
 
     #[test]
     fn read_past_end_refused() -> Result<(), BlockError> {
         let image = [0u8; SECTOR];
-        let mut device = Loopback::new(&image)?;
+        let mut device = Loopback::read(&image)?;
 
         assert_eq!(device.read(1, &mut [0; SECTOR]), Err(BlockError::Range));
         Ok(())
@@ -121,7 +121,7 @@ mod tests {
         }
 
         let image = [0xa5u8; SECTOR];
-        let mut device = Loopback::new(&image)?;
+        let mut device = Loopback::read(&image)?;
 
         assert_eq!(first_sector(&mut device), image);
         assert_eq!(device.sectors(), 1, "lending it back does not consume it");
@@ -130,14 +130,14 @@ mod tests {
 
     #[test]
     fn partial_image_refused() {
-        assert!(matches!(Loopback::new(&[0; SECTOR + 1]), Err(BlockError::Unaligned)));
+        assert!(matches!(Loopback::read(&[0; SECTOR + 1]), Err(BlockError::Unaligned)));
     }
 
     #[test]
     fn sector_write_survives_flush() -> Result<(), BlockError> {
         let mut image = [0u8; 2 * SECTOR];
         let written = [0xa5; SECTOR];
-        let mut device = Loopback::writable(&mut image)?;
+        let mut device = Loopback::write(&mut image)?;
 
         device.write(1, &written)?;
         device.flush()?;

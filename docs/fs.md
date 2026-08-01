@@ -58,19 +58,21 @@ The brief was btrfs's ideas without btrfs's legacy, leaning bcachefs. The ideas
 arrive here in the cheapest form that is still the real thing.
 
 **Checksums that cover data, not just metadata.** Every data block carries a
-crc32c in a region of its own, and every metadata region carries one in the
-superblock. This is bcachefs's position — checksums are not optional and not a
-mount flag — and it is why [`Volume::mount`](../crates/molt-fs/src/volume.rs)
-verifies all six regions before the first lookup rather than discovering
-corruption at whatever block a directory search happens to land on. A volume
-that mounts is a volume whose metadata is intact, which is a much stronger
-statement than "the superblock parsed".
+crc32c, and every metadata region carries one in the superblock. This is
+bcachefs's position — checksums are not optional and not a mount flag — and it
+is why [`Volume::mount`](../crates/molt-fs/src/volume.rs) verifies all five
+regions before the first lookup rather than discovering corruption at whatever
+block a directory search happens to land on. A volume that mounts is a volume
+whose metadata is intact, which is a much stronger statement than "the
+superblock parsed".
 
-The sums live in their own region rather than beside the blocks they cover.
-That costs a second block read per data block — or did, until `Volume` had
-enough slots to keep the sums block resident while the file it covers streams
-past — and it buys a scrub that walks one contiguous region instead of seeking
-across the volume, the Stage 4 item this leaves room for.
+The sums travel with the extents, as bcachefs's do, rather than in a region of
+their own: locating a block is already learning what it must hash to, so the
+check costs nothing beyond the record the read had to fetch anyway. A region
+apart cost a second lookup per block, which slots hid only while a file was
+streaming. The run is bounded at twelve blocks because that is how many sums a
+64-byte record holds, and a sum per block is what keeps a read of one block
+from hashing the run around it.
 
 **A generation in the superblock, and a checkpoint that swings it.** Below.
 
@@ -81,7 +83,8 @@ tree with three key spaces:
 
 - `Object(id)` maps to current kind, entry count, and file size;
 - `Dirent(parent, name)` maps a directory leaf name to an object id;
-- `Write(object, cursor)` maps a file update to its journal payload.
+- `Extent(object, end)` maps a byte range of a file to the journal payload
+  holding it.
 
 This is the same useful boundary at smaller scale: namespace and object queries
 are tree lookups rather than mutation-log scans, while file payloads remain in
@@ -89,8 +92,20 @@ the bounded log until extent allocation and compaction arrive. See bcachefs's
 [architecture overview](https://bcachefs.org/) and
 [transaction design](https://bcachefs.org/Transactions/).
 
-**Extents, not block pointers.** A file is a run of `(logical, blocks, block)`
-records, sorted by logical block and binary-searched. Contiguous data costs one
+An extent key holds the byte *past* its last, not the byte it starts at, so one
+descent lands on the first extent that can reach into a read and everything the
+window needs follows it in order — a read costs the tree's height, not the
+number of writes the file has taken. That works only while the extents of a file
+do not overlap, which is what the write path buys with a trim: a range the new
+write covers is cut out of whatever was already there, keeping the piece to the
+left under a new key and the piece to the right under its old one. An extent
+swallowed whole leaves a whiteout, a zero-length record, because the tree is
+copy-on-write and has no `remove`; bcachefs does the same, and a walk skips
+whiteouts rather than stopping at one.
+
+**Extents, not block pointers.** A file is a run of
+`(logical, blocks, block, sums)` records, sorted by logical block and
+binary-searched. Contiguous data costs one
 record however long it is, a logical block no extent covers is a hole that reads
 as zeros, and `xtask mkfs` drops every all-zero block on the floor — so a sparse
 file costs its content, not its length. Extents are also the only structure here
@@ -110,7 +125,7 @@ What was deliberately *not* taken:
 
 ## The base format
 
-Six regions, two superblocks, all little-endian, everything block-addressed.
+Five regions, two superblocks, all little-endian, everything block-addressed.
 [`layout.rs`](../crates/molt-fs/src/layout.rs) is the definition; both the
 reader and `xtask mkfs` compile against it, so there is no second copy of the
 format to drift.
@@ -119,10 +134,9 @@ format to drift.
 block 0   superblock copy 0
 block 1   superblock copy 1
           objects   one 32-byte record per object, indexed by id
-          extents   16-byte runs, sorted by logical block within a file
+          extents   64-byte runs with their sums, sorted by logical block
           entries   16-byte directory entries, sorted by name within a directory
           names     the byte arena every entry's name points into
-          sums      one crc32c per data block
           data      the blocks extents address
           tree      fixed arena of checksummed 4096-byte COW nodes
           log 0     active, previous, or free checkpoint bank
@@ -163,8 +177,10 @@ The base image remains immutable. `Journal` appends two typed payload records:
 
 - `Create(object, parent, kind, name)` allocates the next object id and adds one
   directory entry.
-- `Write(object, offset, bytes)` overlays file data. Later records win, and a
-  write beyond end creates a zero-filled hole.
+- `Write(object, offset, bytes)` carries file data. The extent keys pointing at
+  it decide what a read sees, so a later write wins by trimming the extents it
+  lands on rather than by sitting after them in the log; a write beyond end
+  creates a zero-filled hole.
 
 Records start on 512-byte sector boundaries. One sector write can therefore
 tear only the record being appended, never an earlier record. The active
@@ -180,7 +196,7 @@ superblock. `Journal::sync` publishes that root only after the nodes and log
 have passed a durability barrier.
 
 The tree API is deliberately small: exact lookup, ordered successor, insert,
-and transaction root. Filesystem code builds object, directory, and write keys
+and transaction root. Filesystem code builds object, directory, and extent keys
 on top rather than teaching the tree about files. Nodes, the path a mutation
 walks, and the split scratch live on the heap — see [the stack budget](#the-stack-budget)
 for what that replaced.
@@ -274,6 +290,17 @@ is the proof it is handled rather than merely typed — it replaces the global
 allocator with one that refuses large allocations on the calling thread, and
 shows a mount answering `FsError::Memory` and a refused create rolling back to
 its snapshot while the journal keeps taking work.
+
+A mutation allocates that path once. It retires a block for every block it
+writes, and what the retired one parsed to is dead the moment it is: the cache
+hands the node back — when a write displaces its entry, or when `release`
+returns the block to the arena — and `Spare` keeps up to `MAX_HEIGHT + 1` of
+those allocations, zeroing one in place when the next node is asked for.
+`crates/molt-fs/tests/cost.rs` counts what an operation asks the allocator for
+rather than timing it: a read costs nothing at all, a write costs nothing of a
+block's size, and what is left of a write is the bitmaps its transaction opens
+with. Without the pool the same test measures 709 block-sized allocations over
+64 writes.
 
 ## Crash consistency
 
@@ -550,19 +577,69 @@ pub enum BlockOp {
   lifetime, and there is nothing for the device to alias while the submitter is
   somewhere else. That is the part `&mut [u8]` in a trait cannot do once the
   read outlives the call.
-- **Answers come back in submission order.** `BlockClient::take` walks past the
-  ones it is not waiting for and parks them; a ring `N` deep parks at most
-  `N - 1`, so a caller awaiting the read it needs never loses the readahead it
-  does not. Order is also what keeps the crash tests meaningful — the driver
-  runs the queue one submission at a time, so a flush still separates
-  durability epochs.
+- **Answers come back in whatever order the device finished them.**
+  `BlockClient::take` walks past the ones it is not waiting for and parks them;
+  a ring `N` deep parks at most `N - 1`, so a caller awaiting the read it needs
+  never loses the readahead it does not. The one order that matters is stated
+  rather than assumed, and it is the flush below.
 - **`Backing` is the bottom.** It owns the driver end and the device, and `run`
-  is `drive(future, || driver.pump(device))`: poll the task, serve what it
+  is `drive(future, || driver.pump(queue))`: poll the task, serve what it
   queued, repeat. Awaiting stops there, because something has to move sectors.
 
 `bytes` is on the operation because a checkpoint writes one sector out of a
 4 KiB buffer and a data read fills all eight; making the ring speak blocks would
 have meant a second path for the superblock.
+
+**A queue below the ring.** The ring let eight reads be outstanding above the
+driver, and the driver then ran them one at a time, because a `Disk` answers one
+call before it hears the next. That is a device kept at a queue depth of one no
+matter how much the filesystem asks for, and it is the difference between a
+device working on four requests and a device idle for three of them. `Queue` is
+the depth stated where the device is:
+
+```rust
+pub trait Queue {
+    fn sectors(&self) -> u64;
+    fn depth(&self) -> usize;
+    fn start(&mut self, id: RequestId, op: BlockOp) -> Result<(), BlockOp>;
+    fn reap(&mut self) -> Option<(RequestId, BlockDone)>;
+}
+```
+
+- **`start` and `reap` are separate because in flight is a state.** A request
+  the device has taken and not answered is neither submitted nor complete, and
+  the trait that returns an answer from the call it was asked in has nowhere to
+  put it. `depth` is how many of those the device holds, and the driver fills to
+  it: `pump` drains what finished, feeds what fits, and repeats until neither
+  moves.
+- **The id travels down, not just the buffer.** A device that answers out of
+  order has to say what it is answering, and `RequestId` is what the ring
+  already routes by, so a driver with several descriptors outstanding maps them
+  to ids instead of to the one command in progress.
+- **A flush runs alone.** The journal's crash consistency is an ordering claim —
+  these writes are durable before that superblock — and a device free to reorder
+  would break it. So the driver holds a flush until everything outstanding has
+  answered and starts nothing beside it, which makes the boundary explicit
+  instead of a side effect of a depth of one.
+- **`Serial<D>` is `Queued<D, 1>`.** Any blocking `Disk` becomes a queue of a
+  depth the caller picks: the slots are a const-generic array in the struct, so
+  nothing allocates, and `Serial::new(device)` is what every mount that has no
+  real queue underneath writes. A driver whose hardware queues for itself
+  implements `Queue` and skips the adapter.
+
+`Queued` answers newest first on purpose. A host device that returns things in
+the order they were asked would let an ordering bug live in the tree until real
+hardware found it; the one that reorders is the one worth testing against, and
+`tests/reads.rs` mounts over a device eight deep to assert the fetch counts hold
+either way.
+
+**What the depth is worth.** `Loopback` has no flight time to hide, so the same
+test file attaches a `Slow` queue that holds every answer for sixteen turns and
+counts the turns the driver spends waiting. Streaming 256 KiB through a 4 KiB
+window costs **1792 turns at depth one and 847 at depth eight** — 2.1× — and
+that is with readahead three blocks ahead, which is what the volume asks for
+today. The number is a count rather than a clock, so it is the same on every
+machine and it fails when the depth stops reaching the device.
 
 ## Slots, readahead, and what the ring cost
 
@@ -580,7 +657,7 @@ caller goes next. Being a guess is what shapes the rest: it stops at the end of
 the run, because the block after a hole is not a block, and it declines when
 there is no free slot rather than waiting for one.
 
-**A region walk spends every slot.** Mount verifies six regions, and a commit
+**A region walk spends every slot.** Mount verifies five regions, and a commit
 sums what it wrote; both walk a range in order. `sweep` keeps starting reads on
 free slots ahead of the block it is handing over, and releases each block as it
 is taken: a walk reads a region through, and nothing behind it is coming back.
@@ -749,20 +826,20 @@ line editor away and needs a serial `read` before it is worth writing.
 - **No data cache.** Metadata nodes are cached; `Volume` keeps eight block
   buffers and nothing beyond them. That is enough for a directory search to
   re-read a block only when the binary search moves off every slot, and for the
-  sums block covering a file to stay resident while the file streams past it —
+  extent record covering a run to stay resident while that run streams past —
   and it is a window, not a cache: it holds what one mount is doing now, and
   forgets it when the slot is worth more. A cache that outlives the operation is
   the page cache below, which needs the writeback policy this stage does not
   have.
-- **No scrub.** The sums region exists and is checked per block on read; walking
-  it deliberately is a Stage 4 item, and the region layout is what makes it
-  cheap when it comes.
-- **The depth stops at the driver.** `Volume` holds eight reads in flight over
-  a ring twice that deep, but `Backing` serves them one at a time and
-  `Device::read` blocks until its interrupt, so readahead queues at the ring and
-  not at the device. Moving it further down is the virtio half of the same
-  change — several descriptors outstanding, and a used entry routed by request
-  id rather than by the one command in progress.
+- **No scrub.** Sums are checked per block on read; walking every extent
+  deliberately is a Stage 4 item, and the extent region is the work list it
+  will walk.
+- **The depth stops at virtio.** `Backing` hands the device as many requests as
+  its `Queue` takes, so nothing above the driver limits what is in flight any
+  more — but `molt_virtio::Block` is still one command at a time behind a
+  `Serial`, which is a queue of depth one. The depth becomes real when the
+  driver keeps several descriptors outstanding and routes a used entry by
+  request id rather than by the one command in progress.
 - **One operation at a time above the ring.** `Fs::on` drives an `FsOp` to its
   answer before taking the next, so the concurrency the block ring buys is
   between the reads of a single operation. Overlapping two clients' requests
@@ -774,9 +851,10 @@ line editor away and needs a serial `read` before it is worth writing.
   accident. Stage 4 gives the block layer its own concurrency story, and the
   shape that survives it is a filesystem *cell* other cores talk to by ring,
   which is why the service exists now and the locks do not.
-- **crc32c uses a software fallback.** No `SSE4.2` or `Zbc` path. It is 75 lines and
-  the disk it runs against is a boot-time image; the moment it shows up in a
-  profile, the intrinsic is a one-file change.
+- **No `Zbc` crc32c.** x86_64 folds through the `crc32` instruction and
+  everything else through the table, which is 15× the bit-at-a-time loop it
+  replaced and enough that riscv64 is not the machine the checksum is measured
+  on. The Zbc path is the same one-file change the x86_64 one was.
 
 ## How it is tested
 
@@ -889,18 +967,21 @@ the types.
 
 ## Version and growth path
 
-Writable COW layout is version 3. Adding the tree arena and root changes bytes
-and geometry an older reader interprets. There is no published standard yet,
-but that is a reason to keep migration policy small, not to label incompatible
-layouts with the same version. Version 1 and 2 images are rejected rather than
-guessed at; `xtask mkfs` rebuilds development images as version 3.
+Extents carrying their own sums are version 4. Every layout change so far has
+moved bytes and geometry an older reader interprets — the tree arena and root in
+version 3, the wider extent record and the region that stopped existing here.
+There is no published standard yet, but that is a reason to keep migration
+policy small, not to label incompatible layouts with the same version. Older
+images are rejected rather than guessed at; `xtask mkfs` rebuilds development
+images as version 4. Tree nodes carry their own magic and version, `MOLTBTR4`,
+because a node written under the old write keys parses cleanly under the extent
+ones and would answer reads with the wrong bytes.
 
 - **Stage 4.4, asynchronous I/O.** Done: `Volume` and `Journal` are `async` over
   a `BlockOp` ring, with readahead and region sweeps above it.
 - **Stage 4, scale.** File payloads compact from the journal into extent keys;
   reference counts and bucket generations generalize the bounded tree arena;
-  sums become a scrub work list; the block layer gains a data cache and a driver
-  that keeps more than one request at the device, both behind the same traits.
+  extents become a scrub work list; the block layer gains a data cache.
 - **Stage 5, storage for cells.** A signed cell image is a file with a signature
   region, and the loader is a client of this protocol — which is the argument
   for the protocol being pleasant to write against, since a loader is the next

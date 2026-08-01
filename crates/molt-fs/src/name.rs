@@ -2,31 +2,32 @@
 //!
 //! An operation crossing a ring cannot hold a borrow, and registering a buffer
 //! for every path is more ceremony than a name is worth, so a name is a fixed
-//! [`MAX_NAME`] bytes and travels in the operation itself.
+//! [`layout::MAX_NAME`] bytes and travels in the operation itself.
 
 use core::fmt;
 
-use crate::FsError;
-use crate::layout::MAX_NAME;
+use crate::{FsError, layout};
 
 /// A bounded, inline entry name.
 #[derive(Clone, Copy, Eq)]
 pub struct Name {
-    bytes: [u8; MAX_NAME],
+    bytes: [u8; Self::MAX],
     len: u8,
 }
 
 impl Name {
-    /// Copies `bytes`, which must be no longer than [`MAX_NAME`] and must not
+    pub const MAX: usize = layout::MAX_NAME;
+
+    /// Copies `bytes`, which must be no longer than [`Self::MAX`] and must not
     /// contain a path separator or a null.
     pub fn new(bytes: &[u8]) -> Result<Self, FsError> {
-        if bytes.is_empty() || bytes.len() > MAX_NAME {
+        if bytes.is_empty() || bytes.len() > Self::MAX {
             return Err(FsError::Name);
         }
         if bytes.iter().any(|&byte| byte == b'/' || byte == 0) {
             return Err(FsError::Name);
         }
-        let mut name = Self { bytes: [0; MAX_NAME], len: bytes.len() as u8 };
+        let mut name = Self { bytes: [0; Self::MAX], len: bytes.len() as u8 };
         name.bytes[..bytes.len()].copy_from_slice(bytes);
         Ok(name)
     }

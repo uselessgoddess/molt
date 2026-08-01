@@ -20,8 +20,8 @@
 //! learns the name without the core would have to ask somebody else where to
 //! send — which is the shared table this design is spent avoiding.
 
-use crate::capability::{Capability, CapabilityError, CapabilityRights, CapabilityTable, CellId};
-use crate::cpu::CpuId;
+use crate::capability::{Capability, CapabilityError, CapabilityRights, CapabilityTable};
+use crate::{CellId, CpuId};
 
 /// A kind of service, named by a type rather than by a path.
 ///

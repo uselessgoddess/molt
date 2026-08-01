@@ -2,7 +2,7 @@
 
 use std::hint::black_box;
 
-use molt_block::{Backing, Disk, Loopback};
+use molt_block::{Backing, Disk, Loopback, Serial};
 use molt_fs::format::{self, Tree};
 use molt_fs::{DEPTH, FsError, Journal, Kind, Name, attach};
 
@@ -23,8 +23,8 @@ fn name(index: usize) -> Name {
     Name::try_from(format!("file-{index:02}").as_str()).unwrap()
 }
 
-fn mount<D: Disk>(device: D) -> Result<(Journal, Backing<D, DEPTH>), FsError> {
-    let (blocks, mut backing) = attach(device)?;
+fn mount<D: Disk>(device: D) -> Result<(Journal, Backing<Serial<D>, DEPTH>), FsError> {
+    let (blocks, mut backing) = attach(Serial::new(device))?;
     let journal = backing.run(Journal::mount(blocks))?;
     Ok((journal, backing))
 }
@@ -53,7 +53,7 @@ fn mount_fits_kernel_stack() -> Result<(), FsError> {
     let bytes = image();
 
     let base = paint();
-    let mounted = mount(Loopback::new(&bytes)?).is_ok();
+    let mounted = mount(Loopback::read(&bytes)?).is_ok();
     let spent = depth(base);
 
     assert!(mounted, "image did not mount");
@@ -64,7 +64,7 @@ fn mount_fits_kernel_stack() -> Result<(), FsError> {
 #[test]
 fn commit_fits_kernel_stack() -> Result<(), FsError> {
     let mut bytes = image();
-    let (mut journal, mut backing) = mount(Loopback::writable(&mut bytes)?)?;
+    let (mut journal, mut backing) = mount(Loopback::write(&mut bytes)?)?;
     let root = journal.root();
     // A tree deep enough that one more key rewrites a root-to-leaf path.
     backing.run(async {

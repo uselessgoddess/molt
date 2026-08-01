@@ -1,5 +1,5 @@
+use molt_core::CellId;
 use molt_core::buffer::{BufferOperation, BufferRegistry};
-use molt_core::capability::CellId;
 use molt_core::ring::{IoRing, RequestId, Submission};
 use molt_net::arp::{Operation, Packet as Arp};
 use molt_net::eth::{EtherType, Frame};

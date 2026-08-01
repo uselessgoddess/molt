@@ -21,3 +21,6 @@ pub mod ring;
 pub(crate) mod sync;
 pub mod task;
 pub mod waker;
+
+pub use cell::CellId;
+pub use cpu::CpuId;

@@ -1,7 +1,8 @@
 //! A capability-addressed TCP service over an Ethernet link.
 
+use molt_core::CellId;
 use molt_core::buffer::{BufferOperation, BufferRegistry};
-use molt_core::capability::{Capability, CapabilityTable, CellId, Read, Write};
+use molt_core::capability::{Capability, CapabilityTable, Read, Write};
 use molt_core::ring::{Completion, IoDriver, RequestId};
 use molt_net::{Config, IpAddr, Link};
 use smoltcp::iface::{Config as Interfaced, Interface, SocketHandle, SocketSet, SocketStorage};

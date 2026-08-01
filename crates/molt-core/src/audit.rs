@@ -6,7 +6,8 @@
 //! is that trace. It lives in a fixed ring so a busy cell cannot exhaust it, and
 //! counts what it overwrote so a full log reads as lossy rather than short.
 
-use crate::capability::{CellId, Rights};
+use crate::CellId;
+use crate::capability::Rights;
 
 /// Which authority change an [`Event`] records.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

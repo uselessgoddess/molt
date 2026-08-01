@@ -2,7 +2,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::ptr;
 
-use molt_block::{Backing, Disk, Loopback};
+use molt_block::{Backing, Disk, Loopback, Serial};
 use molt_fs::format::{self, Tree};
 use molt_fs::{DEPTH, FsError, Journal, Kind, Name, attach};
 
@@ -49,8 +49,8 @@ fn name(text: &str) -> Name {
     Name::try_from(text).unwrap()
 }
 
-fn mount<D: Disk>(device: D) -> Result<(Journal, Backing<D, DEPTH>), FsError> {
-    let (blocks, mut backing) = attach(device)?;
+fn mount<D: Disk>(device: D) -> Result<(Journal, Backing<Serial<D>, DEPTH>), FsError> {
+    let (blocks, mut backing) = attach(Serial::new(device))?;
     let journal = backing.run(Journal::mount(blocks))?;
     Ok((journal, backing))
 }
@@ -59,10 +59,10 @@ fn mount<D: Disk>(device: D) -> Result<(Journal, Backing<D, DEPTH>), FsError> {
 fn mount_refused_without_buffer() -> Result<(), FsError> {
     let bytes = image();
 
-    let mounted = starved(|| mount(Loopback::new(&bytes)?));
+    let mounted = starved(|| mount(Loopback::read(&bytes)?));
 
     assert_eq!(mounted.err(), Some(FsError::Memory));
-    assert!(mount(Loopback::new(&bytes)?).is_ok(), "heap came back and mount did not");
+    assert!(mount(Loopback::read(&bytes)?).is_ok(), "heap came back and mount did not");
     Ok(())
 }
 
@@ -70,7 +70,7 @@ fn mount_refused_without_buffer() -> Result<(), FsError> {
 fn refused_node_rolls_back() -> Result<(), FsError> {
     let mut bytes = image();
     {
-        let (mut journal, mut backing) = mount(Loopback::writable(&mut bytes)?)?;
+        let (mut journal, mut backing) = mount(Loopback::write(&mut bytes)?)?;
         let root = journal.root();
         backing.run(async {
             journal.create(root, name("kept"), Kind::File).await?;
@@ -87,7 +87,7 @@ fn refused_node_rolls_back() -> Result<(), FsError> {
             journal.sync().await
         })?;
     }
-    let (mut journal, mut backing) = mount(Loopback::new(&bytes)?)?;
+    let (mut journal, mut backing) = mount(Loopback::read(&bytes)?)?;
     let root = journal.root();
 
     backing.run(async {

@@ -1,7 +1,6 @@
+use molt_core::CellId;
 use molt_core::audit::{Action, Event, Log};
-use molt_core::capability::{
-    CapabilityError, CapabilityTable, CellId, Read, ReadWrite, Rights, Write,
-};
+use molt_core::capability::{CapabilityError, CapabilityTable, Read, ReadWrite, Rights, Write};
 
 #[derive(Debug, Eq, PartialEq)]
 struct Buffer(u32);

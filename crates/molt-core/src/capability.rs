@@ -2,8 +2,8 @@
 
 use core::marker::PhantomData;
 
+use crate::CellId;
 use crate::audit::{Audit, Event};
-pub use crate::cell::CellId;
 
 /// Runtime rights stored beside a resource in the supervisor-owned table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

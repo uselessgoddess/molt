@@ -3,8 +3,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use molt_core::buffer::{BufferOperation, BufferRegistry};
-use molt_core::capability::CellId;
-use molt_core::cell::Cell;
+use molt_core::cell::{Cell, CellId};
 use molt_core::ring::{IoDriver, IoRing, RequestId, Submission};
 use molt_net::{Config, IpAddr, Ipv4Addr, Link, LinkError, MacAddr};
 use molt_tcp::{Endpoint, SocketStorage, Tcp, TcpCell, TcpDone, TcpError, TcpOp, TcpState};

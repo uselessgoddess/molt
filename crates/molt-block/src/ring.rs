@@ -10,6 +10,10 @@
 //! Buffers travel with the operation. A submitted read hands its buffer over
 //! and gets it back on the completion, so there is nothing for the device to
 //! alias and no lifetime for a queue to carry.
+//!
+//! The depth does not stop here either: the driver holds as many requests at
+//! the [`Queue`] as the device takes, so the ring being full is the only thing
+//! that ever limits how much is in flight.
 
 use alloc::boxed::Box;
 use alloc::rc::Rc;
@@ -18,7 +22,7 @@ use core::alloc::AllocError;
 use molt_core::ring::{Completion, HeldClient, HeldDriver, IoRing, RequestId, Submission};
 use molt_core::task;
 
-use crate::{BlockError, Disk, SECTOR};
+use crate::{BlockError, Queue, SECTOR};
 
 /// A block is 4 KiB, the unit every buffer on the ring is sized in.
 pub const BLOCK: usize = 4096;
@@ -53,7 +57,7 @@ pub fn channel<const N: usize>() -> Result<(BlockClient<N>, BlockDriver<N>), All
     let (client, driver) = IoRing::held(Rc::try_new(IoRing::new())?);
     Ok((
         BlockClient { ring: client, parked: Box::try_new([const { None }; N])?, next: 0 },
-        BlockDriver { ring: driver, pending: None },
+        BlockDriver { ring: driver, pending: None, held: None, outstanding: 0, barrier: false },
     ))
 }
 
@@ -80,10 +84,10 @@ impl<const N: usize> BlockClient<N> {
 
     /// Takes `id`'s answer if it has landed, keeping the ones it passes.
     ///
-    /// Completions arrive in submission order, so a caller awaiting the read it
-    /// needs walks past the readahead it does not. Those are parked rather than
-    /// dropped: `N` requests can be in flight and one of them is `id`, so the
-    /// rest always fit.
+    /// A device answers in whatever order it finished, and a caller awaiting
+    /// the read it needs walks past the readahead it does not. Those are parked
+    /// rather than dropped: `N` requests can be in flight and one of them is
+    /// `id`, so the rest always fit.
     pub fn take(&mut self, id: RequestId) -> Option<BlockDone> {
         let held =
             |slot: &Option<Completion<BlockDone>>| slot.as_ref().is_some_and(|c| c.id() == id);
@@ -127,80 +131,109 @@ impl<const N: usize> BlockClient<N> {
 pub struct BlockDriver<const N: usize> {
     ring: HeldDriver<Rc<IoRing<BlockOp, BlockDone, N>>>,
     pending: Option<Completion<BlockDone>>,
+    held: Option<(RequestId, BlockOp)>,
+    outstanding: usize,
+    barrier: bool,
 }
 
 impl<const N: usize> BlockDriver<N> {
-    /// Runs every queued submission against `disk`, returning how many.
-    ///
-    /// An answer that does not fit is held until the client has taken enough
-    /// for it to, which cannot happen while at most `N` are in flight — it is
-    /// here so a client that stops taking blocks the driver rather than losing
-    /// what it asked for.
-    pub fn pump<D: Disk>(&mut self, disk: &mut D) -> usize {
+    /// Keeps `queue` as full as its depth allows, returning answers served.
+    pub fn pump<Q: Queue>(&mut self, queue: &mut Q) -> usize {
         let mut served = 0;
         loop {
-            if let Some(completion) = self.pending.take()
-                && let Err(refused) = self.ring.try_complete(completion)
-            {
-                self.pending = Some(refused);
+            let drained = self.drain(queue, &mut served);
+            if !self.feed(queue) && !drained {
                 return served;
             }
-            let Some(submission) = self.ring.try_next() else { return served };
-            let (id, op) = (submission.id(), submission.into_operation());
-            let done = act(disk, op);
-            self.pending = self.ring.try_complete(Completion::new(id, done)).err();
-            served += 1;
         }
+    }
+
+    /// Hands finished requests back to the client; false if it moved none.
+    fn drain<Q: Queue>(&mut self, queue: &mut Q, served: &mut usize) -> bool {
+        let mut moved = false;
+        loop {
+            if let Some(completion) = self.pending.take() {
+                if let Err(refused) = self.ring.try_complete(completion) {
+                    self.pending = Some(refused);
+                    return moved;
+                }
+                *served += 1;
+                moved = true;
+            }
+            let Some((id, done)) = queue.reap() else { return moved };
+            self.outstanding -= 1;
+            if self.outstanding == 0 {
+                self.barrier = false;
+            }
+            self.pending = Some(Completion::new(id, done));
+        }
+    }
+
+    /// Starts what the device has room for; false if it started none.
+    fn feed<Q: Queue>(&mut self, queue: &mut Q) -> bool {
+        let mut moved = false;
+        while !self.barrier && self.outstanding < queue.depth() {
+            let taken = self.held.take().or_else(|| {
+                self.ring
+                    .try_next()
+                    .map(|submission| (submission.id(), submission.into_operation()))
+            });
+            let Some((id, op)) = taken else { return moved };
+            // A flush is the boundary a journal commits across, so it runs on a
+            // device with nothing else on it: everything before it has landed,
+            // and nothing after it starts until it answers.
+            let flush = matches!(op, BlockOp::Flush);
+            if flush && self.outstanding > 0 {
+                self.held = Some((id, op));
+                return moved;
+            }
+            if let Err(refused) = queue.start(id, op) {
+                self.held = Some((id, refused));
+                return moved;
+            }
+            self.outstanding += 1;
+            self.barrier = flush;
+            moved = true;
+        }
+        moved
     }
 }
 
-/// A driver and the device it answers from: the bottom of a block ring, where
+/// A driver and the queue it answers from: the bottom of a block ring, where
 /// awaiting stops and something has to actually move the sectors.
-pub struct Backing<D, const N: usize> {
+pub struct Backing<Q, const N: usize> {
     driver: BlockDriver<N>,
-    device: D,
+    queue: Q,
 }
 
-impl<D: Disk, const N: usize> Backing<D, N> {
-    pub const fn new(driver: BlockDriver<N>, device: D) -> Self {
-        Self { driver, device }
+impl<Q: Queue, const N: usize> Backing<Q, N> {
+    pub const fn new(driver: BlockDriver<N>, queue: Q) -> Self {
+        Self { driver, queue }
     }
 
     /// Polls `future` to completion, serving the ring between polls.
     pub fn run<F: Future>(&mut self, future: F) -> F::Output {
-        let Self { driver, device } = self;
+        let Self { driver, queue } = self;
         task::drive(future, || {
-            driver.pump(device);
+            driver.pump(queue);
         })
     }
-}
 
-fn act<D: Disk>(disk: &mut D, op: BlockOp) -> BlockDone {
-    match op {
-        BlockOp::Read { sector, bytes, mut buffer } => {
-            let result = match buffer.get_mut(..bytes) {
-                Some(buf) => disk.read(sector, buf),
-                None => Err(BlockError::Range),
-            };
-            BlockDone { result, buffer: Some(buffer) }
-        }
-        BlockOp::Write { sector, bytes, buffer } => {
-            let result = match buffer.get(..bytes) {
-                Some(buf) => disk.write(sector, buf),
-                None => Err(BlockError::Range),
-            };
-            BlockDone { result, buffer: Some(buffer) }
-        }
-        BlockOp::Flush => BlockDone { result: disk.flush(), buffer: None },
+    /// The queue underneath, for whoever handed it over.
+    pub const fn queue(&mut self) -> &mut Q {
+        &mut self.queue
     }
 }
 
 #[cfg(test)]
 mod tests {
     use alloc::boxed::Box;
+    use core::{array, iter};
 
     use super::{BLOCK, Backing, BlockOp, Buffer, channel};
-    use crate::{BlockError, Loopback, SECTOR};
+    use crate::{BlockError, Loopback, Queue, Queued, SECTOR, Serial};
+
+    const SECTORS: u64 = (BLOCK / SECTOR) as u64;
 
     fn buffer() -> Buffer {
         Box::new([0; BLOCK])
@@ -210,11 +243,15 @@ mod tests {
         BlockOp::Read { sector, bytes: BLOCK, buffer: buffer() }
     }
 
+    fn serial(bytes: &[u8]) -> Result<Serial<Loopback<'_>>, BlockError> {
+        Ok(Serial::new(Loopback::read(bytes)?))
+    }
+
     #[test]
     fn read_lands_through_ring() -> Result<(), BlockError> {
         let bytes = [0xa5; 2 * BLOCK];
         let (mut client, driver) = channel::<4>().unwrap();
-        let mut backing = Backing::new(driver, Loopback::new(&bytes)?);
+        let mut backing = Backing::new(driver, serial(&bytes)?);
 
         let done = backing.run(client.once(read(0)));
 
@@ -228,7 +265,7 @@ mod tests {
         let mut bytes = [0; 2 * BLOCK];
         bytes[BLOCK] = 7;
         let (mut client, driver) = channel::<4>().unwrap();
-        let mut backing = Backing::new(driver, Loopback::new(&bytes)?);
+        let mut backing = Backing::new(driver, serial(&bytes)?);
 
         let first = client.submit(read(0)).ok().unwrap();
         let second = client.submit(read((BLOCK / SECTOR) as u64)).ok().unwrap();
@@ -245,7 +282,7 @@ mod tests {
     fn full_ring_waits_for_driver() -> Result<(), BlockError> {
         let bytes = [0; BLOCK];
         let (mut client, driver) = channel::<1>().unwrap();
-        let mut backing = Backing::new(driver, Loopback::new(&bytes)?);
+        let mut backing = Backing::new(driver, serial(&bytes)?);
 
         client.submit(read(0)).ok().unwrap();
         assert!(client.submit(read(0)).is_err(), "a one deep ring took two");
@@ -259,7 +296,8 @@ mod tests {
         let mut bytes = [0; BLOCK];
         let (mut client, driver) = channel::<4>().unwrap();
         {
-            let mut backing = Backing::new(driver, Loopback::writable(&mut bytes)?);
+            let device = Serial::new(Loopback::write(&mut bytes)?);
+            let mut backing = Backing::new(driver, device);
             let mut buffer = buffer();
             buffer[..4].copy_from_slice(b"molt");
             let op = BlockOp::Write { sector: 0, bytes: SECTOR, buffer };
@@ -277,11 +315,63 @@ mod tests {
     fn read_past_end_refused() -> Result<(), BlockError> {
         let bytes = [0; BLOCK];
         let (mut client, driver) = channel::<2>().unwrap();
-        let mut backing = Backing::new(driver, Loopback::new(&bytes)?);
+        let mut backing = Backing::new(driver, serial(&bytes)?);
 
         let done = backing.run(client.once(read(1)));
 
         assert_eq!(done.result, Err(BlockError::Range));
+        Ok(())
+    }
+
+    #[test]
+    fn every_submission_reaches_deep_device() -> Result<(), BlockError> {
+        let bytes = [0; 4 * BLOCK];
+        let (mut client, mut driver) = channel::<4>().unwrap();
+        let mut queue = Queued::<_, 4>::new(Loopback::read(&bytes)?);
+
+        for block in 0..4 {
+            client.submit(read(block * SECTORS)).ok().unwrap();
+        }
+        driver.feed(&mut queue);
+
+        assert_eq!(iter::from_fn(|| queue.reap()).count(), 4, "the device was left idle");
+        Ok(())
+    }
+
+    #[test]
+    fn reordered_answers_reach_who_asked() -> Result<(), BlockError> {
+        let mut bytes = [0; 4 * BLOCK];
+        bytes[3 * BLOCK] = 7;
+        let (mut client, driver) = channel::<4>().unwrap();
+        let mut backing = Backing::new(driver, Queued::<_, 4>::new(Loopback::read(&bytes)?));
+
+        let ids: [_; 4] =
+            array::from_fn(|block| client.submit(read(block as u64 * SECTORS)).ok().unwrap());
+        // The device answers newest first, so the one awaited here lands last.
+        let first = backing.run(client.settle(ids[0]));
+        let last = backing.run(client.settle(ids[3]));
+
+        assert_eq!(first.buffer.unwrap()[0], 0);
+        assert_eq!(last.buffer.unwrap()[0], 7);
+        Ok(())
+    }
+
+    #[test]
+    fn flush_runs_alone() -> Result<(), BlockError> {
+        let mut bytes = [0; 2 * BLOCK];
+        let (mut client, mut driver) = channel::<4>().unwrap();
+        let mut queue = Queued::<_, 4>::new(Loopback::write(&mut bytes)?);
+
+        let write = client
+            .submit(BlockOp::Write { sector: 0, bytes: SECTOR, buffer: buffer() })
+            .ok()
+            .unwrap();
+        client.submit(BlockOp::Flush).ok().unwrap();
+        client.submit(read(0)).ok().unwrap();
+        driver.feed(&mut queue);
+
+        assert_eq!(queue.reap().map(|(id, _)| id), Some(write));
+        assert!(queue.reap().is_none(), "the flush started beside the write");
         Ok(())
     }
 }

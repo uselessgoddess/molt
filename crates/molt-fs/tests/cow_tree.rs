@@ -1,4 +1,4 @@
-use molt_block::{Backing, Disk, Loopback};
+use molt_block::{Backing, Disk, Loopback, Serial};
 use molt_fs::format::{self, Tree};
 use molt_fs::{DEPTH, FsError, Journal, Kind, Name, attach};
 
@@ -10,8 +10,8 @@ fn name(index: usize) -> Name {
     Name::try_from(format!("file-{index:02}").as_str()).unwrap()
 }
 
-fn mount<D: Disk>(device: D) -> Result<(Journal, Backing<D, DEPTH>), FsError> {
-    let (blocks, mut backing) = attach(device)?;
+fn mount<D: Disk>(device: D) -> Result<(Journal, Backing<Serial<D>, DEPTH>), FsError> {
+    let (blocks, mut backing) = attach(Serial::new(device))?;
     let journal = backing.run(Journal::mount(blocks))?;
     Ok((journal, backing))
 }
@@ -20,7 +20,7 @@ fn mount<D: Disk>(device: D) -> Result<(Journal, Backing<D, DEPTH>), FsError> {
 fn tree_splits_and_remounts() -> Result<(), FsError> {
     let mut bytes = image();
     {
-        let (mut journal, mut backing) = mount(Loopback::writable(&mut bytes)?)?;
+        let (mut journal, mut backing) = mount(Loopback::write(&mut bytes)?)?;
         let root = journal.root();
         let stats = backing.run(async {
             for index in 0..40 {
@@ -33,7 +33,7 @@ fn tree_splits_and_remounts() -> Result<(), FsError> {
         assert!(stats.height >= 2, "forty keys stayed in one leaf: {stats:?}");
         assert!(stats.nodes >= 4, "split did not create a real tree: {stats:?}");
     }
-    let (mut journal, mut backing) = mount(Loopback::new(&bytes)?)?;
+    let (mut journal, mut backing) = mount(Loopback::read(&bytes)?)?;
     let root = journal.root();
     backing.run(async {
         for index in 0..40 {
@@ -51,7 +51,7 @@ fn root_swing_hides_unsynced_tree() -> Result<(), FsError> {
     let mut bytes = image();
     let stable_root;
     {
-        let (mut journal, mut backing) = mount(Loopback::writable(&mut bytes)?)?;
+        let (mut journal, mut backing) = mount(Loopback::write(&mut bytes)?)?;
         let root = journal.root();
         stable_root = backing.run(async {
             journal.create(root, name(1), Kind::File).await?;
@@ -64,7 +64,7 @@ fn root_swing_hides_unsynced_tree() -> Result<(), FsError> {
             Ok::<_, FsError>(stable)
         })?;
     }
-    let (mut journal, mut backing) = mount(Loopback::new(&bytes)?)?;
+    let (mut journal, mut backing) = mount(Loopback::read(&bytes)?)?;
     let root = journal.root();
     backing.run(async {
         assert!(journal.lookup(root, &name(1)).await.is_ok());
@@ -79,14 +79,14 @@ fn root_swing_hides_unsynced_tree() -> Result<(), FsError> {
 fn cache_hit_skips_device_read() -> Result<(), FsError> {
     let mut bytes = image();
     {
-        let (mut journal, mut backing) = mount(Loopback::writable(&mut bytes)?)?;
+        let (mut journal, mut backing) = mount(Loopback::write(&mut bytes)?)?;
         let root = journal.root();
         backing.run(async {
             journal.create(root, name(0), Kind::File).await?;
             journal.sync().await
         })?;
     }
-    let (mut journal, mut backing) = mount(Loopback::new(&bytes)?)?;
+    let (mut journal, mut backing) = mount(Loopback::read(&bytes)?)?;
     let root = journal.root();
     let (first, second) = backing.run(async {
         journal.lookup(root, &name(0)).await?;

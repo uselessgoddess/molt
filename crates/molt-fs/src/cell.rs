@@ -6,24 +6,24 @@
 //! and a restart that puts the volume back at its last durable checkpoint —
 //! while [`Fs`] stays the protocol underneath it.
 
-use molt_block::Disk;
+use molt_block::Queue;
 use molt_core::cell::{Cell, Health};
 
 use crate::FsError;
 use crate::service::Fs;
 
 /// A mounted filesystem with a restart of its own.
-pub struct FsCell<D, const N: usize> {
-    fs: Fs<D, N>,
+pub struct FsCell<Q, const N: usize> {
+    fs: Fs<Q, N>,
     health: Health,
 }
 
-impl<D: Disk, const N: usize> FsCell<D, N> {
+impl<Q: Queue, const N: usize> FsCell<Q, N> {
     /// The service other cells talk to, while there is one.
     ///
     /// A cell whose restart failed answers [`FsError::Failed`] from here on:
     /// see [`restart`](Cell::restart) for what is left behind by then.
-    pub fn fs(&mut self) -> Result<&mut Fs<D, N>, FsError> {
+    pub fn fs(&mut self) -> Result<&mut Fs<Q, N>, FsError> {
         match self.health {
             Health::Running => Ok(&mut self.fs),
             Health::Failed => Err(FsError::Failed),
@@ -42,14 +42,14 @@ impl<D: Disk, const N: usize> FsCell<D, N> {
     }
 }
 
-impl<D: Disk, const N: usize> Cell for FsCell<D, N> {
+impl<Q: Queue, const N: usize> Cell for FsCell<Q, N> {
     /// The device to mount, which the cell then owns for its life: a restart
     /// remounts it rather than asking for another.
-    type State = D;
+    type State = Q;
     type Error = FsError;
 
-    fn spawn(device: D) -> Result<Self, FsError> {
-        Ok(Self { fs: Fs::mount(device)?, health: Health::Running })
+    fn spawn(queue: Q) -> Result<Self, FsError> {
+        Ok(Self { fs: Fs::mount(queue)?, health: Health::Running })
     }
 
     /// Brings the volume back at its last durable checkpoint.
@@ -75,10 +75,10 @@ mod tests {
     use alloc::vec::Vec;
     use core::cell::Cell as Flag;
 
-    use molt_block::{BlockError, Device, Disk, Loopback};
+    use molt_block::{BlockError, Device, Disk, Loopback, Serial};
     use molt_core::buffer::{BufferOperation, BufferRegistry};
-    use molt_core::capability::{CapabilityError, CellId, Read};
-    use molt_core::cell::{Cell, Health, RestartHooks, Supervisor};
+    use molt_core::capability::{CapabilityError, Read};
+    use molt_core::cell::{Cell, CellId, Health, RestartHooks, Supervisor};
 
     use super::FsCell;
     use crate::format::{Tree, build};
@@ -139,7 +139,7 @@ mod tests {
 
     /// Creates `name` holding `source`, syncing only if asked.
     fn write(
-        cell: &mut FsCell<Loopback<'_>, 4>,
+        cell: &mut FsCell<Serial<Loopback<'_>>, 4>,
         buffers: &mut BufferRegistry<'_, 1>,
         buffer: BufferOperation<Read>,
         name: &str,
@@ -166,7 +166,7 @@ mod tests {
         let mut buffers = BufferRegistry::<1>::new();
         let buffer = buffers.register_read(OWNER, &mut source).unwrap();
         let window = BufferOperation::new(buffer, 0, 12);
-        let mut cell = FsCell::<_, 4>::spawn(Loopback::writable(&mut bytes)?)?;
+        let mut cell = FsCell::<_, 4>::spawn(Serial::new(Loopback::write(&mut bytes)?))?;
 
         write(&mut cell, &mut buffers, window, "kept.txt", true)?;
         cell.restart()?;
@@ -187,7 +187,7 @@ mod tests {
         let mut buffers = BufferRegistry::<1>::new();
         let buffer = buffers.register_read(OWNER, &mut source).unwrap();
         let window = BufferOperation::new(buffer, 0, 12);
-        let mut cell = FsCell::<_, 4>::spawn(Loopback::writable(&mut bytes)?)?;
+        let mut cell = FsCell::<_, 4>::spawn(Serial::new(Loopback::write(&mut bytes)?))?;
 
         write(&mut cell, &mut buffers, window, "lost.txt", false)?;
         cell.restart()?;
@@ -205,7 +205,7 @@ mod tests {
     fn restart_revokes_handles() -> Result<(), FsError> {
         let mut bytes = image();
         let mut buffers = BufferRegistry::<1>::new();
-        let mut cell = FsCell::<_, 4>::spawn(Loopback::writable(&mut bytes)?)?;
+        let mut cell = FsCell::<_, 4>::spawn(Serial::new(Loopback::write(&mut bytes)?))?;
         let stale = cell.fs()?.root(OWNER)?;
         cell.fs()?.seal();
 
@@ -224,7 +224,8 @@ mod tests {
     #[test]
     fn supervised_restart_is_ordered() -> Result<(), FsError> {
         let mut bytes = image();
-        let mut supervisor = Supervisor::<FsCell<_, 4>>::new(Loopback::writable(&mut bytes)?)?;
+        let mut supervisor =
+            Supervisor::<FsCell<_, 4>>::new(Serial::new(Loopback::write(&mut bytes)?))?;
         let mut hooks = Order::default();
 
         supervisor.restart(&mut hooks)?;
@@ -239,8 +240,8 @@ mod tests {
     fn failed_remount_stays_failed() -> Result<(), FsError> {
         let mut bytes = image();
         let gone = Flag::new(false);
-        let disk = Unplug { disk: Loopback::writable(&mut bytes)?, gone: &gone };
-        let mut cell = FsCell::<_, 4>::spawn(disk)?;
+        let disk = Unplug { disk: Loopback::write(&mut bytes)?, gone: &gone };
+        let mut cell = FsCell::<_, 4>::spawn(Serial::new(disk))?;
 
         gone.set(true);
         let restarted = cell.restart();
