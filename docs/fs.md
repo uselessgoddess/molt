@@ -51,10 +51,12 @@ The brief was btrfs's ideas without btrfs's legacy, leaning bcachefs. The ideas
 arrive here in the cheapest form that is still the real thing.
 
 **Checksums cover both metadata and payload.** Every tree node has its own
-crc32c. The active payload region has one crc32c in the superblock, and the
-superblock has another over its fields. [`Volume::mount`](../crates/molt-fs/src/volume.rs)
-verifies the complete candidate before it becomes visible and falls back to
-the other superblock if the newer tree or payload bank is damaged.
+crc32c. Each payload record has one crc32c per 4 KiB chunk, the superblock
+commits the ordered record-header stream, and the superblock has another crc32c
+over its own fields. [`Volume::mount`](../crates/molt-fs/src/volume.rs) verifies
+the candidate's complete metadata tree and log structure before it becomes
+visible and falls back to the other superblock if either is damaged. Payload
+chunks are verified when read, so mounting does not scale with file-data size.
 
 **A generation in the superblock, and a checkpoint that swings it.** Below.
 
@@ -128,9 +130,11 @@ live.
 **The superblock** carries magic `MOLTFS05`, format version 5, block size,
 generation, volume length, root object id, tree geometry and root, log-bank
 capacity, and the active payload region's offset, byte length, and crc32c. Its
-own checksum is checked before any other field is trusted. `Super::check` proves
-the tree and three banks fit without overlap, the tree root is inside its arena,
-and the selected payload region starts at a bank boundary and fits that bank.
+own checksum is checked before any other field is trusted. The payload-region
+crc32c commits its ordered 32-byte record headers rather than rereading every
+file byte at mount. `Super::check` proves the tree and three banks fit without
+overlap, the tree root is inside its arena, and the selected payload region
+starts at a bank boundary and fits that bank.
 
 **Object values** hold kind, directory-entry count, and file size. Directory
 size and file entry count are zero. Object ids are dense from zero; mount checks
@@ -152,10 +156,14 @@ write appends one payload record, updates file size, trims intersecting extent
 keys, and inserts the new `Extent`. The tree root is the complete namespace and
 extent index for that generation.
 
-Records start on 512-byte sector boundaries. One sector write can therefore
-tear only the record being appended, never an earlier record. The active
-superblock carries the exact log length and its crc32c, so padding and
-uncommitted tail bytes are invisible.
+Records start on 512-byte sector boundaries. A 32-byte header is followed by a
+four-byte crc32c for every at-most-4-KiB payload chunk, then the payload and
+sector padding. One sector write can therefore tear only the record being
+appended, never an earlier record. The active superblock carries the exact log
+length and commits the record-header stream, so padding and uncommitted tail
+bytes are invisible. Reads verify touched payload chunks against the record's
+table and remember eight recent results; corruption that did not affect the
+metadata checkpoint is reported at the first affected read.
 
 Each mutation also inserts its current state into the metadata B+ tree. A node
 is one checksummed 4096-byte block. Leaves hold typed keys and values; internal
@@ -177,14 +185,16 @@ reclaimable. Replaced paths created in the same transaction are released
 immediately. This keeps both crash fallbacks intact while allowing old
 generations to be reused without fsck.
 
-The payload log uses the same two-generation rule. A transaction writes the
-bank that is neither active nor used by the previous checkpoint. Below half
-capacity it copies the active bank before appending. Above half capacity it
-walks the durable extent index, streams only live extent slices into fresh
-records, and retargets those extent values through the COW transaction. The
-copy is sector-sized and needs no payload-sized heap buffer. If live data does
-not fit, the operation returns `FsError::Full` without publishing a partial
-generation. `build_with_capacity` selects both finite bounds explicitly.
+The payload log uses the same two-generation rule without copying live bytes on
+every mutation. While the active bank has room, a transaction appends after its
+durable prefix. The old superblock still names the shorter prefix, so a torn
+tail is unreachable. Only when the bank fills does the transaction choose the
+bank named by neither durable checkpoint, walk the extent index, stream live
+payload slices into fresh checksummed records, and retarget those extent values
+through the COW transaction. The copy is block-sized and needs no
+payload-sized heap buffer. If live data plus the pending record does not fit,
+the operation returns `FsError::Full` without publishing a partial generation.
+`build_with_capacity` selects both finite bounds explicitly.
 
 ## Metadata cache
 
@@ -295,11 +305,10 @@ three log banks:
 2. one named by the previous superblock;
 3. one safe target for the next transaction.
 
-The first mutation chooses the free bank and writes new COW nodes into
-unprotected arena blocks. It either copies the active log or, after the
-half-capacity threshold, compacts only payload slices reachable from live
-extent keys. It then appends there. `Sync` uses one deterministic, synchronous
-sequence:
+The first mutation writes new COW nodes into unprotected arena blocks and
+appends after the active bank's committed prefix. If that bank is full, it
+instead compacts payload slices reachable from live extent keys into the free
+bank before appending. `Sync` uses one deterministic, synchronous sequence:
 
 1. finish all target-bank and COW-node writes;
 2. issue device `flush`;
@@ -311,10 +320,12 @@ The first flush makes every byte the new superblock will name durable. The
 second is the commit point. Losing power before it leaves both old
 superblocks and their banks intact; losing power after it leaves a complete
 new checkpoint. Mount parses both copies in generation order and verifies each
-selected log. If the newest copy parses but its log checksum fails, mount
-continues to the previous copy instead of treating a generation number as
-proof. It applies the same rule to the tree: every reachable node checksum,
-level, child address, and generation is verified before the checkpoint can win.
+selected log's record headers. If the newest copy parses but that structural
+checksum fails, mount continues to the previous copy instead of treating a
+generation number as proof. It applies the same rule to the tree: every
+reachable node checksum, level, child address, and generation is verified
+before the checkpoint can win. Payload data is independently verified in
+bounded chunks when a read reaches it.
 
 There is deliberately one outstanding mutation at a time. Reads go several deep
 on the ring; a write, a flush, and a checkpoint each submit and await, so
@@ -617,7 +628,7 @@ either way.
 test file attaches a `Slow` queue that holds every answer for sixteen turns and
 counts the turns the driver spends waiting. Streaming 256 KiB through a 4 KiB
 window costs **1792 turns at depth one and 847 at depth eight** — 2.1× — and
-that is with readahead three blocks ahead, which is what the volume asks for
+that is with readahead four blocks ahead, which is what the volume asks for
 today. The number is a count rather than a clock, so it is the same on every
 machine and it fails when the depth stops reaching the device.
 
@@ -630,19 +641,18 @@ submission not taken back yet, over a ring `2 * SLOTS` deep so the ring is never
 the reason a read waits.
 
 **A sequential read asks ahead.** `Journal::read` submits the next
-`AHEAD = 3` payload blocks of the extent it is on before awaiting the one it
+`AHEAD = 4` payload blocks of the extent it is on before awaiting the one it
 needs, so what a streaming `cat` is about to want is already at the device when
 it asks. The extent boundary is known by then, so this costs no metadata read —
 only a guess about where the caller goes next. Being a guess is what shapes the
 rest: it stops at the end of the extent and declines when there is no free slot
 rather than waiting for one.
 
-**A region walk spends every slot.** Mount verifies the active payload region,
-and a commit sums what it wrote; both walk a range in order. `sweep` keeps
-starting reads on free slots ahead of the block it is handing over, and
-releases each block as it is taken: a walk reads a region through, and nothing
-behind it is coming back. That is what keeps the pool from being spent on
-blocks a mount will never look at again.
+**Payload verification stays on the read path.** Mount and sync walk the compact
+record-header stream; they do not hash whole payload banks. The first read of a
+payload chunk computes its crc32c while the requested block is resident, and a
+small verified-chunk cache avoids repeating that work for adjacent windows.
+Compaction performs the same check before it moves a live slice.
 
 **The pool fills as reads ask for it.** Slots are allocated lazily up to
 `SLOTS`, and `free` prefers an empty slot, then a fresh one, then the
@@ -678,6 +688,25 @@ exactly what readahead is for and what a real device already does. Nothing here
 proves that, and a fake device with a latency loop would not either: `Device` is
 synchronous, so a spinning fake overlaps nothing. The number that proves it
 comes from virtio, and needs the driver's own queue depth to be worth taking.
+
+**What the unified format changed.** The same Criterion benchmark, built in
+isolated target directories at version 5 and at `main` immediately before it,
+gave these medians on one loopback host. They are regression measurements, not
+device-throughput claims:
+
+| Benchmark | Previous format | Unified v5 |
+| --- | ---: | ---: |
+| `fs_mount` | 4.94 µs | 14.43 µs |
+| `fs_open` | 926 ns | 494 ns |
+| `fs_read_stream`, 256 KiB through a 4 KiB window | 117.56 µs | 134.93 µs |
+| `fs_commit`, per commit | 41.68 µs | 15.19 µs |
+
+Mount now validates a typed tree rather than fixed tables. A first streamed
+read also hashes each payload chunk it touches. In return, every lookup avoids
+merging base and overlay state, and an ordinary checkpoint appends one record
+instead of copying an entire payload bank. That makes opens about 47% faster
+and commits about 64% faster in this loopback run; the absolute mount and read
+costs increased by about 9.5 µs and 17.4 µs respectively.
 
 ## The protocol
 
@@ -811,9 +840,10 @@ line editor away and needs a serial `read` before it is worth writing.
   forgets it when the slot is worth more. A cache that outlives the operation is
   the page cache below, which needs the writeback policy this stage does not
   have.
-- **No scrub.** Mount verifies the complete payload bank and every reachable
-  metadata node. A background walk that reports which object owns a damaged
-  range is still a Stage 4 item; the extent key space is its work list.
+- **No scrub.** Mount verifies the complete metadata tree and payload-log
+  structure; payload chunks are verified on first read or compaction. A
+  background walk that proactively reports which object owns a damaged range
+  is still a Stage 4 item; the extent key space is its work list.
 - **The depth stops at virtio.** `Backing` hands the device as many requests as
   its `Queue` takes, so nothing above the driver limits what is in flight any
   more — but `molt_virtio::Block` is still one command at a time behind a
