@@ -24,8 +24,8 @@ const _: () = assert!(BLOCK == molt_block::BLOCK);
 /// Blocks a volume keeps a buffer for.
 ///
 /// Small enough that finding one stays a linear scan, big enough that a
-/// streaming read holds its extent record, its sums block, the block it is on
-/// and the ones it asked for ahead, all at once.
+/// streaming read holds its tree path, checksum table, current payload block,
+/// and the blocks it asked for ahead, all at once.
 const SLOTS: usize = 8;
 
 /// How deep the ring under a volume is.
@@ -115,9 +115,8 @@ impl Volume {
 
     /// Takes the newest superblock copy that verifies.
     ///
-    /// Every metadata region is checked against the checksum the superblock
-    /// records, so a corrupt volume fails here rather than at the first lookup
-    /// that happens to touch the damaged block.
+    /// The log structure and every reachable metadata node are checked before
+    /// a candidate is adopted. Payload chunks carry their own lazy checksums.
     async fn survey(&mut self) -> Result<Checkpoint, FsError> {
         let mut copies = [None; SUPERS as usize];
         let mut last_error = FsError::Magic;

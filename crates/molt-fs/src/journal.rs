@@ -63,7 +63,7 @@ pub struct Journal {
 }
 
 impl Journal {
-    /// Mounts the newest valid checkpoint and replays its mutation log.
+    /// Mounts the newest valid checkpoint and validates its typed index.
     pub async fn mount(blocks: Blocks) -> Result<Self, FsError> {
         let mut journal = Self {
             volume: Volume::mount(blocks).await?,
@@ -1188,7 +1188,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_overlay_checkpoint_and_extend() -> Result<(), FsError> {
+    fn writes_checkpoint_and_extends() -> Result<(), FsError> {
         let mut bytes = image();
         let (mut journal, mut backing) = mount(Loopback::write(&mut bytes)?)?;
         let root = journal.root();

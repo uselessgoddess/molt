@@ -8,13 +8,13 @@ use crate::layout::BLOCK;
 /// Every record starts on a sector so one device write never tears two records.
 pub const ALIGN: u64 = molt_block::SECTOR as u64;
 
-/// Bytes before a record's name or file data.
+/// Bytes in the fixed record header, before its checksum table and payload.
 pub const HEADER: usize = 32;
 
 const MAGIC: [u8; 4] = *b"MLOG";
 const WRITE: u8 = 2;
 
-/// One file payload header. Its bytes follow immediately.
+/// One file payload header. Its checksum table and bytes follow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Record {
     pub object: u32,
