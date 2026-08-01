@@ -984,7 +984,7 @@ writable checkpoint. Tree nodes carry their own v5 magic, `MOLTBT05`, so a node
 from an older key/value schema cannot parse as current metadata.
 
 - **Stage 4.4, asynchronous I/O.** Done: `Volume` and `Journal` are `async` over
-  a `BlockOp` ring, with readahead and region sweeps above it.
+  a `BlockOp` ring, with readahead and bounded payload verification above it.
 - **Stage 4, scale.** Live payloads already compact between checkpoint banks.
   Reference counts and bucket generations can generalize the bounded arenas;
   extent keys become a scrub work list; the block layer gains a data cache.
