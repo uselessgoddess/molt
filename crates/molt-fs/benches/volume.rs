@@ -1,10 +1,3 @@
-//! What the filesystem costs above the device.
-//!
-//! Every run is over [`Loopback`], so a block fetch is a memcpy and what is
-//! left is the path around it: the extent search, the block cache, the tree
-//! lookup, and the checksum. That is the part Stage 4.4 moves onto a ring, so
-//! it is the part worth a number.
-
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -82,9 +75,9 @@ fn read(criterion: &mut Criterion) {
     });
 }
 
-/// Transactions a fresh image holds before its log is full. Nothing reclaims a
-/// write record, so a commit loop is measured in batches and remounted between
-/// them, with the remount outside the clock.
+/// Transactions measured before a log rotation. A commit loop runs in batches
+/// and remounts outside the clock so ordinary append cost is not mixed with the
+/// deliberately rarer live-data compaction.
 const BATCH: u64 = 32;
 
 fn commit(criterion: &mut Criterion) {

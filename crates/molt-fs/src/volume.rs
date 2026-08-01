@@ -1,14 +1,10 @@
-//! Reading a mounted volume through a ring of block buffers.
+//! Block I/O and checkpoint selection through a ring of buffers.
 //!
 //! Nothing here calls a device. [`Volume`] submits reads on a [`BlockClient`]
-//! and awaits them where the bytes are wanted, which is what lets a sequential
-//! read ask for the blocks after the one it is waiting on. The slots hold what
-//! came back: a binary search over a directory re-reads a block only when it
-//! moves off every slot, and the sums block covering a file stays resident
-//! while the file streams past it.
+//! and awaits them where the bytes are wanted. The slots hold what came back so
+//! tree walks and payload reads can reuse blocks without calling a device.
 
 use alloc::vec::Vec;
-use core::cmp::Ordering;
 use core::ops::Range;
 
 use molt_block::{Backing, BlockClient, BlockOp, Buffer, Queue, SECTOR, channel};
@@ -16,12 +12,9 @@ use molt_core::ring::RequestId;
 use molt_core::task;
 
 use crate::FsError;
-use crate::crc::{Crc, crc32c};
-use crate::layout::{
-    Area, BLOCK, ENTRY_BYTES, EXTENT_BYTES, Entry, Extent, Kind, MAX_NAME, OBJECT_BYTES, Object,
-    SUPERS, Super, buffer,
-};
-use crate::name::Name;
+use crate::crc::Crc;
+use crate::layout::{Area, BLOCK, Region, SUPERS, Super, buffer};
+use crate::log::{HEADER, Record};
 
 /// Sectors per block.
 const SECTORS: u64 = (BLOCK / SECTOR) as u64;
@@ -31,8 +24,8 @@ const _: () = assert!(BLOCK == molt_block::BLOCK);
 /// Blocks a volume keeps a buffer for.
 ///
 /// Small enough that finding one stays a linear scan, big enough that a
-/// streaming read holds its extent record, its sums block, the block it is on
-/// and the ones it asked for ahead, all at once.
+/// streaming read holds its tree path, checksum table, current payload block,
+/// and the blocks it asked for ahead, all at once.
 const SLOTS: usize = 8;
 
 /// How deep the ring under a volume is.
@@ -40,9 +33,6 @@ const SLOTS: usize = 8;
 /// Every slot may be at the device at once, and a write travelling on the
 /// scratch buffer is one more, so the ring is never the reason a read waits.
 pub const DEPTH: usize = 2 * SLOTS;
-
-/// Blocks a sequential read asks for beyond the one it needs.
-const AHEAD: u32 = 3;
 
 /// Where one slot's block is.
 enum Slot {
@@ -125,9 +115,8 @@ impl Volume {
 
     /// Takes the newest superblock copy that verifies.
     ///
-    /// Every metadata region is checked against the checksum the superblock
-    /// records, so a corrupt volume fails here rather than at the first lookup
-    /// that happens to touch the damaged block.
+    /// The log structure and every reachable metadata node are checked before
+    /// a candidate is adopted. Payload chunks carry their own lazy checksums.
     async fn survey(&mut self) -> Result<Checkpoint, FsError> {
         let mut copies = [None; SUPERS as usize];
         let mut last_error = FsError::Magic;
@@ -183,11 +172,9 @@ impl Volume {
     }
 
     async fn verify_checkpoint(&mut self, superblock: &Super) -> Result<(), FsError> {
-        for area in Area::ALL {
-            let region = superblock.region(area);
-            if self.checksum(region.at, region.bytes).await? != region.crc {
-                return Err(FsError::Checksum);
-            }
+        let log = superblock.region(Area::Log);
+        if self.log_checksum(log).await? != log.crc {
+            return Err(FsError::Checksum);
         }
         crate::btree::verify(self, superblock).await
     }
@@ -226,198 +213,6 @@ impl Volume {
         self.active_copy = copy;
     }
 
-    /// Reads one object record.
-    pub async fn object(&mut self, id: u32) -> Result<Object, FsError> {
-        Object::parse(self.record(Area::Objects, id as u64, OBJECT_BYTES).await?)
-    }
-
-    /// Reads `dir`'s entry at `index`, in name order.
-    pub async fn entry(&mut self, dir: &Object, index: u32) -> Result<(Name, u32), FsError> {
-        let entry = self.at(dir, index).await?;
-        Ok((self.name(entry).await?, entry.object))
-    }
-
-    /// Finds `name` in `dir`, returning the object it names.
-    ///
-    /// Entries are sorted, so this is a binary search: a directory of a
-    /// thousand names costs ten block reads, not a thousand.
-    pub async fn lookup(&mut self, dir: &Object, name: &[u8]) -> Result<u32, FsError> {
-        if dir.kind != Kind::Dir {
-            return Err(FsError::Kind);
-        }
-        let (mut low, mut high) = (0, dir.count);
-        while low < high {
-            let middle = low + (high - low) / 2;
-            let entry = self.at(dir, middle).await?;
-            match self.name(entry).await?.as_bytes().cmp(name) {
-                Ordering::Less => low = middle + 1,
-                Ordering::Greater => high = middle,
-                Ordering::Equal => return Ok(entry.object),
-            }
-        }
-        Err(FsError::Missing)
-    }
-
-    /// Reads `file` from `offset` into `buf`, returning how many bytes landed.
-    ///
-    /// A read is short only at the end of the file. A logical block no extent
-    /// covers is a hole and reads as zeros, which is how an image elides the
-    /// all-zero blocks of a sparse file.
-    pub async fn read(
-        &mut self,
-        file: &Object,
-        offset: u64,
-        buf: &mut [u8],
-    ) -> Result<usize, FsError> {
-        if file.kind != Kind::File {
-            return Err(FsError::Kind);
-        }
-        if offset > file.size {
-            return Err(FsError::Range);
-        }
-
-        let want = (file.size - offset).min(buf.len() as u64) as usize;
-        let mut done = 0;
-        // One run covers many logical blocks, so a read that stays inside it
-        // searches for it once and afterwards only checks.
-        let mut run = None;
-        while done < want {
-            let at = offset + done as u64;
-            let logical = u32::try_from(at / BLOCK as u64).map_err(|_| FsError::Corrupt)?;
-            let within = (at % BLOCK as u64) as usize;
-            let take = (want - done).min(BLOCK - within);
-            match self.follow(file, &mut run, logical).await? {
-                Some((block, sum)) => {
-                    self.ahead(run, logical).await?;
-                    let source = self.data(block, sum).await?;
-                    buf[done..done + take].copy_from_slice(&source[within..within + take]);
-                }
-                None => buf[done..done + take].fill(0),
-            }
-            done += take;
-        }
-        Ok(want)
-    }
-
-    /// The block holding `file`'s `logical` one, reusing `run` while it covers.
-    async fn follow(
-        &mut self,
-        file: &Object,
-        run: &mut Option<Extent>,
-        logical: u32,
-    ) -> Result<Option<(u64, u32)>, FsError> {
-        if let Some(extent) = *run
-            && let Some(found) = extent.covers(logical)?
-        {
-            return Ok(Some(found));
-        }
-        *run = self.locate(file, logical).await?;
-        match *run {
-            Some(extent) => extent.covers(logical),
-            None => Ok(None),
-        }
-    }
-
-    /// Asks for the blocks after `logical` in the same run.
-    ///
-    /// A sequential reader comes back for them, and asking now overlaps them
-    /// with the read it is about to wait on. The run is already known, so this
-    /// costs no metadata read — only a guess about where the caller goes next.
-    /// It is a guess, so it declines rather than waiting for a free slot.
-    async fn ahead(&mut self, run: Option<Extent>, logical: u32) -> Result<(), FsError> {
-        let Some(run) = run else { return Ok(()) };
-        for step in 1..=AHEAD {
-            let Some(next) = logical.checked_add(step) else { break };
-            let Some((block, _)) = run.covers(next)? else { break };
-            if block >= self.superblock.blocks || self.find(block).is_some() {
-                continue;
-            }
-            let Some(at) = self.free() else { break };
-            self.start(at, block).await?;
-        }
-        Ok(())
-    }
-
-    /// The extent covering `file`'s `logical` block, if it is not a hole.
-    async fn locate(&mut self, file: &Object, logical: u32) -> Result<Option<Extent>, FsError> {
-        let (mut low, mut high) = (0, file.count);
-        while low < high {
-            let middle = low + (high - low) / 2;
-            let index = file.start.checked_add(middle).ok_or(FsError::Corrupt)?;
-            let record = self.record(Area::Extents, index as u64, EXTENT_BYTES).await?;
-            let extent = Extent::parse(record)?;
-            if extent.covers(logical)?.is_some() {
-                return Ok(Some(extent));
-            }
-            if extent.logical < logical {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        Ok(None)
-    }
-
-    async fn at(&mut self, dir: &Object, index: u32) -> Result<Entry, FsError> {
-        if dir.kind != Kind::Dir {
-            return Err(FsError::Kind);
-        }
-        if index >= dir.count {
-            return Err(FsError::Missing);
-        }
-        let index = dir.start.checked_add(index).ok_or(FsError::Corrupt)?;
-        Entry::parse(self.record(Area::Entries, index as u64, ENTRY_BYTES).await?)
-    }
-
-    /// Copies an entry's name out of the name region, which it may straddle
-    /// blocks of.
-    async fn name(&mut self, entry: Entry) -> Result<Name, FsError> {
-        let region = self.superblock.region(Area::Names);
-        let len = entry.name_len as usize;
-        let end = (entry.name_at as u64).checked_add(len as u64).ok_or(FsError::Corrupt)?;
-        if end > region.bytes {
-            return Err(FsError::Corrupt);
-        }
-
-        let mut bytes = [0u8; MAX_NAME];
-        let mut done = 0;
-        while done < len {
-            let at = entry.name_at as u64 + done as u64;
-            let within = (at % BLOCK as u64) as usize;
-            let take = (len - done).min(BLOCK - within);
-            let source = self.block(region.at + at / BLOCK as u64).await?;
-            bytes[done..done + take].copy_from_slice(&source[within..within + take]);
-            done += take;
-        }
-        Name::new(&bytes[..len])
-    }
-
-    /// Borrows one fixed-size record out of a metadata region.
-    async fn record(&mut self, area: Area, index: u64, size: usize) -> Result<&[u8], FsError> {
-        let region = self.superblock.region(area);
-        let at = index.checked_mul(size as u64).ok_or(FsError::Corrupt)?;
-        if at + size as u64 > region.bytes {
-            return Err(FsError::Missing);
-        }
-        let within = (at % BLOCK as u64) as usize;
-        let block = self.block(region.at + at / BLOCK as u64).await?;
-        Ok(&block[within..within + size])
-    }
-
-    /// Reads a data block and checks it against the sum its extent carried.
-    async fn data(&mut self, index: u64, sum: u32) -> Result<&[u8; BLOCK], FsError> {
-        let offset = index.checked_sub(self.superblock.data_at).ok_or(FsError::Corrupt)?;
-        if offset >= self.superblock.data_blocks {
-            return Err(FsError::Corrupt);
-        }
-
-        let block = self.block(index).await?;
-        if crc32c(block) != sum {
-            return Err(FsError::Checksum);
-        }
-        Ok(block)
-    }
-
     /// Reads a block, or hands back the slot already holding it.
     pub(crate) async fn block(&mut self, index: u64) -> Result<&[u8; BLOCK], FsError> {
         if index >= self.superblock.blocks {
@@ -438,29 +233,13 @@ impl Volume {
         }
     }
 
-    /// Reads `blocks` in order, giving each to `take`.
-    ///
-    /// Every slot it can get is spent on the blocks ahead of the one being
-    /// handed over, so a sweep waits for the device once rather than once per
-    /// block. Each block is released as it is taken: a sweep reads a region
-    /// through, and nothing behind it is coming back.
-    async fn sweep(
-        &mut self,
-        blocks: Range<u64>,
-        mut take: impl FnMut(&[u8; BLOCK]),
-    ) -> Result<(), FsError> {
-        let mut next = blocks.start;
-        for index in blocks.clone() {
-            while next < blocks.end
-                && let Some(at) = self.free()
-            {
-                self.start(at, next).await?;
-                next += 1;
-            }
-            take(self.block(index).await?);
-            self.drop_block(index);
+    /// Starts fetching a block if one is not already resident or in flight.
+    pub(crate) async fn prefetch(&mut self, index: u64) -> Result<(), FsError> {
+        if index >= self.superblock.blocks || self.find(index).is_some() {
+            return Ok(());
         }
-        Ok(())
+        let Some(at) = self.free() else { return Ok(()) };
+        self.start(at, index).await
     }
 
     /// Reads a block without keeping it, on the buffer kept aside.
@@ -520,15 +299,6 @@ impl Volume {
         }
         self.slots.push(Slot::Here { block: None, buffer: buffer().ok()? });
         Some(self.slots.len() - 1)
-    }
-
-    /// Forgets `index`, whose slot is worth more than what it holds.
-    fn drop_block(&mut self, index: u64) {
-        if let Some(at) = self.find(index)
-            && let Slot::Here { block, .. } = &mut self.slots[at]
-        {
-            *block = None;
-        }
     }
 
     /// A slot to read into, waiting for one if every buffer is at the device.
@@ -615,33 +385,6 @@ impl Volume {
         Ok(())
     }
 
-    pub(crate) async fn copy_aligned(
-        &mut self,
-        source: u64,
-        target: u64,
-        bytes: u64,
-    ) -> Result<(), FsError> {
-        if bytes % SECTOR as u64 != 0 {
-            return Err(FsError::Corrupt);
-        }
-        self.stale(target..target.saturating_add(bytes.div_ceil(BLOCK as u64))).await;
-        let mut done = 0;
-        while done < bytes {
-            let take = (bytes - done).min(BLOCK as u64) as usize;
-            let at = |block: u64| {
-                block
-                    .checked_mul(SECTORS)
-                    .and_then(|sector| sector.checked_add(done / SECTOR as u64))
-                    .ok_or(FsError::Corrupt)
-            };
-            let (from, to) = (at(source)?, at(target)?);
-            self.aside(|buffer| BlockOp::Read { sector: from, bytes: take, buffer }).await?;
-            self.aside(|buffer| BlockOp::Write { sector: to, bytes: take, buffer }).await?;
-            done += take as u64;
-        }
-        Ok(())
-    }
-
     pub(crate) async fn write_aligned(
         &mut self,
         block: u64,
@@ -692,15 +435,32 @@ impl Volume {
         self.aside(|buffer| BlockOp::Write { sector, bytes: BLOCK, buffer }).await
     }
 
-    pub(crate) async fn checksum(&mut self, block: u64, bytes: u64) -> Result<u32, FsError> {
+    /// Hashes only the headers of a payload-log region.
+    ///
+    /// Their per-record checksums protect file bytes when those bytes are read;
+    /// mount only needs this compact structural commitment to select a root.
+    pub(crate) async fn log_checksum(&mut self, region: Region) -> Result<u32, FsError> {
         let mut crc = Crc::new();
-        let mut left = bytes;
-        self.sweep(block..block + bytes.div_ceil(BLOCK as u64), |whole| {
-            let take = left.min(BLOCK as u64) as usize;
-            crc.update(&whole[..take]);
-            left -= take as u64;
-        })
-        .await?;
+        let mut cursor = 0;
+        while cursor < region.bytes {
+            let within = (cursor % BLOCK as u64) as usize;
+            let end = within.checked_add(HEADER).ok_or(FsError::Corrupt)?;
+            if end > BLOCK {
+                return Err(FsError::Corrupt);
+            }
+            let mut header = [0; HEADER];
+            header.copy_from_slice(
+                &self.block(region.at + cursor / BLOCK as u64).await?[within..end],
+            );
+            let record = Record::parse(&header)?;
+            crc.update(&header);
+            cursor = cursor
+                .checked_add(record.span().map_err(|_| FsError::Corrupt)?)
+                .ok_or(FsError::Corrupt)?;
+        }
+        if cursor != region.bytes {
+            return Err(FsError::Corrupt);
+        }
         Ok(crc.finish())
     }
 
@@ -755,13 +515,11 @@ fn newest(copies: &[Option<Super>], rejected: &[bool]) -> Option<usize> {
 
 #[cfg(all(test, feature = "format"))]
 mod tests {
-    use molt_block::{Backing, Loopback, Serial};
+    use molt_block::{Loopback, Serial};
 
-    use super::{Volume, attach};
-    use crate::crc::crc32c;
     use crate::format::{Tree, build};
-    use crate::layout::{Area, BLOCK, Kind, Super};
-    use crate::{DEPTH, FsError, MAX_NAME};
+    use crate::layout::{BLOCK, Super};
+    use crate::{FsError, Journal, MAX_NAME, Name};
 
     fn image() -> alloc::vec::Vec<u8> {
         let mut tree = Tree::new();
@@ -771,179 +529,16 @@ mod tests {
         build(&tree, 1).unwrap()
     }
 
-    fn mount(bytes: &[u8]) -> (Volume, Backing<Serial<Loopback<'_>>, DEPTH>) {
-        let (blocks, mut backing) = attach(Serial::new(Loopback::read(bytes).unwrap())).unwrap();
-        let volume = backing.run(Volume::mount(blocks)).unwrap();
-        (volume, backing)
-    }
-
     #[test]
-    fn file_reads_back_what_was_written() -> Result<(), FsError> {
-        let bytes = image();
-        let (mut volume, mut backing) = mount(&bytes);
-
-        let mut text = [0u8; 16];
-        let read = backing.run(async {
-            let root = volume.object(volume.root()).await?;
-            let id = volume.lookup(&root, b"hello.txt").await?;
-            let file = volume.object(id).await?;
-            volume.read(&file, 0, &mut text).await
-        })?;
-
-        assert_eq!(&text[..read], b"hello, molt");
-        Ok(())
-    }
-
-    #[test]
-    fn read_crossing_blocks_stays_contiguous() -> Result<(), FsError> {
-        let bytes = image();
-        let (mut volume, mut backing) = mount(&bytes);
-
-        let mut window = [0u8; 8];
-        let read = backing.run(async {
-            let root = volume.object(volume.root()).await?;
-            let id = volume.lookup(&root, b"big.bin").await?;
-            let file = volume.object(id).await?;
-            volume.read(&file, BLOCK as u64 - 4, &mut window).await
-        })?;
-
-        assert_eq!(read, 8);
-        assert_eq!(window, [0xa5; 8], "block boundary lost bytes");
-        Ok(())
-    }
-
-    #[test]
-    fn short_read_stops_at_end() -> Result<(), FsError> {
-        let bytes = image();
-        let (mut volume, mut backing) = mount(&bytes);
-
-        let read = backing.run(async {
-            let root = volume.object(volume.root()).await?;
-            let id = volume.lookup(&root, b"hello.txt").await?;
-            let file = volume.object(id).await?;
-            volume.read(&file, 6, &mut [0; 64]).await
-        });
-
-        assert_eq!(read, Ok(5));
-        Ok(())
-    }
-
-    #[test]
-    fn missing_name_reported() -> Result<(), FsError> {
-        let bytes = image();
-        let (mut volume, mut backing) = mount(&bytes);
-
-        let found = backing.run(async {
-            let root = volume.object(volume.root()).await?;
-            volume.lookup(&root, b"nothing").await
-        });
-
-        assert_eq!(found, Err(FsError::Missing));
-        Ok(())
-    }
-
-    #[test]
-    fn entries_come_back_sorted() -> Result<(), FsError> {
-        let bytes = image();
-        let (mut volume, mut backing) = mount(&bytes);
-
-        let (first, second) = backing.run(async {
-            let root = volume.object(volume.root()).await?;
-            let first = volume.entry(&root, 0).await?.0;
-            let second = volume.entry(&root, 1).await?.0;
-            Ok::<_, FsError>((first, second))
-        })?;
-
-        assert_eq!(first.as_str(), Some("big.bin"));
-        assert_eq!(second.as_str(), Some("docs"));
-        Ok(())
-    }
-
-    #[test]
-    fn nested_directory_reachable() -> Result<(), FsError> {
-        let bytes = image();
-        let (mut volume, mut backing) = mount(&bytes);
-
-        let kind = backing.run(async {
-            let root = volume.object(volume.root()).await?;
-            let docs = volume.lookup(&root, b"docs").await?;
-            let docs = volume.object(docs).await?;
-            let id = volume.lookup(&docs, b"readme").await?;
-            Ok::<_, FsError>(volume.object(id).await?.kind)
-        })?;
-
-        assert_eq!(kind, Kind::File);
-        Ok(())
-    }
-
-    #[test]
-    fn entry_past_end_reported() -> Result<(), FsError> {
-        let bytes = image();
-        let (mut volume, mut backing) = mount(&bytes);
-
-        let entry = backing.run(async {
-            let root = volume.object(volume.root()).await?;
-            volume.entry(&root, 3).await.map(|entry| entry.0)
-        });
-
-        assert_eq!(entry, Err(FsError::Missing));
-        Ok(())
-    }
-
-    #[test]
-    fn corrupt_data_block_refused() -> Result<(), FsError> {
-        let mut bytes = image();
-        let data = Super::parse(&bytes[..BLOCK])?.data_at;
-        bytes[data as usize * BLOCK] ^= 0xff;
-        let (mut volume, mut backing) = mount(&bytes);
-
-        let read = backing.run(async {
-            let root = volume.object(volume.root()).await?;
-            let id = volume.lookup(&root, b"big.bin").await?;
-            let file = volume.object(id).await?;
-            volume.read(&file, 0, &mut [0; 8]).await
-        });
-
-        assert_eq!(read, Err(FsError::Checksum));
-        Ok(())
-    }
-
-    #[test]
-    fn extent_physical_overflow_refused() -> Result<(), FsError> {
-        let mut bytes = image();
-        let mut superblock = Super::parse(&bytes[..BLOCK])?;
-        let mut extents = superblock.region(Area::Extents);
-        let at = extents.at as usize * BLOCK;
-        bytes[at + 8..at + 16].copy_from_slice(&u64::MAX.to_le_bytes());
-        extents.crc = crc32c(&bytes[at..at + extents.bytes as usize]);
-        superblock.set_region(Area::Extents, extents);
-        for copy in 0..super::SUPERS {
-            superblock.encode(&mut bytes[copy as usize * BLOCK..]);
-        }
-        let (mut volume, mut backing) = mount(&bytes);
-
-        let read = backing.run(async {
-            let root = volume.object(volume.root()).await?;
-            let id = volume.lookup(&root, b"big.bin").await?;
-            let file = volume.object(id).await?;
-            volume.read(&file, BLOCK as u64, &mut [0; 8]).await
-        });
-
-        assert_eq!(read, Err(FsError::Corrupt));
-        Ok(())
-    }
-
-    #[test]
-    fn corrupt_metadata_refused_at_mount() -> Result<(), FsError> {
+    fn corrupt_tree_refused_at_mount() -> Result<(), FsError> {
         let mut bytes = image();
         let superblock = Super::parse(&bytes[..BLOCK])?;
-        let at = superblock.region(Area::Objects).at as usize * BLOCK;
-        bytes[at] ^= 0xff;
-        let (blocks, mut backing) = attach(Serial::new(Loopback::read(&bytes)?))?;
+        bytes[superblock.tree_root as usize * BLOCK] ^= 0xff;
+        let (blocks, mut backing) = super::attach(Serial::new(Loopback::read(&bytes)?))?;
 
-        let mounted = backing.run(Volume::mount(blocks));
+        let mounted = backing.run(Journal::mount(blocks));
 
-        assert_eq!(mounted.err(), Some(FsError::Checksum), "damaged object region mounted");
+        assert_eq!(mounted.err(), Some(FsError::Corrupt));
         Ok(())
     }
 
@@ -951,14 +546,13 @@ mod tests {
     fn torn_superblock_falls_back() -> Result<(), FsError> {
         let mut bytes = image();
         bytes[0] ^= 0xff;
-        let (mut volume, mut backing) = mount(&bytes);
+        let (blocks, mut backing) = super::attach(Serial::new(Loopback::read(&bytes)?))?;
+        let mut journal = backing.run(Journal::mount(blocks))?;
+        let root = journal.root();
 
-        let found = backing.run(async {
-            let root = volume.object(volume.root()).await?;
-            volume.lookup(&root, b"hello.txt").await
-        });
+        let found = backing.run(journal.lookup(root, &Name::try_from("hello.txt")?));
 
-        assert!(found.is_ok(), "older copy did not serve");
+        assert!(found.is_ok());
         Ok(())
     }
 

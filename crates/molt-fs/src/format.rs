@@ -8,11 +8,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::FsError;
+use crate::btree::{self, Key, Value};
 use crate::crc::crc32c;
 use crate::layout::{
-    Area, BLOCK, DEFAULT_LOG_BLOCKS, DEFAULT_TREE_BLOCKS, ENTRY_BYTES, EXTENT_BYTES, Entry, Extent,
-    Kind, OBJECT_BYTES, Object, RUN, Region, SUPERS, Super,
+    Area, BLOCK, DEFAULT_LOG_BLOCKS, DEFAULT_TREE_BLOCKS, Kind, Object, Region, SUPERS, Super,
 };
+use crate::log::{HEADER, Record, headers_crc};
 use crate::name::Name;
 
 /// A directory being assembled for an image.
@@ -90,91 +91,85 @@ pub fn build_with_capacity(
 
 #[derive(Default)]
 struct Image {
-    objects: Vec<Object>,
-    extents: Vec<Extent>,
-    entries: Vec<Entry>,
-    names: Vec<u8>,
-    /// Data blocks in the order they were laid down, addressed from zero until
-    /// [`Image::finish`] learns where the data region starts.
-    data: Vec<u8>,
+    entries: Vec<(Key, Value)>,
+    log: Vec<u8>,
+    next_object: u32,
 }
 
 impl Image {
     /// Lays out a directory and everything under it, returning its object id.
-    ///
-    /// Entries are written sorted so a reader can binary search them, and the
-    /// range is reserved before the children are laid out so a directory's
-    /// entries stay contiguous however deep its subtrees go.
     fn dir(&mut self, tree: &Tree) -> Result<u32, FsError> {
         let id = self.reserve()?;
         let mut nodes: Vec<&(Name, Node)> = tree.nodes.iter().collect();
         nodes.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
 
-        let start = index(self.entries.len())?;
-        self.entries.resize(self.entries.len() + nodes.len(), Entry::default());
-        for (at, (name, node)) in nodes.iter().enumerate() {
+        for (name, node) in &nodes {
             let object = match node {
                 Node::Dir(tree) => self.dir(tree)?,
                 Node::File(bytes) => self.file(bytes)?,
             };
-            let name_at = index(self.names.len())?;
-            self.names.extend_from_slice(name.as_bytes());
-            self.entries[start as usize + at] =
-                Entry { name_at, name_len: name.len() as u16, object };
+            self.entries.push((Key::dirent(id, name), Value::dirent(object)));
         }
 
-        self.objects[id as usize] =
-            Object { kind: Kind::Dir, start, count: index(nodes.len())?, size: 0 };
+        let object = Object { kind: Kind::Dir, count: index(nodes.len())?, size: 0 };
+        self.entries.push((Key::object(id), Value::object(object)));
         Ok(id)
     }
 
-    /// Lays out a file's blocks, returning its object id.
-    ///
-    /// An all-zero block is left out entirely: it becomes a hole the reader
-    /// fills in, which is what keeps a sparse file from costing its length.
     fn file(&mut self, bytes: &[u8]) -> Result<u32, FsError> {
-        let start = index(self.extents.len())?;
-        let mut count = 0;
-        for (logical, chunk) in bytes.chunks(BLOCK).enumerate() {
+        let id = self.reserve()?;
+        let mut start = 0;
+        while start < bytes.len() {
+            let block_end = (start + BLOCK).min(bytes.len());
+            let chunk = &bytes[start..block_end];
             if chunk.iter().all(|&byte| byte == 0) {
+                start = block_end;
                 continue;
             }
-            let logical = index(logical)?;
-            let block = (self.data.len() / BLOCK) as u64;
-            self.data.extend_from_slice(chunk);
-            self.data.resize(self.data.len().next_multiple_of(BLOCK), 0);
-            let sum = crc32c(&self.data[block as usize * BLOCK..][..BLOCK]);
-            match self.extents.last_mut() {
-                // Only extend a run this file started, and only while the
-                // record has a sum left to hold it.
-                Some(last)
-                    if count > 0
-                        && last.logical + last.blocks == logical
-                        && (last.blocks as usize) < RUN =>
-                {
-                    last.sums[last.blocks as usize] = sum;
-                    last.blocks += 1;
+            let run = start;
+            start = block_end;
+            while start < bytes.len() {
+                let next = (start + BLOCK).min(bytes.len());
+                if bytes[start..next].iter().all(|&byte| byte == 0) {
+                    break;
                 }
-                _ => {
-                    let mut sums = [0; RUN];
-                    sums[0] = sum;
-                    self.extents.push(Extent { logical, blocks: 1, block, sums });
-                    count += 1;
-                }
+                start = next;
             }
+            let payload = &bytes[run..start];
+            let offset = u64::try_from(run).map_err(|_| FsError::Range)?;
+            let record = Record::write(id, offset, payload.len())?;
+            let cursor = self.append(record, payload)?;
+            let end = offset.checked_add(payload.len() as u64).ok_or(FsError::Range)?;
+            self.entries
+                .push((Key::extent(id, end), Value::extent(cursor, 0, payload.len() as u32)));
         }
 
-        let id = self.reserve()?;
-        self.objects[id as usize] =
-            Object { kind: Kind::File, start, count, size: bytes.len() as u64 };
+        let object = Object { kind: Kind::File, count: 0, size: bytes.len() as u64 };
+        self.entries.push((Key::object(id), Value::object(object)));
         Ok(id)
     }
 
-    /// Takes the next object id, to be filled in once its contents are laid out.
     fn reserve(&mut self) -> Result<u32, FsError> {
-        let id = index(self.objects.len())?;
-        self.objects.push(Object { kind: Kind::Dir, start: 0, count: 0, size: 0 });
+        let id = self.next_object;
+        self.next_object = id.checked_add(1).ok_or(FsError::Range)?;
         Ok(id)
+    }
+
+    fn append(&mut self, record: Record, payload: &[u8]) -> Result<u64, FsError> {
+        let cursor = u64::try_from(self.log.len()).map_err(|_| FsError::Range)?;
+        let span = usize::try_from(record.span()?).map_err(|_| FsError::Range)?;
+        let end = self.log.len().checked_add(span).ok_or(FsError::Range)?;
+        self.log.resize(end, 0);
+        let header: &mut [u8; HEADER] =
+            (&mut self.log[cursor as usize..][..HEADER]).try_into().map_err(|_| FsError::Range)?;
+        record.encode(header);
+        for (chunk, bytes) in payload.chunks(BLOCK).enumerate() {
+            let at = cursor as usize + HEADER + chunk * 4;
+            self.log[at..at + 4].copy_from_slice(&crc32c(bytes).to_le_bytes());
+        }
+        let payload_at = usize::try_from(record.payload_at()?).map_err(|_| FsError::Range)?;
+        self.log[cursor as usize + payload_at..][..payload.len()].copy_from_slice(payload);
+        Ok(cursor)
     }
 
     /// Places the regions, checksums them, and writes both superblock copies.
@@ -185,66 +180,43 @@ impl Image {
         log_blocks: u32,
         tree_blocks: u32,
     ) -> Result<Vec<u8>, FsError> {
-        let data_blocks = (self.data.len() / BLOCK) as u64;
-        let sizes = [
-            self.objects.len() * OBJECT_BYTES,
-            self.extents.len() * EXTENT_BYTES,
-            self.entries.len() * ENTRY_BYTES,
-            self.names.len(),
-        ];
-
-        let mut superblock =
-            Super { generation, root, data_blocks, log_blocks, tree_blocks, ..Super::default() };
-        let mut at = SUPERS;
-        for (area, bytes) in Area::BASE.into_iter().zip(sizes) {
-            let region = Region { at, bytes: bytes as u64, crc: 0 };
-            superblock.set_region(area, region);
-            at += region.blocks();
+        let log_capacity = usize::try_from(log_blocks)
+            .ok()
+            .and_then(|blocks| blocks.checked_mul(BLOCK))
+            .ok_or(FsError::Range)?;
+        if self.log.len() > log_capacity {
+            return Err(FsError::Full);
         }
-        superblock.data_at = at;
-        superblock.tree_at = at.checked_add(data_blocks).ok_or(FsError::Range)?;
+        let mut superblock = Super {
+            generation,
+            root,
+            log_blocks,
+            tree_at: SUPERS,
+            tree_blocks,
+            ..Super::default()
+        };
         let log_at =
             superblock.tree_at.checked_add(u64::from(tree_blocks)).ok_or(FsError::Range)?;
         let log_span =
             u64::from(log_blocks).checked_mul(crate::layout::LOG_BANKS).ok_or(FsError::Range)?;
         superblock.blocks = log_at.checked_add(log_span).ok_or(FsError::Range)?;
-        superblock.set_region(Area::Log, Region { at: log_at, bytes: 0, crc: crc32c(&[]) });
-
-        // Extents were addressed from the start of the data region.
-        for extent in &mut self.extents {
-            extent.block += superblock.data_at;
-        }
-
-        let regions = [
-            records(&self.objects, OBJECT_BYTES, Object::encode),
-            records(&self.extents, EXTENT_BYTES, Extent::encode),
-            records(&self.entries, ENTRY_BYTES, Entry::encode),
-            self.names,
-        ];
+        superblock.set_region(
+            Area::Log,
+            Region { at: log_at, bytes: self.log.len() as u64, crc: headers_crc(&self.log)? },
+        );
 
         let mut image = vec![0; superblock.blocks as usize * BLOCK];
-        for (area, bytes) in Area::BASE.into_iter().zip(regions) {
-            let mut region = superblock.region(area);
-            region.crc = crc32c(&bytes);
-            superblock.set_region(area, region);
-            let at = region.at as usize * BLOCK;
-            image[at..at + bytes.len()].copy_from_slice(&bytes);
-        }
-        image[superblock.data_at as usize * BLOCK..][..self.data.len()].copy_from_slice(&self.data);
+        let tree_start = superblock.tree_at as usize * BLOCK;
+        let tree_end = tree_start + tree_blocks as usize * BLOCK;
+        superblock.tree_root =
+            btree::format(&mut self.entries, &mut image[tree_start..tree_end], generation, SUPERS)?;
+        image[log_at as usize * BLOCK..][..self.log.len()].copy_from_slice(&self.log);
 
         for copy in 0..SUPERS {
             superblock.encode(&mut image[copy as usize * BLOCK..]);
         }
         Ok(image)
     }
-}
-
-fn records<T>(values: &[T], size: usize, encode: fn(&T, &mut [u8])) -> Vec<u8> {
-    let mut bytes = vec![0; values.len() * size];
-    for (at, value) in values.iter().enumerate() {
-        encode(value, &mut bytes[at * size..]);
-    }
-    bytes
 }
 
 fn index(value: usize) -> Result<u32, FsError> {
@@ -257,7 +229,7 @@ mod tests {
 
     use super::{Tree, build, build_with_capacity};
     use crate::FsError;
-    use crate::layout::{BLOCK, DEFAULT_TREE_BLOCKS, MAX_TREE_BLOCKS, Super};
+    use crate::layout::{Area, BLOCK, DEFAULT_TREE_BLOCKS, MAX_TREE_BLOCKS, Super};
 
     #[test]
     fn empty_tree_mounts() -> Result<(), FsError> {
@@ -265,8 +237,22 @@ mod tests {
         let superblock = Super::parse(&image)?;
 
         assert_eq!(superblock.generation, 1);
-        assert_eq!(superblock.data_blocks, 0);
+        assert_ne!(superblock.tree_root, 0);
         assert_eq!(superblock.tree_blocks, DEFAULT_TREE_BLOCKS);
+        Ok(())
+    }
+
+    #[test]
+    fn mkfs_starts_from_tree_checkpoint() -> Result<(), FsError> {
+        let mut tree = Tree::new();
+        tree.file("seed", vec![1; BLOCK])?;
+
+        let image = build(&tree, 1)?;
+        let superblock = Super::parse(&image)?;
+
+        assert_ne!(superblock.tree_root, 0);
+        assert_eq!(superblock.tree_at, crate::layout::SUPERS);
+        assert_eq!(superblock.region(Area::Log).bytes, BLOCK as u64 + crate::log::ALIGN);
         Ok(())
     }
 
@@ -290,13 +276,13 @@ mod tests {
     }
 
     #[test]
-    fn hole_costs_no_data_block() -> Result<(), FsError> {
+    fn hole_costs_no_payload() -> Result<(), FsError> {
         let mut tree = Tree::new();
         tree.file("sparse", vec![0; 4 * BLOCK])?;
 
         let image = build(&tree, 1)?;
 
-        assert_eq!(Super::parse(&image)?.data_blocks, 0);
+        assert_eq!(Super::parse(&image)?.region(Area::Log).bytes, 0);
         Ok(())
     }
 
