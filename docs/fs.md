@@ -1,78 +1,60 @@
 # MoltFS
 
-Status: Stage 3 COW B-tree filesystem, on a block ring since Stage 4.4,
-July 2026.
+Status: version 5 unified checkpointed COW filesystem, on a block ring since
+Stage 4.4, August 2026.
 
-How the read-only Stage 2.4 image became a writable, crash-consistent
-filesystem; how the bounded journal and copy-on-write metadata tree divide the
-work; what comes from bcachefs; and how capabilities, block durability, caching,
-and power-loss tests fit together. This is the record for `molt-block`,
-`molt-fs`, and `molt-shell`.
+How mkfs and runtime mutations now produce the same writable format; how the
+bounded payload journal, COW metadata tree, allocator, and reclamation divide
+the work; what comes from bcachefs; and how capabilities, block durability,
+caching, and power-loss tests fit together. This is the record for
+`molt-block`, `molt-fs`, and `molt-shell`.
 
 ## What this stage has to answer
 
-Stage 2.3 ends with a sector reading back correct. That is a device, not
-storage: nothing yet says which bytes mean something, nobody holds a reference
-to a file, and the only consumer is a smoke test comparing a pattern. Stage 2.4
-is where a name becomes a thing you can hold, and it has to answer four
-questions before writing a byte of format:
+Stage 2.3 ended with a sector reading back correctly. That was a device, not
+storage: nothing said which bytes meant something and nobody held a reference
+to a file. MoltFS now has to keep four answers true at the same time:
 
-1. **What is on the disk.** Superblock, objects, extents — the shape the next
-   ten years of the filesystem grow out of, because a format is the one thing
-   here that cannot be refactored without rewriting every image ever made.
+1. **What is on the disk.** Dual superblocks, a typed metadata B-tree, and
+   payload-log banks form one format for an image built offline and a volume
+   changed at runtime.
 2. **How a cell asks for a file.** Molt has no processes, no paths resolved by
    the kernel, and no `open(2)`. It has rings and capabilities, so the protocol
    has to be built out of those and be pleasant enough that nobody wants a
    shortcut around it.
-3. **What survives a crash.** Stage 2.4 established dual superblocks; Stage 3
-   has to turn that shape into a real ordered checkpoint and prove every power
-   cut.
+3. **What survives a crash.** Dual superblocks publish complete generations;
+   fault injection proves every cut keeps either the old or new checkpoint.
 4. **Where the driver ends and the filesystem begins.** Stage 2.3 shipped
    `molt-virtio` with a `read` method on it. If a filesystem is written against
    that method, the second storage driver is a rewrite of the filesystem.
 
-## Read-only, and why that is the interesting version
+## One format, not a read-only base plus overlays
 
-The instinct is to build the copy-on-write filesystem directly, because CoW is
-where the design is going and a read-only format looks like a throwaway. It is
-the opposite: a read-only volume is the whole read path, and the read path is
-what every later feature is measured against.
+Versions 1–4 grew a read path first, then kept the image-builder output as an
+immutable collection of object, entry, extent, name, and data regions. Runtime
+creates and writes accumulated beside those regions in a separate COW tree and
+mutation log. That proved the checkpoint protocol, but it left every lookup and
+read merging two representations and made the original image impossible to
+reclaim or reorganize.
 
-Writing is where the hard parts are — allocation, a journal or a checkpoint
-tree, ordering against a device that reorders, fsync semantics, and the tests
-that cut power at every one of those points. None of it can be designed
-honestly before there is a reader whose invariants it has to preserve. Building
-the reader first means the write path arrives with something to be correct
-*about*, and it means Stage 2.4 ships something that works instead of something
-that half-works in two directions.
-
-The cost was real and bounded: Stage 2.4 carried no allocator, log, free-space
-map, or write path. It did establish the structures its successor needed:
-dual generation-stamped superblocks, checksummed metadata, crc32c per data
-block, and extents rather than block pointers. Stage 3 preserves that base and
-adds the log banks around it.
+Version 5 deliberately breaks that format. `xtask mkfs` now constructs the
+same `Object`, `Dirent`, and `Extent` keys that runtime operations mutate and
+writes them into an initial COW-tree checkpoint. Initial file bytes use the
+same aligned payload records that later writes use. There is no MoltROFS magic,
+immutable base metadata, base data region, or overlay fallback in the mount
+path. An image from mkfs is simply generation one of an ordinary writable
+MoltFS volume.
 
 ## Taking from bcachefs rather than btrfs
 
 The brief was btrfs's ideas without btrfs's legacy, leaning bcachefs. The ideas
 arrive here in the cheapest form that is still the real thing.
 
-**Checksums that cover data, not just metadata.** Every data block carries a
-crc32c, and every metadata region carries one in the superblock. This is
-bcachefs's position — checksums are not optional and not a mount flag — and it
-is why [`Volume::mount`](../crates/molt-fs/src/volume.rs) verifies all five
-regions before the first lookup rather than discovering corruption at whatever
-block a directory search happens to land on. A volume that mounts is a volume
-whose metadata is intact, which is a much stronger statement than "the
-superblock parsed".
-
-The sums travel with the extents, as bcachefs's do, rather than in a region of
-their own: locating a block is already learning what it must hash to, so the
-check costs nothing beyond the record the read had to fetch anyway. A region
-apart cost a second lookup per block, which slots hid only while a file was
-streaming. The run is bounded at twelve blocks because that is how many sums a
-64-byte record holds, and a sum per block is what keeps a read of one block
-from hashing the run around it.
+**Checksums cover both metadata and payload.** Every tree node has its own
+crc32c. The active payload region has one crc32c in the superblock, and the
+superblock has another over its fields. [`Volume::mount`](../crates/molt-fs/src/volume.rs)
+verifies the complete candidate before it becomes visible and falls back to
+the other superblock if the newer tree or payload bank is damaged.
 
 **A generation in the superblock, and a checkpoint that swings it.** Below.
 
@@ -88,7 +70,7 @@ tree with three key spaces:
 
 This is the same useful boundary at smaller scale: namespace and object queries
 are tree lookups rather than mutation-log scans, while file payloads remain in
-the bounded log until extent allocation and compaction arrive. See bcachefs's
+a bounded log and live extents are compacted when a bank grows old. See bcachefs's
 [architecture overview](https://bcachefs.org/) and
 [transaction design](https://bcachefs.org/Transactions/).
 
@@ -103,29 +85,27 @@ swallowed whole leaves a whiteout, a zero-length record, because the tree is
 copy-on-write and has no `remove`; bcachefs does the same, and a walk skips
 whiteouts rather than stopping at one.
 
-**Extents, not block pointers.** A file is a run of
-`(logical, blocks, block, sums)` records, sorted by logical block and
-binary-searched. Contiguous data costs one
-record however long it is, a logical block no extent covers is a hole that reads
-as zeros, and `xtask mkfs` drops every all-zero block on the floor — so a sparse
-file costs its content, not its length. Extents are also the only structure here
-that a writable version would have kept anyway; block pointers would have been
-thrown away.
+**Extents, not block pointers.** An extent value names a payload record, a byte
+offset inside it, and a length. A logical range no extent covers is a hole that
+reads as zeros. `xtask mkfs` omits all-zero blocks and coalesces adjacent
+non-zero blocks into payload runs, so the initial checkpoint and later sparse
+writes use identical read logic.
 
 What was deliberately *not* taken:
 
 - **Reflinks, snapshots, subvolumes.** All three need reference-counted general
-  allocation. The room they will take is a superblock field and a region, both
-  of which the layout has space for.
+  allocation. The current allocator protects exactly the newest and previous
+  checkpoint.
 - **Inodes as a namespace.** There is no `stat` on a number, no hard links, and
   no `.`/`..`. An object is reached by having opened it; see below.
-- **btrfs's on-disk anything.** The item/key/leaf machinery, the chunk tree, and
-  the backref format are solutions to problems Molt does not have yet, and each
-  one is a compatibility obligation from the moment an image exists.
+- **bcachefs or btrfs on-disk bytes.** Their item/key/leaf machinery, bucket
+  generations, backreferences, and chunk maps are solutions to larger-scale
+  problems. MoltFS borrows invariants, not a compatibility obligation.
 
-## The base format
+## The version 5 format
 
-Five regions, two superblocks, all little-endian, everything block-addressed.
+Two superblocks, one fixed tree arena, and three payload banks; all numbers are
+little-endian and all physical addresses are blocks.
 [`layout.rs`](../crates/molt-fs/src/layout.rs) is the definition; both the
 reader and `xtask mkfs` compile against it, so there is no second copy of the
 format to drift.
@@ -133,54 +113,44 @@ format to drift.
 ```
 block 0   superblock copy 0
 block 1   superblock copy 1
-          objects   one 32-byte record per object, indexed by id
-          extents   64-byte runs with their sums, sorted by logical block
-          entries   16-byte directory entries, sorted by name within a directory
-          names     the byte arena every entry's name points into
-          data      the blocks extents address
           tree      fixed arena of checksummed 4096-byte COW nodes
           log 0     active, previous, or free checkpoint bank
           log 1     active, previous, or free checkpoint bank
           log 2     active, previous, or free checkpoint bank
 ```
 
-Blocks are 4096 bytes. Every record size divides the block size, so no record
-straddles a boundary and a reader needs exactly one block of buffer to reach any
-of them — which is why an object is 32 bytes rather than the 24 its fields use.
-That constant is what keeps reading bounded: a mounted `Volume` holds exactly
-one `[u8; 4096]`, boxed, and every record it parses is reachable from it.
+Blocks are 4096 bytes. A tree leaf stores typed fixed-width keys and values; an
+internal node stores separator keys and physical child blocks. Every node has a
+magic, version, generation, and crc32c. The arena is fixed in size so its
+allocation map stays bounded, while node reachability decides which blocks are
+live.
 
-**The superblock** carries a magic, version, block size, generation, volume
-length, root object id, data geometry, tree arena and root, log-bank capacity,
-and six region descriptors — each an offset, length, and crc32c. The sixth
-descriptor names the complete mutation log for that checkpoint. Its own
-checksum is checked before any field is trusted. `Super::check` also proves the
-tree root lies inside its arena, the selected log lies at exactly one of three
-bank boundaries, and base metadata, data, tree, and log banks do not overlap.
+**The superblock** carries magic `MOLTFS05`, format version 5, block size,
+generation, volume length, root object id, tree geometry and root, log-bank
+capacity, and the active payload region's offset, byte length, and crc32c. Its
+own checksum is checked before any other field is trusted. `Super::check` proves
+the tree and three banks fit without overlap, the tree root is inside its arena,
+and the selected payload region starts at a bank boundary and fits that bank.
 
-**An object** is a kind, a start index, a count, and a size. For a directory the
-range is into the entries region and the size is zero; for a file the range is
-into the extents region and the size is the file's length in bytes. One record
-serves both because the difference between them is one byte, and a filesystem
-that needs two record types before it has a write path has already spent its
-simplicity budget.
+**Object values** hold kind, directory-entry count, and file size. Directory
+size and file entry count are zero. Object ids are dense from zero; mount checks
+that the advertised root exists and is a directory.
 
-**An entry** is a `(name_at, name_len, object)` triple pointing into the name
-arena. Names are out of line so an entry stays 16 bytes and a directory search
-reads one block per probe regardless of name length; `name_len` is a `u16` on
-disk, and `MAX_NAME` — 255 — bounds only the copy a lookup makes onto the stack
-and the inline `Name` a ring carries, not the stored form.
+**Dirent keys** store their parent id and inline name and map to a child object
+id. Names remain bounded by `MAX_NAME = 255`, and an ordered tree walk is a
+directory listing in bytewise name order.
+
+**Extent keys** store the file id and exclusive byte end. Their values locate a
+record in the active payload bank plus a skip and length. They never overlap
+within a file, and a missing logical range is a sparse hole.
 
 ## Writable tree and payload log
 
-The base image remains immutable. `Journal` appends two typed payload records:
-
-- `Create(object, parent, kind, name)` allocates the next object id and adds one
-  directory entry.
-- `Write(object, offset, bytes)` carries file data. The extent keys pointing at
-  it decide what a read sees, so a later write wins by trimming the extents it
-  lands on rather than by sitting after them in the log; a write beyond end
-  creates a zero-filled hole.
+There is no metadata replay log. Create changes the parent `Object`, inserts a
+new `Object`, and inserts a `Dirent` in one unpublished COW transaction. A file
+write appends one payload record, updates file size, trims intersecting extent
+keys, and inserts the new `Extent`. The tree root is the complete namespace and
+extent index for that generation.
 
 Records start on 512-byte sector boundaries. One sector write can therefore
 tear only the record being appended, never an earlier record. The active
@@ -205,8 +175,16 @@ The tree arena has a bounded tracing allocator. Starting a transaction marks
 nodes reachable from the active and previous roots; every other arena block is
 reclaimable. Replaced paths created in the same transaction are released
 immediately. This keeps both crash fallbacks intact while allowing old
-generations to be reused without fsck. `build_with_capacity` selects tree and
-log capacity, and `FsError::Full` reports either finite bound explicitly.
+generations to be reused without fsck.
+
+The payload log uses the same two-generation rule. A transaction writes the
+bank that is neither active nor used by the previous checkpoint. Below half
+capacity it copies the active bank before appending. Above half capacity it
+walks the durable extent index, streams only live extent slices into fresh
+records, and retargets those extent values through the COW transaction. The
+copy is sector-sized and needs no payload-sized heap buffer. If live data does
+not fit, the operation returns `FsError::Full` without publishing a partial
+generation. `build_with_capacity` selects both finite bounds explicitly.
 
 ## Metadata cache
 
@@ -317,9 +295,11 @@ three log banks:
 2. one named by the previous superblock;
 3. one safe target for the next transaction.
 
-The first mutation copies the active log into the free bank, appends there, and
-writes new COW nodes into unprotected arena blocks. `Sync` uses one
-deterministic, synchronous sequence:
+The first mutation chooses the free bank and writes new COW nodes into
+unprotected arena blocks. It either copies the active log or, after the
+half-capacity threshold, compacts only payload slices reachable from live
+extent keys. It then appends there. `Sync` uses one deterministic, synchronous
+sequence:
 
 1. finish all target-bank and COW-node writes;
 2. issue device `flush`;
@@ -345,9 +325,9 @@ from generation 2, rotates into the third bank, and cuts power before every
 record, tree-node, flush, and superblock action until a full checkpoint
 succeeds. Every interrupted run remounts generation 2; the first uninterrupted
 run remounts generation 3 with all bytes. Separate tests corrupt the newest log
-and newest tree root and require fallback, and cycle hundreds of checkpoints to
-prove arena reclamation. Those tests are the recovery algorithm, not a
-simulation around it.
+and newest tree root and require fallback, cycle hundreds of checkpoints to
+prove arena reclamation, and cut power at every step of a live-data compaction.
+Those tests are the recovery algorithm, not a simulation around it.
 
 ## Schemes: no, and here is the line
 
@@ -649,20 +629,20 @@ the block it holds, `Flight` at the device with a `RequestId`, or `Lent` to a
 submission not taken back yet, over a ring `2 * SLOTS` deep so the ring is never
 the reason a read waits.
 
-**A sequential read asks ahead.** `Volume::read` submits the next `AHEAD = 3`
-blocks of the extent it is on before awaiting the one it needs, so what a
-streaming `cat` is about to want is already at the device when it asks. The run
-is known by then, so this costs no metadata read — only a guess about where the
-caller goes next. Being a guess is what shapes the rest: it stops at the end of
-the run, because the block after a hole is not a block, and it declines when
-there is no free slot rather than waiting for one.
+**A sequential read asks ahead.** `Journal::read` submits the next
+`AHEAD = 3` payload blocks of the extent it is on before awaiting the one it
+needs, so what a streaming `cat` is about to want is already at the device when
+it asks. The extent boundary is known by then, so this costs no metadata read —
+only a guess about where the caller goes next. Being a guess is what shapes the
+rest: it stops at the end of the extent and declines when there is no free slot
+rather than waiting for one.
 
-**A region walk spends every slot.** Mount verifies five regions, and a commit
-sums what it wrote; both walk a range in order. `sweep` keeps starting reads on
-free slots ahead of the block it is handing over, and releases each block as it
-is taken: a walk reads a region through, and nothing behind it is coming back.
-That is what keeps the pool from being spent on blocks a mount will never look
-at again.
+**A region walk spends every slot.** Mount verifies the active payload region,
+and a commit sums what it wrote; both walk a range in order. `sweep` keeps
+starting reads on free slots ahead of the block it is handing over, and
+releases each block as it is taken: a walk reads a region through, and nothing
+behind it is coming back. That is what keeps the pool from being spent on
+blocks a mount will never look at again.
 
 **The pool fills as reads ask for it.** Slots are allocated lazily up to
 `SLOTS`, and `free` prefers an empty slot, then a fresh one, then the
@@ -818,9 +798,9 @@ line editor away and needs a serial `read` before it is worth writing.
 
 ## What this stage does not do
 
-- **No rename, unlink, or compaction.** Create, sparse write, replay, and sync
-  are complete; reclaiming log space and changing namespace links arrive with
-  the B-tree/free-space stage.
+- **No rename or unlink.** Create, sparse write, sync, tree-node reclamation,
+  and live-payload compaction are complete. Changing namespace links still
+  needs key deletion rather than permanent whiteouts.
 - **No snapshots, no reflinks, no compression, no encryption.** Stage 4, and
   each one needs the writer first.
 - **No data cache.** Metadata nodes are cached; `Volume` keeps eight block
@@ -831,9 +811,9 @@ line editor away and needs a serial `read` before it is worth writing.
   forgets it when the slot is worth more. A cache that outlives the operation is
   the page cache below, which needs the writeback policy this stage does not
   have.
-- **No scrub.** Sums are checked per block on read; walking every extent
-  deliberately is a Stage 4 item, and the extent region is the work list it
-  will walk.
+- **No scrub.** Mount verifies the complete payload bank and every reachable
+  metadata node. A background walk that reports which object owns a damaged
+  range is still a Stage 4 item; the extent key space is its work list.
 - **The depth stops at virtio.** `Backing` hands the device as many requests as
   its `Queue` takes, so nothing above the driver limits what is in flight any
   more — but `molt_virtio::Block` is still one command at a time behind a
@@ -859,16 +839,16 @@ line editor away and needs a serial `read` before it is worth writing.
 ## How it is tested
 
 Everything with arithmetic in it is a host test over a real image, because
-`Loopback` made that possible: format round-trips through builder and reader, a
-torn superblock is refused, a foreign block is refused, a future version is
-refused by version rather than checksum, a region past volume end is refused,
-and a damaged region fails at mount rather than first use. Reads cover block
-boundaries, sparse holes, file end, and writes that overlay immutable data and
-extend it through a hole.
+`Loopback` made that possible: mkfs emits a non-empty initial tree root, format
+round-trips through `Journal`, a torn superblock is refused, a foreign block is
+refused, a future version is refused by version rather than checksum, a region
+past volume end is refused, and a damaged tree fails at mount rather than first
+use. Reads cover block boundaries, sparse holes, file end, and writes that trim
+checkpoint extents and extend through a hole.
 
-A checksum-valid but impossible extent is still refused: physical block
-arithmetic is checked before a data read, so a malformed address cannot wrap
-into another region or panic the reader.
+A checksum-valid but structurally impossible index is still refused: object ids
+must be dense, directory counts and children must agree, extents cannot overlap,
+and every live extent slice must fit the file payload record it names.
 
 Ring tests are about who gets which answer: a read lands through the ring, an
 answer parked while a later one is awaited comes back to whoever asked for it,
@@ -931,18 +911,17 @@ feature; each is a decision the write path would otherwise inherit wrong.
 **`MAX_NAME` is 255, and inline.** The read-only stage shipped it at 64, which
 was enough for a boot image and wrong for a filesystem: 255 is the limit every
 mainstream filesystem settled on, and the largest a one-byte inline length can
-hold. Fixing it now costs nothing on disk — names live out of line under a
-`u16` length, so a wider reader bound reinterprets no stored byte and does not
-move the version. What it does widen is the inline [`Name`](../crates/molt-fs/src/name.rs)
-a ring carries, to 256 bytes, and with it every ring slot: `FsOp` and `FsDone`
-reach 272 bytes each. The alternative considered was a `Cow`-shaped name —
+hold. Version 5 stores that byte and the name directly in each `Dirent` key, so
+the tree's ordering is the directory's ordering and a lookup needs no second
+name arena read. The same inline [`Name`](../crates/molt-fs/src/name.rs) a ring
+carries is 256 bytes, and with it every ring slot: `FsOp` and `FsDone` reach 272
+bytes each. The alternative considered was a `Cow`-shaped name —
 inline for short leaves, a registered-buffer reference for long ones — and it
 was rejected. It puts a resolver on the hottest path, `Open` and `Entry`, to
 save bytes on a message that is already `Copy` and already fits a stack ring
 with room to spare; the ceremony of registering a buffer for a path is exactly
 what the inline name exists to avoid, and 256 bytes is a bound a kernel stack
-does not feel. The version stays 1: the encoding did not change, only the
-reader's tolerance for it.
+does not feel.
 
 **A ring slot's size is asserted, not assumed.** `op.rs` carries
 `const _: () = assert!(size_of::<FsOp>() <= 512)` and the same for `FsDone`, so
@@ -967,21 +946,18 @@ the types.
 
 ## Version and growth path
 
-Extents carrying their own sums are version 4. Every layout change so far has
-moved bytes and geometry an older reader interprets — the tree arena and root in
-version 3, the wider extent record and the region that stopped existing here.
-There is no published standard yet, but that is a reason to keep migration
-policy small, not to label incompatible layouts with the same version. Older
-images are rejected rather than guessed at; `xtask mkfs` rebuilds development
-images as version 4. Tree nodes carry their own magic and version, `MOLTBTR4`,
-because a node written under the old write keys parses cleanly under the extent
-ones and would answer reads with the wrong bytes.
+The unified format is version 5, magic `MOLTFS05`. It intentionally retires the
+MoltROFS object, extent, entry, name, and data regions from versions 1–4 rather
+than keeping two representations forever. Older images are rejected rather
+than guessed at; `xtask mkfs` rebuilds development images directly as a v5
+writable checkpoint. Tree nodes carry their own v5 magic, `MOLTBT05`, so a node
+from an older key/value schema cannot parse as current metadata.
 
 - **Stage 4.4, asynchronous I/O.** Done: `Volume` and `Journal` are `async` over
   a `BlockOp` ring, with readahead and region sweeps above it.
-- **Stage 4, scale.** File payloads compact from the journal into extent keys;
-  reference counts and bucket generations generalize the bounded tree arena;
-  extents become a scrub work list; the block layer gains a data cache.
+- **Stage 4, scale.** Live payloads already compact between checkpoint banks.
+  Reference counts and bucket generations can generalize the bounded arenas;
+  extent keys become a scrub work list; the block layer gains a data cache.
 - **Stage 5, storage for cells.** A signed cell image is a file with a signature
   region, and the loader is a client of this protocol — which is the argument
   for the protocol being pleasant to write against, since a loader is the next
