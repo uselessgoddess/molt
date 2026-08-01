@@ -291,6 +291,17 @@ allocator with one that refuses large allocations on the calling thread, and
 shows a mount answering `FsError::Memory` and a refused create rolling back to
 its snapshot while the journal keeps taking work.
 
+A mutation allocates that path once. It retires a block for every block it
+writes, and what the retired one parsed to is dead the moment it is: the cache
+hands the node back — when a write displaces its entry, or when `release`
+returns the block to the arena — and `Spare` keeps up to `MAX_HEIGHT + 1` of
+those allocations, zeroing one in place when the next node is asked for.
+`crates/molt-fs/tests/cost.rs` counts what an operation asks the allocator for
+rather than timing it: a read costs nothing at all, a write costs nothing of a
+block's size, and what is left of a write is the bitmaps its transaction opens
+with. Without the pool the same test measures 709 block-sized allocations over
+64 writes.
+
 ## Crash consistency
 
 The invariant is exact: **after power loss, mount returns the complete old
