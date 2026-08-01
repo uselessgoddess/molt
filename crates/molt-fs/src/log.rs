@@ -1,6 +1,7 @@
 //! File payload records in the append-only checkpoint log.
 
 use crate::FsError;
+#[cfg(any(feature = "format", test))]
 use crate::crc::Crc;
 use crate::layout::BLOCK;
 
@@ -99,6 +100,7 @@ impl Record {
 }
 
 /// Checks and hashes the record-header stream without walking file payloads.
+#[cfg(any(feature = "format", test))]
 pub fn headers_crc(bytes: &[u8]) -> Result<u32, FsError> {
     let mut crc = Crc::new();
     let mut cursor = 0usize;
