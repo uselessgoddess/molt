@@ -13,7 +13,8 @@ use molt_core::task;
 
 use crate::FsError;
 use crate::crc::Crc;
-use crate::layout::{Area, BLOCK, SUPERS, Super, buffer};
+use crate::layout::{Area, BLOCK, Region, SUPERS, Super, buffer};
+use crate::log::{HEADER, Record};
 
 /// Sectors per block.
 const SECTORS: u64 = (BLOCK / SECTOR) as u64;
@@ -172,11 +173,9 @@ impl Volume {
     }
 
     async fn verify_checkpoint(&mut self, superblock: &Super) -> Result<(), FsError> {
-        for area in Area::ALL {
-            let region = superblock.region(area);
-            if self.checksum(region.at, region.bytes).await? != region.crc {
-                return Err(FsError::Checksum);
-            }
+        let log = superblock.region(Area::Log);
+        if self.log_checksum(log).await? != log.crc {
+            return Err(FsError::Checksum);
         }
         crate::btree::verify(self, superblock).await
     }
@@ -244,31 +243,6 @@ impl Volume {
         self.start(at, index).await
     }
 
-    /// Reads `blocks` in order, giving each to `take`.
-    ///
-    /// Every slot it can get is spent on the blocks ahead of the one being
-    /// handed over, so a sweep waits for the device once rather than once per
-    /// block. Each block is released as it is taken: a sweep reads a region
-    /// through, and nothing behind it is coming back.
-    async fn sweep(
-        &mut self,
-        blocks: Range<u64>,
-        mut take: impl FnMut(&[u8; BLOCK]),
-    ) -> Result<(), FsError> {
-        let mut next = blocks.start;
-        for index in blocks.clone() {
-            while next < blocks.end
-                && let Some(at) = self.free()
-            {
-                self.start(at, next).await?;
-                next += 1;
-            }
-            take(self.block(index).await?);
-            self.drop_block(index);
-        }
-        Ok(())
-    }
-
     /// Reads a block without keeping it, on the buffer kept aside.
     ///
     /// This is the way around the slots, for the walks that would sweep every
@@ -326,15 +300,6 @@ impl Volume {
         }
         self.slots.push(Slot::Here { block: None, buffer: buffer().ok()? });
         Some(self.slots.len() - 1)
-    }
-
-    /// Forgets `index`, whose slot is worth more than what it holds.
-    fn drop_block(&mut self, index: u64) {
-        if let Some(at) = self.find(index)
-            && let Slot::Here { block, .. } = &mut self.slots[at]
-        {
-            *block = None;
-        }
     }
 
     /// A slot to read into, waiting for one if every buffer is at the device.
@@ -421,33 +386,6 @@ impl Volume {
         Ok(())
     }
 
-    pub(crate) async fn copy_aligned(
-        &mut self,
-        source: u64,
-        target: u64,
-        bytes: u64,
-    ) -> Result<(), FsError> {
-        if bytes % SECTOR as u64 != 0 {
-            return Err(FsError::Corrupt);
-        }
-        self.stale(target..target.saturating_add(bytes.div_ceil(BLOCK as u64))).await;
-        let mut done = 0;
-        while done < bytes {
-            let take = (bytes - done).min(BLOCK as u64) as usize;
-            let at = |block: u64| {
-                block
-                    .checked_mul(SECTORS)
-                    .and_then(|sector| sector.checked_add(done / SECTOR as u64))
-                    .ok_or(FsError::Corrupt)
-            };
-            let (from, to) = (at(source)?, at(target)?);
-            self.aside(|buffer| BlockOp::Read { sector: from, bytes: take, buffer }).await?;
-            self.aside(|buffer| BlockOp::Write { sector: to, bytes: take, buffer }).await?;
-            done += take as u64;
-        }
-        Ok(())
-    }
-
     pub(crate) async fn write_aligned(
         &mut self,
         block: u64,
@@ -498,15 +436,32 @@ impl Volume {
         self.aside(|buffer| BlockOp::Write { sector, bytes: BLOCK, buffer }).await
     }
 
-    pub(crate) async fn checksum(&mut self, block: u64, bytes: u64) -> Result<u32, FsError> {
+    /// Hashes only the headers of a payload-log region.
+    ///
+    /// Their per-record checksums protect file bytes when those bytes are read;
+    /// mount only needs this compact structural commitment to select a root.
+    pub(crate) async fn log_checksum(&mut self, region: Region) -> Result<u32, FsError> {
         let mut crc = Crc::new();
-        let mut left = bytes;
-        self.sweep(block..block + bytes.div_ceil(BLOCK as u64), |whole| {
-            let take = left.min(BLOCK as u64) as usize;
-            crc.update(&whole[..take]);
-            left -= take as u64;
-        })
-        .await?;
+        let mut cursor = 0;
+        while cursor < region.bytes {
+            let within = (cursor % BLOCK as u64) as usize;
+            let end = within.checked_add(HEADER).ok_or(FsError::Corrupt)?;
+            if end > BLOCK {
+                return Err(FsError::Corrupt);
+            }
+            let mut header = [0; HEADER];
+            header.copy_from_slice(
+                &self.block(region.at + cursor / BLOCK as u64).await?[within..end],
+            );
+            let record = Record::parse(&header)?;
+            crc.update(&header);
+            cursor = cursor
+                .checked_add(record.span().map_err(|_| FsError::Corrupt)?)
+                .ok_or(FsError::Corrupt)?;
+        }
+        if cursor != region.bytes {
+            return Err(FsError::Corrupt);
+        }
         Ok(crc.finish())
     }
 

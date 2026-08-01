@@ -169,7 +169,7 @@ fn readahead_lands_before_asked() -> Result<(), FsError> {
 
     let counts = fetches::<1>(&bytes)?;
 
-    assert!(counts[0] > 3, "the first window fetched nothing ahead of itself");
+    assert!(counts[0] > 3, "the first window fetched only {} blocks", counts[0]);
     let free = counts.iter().filter(|&&count| count == 0).count();
     assert!(free > BLOCKS / 4, "only {free} of {BLOCKS} windows were already here");
     Ok(())

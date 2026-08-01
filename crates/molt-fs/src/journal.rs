@@ -1,19 +1,40 @@
 //! Writable view of a COW-tree checkpoint and its payload log.
 //!
-//! A transaction copies the active log into a third bank, appends typed records,
-//! and path-copies metadata nodes. [`Journal::sync`] flushes those writes before
-//! it publishes their log and tree root, then flushes the superblock. Blocks
-//! reachable from the newest and previous checkpoints are never overwritten.
+//! A transaction appends typed records in the active bank while it has room and
+//! path-copies metadata nodes. When the bank fills, live payload slices stream
+//! into the bank not held by either durable checkpoint. [`Journal::sync`]
+//! flushes those writes before it publishes their log and tree root, then
+//! flushes the superblock.
 
 use molt_block::SECTOR;
 
 use crate::btree::{Key, MetadataTree, TreeStats, TreeTransaction, Value};
+use crate::crc::{Crc, crc32c};
 use crate::layout::{Area, BLOCK, Kind, Object, Region};
 use crate::log::{ALIGN, HEADER, Record};
 use crate::volume::Blocks;
 use crate::{FsError, Name, Volume};
 
-const AHEAD: u64 = 3;
+const AHEAD: u64 = 4;
+const VERIFIED: usize = 8;
+
+#[derive(Clone, Copy)]
+struct VerifiedRecord {
+    bank: u64,
+    cursor: u64,
+    chunk: u32,
+    crc: u32,
+}
+
+#[derive(Clone, Copy)]
+struct ExtentHint {
+    file: u32,
+    start: u64,
+    end: u64,
+    at: u64,
+    skip: u32,
+    len: u32,
+}
 
 /// The unpublished half of a checkpoint: where the new log bank is, how far it
 /// has been filled, and the tree generation indexing it.
@@ -36,6 +57,9 @@ pub struct Journal {
     transaction: Option<Transaction>,
     tree: MetadataTree,
     next_object: u32,
+    verified: [Option<VerifiedRecord>; VERIFIED],
+    verify_hand: usize,
+    extent_hint: Option<ExtentHint>,
 }
 
 impl Journal {
@@ -46,6 +70,9 @@ impl Journal {
             transaction: None,
             tree: MetadataTree::new()?,
             next_object: 0,
+            verified: [None; VERIFIED],
+            verify_hand: 0,
+            extent_hint: None,
         };
         journal.replay().await?;
         Ok(journal)
@@ -59,6 +86,9 @@ impl Journal {
         self.volume.remount().await?;
         self.transaction = None;
         self.tree = MetadataTree::new()?;
+        self.verified.fill(None);
+        self.verify_hand = 0;
+        self.extent_hint = None;
         self.replay().await
     }
 
@@ -180,8 +210,25 @@ impl Journal {
         // One descent lands on the first extent whose end is past `offset`, and
         // extents of a file never overlap, so the walk from there is in file
         // order and the first one starting past the window ends it.
-        let mut key = Key::extent(file, offset.checked_add(1).ok_or(FsError::Corrupt)?);
-        let mut inclusive = true;
+        let (mut key, mut inclusive) = if let Some(hint) = self
+            .extent_hint
+            .filter(|hint| hint.file == file && hint.start <= offset && offset < hint.end)
+        {
+            let end = read_end.min(hint.end);
+            self.copy_payload(
+                hint.at,
+                u64::from(hint.skip) + (offset - hint.start),
+                u64::from(hint.skip) + u64::from(hint.len),
+                &mut buf[..(end - offset) as usize],
+            )
+            .await?;
+            if end == read_end {
+                return Ok(want);
+            }
+            (Key::extent(file, hint.end), false)
+        } else {
+            (Key::extent(file, offset.checked_add(1).ok_or(FsError::Corrupt)?), true)
+        };
         loop {
             let next = self.tree.next(&mut self.volume, root, &key, inclusive).await?;
             let Some((found, value)) = next else { break };
@@ -196,6 +243,7 @@ impl Journal {
             }
             let held_end = found.end();
             let held = held_end.checked_sub(u64::from(len)).ok_or(FsError::Corrupt)?;
+            self.extent_hint = Some(ExtentHint { file, start: held, end: held_end, at, skip, len });
             if held >= read_end {
                 break;
             }
@@ -229,7 +277,7 @@ impl Journal {
         let object = self.next_object;
         let next = object.checked_add(1).ok_or(FsError::Full)?;
         parent_object.count = parent_object.count.checked_add(1).ok_or(FsError::Full)?;
-        let before = self.snapshot().await?;
+        let before = self.snapshot(0).await?;
         let linked = async {
             self.index(Key::object(parent), Value::object(parent_object)).await?;
             let empty = Object { kind, count: 0, size: 0 };
@@ -255,8 +303,9 @@ impl Journal {
         if bytes.is_empty() {
             return Ok(0);
         }
+        self.extent_hint = None;
         let record = Record::write(file, offset, bytes.len())?;
-        let before = self.snapshot().await?;
+        let before = self.snapshot(record.span()?).await?;
         let cursor = match self.append(record, bytes).await {
             Ok(cursor) => cursor,
             Err(error) => {
@@ -328,7 +377,7 @@ impl Journal {
         };
         let (at, bytes, root) = (transaction.at, transaction.bytes, transaction.tree.root);
 
-        let crc = self.volume.checksum(at, bytes).await?;
+        let crc = self.volume.log_checksum(Region { at, bytes, crc: 0 }).await?;
         let mut checkpoint = self.volume.checkpoint();
         checkpoint.generation = checkpoint.generation.checked_add(1).ok_or(FsError::Full)?;
         checkpoint.tree_root = root;
@@ -445,31 +494,77 @@ impl Journal {
         Ok(())
     }
 
-    /// Opens a transaction unless one is already open.
-    async fn begin(&mut self) -> Result<(), FsError> {
-        if self.transaction.is_some() {
-            return Ok(());
-        }
+    /// Opens a transaction with room for `reserve`, reclaiming only when full.
+    async fn begin(&mut self, reserve: u64) -> Result<(), FsError> {
         let checkpoint = self.volume.checkpoint();
-        let active = checkpoint.region(Area::Log);
-        let target = (0..crate::layout::LOG_BANKS)
-            .filter_map(|bank| checkpoint.log_bank(bank).ok())
-            .find(|at| *at != active.at && Some(*at) != self.volume.previous_log())
-            .ok_or(FsError::Corrupt)?;
-        let tree = self.tree.begin(&mut self.volume).await?;
         let capacity =
             u64::from(checkpoint.log_blocks).checked_mul(BLOCK as u64).ok_or(FsError::Corrupt)?;
-        if active.bytes <= capacity / 2 {
-            self.volume.copy_aligned(active.at, target, active.bytes).await?;
-            self.transaction = Some(Transaction { at: target, bytes: active.bytes, tree });
-        } else {
-            self.transaction = Some(Transaction { at: target, bytes: 0, tree });
-            if let Err(error) = self.compact(active, checkpoint.tree_root).await {
-                self.transaction = None;
+        if reserve > capacity {
+            return Err(FsError::Full);
+        }
+
+        if let Some(transaction) = self.transaction.as_ref() {
+            if transaction.bytes.checked_add(reserve).is_some_and(|end| end <= capacity) {
+                return Ok(());
+            }
+            let before = transaction.try_clone()?;
+            let source = Region { at: transaction.at, bytes: transaction.bytes, crc: 0 };
+            let root = transaction.tree.root;
+            let target = self.free_bank(source.at)?;
+            self.forget_bank(target);
+            let transaction = self.transaction.as_mut().ok_or(FsError::Corrupt)?;
+            transaction.at = target;
+            transaction.bytes = 0;
+            if let Err(error) = self.compact(source, root).await {
+                self.transaction = Some(before);
                 return Err(error);
             }
+            if self
+                .transaction
+                .as_ref()
+                .and_then(|transaction| transaction.bytes.checked_add(reserve))
+                .is_some_and(|end| end <= capacity)
+            {
+                return Ok(());
+            }
+            self.transaction = Some(before);
+            return Err(FsError::Full);
+        }
+
+        let active = checkpoint.region(Area::Log);
+        let tree = self.tree.begin(&mut self.volume).await?;
+        if active.bytes.checked_add(reserve).is_some_and(|end| end <= capacity) {
+            self.transaction = Some(Transaction { at: active.at, bytes: active.bytes, tree });
+            return Ok(());
+        }
+
+        let target = self.free_bank(active.at)?;
+        self.forget_bank(target);
+        self.transaction = Some(Transaction { at: target, bytes: 0, tree });
+        if let Err(error) = self.compact(active, checkpoint.tree_root).await {
+            self.transaction = None;
+            return Err(error);
+        }
+        if !self
+            .transaction
+            .as_ref()
+            .and_then(|transaction| transaction.bytes.checked_add(reserve))
+            .is_some_and(|end| end <= capacity)
+        {
+            self.transaction = None;
+            return Err(FsError::Full);
         }
         Ok(())
+    }
+
+    /// Chooses the one bank that no durable root and no compaction source uses.
+    fn free_bank(&self, source: u64) -> Result<u64, FsError> {
+        let checkpoint = self.volume.checkpoint();
+        let active = checkpoint.region(Area::Log).at;
+        (0..crate::layout::LOG_BANKS)
+            .filter_map(|bank| checkpoint.log_bank(bank).ok())
+            .find(|at| *at != source && *at != active && Some(*at) != self.volume.previous_log())
+            .ok_or(FsError::Full)
     }
 
     /// Copies only live extent slices into a fresh bank and retargets their keys.
@@ -488,11 +583,19 @@ impl Journal {
             }
             let end = found.end();
             let start = end.checked_sub(u64::from(len)).ok_or(FsError::Corrupt)?;
-            let record = Record::write(object, start, len as usize)?;
+            let source_record = self.record_in(source, cursor).await?;
+            if source_record.object != object
+                || source_record.offset.checked_add(u64::from(skip)) != Some(start)
+                || u64::from(skip) + u64::from(len) > u64::from(source_record.bytes)
+            {
+                return Err(FsError::Corrupt);
+            }
+            self.verify_range(source, cursor, u64::from(skip), u64::from(len)).await?;
             let payload = cursor
-                .checked_add(HEADER as u64)
+                .checked_add(source_record.payload_at().map_err(|_| FsError::Corrupt)?)
                 .and_then(|at| at.checked_add(u64::from(skip)))
                 .ok_or(FsError::Corrupt)?;
+            let record = Record::checked(object, start, len)?;
             let at = self.append_from(source, payload, record).await?;
             self.index(found, Value::extent(at, 0, len)).await?;
         }
@@ -503,8 +606,8 @@ impl Journal {
         if payload.len() != record.payload() as usize {
             return Err(FsError::Corrupt);
         }
-        self.begin().await?;
         let (at, cursor) = self.bank()?;
+        self.forget_record(at, cursor);
         let span = record.span()?;
         let end = cursor.checked_add(span).ok_or(FsError::Full)?;
         let capacity = u64::from(self.volume.checkpoint().log_blocks)
@@ -516,6 +619,7 @@ impl Journal {
 
         let mut header = [0; HEADER];
         record.encode(&mut header);
+        let payload_start = record.payload_at()?;
         let mut written = 0;
         while written < span {
             let mut sector = [0u8; SECTOR];
@@ -523,7 +627,19 @@ impl Journal {
                 sector[..HEADER].copy_from_slice(&header);
             }
             let sector_end = written + SECTOR as u64;
-            let payload_start = HEADER as u64;
+            let checksums_start = written.max(HEADER as u64);
+            let checksums_end = sector_end.min(payload_start);
+            if checksums_start < checksums_end {
+                let first = (checksums_start - HEADER as u64) / 4;
+                let last = (checksums_end - HEADER as u64) / 4;
+                for chunk in first..last {
+                    let from = chunk as usize * BLOCK;
+                    let to = (from + BLOCK).min(payload.len());
+                    let checksum = crc32c(&payload[from..to]).to_le_bytes();
+                    let target = (HEADER as u64 + chunk * 4 - written) as usize;
+                    sector[target..target + 4].copy_from_slice(&checksum);
+                }
+            }
             let payload_end = payload_start + payload.len() as u64;
             let start = written.max(payload_start);
             let end = sector_end.min(payload_end);
@@ -537,6 +653,9 @@ impl Journal {
             written += ALIGN;
         }
         self.open()?.bytes = end;
+        for (chunk, bytes) in payload.chunks(BLOCK).enumerate() {
+            self.mark_verified(at, cursor, chunk as u32, crc32c(bytes));
+        }
         Ok(cursor)
     }
 
@@ -548,6 +667,7 @@ impl Journal {
         record: Record,
     ) -> Result<u64, FsError> {
         let (at, cursor) = self.bank()?;
+        self.forget_record(at, cursor);
         let span = record.span()?;
         let end = cursor.checked_add(span).ok_or(FsError::Full)?;
         let capacity = u64::from(self.volume.checkpoint().log_blocks)
@@ -564,6 +684,7 @@ impl Journal {
 
         let mut header = [0; HEADER];
         record.encode(&mut header);
+        let payload_start = record.payload_at()?;
         let mut written = 0;
         while written < span {
             let mut sector = [0u8; SECTOR];
@@ -571,7 +692,19 @@ impl Journal {
                 sector[..HEADER].copy_from_slice(&header);
             }
             let sector_end = written + SECTOR as u64;
-            let payload_start = HEADER as u64;
+            let checksums_start = written.max(HEADER as u64);
+            let checksums_end = sector_end.min(payload_start);
+            if checksums_start < checksums_end {
+                let first = (checksums_start - HEADER as u64) / 4;
+                let last = (checksums_end - HEADER as u64) / 4;
+                for chunk in first..last {
+                    let (offset, bytes) = record.chunk(chunk as u32)?;
+                    let at = source_at.checked_add(offset).ok_or(FsError::Corrupt)?;
+                    let crc = self.region_checksum(source, at, u64::from(bytes)).await?;
+                    let target = (HEADER as u64 + chunk * 4 - written) as usize;
+                    sector[target..target + 4].copy_from_slice(&crc.to_le_bytes());
+                }
+            }
             let payload_end = payload_start + u64::from(record.payload());
             let start = written.max(payload_start);
             let finish = sector_end.min(payload_end);
@@ -614,6 +747,27 @@ impl Journal {
         Ok(())
     }
 
+    async fn region_checksum(
+        &mut self,
+        region: Region,
+        mut source: u64,
+        bytes: u64,
+    ) -> Result<u32, FsError> {
+        let end = source.checked_add(bytes).ok_or(FsError::Corrupt)?;
+        if end > region.bytes {
+            return Err(FsError::Corrupt);
+        }
+        let mut crc = Crc::new();
+        while source < end {
+            let within = (source % BLOCK as u64) as usize;
+            let take = (end - source).min((BLOCK - within) as u64) as usize;
+            let block = self.volume.block(region.at + source / BLOCK as u64).await?;
+            crc.update(&block[within..within + take]);
+            source += take as u64;
+        }
+        Ok(crc.finish())
+    }
+
     async fn index(&mut self, key: Key, value: Value) -> Result<(), FsError> {
         // Taken out and put back: the tree needs the volume the journal owns,
         // and a failed insert still leaves a transaction its caller rolls back.
@@ -629,8 +783,8 @@ impl Journal {
     /// caller puts this copy back so the transaction keeps only what it had
     /// before. Blocks the abandoned half wrote stay unreferenced in the arena
     /// until the next generation reuses them.
-    async fn snapshot(&mut self) -> Result<Transaction, FsError> {
-        self.begin().await?;
+    async fn snapshot(&mut self, reserve: u64) -> Result<Transaction, FsError> {
+        self.begin(reserve).await?;
         self.transaction.as_ref().ok_or(FsError::Corrupt)?.try_clone()
     }
 
@@ -660,6 +814,10 @@ impl Journal {
 
     async fn record(&mut self, cursor: u64) -> Result<Record, FsError> {
         let log = self.log_region();
+        self.record_in(log, cursor).await
+    }
+
+    async fn record_in(&mut self, log: Region, cursor: u64) -> Result<Record, FsError> {
         if cursor % ALIGN != 0
             || cursor.checked_add(HEADER as u64).ok_or(FsError::Corrupt)? > log.bytes
         {
@@ -677,6 +835,88 @@ impl Journal {
         Ok(record)
     }
 
+    async fn verify_range(
+        &mut self,
+        log: Region,
+        cursor: u64,
+        offset: u64,
+        bytes: u64,
+    ) -> Result<(), FsError> {
+        let record = self.record_in(log, cursor).await?;
+        let end = offset.checked_add(bytes).ok_or(FsError::Corrupt)?;
+        if bytes == 0 || end > u64::from(record.bytes) {
+            return Err(FsError::Corrupt);
+        }
+        let first = offset / BLOCK as u64;
+        let last = (end - 1) / BLOCK as u64;
+        for chunk in first..=last {
+            self.verify_chunk(log, cursor, record, chunk as u32).await?;
+        }
+        Ok(())
+    }
+
+    async fn verify_chunk(
+        &mut self,
+        log: Region,
+        cursor: u64,
+        record: Record,
+        chunk: u32,
+    ) -> Result<(), FsError> {
+        let checksum = cursor
+            .checked_add(record.checksum_at(chunk).map_err(|_| FsError::Corrupt)?)
+            .ok_or(FsError::Corrupt)?;
+        let mut encoded = [0; 4];
+        self.copy_region(log, checksum, &mut encoded).await?;
+        let crc = u32::from_le_bytes(encoded);
+        if self.verified.iter().flatten().any(|verified| {
+            verified.bank == log.at
+                && verified.cursor == cursor
+                && verified.chunk == chunk
+                && verified.crc == crc
+        }) {
+            return Ok(());
+        }
+        let (offset, bytes) = record.chunk(chunk).map_err(|_| FsError::Corrupt)?;
+        let payload = cursor
+            .checked_add(record.payload_at().map_err(|_| FsError::Corrupt)?)
+            .and_then(|at| at.checked_add(offset))
+            .ok_or(FsError::Corrupt)?;
+        if self.region_checksum(log, payload, u64::from(bytes)).await? != crc {
+            return Err(FsError::Checksum);
+        }
+        self.mark_verified(log.at, cursor, chunk, crc);
+        Ok(())
+    }
+
+    fn mark_verified(&mut self, bank: u64, cursor: u64, chunk: u32, crc: u32) {
+        if self.verified.iter().flatten().any(|verified| {
+            verified.bank == bank
+                && verified.cursor == cursor
+                && verified.chunk == chunk
+                && verified.crc == crc
+        }) {
+            return;
+        }
+        self.verified[self.verify_hand] = Some(VerifiedRecord { bank, cursor, chunk, crc });
+        self.verify_hand = (self.verify_hand + 1) % VERIFIED;
+    }
+
+    fn forget_record(&mut self, bank: u64, cursor: u64) {
+        for verified in &mut self.verified {
+            if verified.is_some_and(|record| record.bank == bank && record.cursor == cursor) {
+                *verified = None;
+            }
+        }
+    }
+
+    fn forget_bank(&mut self, bank: u64) {
+        for verified in &mut self.verified {
+            if verified.is_some_and(|record| record.bank == bank) {
+                *verified = None;
+            }
+        }
+    }
+
     async fn copy_payload(
         &mut self,
         cursor: u64,
@@ -685,18 +925,34 @@ impl Journal {
         target: &mut [u8],
     ) -> Result<(), FsError> {
         let log = self.log_region();
+        let record = self.record_in(log, cursor).await?;
+        let read_end = payload_offset.checked_add(target.len() as u64).ok_or(FsError::Corrupt)?;
+        if read_end > payload_end || payload_end > u64::from(record.bytes) {
+            return Err(FsError::Corrupt);
+        }
+        let payload_at = record.payload_at().map_err(|_| FsError::Corrupt)?;
         let mut source = cursor
-            .checked_add(HEADER as u64)
+            .checked_add(payload_at)
             .and_then(|at| at.checked_add(payload_offset))
             .ok_or(FsError::Corrupt)?;
         let end = source.checked_add(target.len() as u64).ok_or(FsError::Corrupt)?;
         let ahead_end = cursor
-            .checked_add(HEADER as u64)
+            .checked_add(payload_at)
             .and_then(|at| at.checked_add(payload_end))
             .ok_or(FsError::Corrupt)?;
         if end > ahead_end || ahead_end > log.bytes {
             return Err(FsError::Corrupt);
         }
+        let first = source / BLOCK as u64;
+        self.volume.prefetch(log.at + first).await?;
+        for step in 1..=AHEAD {
+            let next = first + step;
+            if next * BLOCK as u64 >= ahead_end {
+                break;
+            }
+            self.volume.prefetch(log.at + next).await?;
+        }
+        self.verify_range(log, cursor, payload_offset, target.len() as u64).await?;
         let mut done = 0;
         while done < target.len() {
             let within = (source % BLOCK as u64) as usize;
@@ -728,6 +984,8 @@ mod tests {
 
     use super::Journal;
     use crate::format::{Tree, build, build_with_log};
+    use crate::layout::{Area, Super};
+    use crate::log::{ALIGN, Record};
     use crate::volume::DEPTH;
     use crate::{BLOCK, FsError, Kind, Name, attach};
 
@@ -757,6 +1015,12 @@ mod tests {
                 journal.sync().await
             })
             .unwrap()
+    }
+
+    fn newest(bytes: &[u8]) -> Result<Super, FsError> {
+        let left = Super::parse(&bytes[..BLOCK])?;
+        let right = Super::parse(&bytes[BLOCK..2 * BLOCK])?;
+        Ok(if left.generation >= right.generation { left } else { right })
     }
 
     fn assert_checkpoint(bytes: &[u8], generation: u64) {
@@ -819,8 +1083,8 @@ mod tests {
 
         assert_eq!(
             first_success,
-            Some(10),
-            "copy, payload, COW paths, log/tree flush, root swing, checkpoint flush"
+            Some(9),
+            "payload, COW paths, log/tree flush, root swing, checkpoint flush"
         );
         Ok(())
     }
@@ -832,12 +1096,51 @@ mod tests {
 
         let active = crate::layout::Super::parse(&bytes[BLOCK..2 * BLOCK])?;
         let log = active.region(crate::layout::Area::Log);
-        bytes[log.at as usize * BLOCK] ^= 1;
+        bytes[log.at as usize * BLOCK + (log.bytes - ALIGN) as usize] ^= 1;
         let (mut journal, mut backing) = mount(Loopback::read(&bytes)?)?;
         let root = journal.root();
 
         assert_eq!(journal.generation(), 1);
         assert_eq!(backing.run(journal.lookup(root, &name("first"))), Err(FsError::Missing));
+        Ok(())
+    }
+
+    #[test]
+    fn small_checkpoint_appends_in_active_bank() -> Result<(), FsError> {
+        let mut bytes = image();
+        let initial = newest(&bytes)?.region(Area::Log);
+        {
+            let (mut journal, mut backing) = mount(Loopback::write(&mut bytes)?)?;
+            let root = journal.root();
+            backing.run(async {
+                let file = journal.create(root, name("next"), Kind::File).await?;
+                journal.write(file, 0, b"next").await?;
+                journal.sync().await
+            })?;
+        }
+
+        let active = newest(&bytes)?.region(Area::Log);
+        assert_eq!(active.at, initial.at);
+        assert_eq!(active.bytes, initial.bytes + ALIGN);
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_payload_is_refused_when_read() -> Result<(), FsError> {
+        let mut bytes = image();
+        let log = newest(&bytes)?.region(Area::Log);
+        let record = Record::parse(&bytes[log.at as usize * BLOCK..])?;
+        bytes[log.at as usize * BLOCK + record.payload_at()? as usize] ^= 1;
+        let (mut journal, mut backing) = mount(Loopback::read(&bytes)?)?;
+        let root = journal.root();
+        let mut contents = [0; 16];
+
+        let read = backing.run(async {
+            let file = journal.lookup(root, &name("base")).await?;
+            journal.read(file, 0, &mut contents).await
+        });
+
+        assert_eq!(read, Err(FsError::Checksum));
         Ok(())
     }
 
@@ -928,7 +1231,9 @@ mod tests {
     #[test]
     fn power_loss_during_reclaim_keeps_checkpoint() -> Result<(), FsError> {
         let mut baseline = build_with_log(&Tree::new(), 1, 4)?;
-        let old = 16u8;
+        // Thirty-two sector-aligned writes exactly fill this 16 KiB bank, so
+        // the attempted checkpoint must compact into the third bank.
+        let old = 31u8;
         {
             let (mut journal, mut backing) = mount(Loopback::write(&mut baseline)?)?;
             let root = journal.root();

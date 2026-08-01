@@ -300,8 +300,7 @@ impl Value {
         value
     }
 
-    /// A run of one write record's payload: where the record sits in the log,
-    /// how far into its payload the run starts, and how long it is.
+    /// A slice of one checksummed write record's payload.
     pub fn extent(at: u64, skip: u32, len: u32) -> Self {
         let mut value = Self::default();
         value.bytes[..8].copy_from_slice(&at.to_le_bytes());

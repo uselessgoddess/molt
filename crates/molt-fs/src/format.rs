@@ -13,7 +13,7 @@ use crate::crc::crc32c;
 use crate::layout::{
     Area, BLOCK, DEFAULT_LOG_BLOCKS, DEFAULT_TREE_BLOCKS, Kind, Object, Region, SUPERS, Super,
 };
-use crate::log::{HEADER, Record};
+use crate::log::{HEADER, Record, headers_crc};
 use crate::name::Name;
 
 /// A directory being assembled for an image.
@@ -163,7 +163,12 @@ impl Image {
         let header: &mut [u8; HEADER] =
             (&mut self.log[cursor as usize..][..HEADER]).try_into().map_err(|_| FsError::Range)?;
         record.encode(header);
-        self.log[cursor as usize + HEADER..][..payload.len()].copy_from_slice(payload);
+        for (chunk, bytes) in payload.chunks(BLOCK).enumerate() {
+            let at = cursor as usize + HEADER + chunk * 4;
+            self.log[at..at + 4].copy_from_slice(&crc32c(bytes).to_le_bytes());
+        }
+        let payload_at = usize::try_from(record.payload_at()?).map_err(|_| FsError::Range)?;
+        self.log[cursor as usize + payload_at..][..payload.len()].copy_from_slice(payload);
         Ok(cursor)
     }
 
@@ -197,7 +202,7 @@ impl Image {
         superblock.blocks = log_at.checked_add(log_span).ok_or(FsError::Range)?;
         superblock.set_region(
             Area::Log,
-            Region { at: log_at, bytes: self.log.len() as u64, crc: crc32c(&self.log) },
+            Region { at: log_at, bytes: self.log.len() as u64, crc: headers_crc(&self.log)? },
         );
 
         let mut image = vec![0; superblock.blocks as usize * BLOCK];

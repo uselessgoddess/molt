@@ -6,8 +6,9 @@
 //! banks. A sync flushes both before publishing their root through the older of
 //! two generation-stamped superblocks, then flushes the superblock. Power loss
 //! therefore leaves either the previous generation or the complete new
-//! generation mountable, without fsck. When a payload bank fills, live extent
-//! slices stream into the free bank and stale writes are reclaimed.
+//! generation mountable, without fsck. Records carry per-chunk checksums and
+//! append in the active bank until it fills; then live extent slices stream
+//! into the free bank and stale writes are reclaimed.
 //!
 //! [`Volume`] selects checkpoints and supplies block I/O. It never calls a
 //! device: [`attach`] puts a block ring under it, so a read submits and awaits.
