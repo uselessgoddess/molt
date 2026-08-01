@@ -22,7 +22,7 @@ use crate::layout::{BLOCK, Kind, MAX_NAME, Object, Super};
 use crate::mem::{Unique, Zeroed};
 use crate::{FsError, Name, Volume, mem};
 
-const MAGIC: [u8; 8] = *b"MOLTBTR4";
+const MAGIC: [u8; 8] = *b"MOLTBT05";
 const HEADER: usize = 64;
 const KEY_BYTES: usize = 272;
 const VALUE_BYTES: usize = 32;
@@ -110,8 +110,16 @@ impl Key {
         u32::from_le_bytes(self.bytes[1..5].try_into().expect("fixed key field"))
     }
 
+    pub fn as_object(&self) -> Option<u32> {
+        (self.tag() == OBJECT).then(|| self.object_id())
+    }
+
     pub fn is_dirent(&self, parent: u32) -> bool {
         self.tag() == DIRENT && self.object_id() == parent
+    }
+
+    pub fn dirent_parent(&self) -> Option<u32> {
+        (self.tag() == DIRENT).then(|| self.object_id())
     }
 
     /// The file an extent key belongs to, if it is one.
@@ -166,6 +174,87 @@ impl Key {
     }
 }
 
+#[cfg(feature = "format")]
+pub(crate) fn format(
+    entries: &mut [(Key, Value)],
+    arena: &mut [u8],
+    generation: u64,
+    tree_at: u64,
+) -> Result<u64, FsError> {
+    entries.sort_unstable_by_key(|(key, _)| *key);
+    if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(FsError::Corrupt);
+    }
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    let mut cursor = 0usize;
+    let mut level = 0u8;
+    let mut children = Vec::new();
+    children.try_reserve(entries.len().div_ceil(CAPACITY))?;
+    for chunk in entries.chunks(CAPACITY) {
+        let mut node = Unique::<Node>::zeroed()?;
+        node.generation = generation;
+        node.len = chunk.len() as u8;
+        for (at, (key, value)) in chunk.iter().enumerate() {
+            node.keys[at] = *key;
+            node.values[at] = *value;
+        }
+        let block = write_formatted(arena, &node, &mut cursor, tree_at)?;
+        children.push((chunk[0].0, block));
+    }
+
+    while children.len() > 1 {
+        level = level.checked_add(1).ok_or(FsError::Full)?;
+        if level as usize >= MAX_HEIGHT {
+            return Err(FsError::Full);
+        }
+        let mut parents = Vec::new();
+        parents.try_reserve(children.len().div_ceil(CAPACITY + 1))?;
+        let mut from = 0;
+        while from < children.len() {
+            let remaining = children.len() - from;
+            let mut count = remaining.min(CAPACITY + 1);
+            if remaining - count == 1 {
+                count -= 1;
+            }
+            let group = &children[from..from + count];
+            let mut node = Unique::<Node>::zeroed()?;
+            node.level = level;
+            node.len = (count - 1) as u8;
+            node.generation = generation;
+            for (at, (key, block)) in group.iter().enumerate() {
+                node.children[at] = *block;
+                if at > 0 {
+                    node.keys[at - 1] = *key;
+                }
+            }
+            let block = write_formatted(arena, &node, &mut cursor, tree_at)?;
+            parents.push((group[0].0, block));
+            from += count;
+        }
+        children = parents;
+    }
+    Ok(children[0].1)
+}
+
+#[cfg(feature = "format")]
+fn write_formatted(
+    arena: &mut [u8],
+    node: &Node,
+    cursor: &mut usize,
+    tree_at: u64,
+) -> Result<u64, FsError> {
+    let end = cursor.checked_add(BLOCK).ok_or(FsError::Full)?;
+    let block: &mut [u8; BLOCK] =
+        arena.get_mut(*cursor..end).ok_or(FsError::Full)?.try_into().map_err(|_| FsError::Full)?;
+    node.encode(block);
+    let relative = u64::try_from(*cursor / BLOCK).map_err(|_| FsError::Full)?;
+    *cursor = end;
+    tree_at.checked_add(relative).ok_or(FsError::Full)
+}
+
 impl Default for Key {
     fn default() -> Self {
         Self { bytes: [0; KEY_BYTES] }
@@ -211,8 +300,7 @@ impl Value {
         value
     }
 
-    /// A run of one write record's payload: where the record sits in the log,
-    /// how far into its payload the run starts, and how long it is.
+    /// A slice of one checksummed write record's payload.
     pub fn extent(at: u64, skip: u32, len: u32) -> Self {
         let mut value = Self::default();
         value.bytes[..8].copy_from_slice(&at.to_le_bytes());
@@ -235,7 +323,6 @@ impl Value {
         };
         Ok(Object {
             kind,
-            start: 0,
             count: u32::from_le_bytes(self.bytes[4..8].try_into().expect("fixed value field")),
             size: u64::from_le_bytes(self.bytes[8..16].try_into().expect("fixed value field")),
         })
@@ -313,7 +400,7 @@ impl Node {
     }
 
     fn parse(spare: &mut Spare, block: &[u8; BLOCK]) -> Result<Unique<Self>, FsError> {
-        if block[..MAGIC.len()] != MAGIC || u32_at(block, 8) != 4 {
+        if block[..MAGIC.len()] != MAGIC || u32_at(block, 8) != 5 {
             return Err(FsError::Corrupt);
         }
         if node_crc(block) != u32_at(block, 32) {
@@ -354,7 +441,7 @@ impl Node {
     fn encode(&self, block: &mut [u8; BLOCK]) {
         block.fill(0);
         block[..MAGIC.len()].copy_from_slice(&MAGIC);
-        block[8..12].copy_from_slice(&4u32.to_le_bytes());
+        block[8..12].copy_from_slice(&5u32.to_le_bytes());
         block[12] = self.level;
         block[13] = self.len;
         block[16..24].copy_from_slice(&self.generation.to_le_bytes());

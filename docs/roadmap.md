@@ -171,8 +171,8 @@ extends the same queue with `VIRTIO_BLK_T_OUT` and durable flush; see
 
 - [x] `molt-block`: a `Device` trait every storage driver implements, so a
       filesystem never sees a virtqueue and a loopback disk tests it on the host
-- [x] MoltROFS: a read-only, checksummed, extent-based format with a
-      generation-stamped superblock kept in two copies
+- [x] the read-only MoltFS v1–4 predecessor, retired by the unified writable v5
+      checkpoint format in Stage 3
 - [x] `FsOp`/`FsDone` over an `IoRing`, addressed by `Capability<Dir>` and
       `Capability<File>` with no paths and no ambient root
 - [x] `cargo xtask mkfs <tree> <image>`, which lays a directory tree out as a
@@ -210,10 +210,12 @@ Stage 3 supplies. Both are argued in `docs/fs.md`.
 Writable filesystem includes sector writes, required virtio flush support,
 three rotating checkpoint-log banks, a checksummed copy-on-write metadata
 B-tree with bounded node caching and generation reclamation, deterministic
-tree/log/flush/root-swing/flush ordering, `Create`/`Write`/`Sync` capability
-operations, and fault injection that cuts power before every checkpoint action.
-Mount always selects a complete old or new generation and never depends on
-fsck. `MOLT_FS_WRITE_OK` proves the same path through QEMU's virtio-blk device.
+tree/log/flush/root-swing/flush ordering, one typed tree representation for
+mkfs and runtime mutations, live-payload compaction, `Create`/`Write`/`Sync`
+capability operations, and fault injection that cuts power before every
+checkpoint and reclamation action. Mount always selects a complete old or new
+generation and never depends on fsck. `MOLT_FS_WRITE_OK` proves the same path
+through QEMU's virtio-blk device.
 
 Networking follows the ring-first boundary rather than adding sockets to the
 kernel. `molt-net` owns Ethernet, ARP, IPv4, IPv6, ICMPv6, neighbor discovery,

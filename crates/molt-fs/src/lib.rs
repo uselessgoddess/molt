@@ -1,17 +1,19 @@
 //! MoltFS, a checksummed writable filesystem over [`molt_block::Disk`].
 //!
-//! `xtask mkfs` lays out immutable objects, extents, entries, names, sums, and
-//! data. Runtime metadata lives in a checksummed copy-on-write B+ tree while
-//! create and write payloads live in one of three rotating log banks. A sync
-//! flushes both before publishing their root through the older of two
-//! generation-stamped superblocks, then flushes the superblock. Power loss
+//! `xtask mkfs` creates generation one of the same format runtime mutations
+//! use: objects, directory entries, and extents are typed keys in a checksummed
+//! copy-on-write B+ tree, while file bytes live in one of three rotating payload
+//! banks. A sync flushes both before publishing their root through the older of
+//! two generation-stamped superblocks, then flushes the superblock. Power loss
 //! therefore leaves either the previous generation or the complete new
-//! generation mountable, without fsck.
+//! generation mountable, without fsck. Records carry per-chunk checksums and
+//! append in the active bank until it fills; then live extent slices stream
+//! into the free bank and stale writes are reclaimed.
 //!
-//! [`Volume`] is the reader. It never calls a device: [`attach`] puts a block
-//! ring under it, so a read submits and awaits, and a streaming read asks for
-//! the blocks ahead of the one it waits on.
-//! [`Journal`] adds replay and mutation, and [`Fs`] wraps it in the ring
+//! [`Volume`] selects checkpoints and supplies block I/O. It never calls a
+//! device: [`attach`] puts a block ring under it, so a read submits and awaits.
+//! [`Journal`] validates the typed index, reads payloads with readahead, and
+//! applies mutations; [`Fs`] wraps it in the ring
 //! protocol every other cell talks: typed [`FsOp`] submissions in, [`FsDone`]
 //! completions out, with directories and files named by capability rather than
 //! by path. Metadata nodes and the arena bitmap live on the heap, so a mutation

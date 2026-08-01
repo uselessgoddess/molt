@@ -82,9 +82,9 @@ fn read(criterion: &mut Criterion) {
     });
 }
 
-/// Transactions a fresh image holds before its log is full. Nothing reclaims a
-/// write record, so a commit loop is measured in batches and remounted between
-/// them, with the remount outside the clock.
+/// Transactions measured before a log rotation. A commit loop runs in batches
+/// and remounts outside the clock so ordinary append cost is not mixed with the
+/// deliberately rarer live-data compaction.
 const BATCH: u64 = 32;
 
 fn commit(criterion: &mut Criterion) {
