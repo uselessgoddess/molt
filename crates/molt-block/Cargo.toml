@@ -8,5 +8,12 @@ publish = false
 [dependencies]
 molt-core.workspace = true
 
+[dev-dependencies]
+criterion = "0.7"
+
 [lib]
 bench = false
+
+[[bench]]
+name = "queue"
+harness = false

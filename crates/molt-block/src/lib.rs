@@ -25,6 +25,8 @@ mod loopback;
 mod queue;
 mod ring;
 
+pub use molt_core::ring::RequestId;
+
 pub use crate::device::{Device, Disk, bounds};
 pub use crate::fault::Fault;
 pub use crate::loopback::Loopback;

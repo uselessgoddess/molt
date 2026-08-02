@@ -169,7 +169,10 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
             "MOLT_INTERRUPT_OK:",
             "MOLT_AFFINITY_OK:",
             "MOLT_VIRTIO_OK:",
+            "MOLT_IOMMU_OK:",
+            "MOLT_IOMMU_MAP_OK:",
             "MOLT_BLOCK_OK:",
+            "MOLT_BLOCK_DEPTH_OK:",
             "MOLT_BLK_IRQ_OK:",
             "MOLT_FS_OK:",
             "MOLT_FS_WRITE_OK:",
@@ -180,6 +183,7 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
             "MOLT_SHELL_OK:",
             "MOLT_FS_RESTART_OK:",
             "MOLT_VIRTIO_RESET_OK:",
+            "MOLT_IOMMU_FAULT_OK:",
             "MOLT_NET_OK:",
             "MOLT_UDP_OK:",
             "MOLT_NDP_OK:",
@@ -374,8 +378,13 @@ fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
         "isa-debug-exit,iobase=0xf4,iosize=0x04",
     ]);
     command.arg("-drive").arg(format!("format=raw,file={}", image.display()));
-    command.arg("-drive").arg(format!("if=none,id=molt-disk,format=raw,file={}", disk.display()));
-    command.arg("-device").arg("virtio-blk-pci,drive=molt-disk,disable-legacy=on");
+    command
+        .arg("-drive")
+        .arg(format!("if=none,id=molt-disk,format=raw,cache=none,file={}", disk.display()));
+    command.arg("-device").arg("virtio-iommu-pci");
+    command
+        .arg("-device")
+        .arg("virtio-blk-pci,drive=molt-disk,disable-legacy=on,iommu_platform=on");
     // `cat` behind the forwarder is the TCP smoke's peer: slirp runs one per
     // connection and pipes the stream through it, so it answers with the bytes
     // it was sent without the host having to listen anywhere.

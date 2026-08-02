@@ -178,6 +178,14 @@ raised on demand from software, which is what makes asserting a *delivery*
 possible rather than just asserting that a capability was written. See
 [`docs/pci.md`](pci.md).
 
+**The block smoke runs behind `virtio-iommu-pci`.** The block function is
+created with `iommu_platform=on`, stays unable to bus-master while its requester
+is attached and its five DMA regions are mapped, and must negotiate
+`ACCESS_PLATFORM`. `MOLT_IOMMU_OK` and `MOLT_IOMMU_MAP_OK` cover that ordering;
+`MOLT_BLOCK_DEPTH_OK` requires two reads to be submitted before either is
+reaped; and `MOLT_IOMMU_FAULT_OK` requires the replenished event queue to remain
+clean through filesystem I/O and block reset. See [`block.md`](block.md).
+
 **`MOLT_BLK_IRQ_OK` is a marker about an absence.** The block driver's used-ring
 poll is gone, so a sector read that returns at all returns because queue zero's
 MSI-X vector fired and the line counted it. The marker names the vector that
