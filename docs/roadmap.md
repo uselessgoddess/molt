@@ -412,12 +412,34 @@ spends every free slot on the blocks ahead of the one it is handing over.
 
 ### Stage 4.5 — Device isolation
 
-- [ ] IOMMU where available, so bus mastering stops meaning the whole physical
-      address space — the trade Stage 2.2 recorded rather than made
+- [x] typed `Iova`, `DeviceId`, permissions, and consuming mappings; no raw
+      address can enter a virtqueue descriptor
+- [x] identity and fake mapper backends, with overlap, reuse, device-scope,
+      permission, and double-unmap tests
+- [x] VirtIO-IOMMU attach/map/unmap/detach plus a permanently replenished fault
+      event queue
+- [x] `VIRTIO_F_ACCESS_PLATFORM` required for translated VirtIO block DMA
+- [x] eight independent virtio-blk requests, out-of-order completion matching,
+      device error propagation, interrupt completion, timeout/stale ownership,
+      and flush barriers through the stable `BlockOp` contract
+- [x] QEMU `q35` smoke with `virtio-iommu-pci`, `iommu_platform=on`, bus
+      mastering enabled only after mappings exist, two reads live together,
+      clean fault reporting, and ordered teardown
+- [x] [`docs/block.md`](block.md)
+
+Acceptance: a block endpoint is attached and mapped before it can bus-master;
+every descriptor carries an IOVA derived from a live permissioned mapping;
+multiple operations are demonstrably in flight; and device reset precedes
+unmap, detach, and frame reuse. MoltFS's format and durability ordering are
+unchanged.
 
 ### Stage 4.6 — Hardware breadth
 
 - [ ] NVMe and selected real NIC/storage targets
+
+Next, implement NVMe behind the existing `molt_block::Queue` and `Mapper`
+boundaries. Namespace discovery and PRP/queue-pair setup are driver work, not a
+new filesystem operation or a reason to bypass typed DMA ownership.
 
 ### Stage 4.7 — Numbers
 

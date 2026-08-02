@@ -67,5 +67,6 @@ capability handles, as described in
 
 See [the roadmap](docs/roadmap.md) for first-stage acceptance criteria and later
 milestones, [the testing strategy](docs/testing.md) for what each layer of the
-suite is for, and [the style guide](docs/style.md) for the conventions rustfmt
-and clippy cannot check.
+suite is for, [the block and DMA boundary](docs/block.md) for the stable storage
+contract, and [the style guide](docs/style.md) for the conventions rustfmt and
+clippy cannot check.
