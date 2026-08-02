@@ -493,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_iova_refused() -> Result<(), DmaError> {
+    fn iova_overlap() -> Result<(), DmaError> {
         let mut space = IovaSpace::<3>::new(Iova::new(0x1000), Iova::new(0x5000));
         space.reserve_at(Iova::new(0x2000), 0x1000)?;
 
@@ -502,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn released_iova_reused() -> Result<(), DmaError> {
+    fn iova_reuse() -> Result<(), DmaError> {
         let mut space = IovaSpace::<2>::new(Iova::new(0x1000), Iova::new(0x5000));
         let first = space.reserve(0x1000, 0x1000)?;
         space.release(first, 0x1000)?;
@@ -514,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn fake_mapping_scopes_device_and_rights() -> Result<(), DmaError> {
+    fn fake_scope() -> Result<(), DmaError> {
         let mut bytes = [0u8; 32];
         let mut fake = Fake::<2>::new(Iova::new(0x8000), Iova::new(0x9000));
         let owner = DeviceId::new(7);
@@ -537,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_keeps_physical_value_typed() -> Result<(), DmaError> {
+    fn identity_iova() -> Result<(), DmaError> {
         let mut bytes = [0u8; 16];
         let mut identity = Identity;
         let mapping = identity

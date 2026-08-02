@@ -395,7 +395,7 @@ fn make_queue(
         &mut identity,
         controller,
         arena.region(queue::device_bytes(size))?,
-        DmaPerm::WRITE,
+        DmaPerm::READ_WRITE,
     )?;
     let queue = Queue::new(size, descriptors, driver, device)?;
     common.set_queue_size(size)?;
@@ -540,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn map_request_is_inclusive_and_permissioned() {
+    fn map_encoding() {
         let mut bytes = [0u8; 40];
         let request = mapping(&mut bytes);
 
@@ -554,13 +554,13 @@ mod tests {
     }
 
     #[test]
-    fn aperture_prefers_addresses_distinct_from_ram() {
+    fn aperture_bounds() {
         assert_eq!(aperture(0, u64::MAX, 0x1000), Ok((0x1_0000_0000, !0xfff)));
         assert_eq!(aperture(0x2000, 0x9fff, 0x1000), Ok((0x2000, 0xa000)));
     }
 
     #[test]
-    fn fault_event_fields_round_trip() {
+    fn fault_parse() {
         let mut bytes = [0u8; EVENT_BYTES as usize];
         bytes[0] = 3;
         bytes[4..8].copy_from_slice(&5u32.to_le_bytes());
@@ -577,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_size_is_power_of_two_and_bounded() {
+    fn queue_bound() {
         assert_eq!(queue_size(256, 2), Ok(32));
         assert_eq!(queue_size(17, 2), Ok(16));
         assert!(queue_size(1, 2).is_err());

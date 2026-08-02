@@ -36,6 +36,7 @@ const FRAME: usize = molt_net::FRAME;
 /// One staged frame in either direction: a header and the frame behind it.
 const BUFFER: usize = HEADER + FRAME;
 const CONFIG_SPINS: u32 = 16;
+const NETWORK_SIZE: u16 = 8;
 
 struct Receive {
     queue: Queue,
@@ -298,7 +299,8 @@ fn queue(
     let descriptors =
         map(mapper, endpoint, arena.region(queue::descriptor_bytes(size))?, DmaPerm::READ)?;
     let driver = map(mapper, endpoint, arena.region(queue::driver_bytes(size))?, DmaPerm::READ)?;
-    let device = map(mapper, endpoint, arena.region(queue::device_bytes(size))?, DmaPerm::WRITE)?;
+    let device =
+        map(mapper, endpoint, arena.region(queue::device_bytes(size))?, DmaPerm::READ_WRITE)?;
     let queue = Queue::new(size, descriptors, driver, device)?;
     common.set_queue_size(size)?;
     common.set_queue_vector(vector)?;
@@ -334,7 +336,7 @@ fn clamp_queue(device_max: u16) -> Result<u16, VirtioError> {
     if device_max == 0 {
         return Err(VirtioError::Device);
     }
-    let size = device_max.min(MAX_SIZE);
+    let size = device_max.min(NETWORK_SIZE);
     if !size.is_power_of_two() {
         return Err(VirtioError::Device);
     }
@@ -354,7 +356,8 @@ mod tests {
     use molt_arch::iommu::{DeviceId, DmaPerm, Identity, Mapper, Mapping};
 
     use super::{
-        BUFFER, HEADER, REQUIRED_FEATURES, Receive, Transmit, VIRTIO_NET_F_MAC, require_features,
+        BUFFER, HEADER, NETWORK_SIZE, REQUIRED_FEATURES, Receive, Transmit, VIRTIO_NET_F_MAC,
+        clamp_queue, require_features,
     };
     use crate::VirtioError;
     use crate::queue::{Queue, device_bytes, driver_bytes};
@@ -373,7 +376,7 @@ mod tests {
             8,
             mapping(descriptors, 0x1000, DmaPerm::READ),
             mapping(&mut driver[..driver_bytes(8) as usize], 0x2000, DmaPerm::READ),
-            mapping(&mut device[..device_bytes(8) as usize], 0x3000, DmaPerm::WRITE),
+            mapping(&mut device[..device_bytes(8) as usize], 0x3000, DmaPerm::READ_WRITE),
         )
         .unwrap()
     }
@@ -428,5 +431,10 @@ mod tests {
     fn modern_header_requires_merge_buffer_format() {
         assert_eq!(require_features(VIRTIO_NET_F_MAC), Err(VirtioError::Features));
         assert_eq!(require_features(REQUIRED_FEATURES), Ok(()));
+    }
+
+    #[test]
+    fn queue_depth() {
+        assert_eq!(clamp_queue(256), Ok(NETWORK_SIZE));
     }
 }

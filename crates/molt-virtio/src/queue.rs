@@ -13,6 +13,7 @@
 
 use core::sync::atomic::{Ordering, fence};
 
+use molt_arch::dma::DmaError;
 use molt_arch::iommu::{DmaSlice, Iova, Mapping};
 
 use crate::VirtioError;
@@ -85,9 +86,10 @@ pub struct Queue {
 impl Queue {
     /// Lays a queue of `size` descriptors over its three regions.
     ///
-    /// `size` must be a power of two no larger than `MAX_SIZE`, and each
-    /// region must be large enough for its structure; anything else is a
-    /// programming error the device would turn into silent corruption.
+    /// `size` must be a power of two no larger than `MAX_SIZE`, each region
+    /// must be large enough for its structure, and the mappings must grant the
+    /// device the access each split-ring role needs. In particular, a device
+    /// both reads and writes its used-ring index while maintaining the ring.
     pub fn new(
         size: u16,
         descriptors: Mapping,
@@ -102,6 +104,13 @@ impl Queue {
             || device.len() < device_bytes(size)
         {
             return Err(VirtioError::Device);
+        }
+        if !descriptors.perm().can_read()
+            || !driver.perm().can_read()
+            || !device.perm().can_read()
+            || !device.perm().can_write()
+        {
+            return Err(VirtioError::Dma(DmaError::Permission));
         }
         descriptors.zero();
         driver.zero();
@@ -272,7 +281,7 @@ impl Queue {
 
 #[cfg(test)]
 mod tests {
-    use molt_arch::dma::Region;
+    use molt_arch::dma::{DmaError, Region};
     use molt_arch::iommu::{DeviceId, DmaPerm, Identity, Mapper, Mapping};
 
     use super::{Queue, Used, device_bytes, driver_bytes};
@@ -294,9 +303,23 @@ mod tests {
             4,
             mapping(descriptors, 0x1000, DmaPerm::READ),
             mapping(driver, 0x2000, DmaPerm::READ),
-            mapping(device, 0x3000, DmaPerm::WRITE),
+            mapping(device, 0x3000, DmaPerm::READ_WRITE),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn used_perm() {
+        let (mut d, mut a, mut u) = ([0u8; 64], [0u8; 16], [0u8; 64]);
+
+        let result = Queue::new(
+            4,
+            mapping(&mut d, 0x1000, DmaPerm::READ),
+            mapping(&mut a, 0x2000, DmaPerm::READ),
+            mapping(&mut u, 0x3000, DmaPerm::WRITE),
+        );
+
+        assert!(matches!(result, Err(VirtioError::Dma(DmaError::Permission))));
     }
 
     #[test]
@@ -352,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn cyclic_used_chain_is_refused_without_freeing() -> Result<(), VirtioError> {
+    fn cyclic_used() -> Result<(), VirtioError> {
         let (mut d, mut a, mut u) = ([0u8; 64], [0u8; 16], [0u8; 64]);
         let mut queue = queue(&mut d, &mut a, &mut u);
         let mut bytes = [0u8; 16];
