@@ -1,10 +1,9 @@
-//! Registered DMA memory: frames a device reads and writes, addressed both ways
-//! at once.
+//! Registered DMA memory: frames a driver owns before a mapper makes them
+//! device-visible.
 //!
-//! A driver hands the device physical addresses and touches the same bytes
-//! through a CPU pointer. [`Region`] carries the pair, so a public operation
-//! never passes a raw physical address around, and [`Arena`] hands regions out
-//! of one span of [`Owner::Device`] frames: one at a time through
+//! [`Region`] carries CPU and physical-backing addresses; an identity or IOMMU
+//! mapper turns it into the address a device may use. [`Arena`] hands regions
+//! out of one span of [`Owner::Device`] frames: one at a time through
 //! [`region`](Arena::region), back one at a time through
 //! [`release`](Arena::release), and all at once through [`reset`](Arena::reset)
 //! once the device has been told to stop.
@@ -62,11 +61,12 @@ impl From<RunError> for DmaError {
 /// A registered DMA window: the same bytes reached as a CPU pointer and as a
 /// physical address.
 ///
-/// The device reads and writes through [`physical`](Region::physical); the
-/// driver touches the same bytes through the checked accessors, which the CPU
-/// sees because the region is plain write-back RAM. Like [`Mmio`](crate::Mmio)
-/// it is `Send` but not `Sync`: a DMA buffer is order-sensitive, so sharing one
-/// across cores is a decision a driver makes explicitly.
+/// A mapper uses [`physical`](Region::physical) as the backing for an identity
+/// or translated device address. The driver touches the same bytes through the
+/// checked accessors, which the CPU sees because the region is plain write-back
+/// RAM. Like [`Mmio`](crate::Mmio) it is `Send` but not `Sync`: a DMA buffer is
+/// order-sensitive, so sharing one across cores is a decision a driver makes
+/// explicitly.
 #[derive(Debug)]
 pub struct Region {
     cpu: *mut u8,
@@ -93,7 +93,7 @@ impl Region {
         Self { cpu, physical, len, frames: None }
     }
 
-    /// The physical address a device is given to reach these bytes.
+    /// The physical backing address a mapper installs for these bytes.
     pub const fn physical(&self) -> u64 {
         self.physical
     }
