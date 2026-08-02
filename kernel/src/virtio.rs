@@ -1,7 +1,7 @@
 use molt_arch::dma::Arena;
 use molt_arch::memory::{Inventory, Owner, Rights};
 use molt_arch::{BootInfo, FrameAllocator, Platform, SerialWriter};
-use molt_block::{Device, SECTOR, Serial};
+use molt_block::{Device, SECTOR};
 use molt_kernel::report;
 use molt_pci::{Bus, Command, bus_span};
 use molt_virtio::{Block, Transport};
@@ -13,7 +13,7 @@ const VIRTIO_VENDOR: u16 = 0x1af4;
 const VIRTIO_BLOCK: u16 = 0x1042;
 
 const SIGNATURE: [u8; 8] = molt_fs::MAGIC;
-const DMA_FRAMES: usize = 8;
+const DMA_FRAMES: usize = 12;
 const BLOCK_TAG: u32 = 0xb10c;
 
 pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
@@ -95,6 +95,7 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
         transport.notify_multiplier(),
         vectored.index(),
         vectored.line(),
+        device::requester(function.address()),
         arena,
     )
     .expect("the device completes its handshake");
@@ -105,7 +106,7 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     report!(platform, "MOLT_BLOCK_OK: sector zero carries the volume signature");
     report!(platform, "MOLT_BLK_IRQ_OK: queue zero answered on vector {}", vectored.index());
 
-    crate::init::smoke(platform, Serial::new(&mut block));
+    crate::init::smoke(platform, &mut block);
 
     block.reset().expect("the device stops and its frames return");
     report!(platform, "MOLT_VIRTIO_RESET_OK: device stopped and frames reclaimed");

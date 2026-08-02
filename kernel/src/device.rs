@@ -5,10 +5,11 @@
 //! slab owns, and that line given back once the device has stopped. Written
 //! once here so the two smokes differ only in the device they find.
 
+use molt_arch::iommu::DeviceId;
 use molt_arch::memory::{Inventory, Rights};
 use molt_arch::{Mmio, Platform};
 use molt_core::interrupt::InterruptToken;
-use molt_pci::{Bar, Function, MsiX, MsiXCapability, Vector};
+use molt_pci::{Address, Bar, Function, MsiX, MsiXCapability, Vector};
 use molt_virtio::{Arrivals, Location};
 
 /// How long a driver waits on its line before calling the device wedged.
@@ -16,6 +17,13 @@ use molt_virtio::{Arrivals, Location};
 /// Ticks of the core's own quantum, so a couple of seconds: generous, because
 /// what it has to outlast is a slow disk rather than a scheduler.
 const WAIT_TICKS: u64 = 256;
+
+/// The PCI requester ID VirtIO-IOMMU uses for one function.
+pub(crate) const fn requester(address: Address) -> DeviceId {
+    DeviceId::new(
+        (address.bus() as u32) << 8 | (address.device() as u32) << 3 | address.function() as u32,
+    )
+}
 
 /// Maps the BAR at `index` and reports where it landed.
 pub(crate) fn map_bar<P: Platform>(

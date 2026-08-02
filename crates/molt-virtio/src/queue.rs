@@ -1,4 +1,4 @@
-//! One split virtqueue, laid over three DMA regions the device shares.
+//! One split virtqueue, laid over three mapped DMA regions the device shares.
 //!
 //! A queue is a descriptor table plus two rings: the driver publishes
 //! descriptor chains through the *available* ring and the device returns them
@@ -13,13 +13,13 @@
 
 use core::sync::atomic::{Ordering, fence};
 
-use molt_arch::dma::Region;
+use molt_arch::iommu::{DmaSlice, Iova, Mapping};
 
 use crate::VirtioError;
 
 /// The largest queue this driver builds. A read is three descriptors, so a
 /// handful of slots keeps several requests in flight without a heap.
-pub const MAX_SIZE: u16 = 8;
+pub const MAX_SIZE: u16 = 32;
 
 /// Descriptor flags (§2.7.1).
 mod flag {
@@ -47,26 +47,8 @@ pub const fn device_bytes(size: u16) -> u64 {
     4 + 8 * size as u64 + 2
 }
 
-/// One buffer a descriptor points at: a physical range the device may read, or
-/// read and write.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Segment {
-    physical: u64,
-    len: u32,
-    writable: bool,
-}
-
-impl Segment {
-    /// A segment the device only reads, such as a request header.
-    pub const fn readable(physical: u64, len: u32) -> Self {
-        Self { physical, len, writable: false }
-    }
-
-    /// A segment the device writes into, such as a data or status buffer.
-    pub const fn writable(physical: u64, len: u32) -> Self {
-        Self { physical, len, writable: true }
-    }
-}
+/// One checked mapping slice a descriptor points at.
+pub type Segment = DmaSlice;
 
 /// One completed chain: the head descriptor the device returned and how many
 /// bytes it wrote.
@@ -90,9 +72,9 @@ impl Used {
 
 /// A split virtqueue over its three regions.
 pub struct Queue {
-    descriptors: Region,
-    driver: Region,
-    device: Region,
+    descriptors: Mapping,
+    driver: Mapping,
+    device: Mapping,
     size: u16,
     free: [u16; MAX_SIZE as usize],
     available: u16,
@@ -108,9 +90,9 @@ impl Queue {
     /// programming error the device would turn into silent corruption.
     pub fn new(
         size: u16,
-        descriptors: Region,
-        driver: Region,
-        device: Region,
+        descriptors: Mapping,
+        driver: Mapping,
+        device: Mapping,
     ) -> Result<Self, VirtioError> {
         if size == 0 || size > MAX_SIZE || !size.is_power_of_two() {
             return Err(VirtioError::Device);
@@ -152,20 +134,20 @@ impl Queue {
         self.available
     }
 
-    pub fn descriptors_physical(&self) -> u64 {
-        self.descriptors.physical()
+    pub fn descriptors_iova(&self) -> Iova {
+        self.descriptors.iova()
     }
 
-    pub fn driver_physical(&self) -> u64 {
-        self.driver.physical()
+    pub fn driver_iova(&self) -> Iova {
+        self.driver.iova()
     }
 
-    pub fn device_physical(&self) -> u64 {
-        self.device.physical()
+    pub fn device_iova(&self) -> Iova {
+        self.device.iova()
     }
 
-    /// Gives up the three regions, for a caller that has stopped the device.
-    pub fn regions(self) -> [Region; 3] {
+    /// Gives up the three mappings, for a caller that has stopped the device.
+    pub fn mappings(self) -> [Mapping; 3] {
         [self.descriptors, self.driver, self.device]
     }
 
@@ -191,7 +173,7 @@ impl Queue {
             let last = offset + 1 == count;
             let next = if last { 0 } else { self.free[(top - offset - 1) as usize] };
             let mut flags = 0;
-            if segment.writable {
+            if segment.is_writable() {
                 flags |= flag::WRITE;
             }
             if !last {
@@ -242,8 +224,8 @@ impl Queue {
         next: u16,
     ) -> Result<(), VirtioError> {
         let at = index as u64 * DESCRIPTOR;
-        self.descriptors.write_u64(at, segment.physical)?;
-        self.descriptors.write_u32(at + 8, segment.len)?;
+        self.descriptors.write_u64(at, segment.iova().get())?;
+        self.descriptors.write_u32(at + 8, segment.len())?;
         self.descriptors.write_u16(at + 12, flags)?;
         self.descriptors.write_u16(at + 14, next)?;
         Ok(())
@@ -255,16 +237,31 @@ impl Queue {
     /// longer than the table describes a cycle, which is refused rather than
     /// followed forever.
     fn free_chain(&mut self, head: u16) -> Result<(), VirtioError> {
+        let mut chain = [0u16; MAX_SIZE as usize];
+        let mut seen = 0u32;
+        let mut count = 0usize;
         let mut index = head;
         for _ in 0..self.size {
             if index >= self.size {
                 return Err(VirtioError::Device);
             }
+            let bit = 1u32 << index;
+            if seen & bit != 0 {
+                return Err(VirtioError::Device);
+            }
+            seen |= bit;
+            chain[count] = index;
+            count += 1;
             let flags = self.descriptors.read_u16(index as u64 * DESCRIPTOR + 12)?;
             let next = self.descriptors.read_u16(index as u64 * DESCRIPTOR + 14)?;
-            self.free[self.available as usize] = index;
-            self.available += 1;
             if flags & flag::NEXT == 0 {
+                if self.available as usize + count > self.size as usize {
+                    return Err(VirtioError::Device);
+                }
+                for index in chain[..count].iter().copied() {
+                    self.free[self.available as usize] = index;
+                    self.available += 1;
+                }
                 return Ok(());
             }
             index = next;
@@ -276,8 +273,9 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use molt_arch::dma::Region;
+    use molt_arch::iommu::{DeviceId, DmaPerm, Identity, Mapper, Mapping};
 
-    use super::{Queue, Segment, Used, device_bytes, driver_bytes};
+    use super::{Queue, Used, device_bytes, driver_bytes};
     use crate::VirtioError;
 
     /// A region over a plain buffer, addressed at a fake physical base.
@@ -287,9 +285,18 @@ mod tests {
         unsafe { Region::new(bytes.as_mut_ptr(), physical, bytes.len() as u64) }
     }
 
+    fn mapping(bytes: &mut [u8], physical: u64, perm: DmaPerm) -> Mapping {
+        Identity.map(DeviceId::new(0), region(bytes, physical), perm).ok().unwrap()
+    }
+
     fn queue(descriptors: &mut [u8], driver: &mut [u8], device: &mut [u8]) -> Queue {
-        Queue::new(4, region(descriptors, 0x1000), region(driver, 0x2000), region(device, 0x3000))
-            .unwrap()
+        Queue::new(
+            4,
+            mapping(descriptors, 0x1000, DmaPerm::READ),
+            mapping(driver, 0x2000, DmaPerm::READ),
+            mapping(device, 0x3000, DmaPerm::WRITE),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -297,7 +304,11 @@ mod tests {
         let (mut d, mut a, mut u) = ([0u8; 64], [0u8; 16], [0u8; 64]);
         let mut queue = queue(&mut d, &mut a, &mut u);
 
-        let head = queue.push(&[Segment::readable(0xaa00, 16), Segment::writable(0xbb00, 512)])?;
+        let mut header = [0u8; 16];
+        let mut data = [0u8; 512];
+        let header = mapping(&mut header, 0xaa00, DmaPerm::READ);
+        let data = mapping(&mut data, 0xbb00, DmaPerm::WRITE);
+        let head = queue.push(&[header.readable(0, 16)?, data.writable(0, 512)?])?;
 
         assert_eq!(head, 0);
         assert_eq!(&d[12..14], &1u16.to_le_bytes(), "head lacked the NEXT flag");
@@ -311,11 +322,13 @@ mod tests {
         let (mut d, mut a, mut u) = ([0u8; 64], [0u8; 16], [0u8; 64]);
         let mut queue = queue(&mut d, &mut a, &mut u);
 
-        for _ in 0..4 {
-            queue.push(&[Segment::readable(0, 8)])?;
+        let mut bytes = [0u8; 32];
+        let buffers = mapping(&mut bytes, 0xaa00, DmaPerm::READ);
+        for offset in [0, 8, 16, 24] {
+            queue.push(&[buffers.readable(offset, 8)?])?;
         }
 
-        assert_eq!(queue.push(&[Segment::readable(0, 8)]).err(), Some(super::VirtioError::Full));
+        assert_eq!(queue.push(&[buffers.readable(0, 8)?]).err(), Some(super::VirtioError::Full));
         Ok(())
     }
 
@@ -323,7 +336,11 @@ mod tests {
     fn pop_free_descriptors() -> Result<(), VirtioError> {
         let (mut d, mut a, mut u) = ([0u8; 64], [0u8; 16], [0u8; 64]);
         let mut queue = queue(&mut d, &mut a, &mut u);
-        let head = queue.push(&[Segment::readable(0xaa00, 16), Segment::writable(0xbb00, 512)])?;
+        let mut header = [0u8; 16];
+        let mut data = [0u8; 512];
+        let header = mapping(&mut header, 0xaa00, DmaPerm::READ);
+        let data = mapping(&mut data, 0xbb00, DmaPerm::WRITE);
+        let head = queue.push(&[header.readable(0, 16)?, data.writable(0, 512)?])?;
 
         queue.device.write_u32(4, head as u32)?;
         queue.device.write_u32(8, 512)?;
@@ -331,6 +348,24 @@ mod tests {
 
         assert_eq!(queue.pop(), Ok(Some(Used { head: 0, len: 512 })));
         assert_eq!(queue.available(), 4, "the completed chain was not reclaimed");
+        Ok(())
+    }
+
+    #[test]
+    fn cyclic_used_chain_is_refused_without_freeing() -> Result<(), VirtioError> {
+        let (mut d, mut a, mut u) = ([0u8; 64], [0u8; 16], [0u8; 64]);
+        let mut queue = queue(&mut d, &mut a, &mut u);
+        let mut bytes = [0u8; 16];
+        let buffers = mapping(&mut bytes, 0xaa00, DmaPerm::READ);
+        let head = queue.push(&[buffers.readable(0, 8)?, buffers.readable(8, 8)?])?;
+        // Make the second descriptor point back to the head.
+        queue.descriptors.write_u16(16 + 12, 1)?;
+        queue.descriptors.write_u16(16 + 14, head)?;
+        queue.device.write_u32(4, head as u32)?;
+        queue.device.write_u16(2, 1)?;
+
+        assert_eq!(queue.pop(), Err(VirtioError::Device));
+        assert_eq!(queue.available(), 2, "a malformed chain freed live descriptors");
         Ok(())
     }
 

@@ -110,9 +110,16 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let mut slots: [Option<Owner>; DMA_FRAMES] = [None; DMA_FRAMES];
     let arena = Arena::claim(&mut allocator, offset, NET_TAG, &mut slots)
         .expect("a contiguous network DMA span");
-    let net =
-        Net::start(common, notify, config, transport.notify_multiplier(), vectored.index(), arena)
-            .expect("the network device completes its handshake");
+    let net = Net::start(
+        common,
+        notify,
+        config,
+        transport.notify_multiplier(),
+        vectored.index(),
+        device::requester(function.address()),
+        arena,
+    )
+    .expect("the network device completes its handshake");
     let mac = net.mac();
     report!(platform, "MOLT_NET_OK: {} mac {:02x?}", function.address(), mac.octets(),);
 
