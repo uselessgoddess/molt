@@ -247,8 +247,9 @@ impl<'s> Arena<'s> {
 
     /// Claims a region of `bytes`, backed by whole frames.
     ///
-    /// The region reports the exact `bytes` asked for, so its accessors stay
-    /// tightly bounded, while the frames behind it belong to no other region.
+    /// The region reports the whole frames it owns. This keeps its physical
+    /// extent suitable for page-granular IOMMU mappings; callers still hand a
+    /// device only the checked slices that contain their queue or buffer.
     pub fn region(&mut self, bytes: u64) -> Result<Region, DmaError> {
         if bytes == 0 {
             return Err(DmaError::Empty);
@@ -261,7 +262,7 @@ impl<'s> Arena<'s> {
         // `Region::new`'s contract, met with the claim kept inside: the table
         // holds these whole frames for this arena until the region comes back,
         // `offset` is their live write-back direct map, and `bytes` fits them.
-        Ok(Region { cpu, physical: span.start(), len: bytes, frames: Some(frames) })
+        Ok(Region { cpu, physical: span.start(), len: step, frames: Some(frames) })
     }
 
     /// Takes one region's frames back, for the next region to use.
@@ -388,6 +389,8 @@ mod tests {
         let second = arena.region(FRAME_SIZE + 1)?;
 
         assert_eq!(first.physical(), 0x10_0000);
+        assert_eq!(first.len(), FRAME_SIZE, "a sub-page claim exposed a partial IOMMU page");
+        assert_eq!(second.len(), 2 * FRAME_SIZE);
         assert_eq!(second.physical(), 0x10_0000 + FRAME_SIZE, "regions shared a frame");
         assert_eq!(arena.span().count(), 8);
         Ok(())

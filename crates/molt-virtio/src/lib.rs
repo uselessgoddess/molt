@@ -23,6 +23,7 @@ extern crate std;
 mod block;
 mod config;
 mod interrupt;
+mod iommu;
 mod net;
 mod notify;
 mod queue;
@@ -37,6 +38,7 @@ use molt_pci::PciError;
 pub use crate::block::Block;
 pub use crate::config::Common;
 pub use crate::interrupt::Arrivals;
+pub use crate::iommu::{Fault, Iommu};
 pub use crate::net::Net;
 pub use crate::notify::Notify;
 pub use crate::queue::{Queue, Segment, Used};
@@ -66,6 +68,8 @@ pub enum VirtioError {
     Full,
     /// A request did not complete within the driver's spin budget.
     Timeout,
+    /// A VirtIO IOMMU control request completed with this status byte.
+    Iommu(u8),
 }
 
 impl From<PciError> for VirtioError {

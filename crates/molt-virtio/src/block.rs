@@ -361,6 +361,11 @@ impl<'slots, 'window, A: Arrivals, M: Mapper> Block<'slots, 'window, A, M> {
         self.engine.capacity
     }
 
+    /// The translation backend that owns this device's DMA address space.
+    pub const fn mapper(&self) -> &M {
+        &self.mapper
+    }
+
     /// Stops the device, removes every mapping, and reclaims its arena.
     pub fn reset(self) -> Result<M, VirtioError> {
         let Self { mut common, engine, mut mapper, mut arena, .. } = self;
