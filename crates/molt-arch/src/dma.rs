@@ -31,6 +31,16 @@ pub enum DmaError {
     Foreign,
     /// The frame table refused the claim or release.
     Frames(MemoryError),
+    /// An address or length overflowed the device-visible range.
+    Address,
+    /// A requested IOVA overlaps a live mapping.
+    Overlap,
+    /// The mapping does not grant the requested device access.
+    Permission,
+    /// No live mapping matches the requested device-visible range.
+    NotMapped,
+    /// The translation backend refused the operation.
+    Backend,
 }
 
 impl From<MemoryError> for DmaError {

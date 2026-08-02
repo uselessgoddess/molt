@@ -5,6 +5,7 @@
 pub mod audit;
 pub mod cpu;
 pub mod dma;
+pub mod iommu;
 pub mod irq;
 pub mod memory;
 pub mod mmio;
