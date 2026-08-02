@@ -8,6 +8,7 @@
 //! transport is not one this crate drives.
 
 use molt_arch::Mmio;
+use molt_arch::iommu::Iova;
 
 use crate::VirtioError;
 
@@ -156,16 +157,16 @@ impl<'w> Common<'w> {
         Ok(())
     }
 
-    /// Programs the selected queue's three ring physical addresses.
+    /// Programs the selected queue's three device-visible addresses.
     pub fn set_queue_rings(
         &mut self,
-        desc: u64,
-        driver: u64,
-        device: u64,
+        desc: Iova,
+        driver: Iova,
+        device: Iova,
     ) -> Result<(), VirtioError> {
-        self.window.write_u64(register::QUEUE_DESC, desc)?;
-        self.window.write_u64(register::QUEUE_DRIVER, driver)?;
-        self.window.write_u64(register::QUEUE_DEVICE, device)?;
+        self.window.write_u64(register::QUEUE_DESC, desc.get())?;
+        self.window.write_u64(register::QUEUE_DRIVER, driver.get())?;
+        self.window.write_u64(register::QUEUE_DEVICE, device.get())?;
         Ok(())
     }
 
@@ -183,6 +184,7 @@ impl<'w> Common<'w> {
 #[cfg(test)]
 mod tests {
     use molt_arch::Mmio;
+    use molt_arch::iommu::Iova;
 
     use super::{Common, register};
     use crate::VirtioError;
@@ -223,7 +225,7 @@ mod tests {
         let mut common = common(&mut registers);
 
         common.select_queue(0)?;
-        common.set_queue_rings(0x1000, 0x2000, 0x3000)?;
+        common.set_queue_rings(Iova::new(0x1000), Iova::new(0x2000), Iova::new(0x3000))?;
 
         assert_eq!(&registers[0x20..0x28], &0x1000u64.to_le_bytes());
         assert_eq!(&registers[0x28..0x30], &0x2000u64.to_le_bytes());

@@ -5,6 +5,7 @@
 pub mod audit;
 pub mod cpu;
 pub mod dma;
+pub mod iommu;
 pub mod irq;
 pub mod memory;
 pub mod mmio;
@@ -151,16 +152,16 @@ impl PhysicalFrame {
 }
 
 /// Rounds `value` down to a multiple of `alignment`, which must be a power of two.
-pub const fn align_down(value: u64, alignment: u64) -> u64 {
-    value & !(alignment - 1)
+pub const fn align_down(value: u64, align: u64) -> u64 {
+    value & !(align - 1)
 }
 
 /// Rounds `value` up to a multiple of `alignment`, or `None` when that overflows.
 ///
 /// `alignment` must be a power of two.
-pub const fn align_up(value: u64, alignment: u64) -> Option<u64> {
-    match value.checked_add(alignment - 1) {
-        Some(value) => Some(align_down(value, alignment)),
+pub const fn align_up(value: u64, align: u64) -> Option<u64> {
+    match value.checked_add(align - 1) {
+        Some(value) => Some(align_down(value, align)),
         None => None,
     }
 }

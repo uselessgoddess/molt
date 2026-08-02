@@ -36,6 +36,24 @@ pub trait Queue {
     fn reap(&mut self) -> Option<(RequestId, BlockDone)>;
 }
 
+impl<Q: Queue + ?Sized> Queue for &mut Q {
+    fn sectors(&self) -> u64 {
+        (**self).sectors()
+    }
+
+    fn depth(&self) -> usize {
+        (**self).depth()
+    }
+
+    fn start(&mut self, id: RequestId, op: BlockOp) -> Result<(), BlockOp> {
+        (**self).start(id, op)
+    }
+
+    fn reap(&mut self) -> Option<(RequestId, BlockDone)> {
+        (**self).reap()
+    }
+}
+
 /// A blocking [`Disk`] given a queue `DEPTH` requests deep.
 ///
 /// The disk does the work when a request is reaped rather than when it is

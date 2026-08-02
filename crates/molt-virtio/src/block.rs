@@ -1,93 +1,250 @@
-//! The block driver: the handshake that brings a device up, sector I/O with a
-//! durable flush, and the reset that reclaims its frames.
+//! A modern VirtIO block queue with several independent requests in flight.
 //!
-//! [`Block::start`] runs the modern initialization sequence, requires cache
-//! flush support, routes queue zero through an MSI-X vector, and programs it
-//! out of an [`Arena`] of device-owned frames. Each command waits on
-//! [`Arrivals`] for the interrupt that says the used ring moved, giving up with
-//! [`VirtioError::Timeout`] when the line stays quiet, so a wedged device
-//! cannot hang the caller. [`Block::reset`] stops the device *before* it hands
-//! the frames back, so no in-flight DMA can land in a reclaimed frame.
-//!
-//! [`molt_block::Device`] is how anything above reaches this: the filesystem
-//! reads sectors, not virtqueues, and gets the same contract from a loopback
-//! image.
+//! Each slot owns a control record and one 4 KiB bounce buffer inside mapped
+//! DMA regions. Submitting only publishes descriptors; completions match the
+//! returned descriptor head to the original [`BlockOp`](molt_block::BlockOp),
+//! so a device may answer out of order. Flush ordering remains the block
+//! scheduler's barrier rather than an accidental consequence of a depth-one
+//! driver.
+
+use alloc::boxed::Box;
 
 use molt_arch::Mmio;
 use molt_arch::dma::{Arena, DmaError, Region};
-use molt_block::{BlockError, Device, Disk};
+use molt_arch::iommu::{DeviceId, DmaPerm, Identity, Mapper, Mapping};
+use molt_block::{
+    BLOCK, BlockDone, BlockError, BlockOp, Buffer, Device, Disk, Queue as BlockQueue, SECTOR,
+};
+use molt_core::ring::RequestId;
 
 use crate::VirtioError;
 use crate::config::{Common, status};
 use crate::interrupt::Arrivals;
 use crate::notify::Notify;
-use crate::queue::{self, Queue, Segment};
-use crate::request::{Completion, Requests};
+use crate::queue::{self, Queue as Virtqueue};
+use crate::request::{Completion, Requests, Token};
 
-/// A block read request (`VIRTIO_BLK_T_IN`).
 const VIRTIO_BLK_T_IN: u32 = 0;
-
-/// A block write request (`VIRTIO_BLK_T_OUT`).
 const VIRTIO_BLK_T_OUT: u32 = 1;
-
-/// A cache flush request (`VIRTIO_BLK_T_FLUSH`).
 const VIRTIO_BLK_T_FLUSH: u32 = 4;
 
-/// The device is read-only (`VIRTIO_BLK_F_RO`).
 const VIRTIO_BLK_F_RO: u64 = 1 << 5;
-
-/// The device accepts cache flush requests (`VIRTIO_BLK_F_FLUSH`).
 const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
+const VIRTIO_F_ACCESS_PLATFORM: u64 = 1 << 33;
 
-/// The status byte a device writes on success (`VIRTIO_BLK_S_OK`).
 const VIRTIO_BLK_S_OK: u8 = 0;
-
-/// Where the block device's capacity, in sectors, sits in its configuration
-/// structure (§5.2.4).
 const CAPACITY_AT: u64 = 0;
-
-/// How many times a capacity read retries a device that changes its
-/// configuration underneath it.
 const CONFIG_SPINS: u32 = 16;
 
-/// The request header the device reads: type, reserved, sector.
 const HEADER_LEN: u32 = 16;
+const CONTROL_STRIDE: u64 = 32;
+const STATUS_OFFSET: u64 = HEADER_LEN as u64;
 
-/// Where the one-byte status sits in the control region, past the header.
-const STATUS_AT: u64 = HEADER_LEN as u64;
+/// The maximum number of block requests this driver owns at once.
+pub const REQUESTS: usize = 8;
 
-/// The control region holds the header and the trailing status byte.
-const CONTROL_BYTES: u64 = HEADER_LEN as u64 + 1;
+const CONTROL_BYTES: u64 = CONTROL_STRIDE * REQUESTS as u64;
+const DATA_BYTES: u64 = BLOCK as u64 * REQUESTS as u64;
 
-/// The data region is one frame, which bounds a single transfer.
-const DATA_BYTES: u64 = 4096;
-
-/// The largest transfer the driver issues as one request.
-const TRANSFER: usize = DATA_BYTES as usize;
-
-/// A VirtIO block device driven through one queue of frames it owns.
-pub struct Block<'slots, 'window, A> {
-    common: Common<'window>,
-    notify: Notify<'window>,
-    queue: Queue,
-    requests: Requests<{ queue::MAX_SIZE as usize }>,
-    arrivals: A,
-    control: Region,
-    data: Region,
-    arena: Arena<'slots>,
-    notify_off: u16,
-    capacity: u64,
+struct Flight {
+    id: RequestId,
+    head: u16,
+    token: Token,
+    op: Option<BlockOp>,
 }
 
-impl<'slots, 'window, A: Arrivals> Block<'slots, 'window, A> {
-    /// Brings a device up over its `common`, `notify`, and `device` windows,
-    /// allocating every ring and buffer from `arena`.
-    ///
-    /// Runs the modern handshake, refuses read-only devices, requires durable
-    /// flush support, and programs queue zero onto `vector`, which the caller
-    /// must already have routed and enabled — `arrivals` is the line it lands
-    /// on. A device that offers no usable queue, will not take the vector, or
-    /// rejects the feature set, is refused rather than left half-initialized.
+struct Engine<'window, A> {
+    notify: Notify<'window>,
+    queue: Virtqueue,
+    requests: Requests<{ queue::MAX_SIZE as usize }>,
+    arrivals: A,
+    control: Mapping,
+    data: Mapping,
+    flights: [Option<Flight>; REQUESTS],
+    ready: [Option<(RequestId, BlockDone)>; REQUESTS],
+    notify_off: u16,
+    capacity: u64,
+    depth: usize,
+}
+
+impl<A: Arrivals> Engine<'_, A> {
+    fn start(&mut self, id: RequestId, op: BlockOp) -> Result<(), BlockOp> {
+        let Some(slot) = self.free_slot() else {
+            return Err(op);
+        };
+        if let Err(error) = validate(self.capacity, &op) {
+            self.ready[slot] = Some((id, finish(op, Err(error))));
+            return Ok(());
+        }
+
+        let control_at = slot as u64 * CONTROL_STRIDE;
+        let data_at = slot as u64 * BLOCK as u64;
+        let (kind, sector) = match &op {
+            BlockOp::Read { sector, .. } => (VIRTIO_BLK_T_IN, *sector),
+            BlockOp::Write { sector, .. } => (VIRTIO_BLK_T_OUT, *sector),
+            BlockOp::Flush => (VIRTIO_BLK_T_FLUSH, 0),
+        };
+        if let BlockOp::Write { bytes, buffer, .. } = &op {
+            if let Err(error) = self.data.write_from(data_at, &buffer[..*bytes]) {
+                self.ready[slot] = Some((id, finish(op, Err(map_dma(error)))));
+                return Ok(());
+            }
+        }
+        if let Err(error) = self.header(control_at, kind, sector) {
+            self.ready[slot] = Some((id, finish(op, Err(map_dma(error)))));
+            return Ok(());
+        }
+
+        let header = match self.control.readable(control_at, HEADER_LEN) {
+            Ok(header) => header,
+            Err(error) => {
+                self.ready[slot] = Some((id, finish(op, Err(map_dma(error)))));
+                return Ok(());
+            }
+        };
+        let status = match self.control.writable(control_at + STATUS_OFFSET, 1) {
+            Ok(status) => status,
+            Err(error) => {
+                self.ready[slot] = Some((id, finish(op, Err(map_dma(error)))));
+                return Ok(());
+            }
+        };
+        let pushed = match &op {
+            BlockOp::Read { bytes, .. } => self
+                .data
+                .writable(data_at, *bytes as u32)
+                .map_err(VirtioError::from)
+                .and_then(|data| self.queue.push(&[header, data, status])),
+            BlockOp::Write { bytes, .. } => self
+                .data
+                .readable(data_at, *bytes as u32)
+                .map_err(VirtioError::from)
+                .and_then(|data| self.queue.push(&[header, data, status])),
+            BlockOp::Flush => self.queue.push(&[header, status]),
+        };
+        let head = match pushed {
+            Ok(head) => head,
+            Err(VirtioError::Full) => return Err(op),
+            Err(error) => {
+                self.ready[slot] = Some((id, finish(op, Err(error.into()))));
+                return Ok(());
+            }
+        };
+
+        let token = self.requests.issue(head);
+        self.flights[slot] = Some(Flight { id, head, token, op: Some(op) });
+        if let Err(error) = self.notify.signal(0, self.notify_off) {
+            let flight = self.flights[slot].as_mut().expect("the published request has a slot");
+            self.requests.cancel(flight.token);
+            let op = flight.op.take().expect("a fresh request still owns its operation");
+            self.ready[slot] = Some((id, finish(op, Err(error.into()))));
+        }
+        Ok(())
+    }
+
+    fn reap(&mut self) -> Option<(RequestId, BlockDone)> {
+        let mut wait_expired = false;
+        loop {
+            if let Some(done) = self.ready.iter_mut().find_map(Option::take) {
+                return Some(done);
+            }
+            match self.queue.pop() {
+                Ok(Some(used)) => {
+                    let Some(slot) = self.flights.iter().position(|flight| {
+                        flight.as_ref().is_some_and(|flight| flight.head == used.head())
+                    }) else {
+                        return self.fail_one(BlockError::Device);
+                    };
+                    let flight = self.flights[slot].take().expect("the matching flight exists");
+                    if self.requests.complete(used.head()) == Completion::Stale {
+                        continue;
+                    }
+                    let Some(op) = flight.op else {
+                        continue;
+                    };
+                    return Some((flight.id, self.complete_with_copy(slot, op)));
+                }
+                Ok(None) if wait_expired => return self.timeout_one(),
+                Ok(None) if self.has_live_request() => wait_expired = self.arrivals.wait() == 0,
+                Ok(None) => return None,
+                Err(_) => return self.fail_one(BlockError::Device),
+            }
+        }
+    }
+
+    fn header(&self, offset: u64, kind: u32, sector: u64) -> Result<(), DmaError> {
+        self.control.write_u32(offset, kind)?;
+        self.control.write_u32(offset + 4, 0)?;
+        self.control.write_u64(offset + 8, sector)?;
+        self.control.write_u8(offset + STATUS_OFFSET, 0xff)
+    }
+
+    fn complete(&self, slot: usize, op: &BlockOp) -> Result<(), BlockError> {
+        let control_at = slot as u64 * CONTROL_STRIDE;
+        if self.control.read_u8(control_at + STATUS_OFFSET).map_err(map_dma)? != VIRTIO_BLK_S_OK {
+            return Err(BlockError::Device);
+        }
+        if let BlockOp::Read { bytes, .. } = op {
+            if *bytes > BLOCK {
+                return Err(BlockError::Range);
+            }
+        }
+        Ok(())
+    }
+
+    fn copy_read(&self, slot: usize, op: &mut BlockOp) -> Result<(), BlockError> {
+        if let BlockOp::Read { bytes, buffer, .. } = op {
+            self.data
+                .read_into(slot as u64 * BLOCK as u64, &mut buffer[..*bytes])
+                .map_err(map_dma)?;
+        }
+        Ok(())
+    }
+
+    fn free_slot(&self) -> Option<usize> {
+        (0..self.depth).find(|slot| self.flights[*slot].is_none() && self.ready[*slot].is_none())
+    }
+
+    fn has_live_request(&self) -> bool {
+        self.flights.iter().flatten().any(|flight| flight.op.is_some())
+    }
+
+    fn timeout_one(&mut self) -> Option<(RequestId, BlockDone)> {
+        let flight = self.flights.iter_mut().flatten().find(|flight| flight.op.is_some())?;
+        self.requests.cancel(flight.token);
+        let op = flight.op.take()?;
+        Some((flight.id, finish(op, Err(BlockError::Timeout))))
+    }
+
+    fn fail_one(&mut self, error: BlockError) -> Option<(RequestId, BlockDone)> {
+        let flight = self.flights.iter_mut().flatten().find(|flight| flight.op.is_some())?;
+        self.requests.cancel(flight.token);
+        let op = flight.op.take()?;
+        Some((flight.id, finish(op, Err(error))))
+    }
+
+    fn complete_with_copy(&self, slot: usize, mut op: BlockOp) -> BlockDone {
+        let result = self.complete(slot, &op).and_then(|()| self.copy_read(slot, &mut op));
+        finish(op, result)
+    }
+
+    fn mappings(self) -> impl Iterator<Item = Mapping> {
+        self.queue.mappings().into_iter().chain([self.control, self.data])
+    }
+}
+
+/// A VirtIO block device driven through one translated queue.
+pub struct Block<'slots, 'window, A, M = Identity> {
+    common: Common<'window>,
+    engine: Engine<'window, A>,
+    mapper: M,
+    arena: Arena<'slots>,
+    direct: u64,
+}
+
+impl<'slots, 'window, A: Arrivals> Block<'slots, 'window, A, Identity> {
+    /// Starts a block device that addresses physical memory directly.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         common: Mmio<'window>,
         notify: Mmio<'window>,
@@ -95,183 +252,238 @@ impl<'slots, 'window, A: Arrivals> Block<'slots, 'window, A> {
         notify_multiplier: u32,
         vector: u16,
         arrivals: A,
+        endpoint: DeviceId,
+        arena: Arena<'slots>,
+    ) -> Result<Self, VirtioError> {
+        Self::start_mapped(
+            common,
+            notify,
+            device,
+            notify_multiplier,
+            vector,
+            arrivals,
+            endpoint,
+            arena,
+            Identity,
+        )
+    }
+}
+
+impl<'slots, 'window, A: Arrivals, M: Mapper> Block<'slots, 'window, A, M> {
+    /// Starts a block device in `endpoint`'s DMA address space.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_mapped(
+        common: Mmio<'window>,
+        notify: Mmio<'window>,
+        device: Mmio<'window>,
+        notify_multiplier: u32,
+        vector: u16,
+        arrivals: A,
+        endpoint: DeviceId,
         mut arena: Arena<'slots>,
+        mut mapper: M,
     ) -> Result<Self, VirtioError> {
         let mut common = Common::new(common);
         common.reset()?;
         common.add_status(status::ACKNOWLEDGE)?;
         common.add_status(status::DRIVER)?;
-        let features = common.negotiate(VIRTIO_BLK_F_RO | VIRTIO_BLK_F_FLUSH)?;
+        let platform = mapper.access_platform();
+        let wanted = VIRTIO_BLK_F_RO
+            | VIRTIO_BLK_F_FLUSH
+            | if platform { VIRTIO_F_ACCESS_PLATFORM } else { 0 };
+        let features = common.negotiate(wanted)?;
         if features & VIRTIO_BLK_F_RO != 0 {
             return Err(VirtioError::ReadOnly);
         }
-        if features & VIRTIO_BLK_F_FLUSH == 0 {
+        if features & VIRTIO_BLK_F_FLUSH == 0
+            || platform && features & VIRTIO_F_ACCESS_PLATFORM == 0
+        {
             return Err(VirtioError::Features);
         }
-
-        // The capacity is only meaningful once the features are settled.
         let capacity = capacity(&common, &device)?;
 
         common.select_queue(0)?;
         let size = clamp_queue(common.queue_size()?)?;
+        let depth = (size as usize / 3).min(REQUESTS);
+        if depth < 2 {
+            return Err(VirtioError::Device);
+        }
 
-        let descriptors = arena.region(queue::descriptor_bytes(size))?;
-        let driver = arena.region(queue::driver_bytes(size))?;
-        let device = arena.region(queue::device_bytes(size))?;
-        let control = arena.region(CONTROL_BYTES)?;
-        let data = arena.region(DATA_BYTES)?;
+        let descriptors = mapped(
+            &mut mapper,
+            endpoint,
+            arena.region(queue::descriptor_bytes(size))?,
+            DmaPerm::READ,
+        )?;
+        let driver =
+            mapped(&mut mapper, endpoint, arena.region(queue::driver_bytes(size))?, DmaPerm::READ)?;
+        let device_ring = mapped(
+            &mut mapper,
+            endpoint,
+            arena.region(queue::device_bytes(size))?,
+            DmaPerm::READ_WRITE,
+        )?;
+        let control =
+            mapped(&mut mapper, endpoint, arena.region(CONTROL_BYTES)?, DmaPerm::READ_WRITE)?;
+        let data = mapped(&mut mapper, endpoint, arena.region(DATA_BYTES)?, DmaPerm::READ_WRITE)?;
 
-        let queue = Queue::new(size, descriptors, driver, device)?;
+        let queue = Virtqueue::new(size, descriptors, driver, device_ring)?;
         common.set_queue_size(size)?;
         common.set_queue_vector(vector)?;
         common.set_queue_rings(
-            queue.descriptors_physical(),
-            queue.driver_physical(),
-            queue.device_physical(),
+            queue.descriptors_iova(),
+            queue.driver_iova(),
+            queue.device_iova(),
         )?;
         common.enable_queue()?;
         let notify_off = common.queue_notify_off()?;
-
-        // The queue is programmed, so the device may run.
         common.add_status(status::DRIVER_OK)?;
 
-        Ok(Self {
-            common,
+        let engine = Engine {
             notify: Notify::new(notify, notify_multiplier),
             queue,
             requests: Requests::new(),
             arrivals,
             control,
             data,
-            arena,
+            flights: [const { None }; REQUESTS],
+            ready: [const { None }; REQUESTS],
             notify_off,
             capacity,
-        })
-    }
-
-    /// How many sectors the device reports holding.
-    pub const fn capacity(&self) -> u64 {
-        self.capacity
-    }
-
-    /// Runs one request and waits for its status byte.
-    ///
-    /// Submits a read, write, or two-descriptor flush chain, kicks the device,
-    /// and sleeps on its vector until the used ring moves. One arrival can
-    /// cover several used entries, so each drains the ring rather than
-    /// assuming one entry per interrupt. A device whose line stays quiet has
-    /// its request cancelled — the slot stays reserved until the device
-    /// returns it — and the command fails with [`VirtioError::Timeout`].
-    fn command(
-        &mut self,
-        request: u32,
-        sector: u64,
-        data: Option<Segment>,
-    ) -> Result<(), VirtioError> {
-        self.control.write_u32(0, request)?;
-        self.control.write_u32(4, 0)?;
-        self.control.write_u64(8, sector)?;
-        // Poison the status so a device that answers without writing it is
-        // caught rather than read as success.
-        self.control.write_u8(STATUS_AT, 0xff)?;
-
-        let header = Segment::readable(self.control.physical(), HEADER_LEN);
-        let status = Segment::writable(self.control.physical() + STATUS_AT, 1);
-        let head = match data {
-            Some(data) => self.queue.push(&[header, data, status])?,
-            None => self.queue.push(&[header, status])?,
+            depth,
         };
-        let token = self.requests.issue(head);
-        self.notify.signal(0, self.notify_off)?;
+        Ok(Self { common, engine, mapper, arena, direct: 0 })
+    }
 
-        while self.arrivals.wait() != 0 {
-            while let Some(used) = self.queue.pop()? {
-                if let Completion::Delivered = self.requests.complete(used.head()) {
-                    if self.control.read_u8(STATUS_AT)? != VIRTIO_BLK_S_OK {
-                        return Err(VirtioError::Device);
-                    }
-                    return Ok(());
-                }
+    pub const fn capacity(&self) -> u64 {
+        self.engine.capacity
+    }
+
+    /// The translation backend that owns this device's DMA address space.
+    pub const fn mapper(&self) -> &M {
+        &self.mapper
+    }
+
+    /// Stops the device, removes every mapping, and reclaims its arena.
+    pub fn reset(self) -> Result<M, VirtioError> {
+        let Self { mut common, engine, mut mapper, mut arena, .. } = self;
+        common.reset()?;
+        for mapping in engine.mappings() {
+            let region = mapper.unmap(mapping).map_err(|error| VirtioError::Dma(error.error()))?;
+            arena.release(region)?;
+        }
+        arena.reset();
+        Ok(mapper)
+    }
+
+    fn execute(&mut self, mut op: BlockOp) -> BlockDone {
+        let id = RequestId::new(self.direct);
+        self.direct = self.direct.wrapping_add(1);
+        loop {
+            match self.engine.start(id, op) {
+                Ok(()) => break,
+                Err(refused) => op = refused,
+            }
+            if let Some((_, done)) = self.engine.reap() {
+                return done;
             }
         }
-
-        self.requests.cancel(token);
-        Err(VirtioError::Timeout)
-    }
-
-    /// Resets the device and reclaims every frame the arena handed out.
-    ///
-    /// The reset comes first so the device stops touching the rings and buffers
-    /// before the frames behind them return to the table.
-    pub fn reset(self) -> Result<(), VirtioError> {
-        let Self { mut common, queue, control, data, arena, .. } = self;
-        common.reset()?;
-        Ok(reclaim(arena, queue.regions().into_iter().chain([control, data]))?)
+        loop {
+            if let Some((answered, done)) = self.engine.reap() {
+                debug_assert_eq!(answered, id);
+                return done;
+            }
+        }
     }
 }
 
-/// Hands `regions` back and drops the arena's whole span behind them.
-///
-/// The reset runs whatever a release does, because by here the device is
-/// already stopped: returning early on a refused region would leave the rest of
-/// the span claimed in the frame table for good, with no handle left to free it
-/// through. The refusal is still reported once the frames are back.
-fn reclaim(
-    mut arena: Arena<'_>,
-    regions: impl IntoIterator<Item = Region>,
-) -> Result<(), DmaError> {
-    let released = regions.into_iter().try_for_each(|region| arena.release(region));
-    arena.reset();
-    released
-}
-
-impl<A: Arrivals> Device for Block<'_, '_, A> {
+impl<A: Arrivals, M: Mapper> BlockQueue for Block<'_, '_, A, M> {
     fn sectors(&self) -> u64 {
-        self.capacity
+        self.engine.capacity
     }
 
-    /// Splits `buf` into transfers the data region can hold, one request each.
+    fn depth(&self) -> usize {
+        self.engine.depth
+    }
+
+    fn start(&mut self, id: RequestId, op: BlockOp) -> Result<(), BlockOp> {
+        self.engine.start(id, op)
+    }
+
+    fn reap(&mut self) -> Option<(RequestId, BlockDone)> {
+        self.engine.reap()
+    }
+}
+
+impl<A: Arrivals, M: Mapper> Device for Block<'_, '_, A, M> {
+    fn sectors(&self) -> u64 {
+        self.capacity()
+    }
+
     fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-        molt_block::bounds(self.capacity, sector, buf)?;
-        for (index, chunk) in buf.chunks_mut(TRANSFER).enumerate() {
-            let at = sector + (index * TRANSFER / molt_block::SECTOR) as u64;
-            let len = u32::try_from(chunk.len()).map_err(|_| BlockError::Range)?;
-            let data = Segment::writable(self.data.physical(), len);
-            self.command(VIRTIO_BLK_T_IN, at, Some(data))?;
-            self.data
-                .read_into(0, chunk)
-                .map_err(|error| BlockError::from(VirtioError::Dma(error)))?;
+        molt_block::bounds(self.capacity(), sector, buf)?;
+        for (index, chunk) in buf.chunks_mut(BLOCK).enumerate() {
+            let at = sector + (index * BLOCK / SECTOR) as u64;
+            let op = BlockOp::Read { sector: at, bytes: chunk.len(), buffer: Box::new([0; BLOCK]) };
+            let done = self.execute(op);
+            done.result?;
+            let buffer = done.buffer.ok_or(BlockError::Device)?;
+            chunk.copy_from_slice(&buffer[..chunk.len()]);
         }
         Ok(())
     }
 }
 
-impl<A: Arrivals> Disk for Block<'_, '_, A> {
-    /// Splits `buf` into transfers the data region can hold, one request each.
+impl<A: Arrivals, M: Mapper> Disk for Block<'_, '_, A, M> {
     fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), BlockError> {
-        molt_block::bounds(self.capacity, sector, buf)?;
-        for (index, chunk) in buf.chunks(TRANSFER).enumerate() {
-            let at = sector + (index * TRANSFER / molt_block::SECTOR) as u64;
-            self.data
-                .write_from(0, chunk)
-                .map_err(|error| BlockError::from(VirtioError::Dma(error)))?;
-            let len = u32::try_from(chunk.len()).map_err(|_| BlockError::Range)?;
-            let data = Segment::readable(self.data.physical(), len);
-            self.command(VIRTIO_BLK_T_OUT, at, Some(data))?;
+        molt_block::bounds(self.capacity(), sector, buf)?;
+        for (index, chunk) in buf.chunks(BLOCK).enumerate() {
+            let at = sector + (index * BLOCK / SECTOR) as u64;
+            let mut buffer: Buffer = Box::new([0; BLOCK]);
+            buffer[..chunk.len()].copy_from_slice(chunk);
+            self.execute(BlockOp::Write { sector: at, bytes: chunk.len(), buffer }).result?;
         }
         Ok(())
     }
 
     fn flush(&mut self) -> Result<(), BlockError> {
-        self.command(VIRTIO_BLK_T_FLUSH, 0, None)?;
-        Ok(())
+        self.execute(BlockOp::Flush).result
     }
 }
 
-/// Reads the device's capacity, in sectors.
-///
-/// A 64-bit configuration field is two accesses wide, so the read is only
-/// coherent if the device's configuration generation did not move across it.
+fn finish(op: BlockOp, result: Result<(), BlockError>) -> BlockDone {
+    let buffer = match op {
+        BlockOp::Read { buffer, .. } | BlockOp::Write { buffer, .. } => Some(buffer),
+        BlockOp::Flush => None,
+    };
+    BlockDone { result, buffer }
+}
+
+fn validate(capacity: u64, op: &BlockOp) -> Result<(), BlockError> {
+    match op {
+        BlockOp::Read { sector, bytes, buffer } | BlockOp::Write { sector, bytes, buffer } => {
+            if *bytes == 0 || *bytes > BLOCK || *bytes > buffer.len() {
+                return Err(BlockError::Range);
+            }
+            molt_block::bounds(capacity, *sector, &buffer[..*bytes]).map(|_| ())
+        }
+        BlockOp::Flush => Ok(()),
+    }
+}
+
+fn map_dma(error: DmaError) -> BlockError {
+    BlockError::from(VirtioError::Dma(error))
+}
+
+fn mapped(
+    mapper: &mut impl Mapper,
+    endpoint: DeviceId,
+    region: Region,
+    perm: DmaPerm,
+) -> Result<Mapping, VirtioError> {
+    mapper.map(endpoint, region, perm).map_err(|error| VirtioError::Dma(error.error()))
+}
+
 fn capacity(common: &Common<'_>, device: &Mmio<'_>) -> Result<u64, VirtioError> {
     for _ in 0..CONFIG_SPINS {
         let before = common.config_generation()?;
@@ -297,51 +509,217 @@ fn clamp_queue(device_max: u16) -> Result<u16, VirtioError> {
 
 #[cfg(test)]
 mod tests {
-    use molt_arch::dma::{Arena, DmaError, Region};
-    use molt_arch::{FRAME_SIZE, FrameAllocator, MemoryMap, MemoryRegion, MemoryRegionKind};
+    use alloc::boxed::Box;
 
-    use super::{clamp_queue, reclaim};
+    use molt_arch::Mmio;
+    use molt_arch::dma::Region;
+    use molt_arch::iommu::{DeviceId, DmaPerm, Identity, Mapper, Mapping};
+    use molt_block::{BLOCK, BlockError, BlockOp};
+    use molt_core::ring::RequestId;
+
+    use super::{CONTROL_BYTES, Engine, REQUESTS, clamp_queue};
     use crate::VirtioError;
+    use crate::notify::Notify;
+    use crate::queue::{self, Queue};
+    use crate::request::Requests;
 
-    struct Map([MemoryRegion; 1]);
+    struct NoWait;
 
-    impl MemoryMap for Map {
-        fn len(&self) -> usize {
-            self.0.len()
-        }
-
-        fn region(&self, index: usize) -> Option<MemoryRegion> {
-            self.0.get(index).copied()
+    impl crate::Arrivals for NoWait {
+        fn wait(&mut self) -> u64 {
+            panic!("a published used entry must not wait")
         }
     }
 
+    struct CompletesOnExpiry(*mut u8);
+
+    impl crate::Arrivals for CompletesOnExpiry {
+        fn wait(&mut self) -> u64 {
+            // SAFETY: the test keeps the used-ring array live. The queue owns
+            // the same device-writable bytes, so this models its DMA before an
+            // interrupt wait expires without creating a CPU reference alias.
+            unsafe {
+                self.0.add(4).cast::<u32>().write_unaligned(0);
+                self.0.add(2).cast::<u16>().write_unaligned(1);
+            }
+            0
+        }
+    }
+
+    fn region(bytes: &mut [u8], physical: u64) -> Region {
+        // SAFETY: the arrays remain live and stand in for device-owned bytes.
+        unsafe { Region::new(bytes.as_mut_ptr(), physical, bytes.len() as u64) }
+    }
+
+    fn mapping(bytes: &mut [u8], physical: u64, perm: DmaPerm) -> Mapping {
+        Identity.map(DeviceId::new(1), region(bytes, physical), perm).ok().unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn engine<'a, A: crate::Arrivals>(
+        descriptors: &mut [u8],
+        driver: &mut [u8],
+        device: &mut [u8],
+        control: &mut [u8],
+        data: &mut [u8],
+        notify: &'a mut [u8],
+        arrivals: A,
+    ) -> Engine<'a, A> {
+        let size = queue::MAX_SIZE;
+        let queue = Queue::new(
+            size,
+            mapping(descriptors, 0x1000, DmaPerm::READ),
+            mapping(driver, 0x2000, DmaPerm::READ),
+            mapping(device, 0x3000, DmaPerm::READ_WRITE),
+        )
+        .unwrap();
+        // SAFETY: the notification array remains live and uniquely represents
+        // this fake BAR window.
+        let notify = unsafe { Mmio::new(notify.as_mut_ptr(), notify.len() as u64) };
+        Engine {
+            notify: Notify::new(notify, 0),
+            queue,
+            requests: Requests::new(),
+            arrivals,
+            control: mapping(control, 0x4000, DmaPerm::READ_WRITE),
+            data: mapping(data, 0x8000, DmaPerm::READ_WRITE),
+            flights: [const { None }; REQUESTS],
+            ready: [const { None }; REQUESTS],
+            notify_off: 0,
+            capacity: 1024,
+            depth: REQUESTS,
+        }
+    }
+
+    fn read(sector: u64) -> BlockOp {
+        BlockOp::Read { sector, bytes: BLOCK, buffer: Box::new([0; BLOCK]) }
+    }
+
     #[test]
-    fn refused_release_still_frees_span() -> Result<(), VirtioError> {
-        let map = Map([MemoryRegion::new(
-            0x10_0000,
-            0x10_0000 + 4 * FRAME_SIZE,
-            MemoryRegionKind::Usable,
-        )]);
-        let mut allocator = FrameAllocator::new(&map);
-        let mut slots = [None; 4];
-        let mut arena = Arena::claim(&mut allocator, 0, 3, &mut slots)?;
-        let held = arena.region(FRAME_SIZE)?;
-        let mut elsewhere = [0u8; 16];
-        // SAFETY: the array is live for the borrow and nothing else names it.
-        let foreign = unsafe { Region::new(elsewhere.as_mut_ptr(), 0x20_0000, 16) };
+    fn two_live() -> Result<(), VirtioError> {
+        let mut descriptors = [0u8; queue::MAX_SIZE as usize * 16];
+        let mut driver = [0u8; 72];
+        let mut device = [0u8; 264];
+        let mut control = [0u8; CONTROL_BYTES as usize];
+        let mut data = [0u8; BLOCK * REQUESTS];
+        let mut notify = [0u8; 2];
+        let mut engine = engine(
+            &mut descriptors,
+            &mut driver,
+            &mut device,
+            &mut control,
+            &mut data,
+            &mut notify,
+            NoWait,
+        );
 
-        let refused = reclaim(arena, [foreign, held]);
+        engine.start(RequestId::new(4), read(0)).ok().unwrap();
+        engine.start(RequestId::new(5), read(8)).ok().unwrap();
 
-        assert_eq!(refused, Err(DmaError::Foreign));
-        assert!(slots.iter().all(Option::is_none), "a refused release stranded frames");
+        assert_eq!(u16::from_le_bytes(driver[2..4].try_into().unwrap()), 2);
+        assert_eq!(engine.queue.available(), queue::MAX_SIZE - 6);
         Ok(())
     }
 
     #[test]
-    fn deep_device_queue_capped_at_drivers_maximum() -> Result<(), VirtioError> {
-        let size = clamp_queue(256)?;
+    fn reordered_reads() -> Result<(), VirtioError> {
+        let mut descriptors = [0u8; queue::MAX_SIZE as usize * 16];
+        let mut driver = [0u8; 72];
+        let mut device = [0u8; 264];
+        let mut control = [0u8; CONTROL_BYTES as usize];
+        let mut data = [0u8; BLOCK * REQUESTS];
+        let mut notify = [0u8; 2];
+        let mut engine = engine(
+            &mut descriptors,
+            &mut driver,
+            &mut device,
+            &mut control,
+            &mut data,
+            &mut notify,
+            NoWait,
+        );
+        engine.start(RequestId::new(4), read(0)).ok().unwrap();
+        engine.start(RequestId::new(5), read(8)).ok().unwrap();
+        let first = u16::from_le_bytes(driver[4..6].try_into().unwrap());
+        let second = u16::from_le_bytes(driver[6..8].try_into().unwrap());
+        engine.control.write_u8(16, 0)?;
+        engine.control.write_u8(32 + 16, 0)?;
+        engine.data.write_u8(0, 4)?;
+        engine.data.write_u8(BLOCK as u64, 5)?;
+        device[4..8].copy_from_slice(&(second as u32).to_le_bytes());
+        device[12..16].copy_from_slice(&(first as u32).to_le_bytes());
+        device[2..4].copy_from_slice(&2u16.to_le_bytes());
 
-        assert_eq!(size, super::queue::MAX_SIZE, "the driver hosted more than it can");
+        let (later, later_done) = engine.reap().unwrap();
+        let (earlier, earlier_done) = engine.reap().unwrap();
+
+        assert_eq!(later, RequestId::new(5));
+        assert_eq!(earlier, RequestId::new(4));
+        assert_eq!(later_done.result, Ok(()));
+        assert_eq!(earlier_done.result, Ok(()));
+        assert_eq!(later_done.buffer.unwrap()[0], 5);
+        assert_eq!(earlier_done.buffer.unwrap()[0], 4);
+        Ok(())
+    }
+
+    #[test]
+    fn device_error() -> Result<(), VirtioError> {
+        let mut descriptors = [0u8; queue::MAX_SIZE as usize * 16];
+        let mut driver = [0u8; 72];
+        let mut device = [0u8; 264];
+        let mut control = [0u8; CONTROL_BYTES as usize];
+        let mut data = [0u8; BLOCK * REQUESTS];
+        let mut notify = [0u8; 2];
+        let mut engine = engine(
+            &mut descriptors,
+            &mut driver,
+            &mut device,
+            &mut control,
+            &mut data,
+            &mut notify,
+            NoWait,
+        );
+        engine.start(RequestId::new(1), read(0)).ok().unwrap();
+        let head = u16::from_le_bytes(driver[4..6].try_into().unwrap());
+        engine.control.write_u8(16, 1)?;
+        device[4..8].copy_from_slice(&(head as u32).to_le_bytes());
+        device[2..4].copy_from_slice(&1u16.to_le_bytes());
+
+        assert_eq!(engine.reap().unwrap().1.result, Err(BlockError::Device));
+        Ok(())
+    }
+
+    #[test]
+    fn final_poll() -> Result<(), VirtioError> {
+        let mut descriptors = [0u8; queue::MAX_SIZE as usize * 16];
+        let mut driver = [0u8; 72];
+        let mut device = [0u8; 264];
+        let device_ptr = device.as_mut_ptr();
+        let mut control = [0u8; CONTROL_BYTES as usize];
+        let mut data = [0u8; BLOCK * REQUESTS];
+        let mut notify = [0u8; 2];
+        let mut engine = engine(
+            &mut descriptors,
+            &mut driver,
+            &mut device,
+            &mut control,
+            &mut data,
+            &mut notify,
+            CompletesOnExpiry(device_ptr),
+        );
+        engine.start(RequestId::new(9), read(0)).ok().unwrap();
+        engine.control.write_u8(16, 0)?;
+
+        let (id, done) = engine.reap().expect("the final poll observes the completion");
+
+        assert_eq!(id, RequestId::new(9));
+        assert_eq!(done.result, Ok(()));
+        Ok(())
+    }
+
+    #[test]
+    fn queue_depth() -> Result<(), VirtioError> {
+        assert_eq!(clamp_queue(256)?, queue::MAX_SIZE);
         Ok(())
     }
 

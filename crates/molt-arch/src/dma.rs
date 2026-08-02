@@ -1,10 +1,9 @@
-//! Registered DMA memory: frames a device reads and writes, addressed both ways
-//! at once.
+//! Registered DMA memory: frames a driver owns before a mapper makes them
+//! device-visible.
 //!
-//! A driver hands the device physical addresses and touches the same bytes
-//! through a CPU pointer. [`Region`] carries the pair, so a public operation
-//! never passes a raw physical address around, and [`Arena`] hands regions out
-//! of one span of [`Owner::Device`] frames: one at a time through
+//! [`Region`] carries CPU and physical-backing addresses; an identity or IOMMU
+//! mapper turns it into the address a device may use. [`Arena`] hands regions
+//! out of one span of [`Owner::Device`] frames: one at a time through
 //! [`region`](Arena::region), back one at a time through
 //! [`release`](Arena::release), and all at once through [`reset`](Arena::reset)
 //! once the device has been told to stop.
@@ -31,6 +30,16 @@ pub enum DmaError {
     Foreign,
     /// The frame table refused the claim or release.
     Frames(MemoryError),
+    /// An address or length overflowed the device-visible range.
+    Address,
+    /// A requested IOVA overlaps a live mapping.
+    Overlap,
+    /// The mapping does not grant the requested device access.
+    Permission,
+    /// No live mapping matches the requested device-visible range.
+    NotMapped,
+    /// The translation backend refused the operation.
+    Backend,
 }
 
 impl From<MemoryError> for DmaError {
@@ -52,11 +61,12 @@ impl From<RunError> for DmaError {
 /// A registered DMA window: the same bytes reached as a CPU pointer and as a
 /// physical address.
 ///
-/// The device reads and writes through [`physical`](Region::physical); the
-/// driver touches the same bytes through the checked accessors, which the CPU
-/// sees because the region is plain write-back RAM. Like [`Mmio`](crate::Mmio)
-/// it is `Send` but not `Sync`: a DMA buffer is order-sensitive, so sharing one
-/// across cores is a decision a driver makes explicitly.
+/// A mapper uses [`physical`](Region::physical) as the backing for an identity
+/// or translated device address. The driver touches the same bytes through the
+/// checked accessors, which the CPU sees because the region is plain write-back
+/// RAM. Like [`Mmio`](crate::Mmio) it is `Send` but not `Sync`: a DMA buffer is
+/// order-sensitive, so sharing one across cores is a decision a driver makes
+/// explicitly.
 #[derive(Debug)]
 pub struct Region {
     cpu: *mut u8,
@@ -83,7 +93,7 @@ impl Region {
         Self { cpu, physical, len, frames: None }
     }
 
-    /// The physical address a device is given to reach these bytes.
+    /// The physical backing address a mapper installs for these bytes.
     pub const fn physical(&self) -> u64 {
         self.physical
     }
@@ -237,8 +247,9 @@ impl<'s> Arena<'s> {
 
     /// Claims a region of `bytes`, backed by whole frames.
     ///
-    /// The region reports the exact `bytes` asked for, so its accessors stay
-    /// tightly bounded, while the frames behind it belong to no other region.
+    /// The region reports the whole frames it owns. This keeps its physical
+    /// extent suitable for page-granular IOMMU mappings; callers still hand a
+    /// device only the checked slices that contain their queue or buffer.
     pub fn region(&mut self, bytes: u64) -> Result<Region, DmaError> {
         if bytes == 0 {
             return Err(DmaError::Empty);
@@ -251,7 +262,7 @@ impl<'s> Arena<'s> {
         // `Region::new`'s contract, met with the claim kept inside: the table
         // holds these whole frames for this arena until the region comes back,
         // `offset` is their live write-back direct map, and `bytes` fits them.
-        Ok(Region { cpu, physical: span.start(), len: bytes, frames: Some(frames) })
+        Ok(Region { cpu, physical: span.start(), len: step, frames: Some(frames) })
     }
 
     /// Takes one region's frames back, for the next region to use.
@@ -378,6 +389,8 @@ mod tests {
         let second = arena.region(FRAME_SIZE + 1)?;
 
         assert_eq!(first.physical(), 0x10_0000);
+        assert_eq!(first.len(), FRAME_SIZE, "a sub-page claim exposed a partial IOMMU page");
+        assert_eq!(second.len(), 2 * FRAME_SIZE);
         assert_eq!(second.physical(), 0x10_0000 + FRAME_SIZE, "regions shared a frame");
         assert_eq!(arena.span().count(), 8);
         Ok(())

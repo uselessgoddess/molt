@@ -9,14 +9,15 @@
 //! on the device to retire the frame before it.
 
 use molt_arch::Mmio;
-use molt_arch::dma::{Arena, Region};
+use molt_arch::dma::Arena;
+use molt_arch::iommu::{DeviceId, DmaPerm, Mapper, Mapping};
 use molt_net::addr::MacAddr;
 use molt_net::{Link, LinkError};
 
 use crate::VirtioError;
 use crate::config::{Common, status};
 use crate::notify::Notify;
-use crate::queue::{self, MAX_SIZE, Queue, Segment};
+use crate::queue::{self, MAX_SIZE, Queue};
 
 const RECEIVE_QUEUE: u16 = 0;
 const TRANSMIT_QUEUE: u16 = 1;
@@ -35,19 +36,21 @@ const FRAME: usize = molt_net::FRAME;
 /// One staged frame in either direction: a header and the frame behind it.
 const BUFFER: usize = HEADER + FRAME;
 const CONFIG_SPINS: u32 = 16;
+const NETWORK_SIZE: u16 = 8;
 
 struct Receive {
     queue: Queue,
-    buffers: Region,
+    buffers: Mapping,
     heads: [Option<u16>; MAX_SIZE as usize],
+    notify_off: u16,
 }
 
 impl Receive {
-    fn new(queue: Queue, buffers: Region) -> Result<Self, VirtioError> {
+    fn new(queue: Queue, buffers: Mapping, notify_off: u16) -> Result<Self, VirtioError> {
         if buffers.len() < queue.size() as u64 * BUFFER as u64 {
             return Err(VirtioError::Device);
         }
-        let mut receive = Self { queue, buffers, heads: [None; MAX_SIZE as usize] };
+        let mut receive = Self { queue, buffers, heads: [None; MAX_SIZE as usize], notify_off };
         for slot in 0..receive.queue.size() {
             receive.post(slot)?;
         }
@@ -56,7 +59,7 @@ impl Receive {
 
     fn post(&mut self, slot: u16) -> Result<(), VirtioError> {
         let offset = slot as u64 * BUFFER as u64;
-        let segment = Segment::writable(self.buffers.physical() + offset, BUFFER as u32);
+        let segment = self.buffers.writable(offset, BUFFER as u32)?;
         let head = self.queue.push(&[segment])?;
         let mapped = self.heads.get_mut(head as usize).ok_or(VirtioError::Device)?;
         if mapped.replace(slot).is_some() {
@@ -104,26 +107,31 @@ impl Receive {
         Ok(())
     }
 
-    fn regions(self) -> impl Iterator<Item = Region> {
-        self.queue.regions().into_iter().chain([self.buffers])
+    fn mappings(self) -> impl Iterator<Item = Mapping> {
+        self.queue.mappings().into_iter().chain([self.buffers])
+    }
+
+    fn kick(&self, notify: &Notify<'_>) -> Result<(), VirtioError> {
+        notify.signal(RECEIVE_QUEUE, self.notify_off)
     }
 }
 
 struct Transmit {
     queue: Queue,
-    buffers: Region,
+    buffers: Mapping,
     heads: [Option<u16>; MAX_SIZE as usize],
+    notify_off: u16,
     /// The staging slots no frame is in flight from, one bit each.
     free: u16,
 }
 
 impl Transmit {
-    fn new(queue: Queue, buffers: Region) -> Result<Self, VirtioError> {
+    fn new(queue: Queue, buffers: Mapping, notify_off: u16) -> Result<Self, VirtioError> {
         if buffers.len() < queue.size() as u64 * BUFFER as u64 {
             return Err(VirtioError::Device);
         }
         let free = (1 << queue.size()) - 1;
-        Ok(Self { queue, buffers, heads: [None; MAX_SIZE as usize], free })
+        Ok(Self { queue, buffers, heads: [None; MAX_SIZE as usize], notify_off, free })
     }
 
     /// Copies `frame` into a free slot and hands the device the slot.
@@ -137,7 +145,8 @@ impl Transmit {
         self.buffers.write_from(offset, &[0; HEADER])?;
         self.buffers.write_from(offset + HEADER as u64, frame)?;
         let len = u32::try_from(HEADER + frame.len()).map_err(|_| VirtioError::Device)?;
-        let head = self.queue.push(&[Segment::readable(self.buffers.physical() + offset, len)])?;
+        let segment = self.buffers.readable(offset, len)?;
+        let head = self.queue.push(&[segment])?;
         let mapped = self.heads.get_mut(head as usize).ok_or(VirtioError::Device)?;
         if mapped.replace(slot).is_some() {
             return Err(VirtioError::Device);
@@ -159,32 +168,42 @@ impl Transmit {
         Ok(())
     }
 
-    fn regions(self) -> impl Iterator<Item = Region> {
-        self.queue.regions().into_iter().chain([self.buffers])
+    fn mappings(self) -> impl Iterator<Item = Mapping> {
+        self.queue.mappings().into_iter().chain([self.buffers])
+    }
+
+    fn kick(&self, notify: &Notify<'_>) -> Result<(), VirtioError> {
+        notify.signal(TRANSMIT_QUEUE, self.notify_off)
     }
 }
 
-/// A VirtIO network device with preposted RX buffers and a staged TX ring.
-pub struct Net<'slots, 'window> {
-    common: Common<'window>,
-    notify: Notify<'window>,
-    receive: Receive,
-    transmit: Transmit,
-    arena: Arena<'slots>,
-    receive_notify: u16,
-    transmit_notify: u16,
+pub struct Nic<'w> {
+    common: Common<'w>,
+    notify: Notify<'w>,
     mac: MacAddr,
 }
 
-impl<'slots, 'window> Net<'slots, 'window> {
+/// A VirtIO network device with preposted RX buffers and a staged TX ring.
+pub struct Net<'s, 'w, M: Mapper> {
+    mapper: M,
+    nic: Nic<'w>,
+    receive: Receive,
+    transmit: Transmit,
+    arena: Arena<'s>,
+}
+
+impl<'s, 'w, M: Mapper> Net<'s, 'w, M> {
     /// Brings up queue pair zero and routes both queues through `vector`.
+    #[allow(clippy::too_many_arguments)] // FIXME: split into high-level types or reorganize 
     pub fn start(
-        common: Mmio<'window>,
-        notify: Mmio<'window>,
-        device: Mmio<'window>,
+        common: Mmio<'w>,
+        notify: Mmio<'w>,
+        device: Mmio<'w>,
         notify_multiplier: u32,
         vector: u16,
-        mut arena: Arena<'slots>,
+        endpoint: DeviceId,
+        mut mapper: M,
+        mut arena: Arena<'s>,
     ) -> Result<Self, VirtioError> {
         let mut common = Common::new(common);
         common.reset()?;
@@ -198,51 +217,61 @@ impl<'slots, 'window> Net<'slots, 'window> {
         let mac = mac(&common, &device)?;
 
         let (receive_queue, receive_notify) =
-            queue(&mut common, &mut arena, RECEIVE_QUEUE, vector)?;
-        let receive_buffers = arena.region(receive_queue.size() as u64 * BUFFER as u64)?;
-        let receive = Receive::new(receive_queue, receive_buffers)?;
+            queue(&mut common, &mut arena, &mut mapper, endpoint, RECEIVE_QUEUE, vector)?;
+        let receive_buffers = map(
+            &mut mapper,
+            endpoint,
+            arena.region(receive_queue.size() as u64 * BUFFER as u64)?,
+            DmaPerm::WRITE,
+        )?;
+        let receive = Receive::new(receive_queue, receive_buffers, receive_notify)?;
 
         let (transmit_queue, transmit_notify) =
-            queue(&mut common, &mut arena, TRANSMIT_QUEUE, vector)?;
-        let transmit_buffers = arena.region(transmit_queue.size() as u64 * BUFFER as u64)?;
-        let transmit = Transmit::new(transmit_queue, transmit_buffers)?;
+            queue(&mut common, &mut arena, &mut mapper, endpoint, TRANSMIT_QUEUE, vector)?;
+        let transmit_buffers = map(
+            &mut mapper,
+            endpoint,
+            arena.region(transmit_queue.size() as u64 * BUFFER as u64)?,
+            DmaPerm::READ,
+        )?;
+        let transmit = Transmit::new(transmit_queue, transmit_buffers, transmit_notify)?;
 
         // RX descriptors are visible before the device begins running.
         common.add_status(status::DRIVER_OK)?;
         let notify = Notify::new(notify, notify_multiplier);
         notify.signal(RECEIVE_QUEUE, receive_notify)?;
 
-        Ok(Self { common, notify, receive, transmit, arena, receive_notify, transmit_notify, mac })
+        let nic = Nic { common, notify, mac };
+        Ok(Self { nic, receive, transmit, mapper, arena })
     }
 
     /// The device-provided Ethernet address negotiated at startup.
     pub const fn mac(&self) -> MacAddr {
-        self.mac
+        self.nic.mac
     }
 
     /// Drains one interrupt-reported RX completion and immediately reposts it.
     pub fn receive(&mut self, frame: &mut [u8]) -> Result<Option<usize>, VirtioError> {
         let received = self.receive.receive(frame);
-        // Kicking a spurious interrupt is harmless and guarantees a buffer
-        // republished on an error is visible before the error leaves the cell.
-        self.notify.signal(RECEIVE_QUEUE, self.receive_notify)?;
+        self.receive.kick(&self.nic.notify)?;
         received
     }
 
     /// Stops DMA before returning every queue and buffer frame to its arena.
     pub fn reset(self) -> Result<(), VirtioError> {
-        let Self { mut common, receive, transmit, mut arena, .. } = self;
-        common.reset()?;
+        let Self { mut nic, receive, transmit, mut mapper, mut arena, .. } = self;
+        nic.common.reset()?;
         let released = receive
-            .regions()
-            .chain(transmit.regions())
-            .try_for_each(|region| arena.release(region));
+            .mappings()
+            .chain(transmit.mappings())
+            .map(|mapping| mapper.unmap(mapping).map_err(|error| error.error()))
+            .try_for_each(|region| arena.release(region?));
         arena.reset();
         Ok(released?)
     }
 }
 
-impl Link for Net<'_, '_> {
+impl<M: Mapper> Link for Net<'_, '_, M> {
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
         if frame.len() > FRAME {
             return Err(LinkError::Device);
@@ -251,7 +280,7 @@ impl Link for Net<'_, '_> {
             VirtioError::Full => LinkError::Busy,
             _ => LinkError::Device,
         })?;
-        self.notify.signal(TRANSMIT_QUEUE, self.transmit_notify).map_err(|_| LinkError::Device)
+        self.transmit.kick(&self.nic.notify).map_err(|_| LinkError::Device)
     }
 
     fn receive(&mut self, frame: &mut [u8]) -> Result<Option<usize>, LinkError> {
@@ -259,27 +288,36 @@ impl Link for Net<'_, '_> {
     }
 }
 
-fn queue(
+fn queue<M: Mapper>(
     common: &mut Common<'_>,
     arena: &mut Arena<'_>,
+    mapper: &mut M,
+    endpoint: DeviceId,
     index: u16,
     vector: u16,
 ) -> Result<(Queue, u16), VirtioError> {
     common.select_queue(index)?;
     let size = clamp_queue(common.queue_size()?)?;
-    let descriptors = arena.region(queue::descriptor_bytes(size))?;
-    let driver = arena.region(queue::driver_bytes(size))?;
-    let device = arena.region(queue::device_bytes(size))?;
+    let descriptors =
+        map(mapper, endpoint, arena.region(queue::descriptor_bytes(size))?, DmaPerm::READ)?;
+    let driver = map(mapper, endpoint, arena.region(queue::driver_bytes(size))?, DmaPerm::READ)?;
+    let device =
+        map(mapper, endpoint, arena.region(queue::device_bytes(size))?, DmaPerm::READ_WRITE)?;
     let queue = Queue::new(size, descriptors, driver, device)?;
     common.set_queue_size(size)?;
     common.set_queue_vector(vector)?;
-    common.set_queue_rings(
-        queue.descriptors_physical(),
-        queue.driver_physical(),
-        queue.device_physical(),
-    )?;
+    common.set_queue_rings(queue.descriptors_iova(), queue.driver_iova(), queue.device_iova())?;
     common.enable_queue()?;
     Ok((queue, common.queue_notify_off()?))
+}
+
+fn map(
+    mapper: &mut impl Mapper,
+    endpoint: DeviceId,
+    region: molt_arch::dma::Region,
+    perm: DmaPerm,
+) -> Result<Mapping, VirtioError> {
+    mapper.map(endpoint, region, perm).map_err(|error| VirtioError::Dma(error.error()))
 }
 
 fn mac(common: &Common<'_>, device: &Mmio<'_>) -> Result<MacAddr, VirtioError> {
@@ -300,7 +338,7 @@ fn clamp_queue(device_max: u16) -> Result<u16, VirtioError> {
     if device_max == 0 {
         return Err(VirtioError::Device);
     }
-    let size = device_max.min(MAX_SIZE);
+    let size = device_max.min(NETWORK_SIZE);
     if !size.is_power_of_two() {
         return Err(VirtioError::Device);
     }
@@ -317,9 +355,11 @@ fn require_features(features: u64) -> Result<(), VirtioError> {
 #[cfg(test)]
 mod tests {
     use molt_arch::dma::Region;
+    use molt_arch::iommu::{DeviceId, DmaPerm, Identity, Mapper, Mapping};
 
     use super::{
-        BUFFER, HEADER, REQUIRED_FEATURES, Receive, Transmit, VIRTIO_NET_F_MAC, require_features,
+        BUFFER, HEADER, NETWORK_SIZE, REQUIRED_FEATURES, Receive, Transmit, VIRTIO_NET_F_MAC,
+        clamp_queue, require_features,
     };
     use crate::VirtioError;
     use crate::queue::{Queue, device_bytes, driver_bytes};
@@ -329,12 +369,16 @@ mod tests {
         unsafe { Region::new(bytes.as_mut_ptr(), physical, bytes.len() as u64) }
     }
 
+    fn mapping(bytes: &mut [u8], physical: u64, perm: DmaPerm) -> Mapping {
+        Identity.map(DeviceId::new(0), region(bytes, physical), perm).ok().unwrap()
+    }
+
     fn queue(descriptors: &mut [u8; 128], driver: &mut [u8; 32], device: &mut [u8; 72]) -> Queue {
         Queue::new(
             8,
-            region(descriptors, 0x1000),
-            region(&mut driver[..driver_bytes(8) as usize], 0x2000),
-            region(&mut device[..device_bytes(8) as usize], 0x3000),
+            mapping(descriptors, 0x1000, DmaPerm::READ),
+            mapping(&mut driver[..driver_bytes(8) as usize], 0x2000, DmaPerm::READ),
+            mapping(&mut device[..device_bytes(8) as usize], 0x3000, DmaPerm::READ_WRITE),
         )
         .unwrap()
     }
@@ -346,8 +390,8 @@ mod tests {
         let mut device = [0u8; 72];
         let queue = queue(&mut descriptors, &mut driver, &mut device);
         let mut storage = [0u8; BUFFER * 8];
-        let buffers = region(&mut storage, 0x4000);
-        let mut receive = Receive::new(queue, buffers)?;
+        let buffers = mapping(&mut storage, 0x4000, DmaPerm::WRITE);
+        let mut receive = Receive::new(queue, buffers, 0)?;
         storage[10..12].copy_from_slice(&1u16.to_le_bytes());
         storage[HEADER..HEADER + 4].copy_from_slice(b"ping");
         device[4..8].copy_from_slice(&0u32.to_le_bytes());
@@ -371,7 +415,8 @@ mod tests {
         let mut device = [0u8; 72];
         let queue = queue(&mut descriptors, &mut driver, &mut device);
         let mut storage = [0u8; BUFFER * 8];
-        let mut transmit = Transmit::new(queue, region(&mut storage, 0x4000))?;
+        let buffers = mapping(&mut storage, 0x4000, DmaPerm::READ);
+        let mut transmit = Transmit::new(queue, buffers, 0)?;
 
         for slot in 0..8u8 {
             transmit.stage(&[slot; 4])?;
@@ -388,5 +433,10 @@ mod tests {
     fn modern_header_requires_merge_buffer_format() {
         assert_eq!(require_features(VIRTIO_NET_F_MAC), Err(VirtioError::Features));
         assert_eq!(require_features(REQUIRED_FEATURES), Ok(()));
+    }
+
+    #[test]
+    fn queue_depth() {
+        assert_eq!(clamp_queue(256), Ok(NETWORK_SIZE));
     }
 }

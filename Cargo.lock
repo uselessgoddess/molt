@@ -531,6 +531,7 @@ dependencies = [
 name = "molt-block"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "molt-core",
 ]
 
@@ -632,6 +633,7 @@ version = "0.1.0"
 dependencies = [
  "molt-arch",
  "molt-block",
+ "molt-core",
  "molt-net",
  "molt-pci",
 ]

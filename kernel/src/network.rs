@@ -2,7 +2,7 @@
 
 use molt_arch::dma::Arena;
 use molt_arch::memory::{Inventory, Owner, Rights};
-use molt_arch::{BootInfo, FrameAllocator, Platform, SerialWriter};
+use molt_arch::{BootInfo, FrameAllocator, Platform, SerialWriter, iommu};
 use molt_core::CellId;
 use molt_core::buffer::{BufferOperation, BufferRegistry};
 use molt_core::ring::{IoRing, RequestId, Submission};
@@ -110,9 +110,17 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let mut slots: [Option<Owner>; DMA_FRAMES] = [None; DMA_FRAMES];
     let arena = Arena::claim(&mut allocator, offset, NET_TAG, &mut slots)
         .expect("a contiguous network DMA span");
-    let net =
-        Net::start(common, notify, config, transport.notify_multiplier(), vectored.index(), arena)
-            .expect("the network device completes its handshake");
+    let net = Net::start(
+        common,
+        notify,
+        config,
+        transport.notify_multiplier(),
+        vectored.index(),
+        device::requester(function.address()),
+        iommu::Identity,
+        arena,
+    )
+    .expect("the network device completes its handshake");
     let mac = net.mac();
     report!(platform, "MOLT_NET_OK: {} mac {:02x?}", function.address(), mac.octets(),);
 
@@ -139,7 +147,11 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
 /// Queries DNS and returns the reply, which only v4 gets: slirp resolves over
 /// whatever nameservers the host has, and those answer on v4. A v6 query stops
 /// once it is on the wire, which discovery alone decides.
-fn udp_round_trip(line: &Line, ip: &mut Ip<Net<'_, '_>, 4>, dns: IpAddr) -> Option<usize> {
+fn udp_round_trip<M: iommu::Mapper>(
+    line: &Line,
+    ip: &mut Ip<Net<'_, '_, M>, 4>,
+    dns: IpAddr,
+) -> Option<usize> {
     let mut source = DNS_QUERY;
     let mut target = [0u8; 512];
     let mut tx = [0u8; 1480];

@@ -1,11 +1,11 @@
 # VirtIO devices
 
-Status: Stage 2.3 block and Stage 3 network implementation record, July 2026.
+Status: Stage 4.5 block/IOMMU and Stage 3 network implementation record, August 2026.
 
-Why a queue is built out of frames the kernel owns rather than memory the device
-names, where a physical address is allowed to exist, what the four request
-semantics actually promise, and how Stage 3 orders writes and flushes. Written
-as the record for `molt-arch::dma` and the `molt-virtio` crate.
+Why a queue is built out of frames the kernel owns, how mappings turn those
+frames into device-scoped IOVAs, what the request semantics promise, and how
+writes and flushes are ordered. The stable block and isolation boundary is
+specified in [`block.md`](block.md); this document records the VirtIO transport.
 
 ## The shape of the problem
 
@@ -17,7 +17,7 @@ line each of them sits on:
   it is classified through `Inventory::device` and mapped as an `Mmio` window
   before anything touches it, exactly as [`docs/pci.md`](pci.md) describes.
 - **The virtqueue** is shared memory the *driver* owns and the device reads and
-  writes by physical address. This is the new thing: the device does DMA into
+  writes through a mapped IOVA (or the typed identity backend). The device does DMA into
   it, so the frames behind it have to be frames the kernel can account for and
   reclaim, not a buffer the device was pointed at and trusted to respect.
 - **The notification** is a store into a third BAR region that tells the device
@@ -56,29 +56,25 @@ queue reuses its span instead of running it down;
 still outstanding. Both are for a device already told to stop, which is the
 point the four semantics below are built around.
 
-## Where a physical address becomes something you may touch
+## Where a device address comes from
 
-The device speaks physical addresses; the CPU speaks pointers. A
-[`Region`](../crates/molt-arch/src/dma.rs) is the pair, and it is the reason no
-public operation in `molt-virtio` passes a raw physical address around.
+The CPU reaches a [`Region`](../crates/molt-arch/src/dma.rs) through its private
+direct-map pointer, while a [`Mapper`](../crates/molt-arch/src/iommu.rs) turns
+the region's physical backing into a device-scoped [`Mapping`](../crates/molt-arch/src/iommu.rs).
+The identity backend's IOVA equals the physical base; the VirtIO-IOMMU backend
+allocates a translated IOVA. The queue does not know or care which was chosen.
 
-A region carries the physical base the device is given
-([`physical`](../crates/molt-arch/src/dma.rs)) and, privately, the write-back
-direct-map pointer the driver reaches the same bytes through. Every accessor is
-bounds- and alignment-checked against the region's declared length, so a
-descriptor that would point the device past its buffer is a `DmaError::Range`
-the driver never emits, not a stray DMA. The `cpu = offset + physical`
-relationship — `offset` being the platform's direct-map base — is established
-once, inside `Arena::region`, under the one `unsafe` block that can see both
-halves; the rest of the driver only ever holds the safe handle.
+`Mapping` owns the region for as long as a device can reach it and carries the
+requester ID and DMA permissions. `readable` and `writable` check both bounds
+and permission and return a `DmaSlice`; only that checked slice can become a
+VirtIO descriptor. A block read builds three slices: header readable, data
+writable, and status writable. No public queue operation accepts a bare
+physical address or IOVA.
 
-`Segment` is the other half of the discipline. A queue descriptor is built from
-`Segment::readable(physical, len)` or `Segment::writable(physical, len)` — the
-physical address comes straight off a `Region`, and readable-versus-writable is
-which way the *device* may touch it. The block read builds exactly three: the
-header readable, the data buffer writable, the status byte writable. There is no
-constructor that takes a bare address, so a segment always names a range some
-region already vouched for.
+Unmap consumes the mapping and is the only safe path back to the region. An
+unmap failure returns the still-live mapping rather than memory the caller
+could recycle. [`block.md`](block.md) gives the complete backend and teardown
+contract.
 
 `Region`, like `Mmio`, is `Send` but not `Sync`. A DMA buffer is
 order-sensitive shared state; two cores writing one interleaved is a driver bug
@@ -101,24 +97,20 @@ before submitting again. A ring that silently overwrote an in-flight descriptor
 would be handing the device two meanings for one slot, which is the corruption
 this replaces with an error.
 
-**Timeout is a bounded spin, not a promise the device answers.** `Block::read`
-polls the used ring up to `TIMEOUT_SPINS` times and then gives up with
-`VirtioError::Timeout`. The number is a spin budget, not wall-clock — there is
-no timer on this path — but the property that matters is that a wedged or absent
-device cannot hang the caller forever. Polling at all, rather than waiting on an
-interrupt, is deliberate for this stage: no MSI-X vector is routed to the block
-device, so the driver drains the used ring itself. The interrupt-driven path is
-Stage 3's, when there is a scheduler with something better to do than spin.
+**Timeout is a line budget, not a promise the device answers.** The driver polls
+the used ring, waits through `Arrivals` when work remains, then polls once more
+if that wait expires so a lost or coalesced interrupt cannot hide an already
+completed request. Only an empty final poll becomes `BlockError::Timeout`.
 
 **Cancellation gives up on a request without lying about its descriptors.**
 This is the subtle one. When `read` times out it calls
 [`Requests::cancel`](../crates/molt-virtio/src/request.rs) — but it does *not*
 free the descriptor head. The device may still be about to write that buffer;
 handing the head back to the free list would let the next request reuse a
-descriptor the device is mid-DMA into. So the head stays reserved, its slot
-marked `Cancelled`, and when the device finally returns it the completion is
-recognized as `Completion::Stale` and dropped rather than delivered to a caller
-that walked away. This is the same generation-stamped discipline
+descriptor the device is mid-DMA into. So the head and that request's bounce
+slot stay reserved, the token is marked cancelled, and when the device returns
+it the completion is recognized as `Completion::Stale` and dropped rather than
+delivered to a caller that walked away. This is the same generation-stamped discipline
 `CompletionSlab` and `InterruptSlab` use — a `Token` carries the slot's
 generation, the generation bumps on every completion, and an old token can no
 longer match a slot that has been reused. Cancellation and stale-rejection are
@@ -127,13 +119,11 @@ one mechanism seen from two ends.
 **Queue reset reclaims frames only after the device is told to stop.** This is
 the fourth acceptance box and the ordering is the whole point.
 `Block::reset` resets the device *first* — writing zero to the status register
-and waiting for the device to clear it, so the device has provably stopped
-reading the rings — and only then calls `Arena::reset` to return the frames to
-the table. Reverse that order and a frame could rejoin the free pool while an
-in-flight descriptor still points the device at it, so the next owner of that
-frame inherits a stray DMA write. The type system helps here too: `reset` takes
-`self` by value, so a driver cannot read a sector through a `Block` whose frames
-it has already handed back.
+and waiting for the device to clear it. It then consumes each mapping through
+the selected backend and returns the resulting regions to the arena. Only an
+empty domain is detached. Reverse that order and a frame could rejoin the free
+pool while an in-flight descriptor still points at it. `reset` takes `self`, so
+a driver cannot submit through a block queue whose mappings it returned.
 
 ## Bringing the device up
 
@@ -156,24 +146,22 @@ picking a smaller queue than it advertised, or a non-power-of-two size, is a
 
 `VIRTIO_BLK_T_OUT` uses a device-readable data descriptor.
 `VIRTIO_BLK_T_FLUSH` carries only request and status descriptors, with sector
-zero. `molt-block::Writable` exposes both without exposing a virtqueue. One
-outstanding request at a time keeps completion order deterministic, and MoltFS
+zero. The stable `BlockOp` contract exposes both without exposing a virtqueue.
+Its driver runs flush alone; reads and writes can complete out of order. MoltFS
 places explicit flushes between log data and the superblock that names it.
 
-**Bus mastering is granted for this device, once, and it is not free.** The same
-trade [`docs/pci.md`](pci.md) recorded for MSI applies with full force here: a
-device with `Command::BUS_MASTER` set can DMA anywhere in physical memory, and
-until there is an IOMMU that is a trust decision. Stage 2.2 granted it so an MSI
-could be posted; Stage 2.3 is where it is granted so the device can read the
-virtqueue at all, which is the more honest version of the same cost. The kernel
-sets `MEMORY | BUS_MASTER` on exactly the one function it chose, in `virtio.rs`,
-after classifying that function's BAR — an interrupt-capable or DMA-capable
-device on this kernel is as privileged as the kernel, and the arena's frame
-ownership is what bounds *where* it writes in practice, not hardware isolation.
+**Bus mastering follows isolation.** On the x86_64 smoke the kernel keeps the
+block function's `BUS_MASTER` bit clear, attaches its requester to a
+VirtIO-IOMMU domain, installs all queue and buffer mappings, and negotiates
+`ACCESS_PLATFORM`. Only then may the function initiate transactions. It is
+disabled again after block reset and before the empty domain is detached. The
+identity backend remains available for platforms without an IOMMU and makes no
+claim that bus mastering is isolated.
 
-**Block completion is polled, and only one block queue is programmed.** No
-MSI-X vector is routed to the block device and only queue zero is built. This
-bounded early-boot exception is not the model used by the network driver.
+**Block completion is interrupt-driven with a final polling fallback.** Queue
+zero is routed through MSI-X. The driver polls before waiting and once after an
+expired wait; an interrupt is therefore the normal wake without being a single
+point of failure for a completion already visible in the used ring.
 
 ## The interrupt-driven network pair
 
@@ -211,17 +199,15 @@ handshake's status accumulation and ring programming, and the arena's
 contiguity, disjointness, and reset. The fences the split virtqueue depends on
 are the same `Release`/`Acquire` pair `molt-core` already exercises under loom.
 
-What no host test can show is that a queue built from claimed frames, a device
-brought up over a mapped BAR, and a physical address handed across the DMA
-boundary all describe the same disk. The only proof is a sector reading back
-correct, so the x86_64 smoke attaches a `virtio-blk-pci,disable-legacy=on`
-function backed by a MoltFS image `xtask mkfs` lays out from the `disk/` tree,
-brings the device up, reads sector zero, commits a filesystem write, and resets.
-It requires `MOLT_VIRTIO_OK`, `MOLT_BLOCK_OK`, `MOLT_FS_WRITE_OK`, and
-`MOLT_VIRTIO_RESET_OK` on the serial line. The last marker proves queue-reset
-ordering: the device stopped, then frames came back.
+What no host test can show is that claimed frames, installed IOVAs, a mapped
+BAR, and QEMU's translator all describe the same disk. The x86_64 smoke adds
+`virtio-iommu-pci` and a `virtio-blk-pci` with `iommu_platform=on`, backed by a
+MoltFS image `xtask mkfs` lays out from `disk/`. It requires markers for attach,
+five installed mappings, two simultaneous reads, block IRQ completion, the
+existing filesystem write/restart path, a clean fault event queue, and ordered
+reset/unmap/detach. The full list and its meaning are in [`block.md`](block.md).
 
-The same smoke then brings up modern VirtIO-net over a second ten-frame arena.
+The same smoke then brings up modern VirtIO-net over a second twelve-frame arena.
 `MOLT_NET_OK` requires its two queues and MSI-X route to complete startup.
 `MOLT_UDP_OK` requires an ARP exchange followed by a DNS response through
 Ethernet, IPv4, the nested IP ring, and the capability-addressed UDP ring. Host
