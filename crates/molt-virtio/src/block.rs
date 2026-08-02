@@ -143,6 +143,7 @@ impl<A: Arrivals> Engine<'_, A> {
     }
 
     fn reap(&mut self) -> Option<(RequestId, BlockDone)> {
+        let mut wait_expired = false;
         loop {
             if let Some(done) = self.ready.iter_mut().find_map(Option::take) {
                 return Some(done);
@@ -163,11 +164,8 @@ impl<A: Arrivals> Engine<'_, A> {
                     };
                     return Some((flight.id, self.complete_with_copy(slot, op)));
                 }
-                Ok(None) if self.has_live_request() => {
-                    if self.arrivals.wait() == 0 {
-                        return self.timeout_one();
-                    }
-                }
+                Ok(None) if wait_expired => return self.timeout_one(),
+                Ok(None) if self.has_live_request() => wait_expired = self.arrivals.wait() == 0,
                 Ok(None) => return None,
                 Err(_) => return self.fail_one(BlockError::Device),
             }
@@ -323,7 +321,7 @@ impl<'slots, 'window, A: Arrivals, M: Mapper> Block<'slots, 'window, A, M> {
             &mut mapper,
             endpoint,
             arena.region(queue::device_bytes(size))?,
-            DmaPerm::WRITE,
+            DmaPerm::READ_WRITE,
         )?;
         let control =
             mapped(&mut mapper, endpoint, arena.region(CONTROL_BYTES)?, DmaPerm::READ_WRITE)?;
@@ -532,6 +530,21 @@ mod tests {
         }
     }
 
+    struct CompletesOnExpiry(*mut u8);
+
+    impl crate::Arrivals for CompletesOnExpiry {
+        fn wait(&mut self) -> u64 {
+            // SAFETY: the test keeps the used-ring array live. The queue owns
+            // the same device-writable bytes, so this models its DMA before an
+            // interrupt wait expires without creating a CPU reference alias.
+            unsafe {
+                self.0.add(4).cast::<u32>().write_unaligned(0);
+                self.0.add(2).cast::<u16>().write_unaligned(1);
+            }
+            0
+        }
+    }
+
     fn region(bytes: &mut [u8], physical: u64) -> Region {
         // SAFETY: the arrays remain live and stand in for device-owned bytes.
         unsafe { Region::new(bytes.as_mut_ptr(), physical, bytes.len() as u64) }
@@ -542,20 +555,21 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn engine<'a>(
+    fn engine<'a, A: crate::Arrivals>(
         descriptors: &mut [u8],
         driver: &mut [u8],
         device: &mut [u8],
         control: &mut [u8],
         data: &mut [u8],
         notify: &'a mut [u8],
-    ) -> Engine<'a, NoWait> {
+        arrivals: A,
+    ) -> Engine<'a, A> {
         let size = queue::MAX_SIZE;
         let queue = Queue::new(
             size,
             mapping(descriptors, 0x1000, DmaPerm::READ),
             mapping(driver, 0x2000, DmaPerm::READ),
-            mapping(device, 0x3000, DmaPerm::WRITE),
+            mapping(device, 0x3000, DmaPerm::READ_WRITE),
         )
         .unwrap();
         // SAFETY: the notification array remains live and uniquely represents
@@ -565,7 +579,7 @@ mod tests {
             notify: Notify::new(notify, 0),
             queue,
             requests: Requests::new(),
-            arrivals: NoWait,
+            arrivals,
             control: mapping(control, 0x4000, DmaPerm::READ_WRITE),
             data: mapping(data, 0x8000, DmaPerm::READ_WRITE),
             flights: [const { None }; REQUESTS],
@@ -581,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn two_requests_publish_before_completion() -> Result<(), VirtioError> {
+    fn two_live() -> Result<(), VirtioError> {
         let mut descriptors = [0u8; queue::MAX_SIZE as usize * 16];
         let mut driver = [0u8; 72];
         let mut device = [0u8; 264];
@@ -595,6 +609,7 @@ mod tests {
             &mut control,
             &mut data,
             &mut notify,
+            NoWait,
         );
 
         engine.start(RequestId::new(4), read(0)).ok().unwrap();
@@ -606,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_reads_keep_their_buffers() -> Result<(), VirtioError> {
+    fn reordered_reads() -> Result<(), VirtioError> {
         let mut descriptors = [0u8; queue::MAX_SIZE as usize * 16];
         let mut driver = [0u8; 72];
         let mut device = [0u8; 264];
@@ -620,6 +635,7 @@ mod tests {
             &mut control,
             &mut data,
             &mut notify,
+            NoWait,
         );
         engine.start(RequestId::new(4), read(0)).ok().unwrap();
         engine.start(RequestId::new(5), read(8)).ok().unwrap();
@@ -646,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn device_status_reaches_block_error() -> Result<(), VirtioError> {
+    fn device_error() -> Result<(), VirtioError> {
         let mut descriptors = [0u8; queue::MAX_SIZE as usize * 16];
         let mut driver = [0u8; 72];
         let mut device = [0u8; 264];
@@ -660,6 +676,7 @@ mod tests {
             &mut control,
             &mut data,
             &mut notify,
+            NoWait,
         );
         engine.start(RequestId::new(1), read(0)).ok().unwrap();
         let head = u16::from_le_bytes(driver[4..6].try_into().unwrap());
@@ -672,7 +689,35 @@ mod tests {
     }
 
     #[test]
-    fn deep_device_queue_capped_at_drivers_maximum() -> Result<(), VirtioError> {
+    fn final_poll() -> Result<(), VirtioError> {
+        let mut descriptors = [0u8; queue::MAX_SIZE as usize * 16];
+        let mut driver = [0u8; 72];
+        let mut device = [0u8; 264];
+        let device_ptr = device.as_mut_ptr();
+        let mut control = [0u8; CONTROL_BYTES as usize];
+        let mut data = [0u8; BLOCK * REQUESTS];
+        let mut notify = [0u8; 2];
+        let mut engine = engine(
+            &mut descriptors,
+            &mut driver,
+            &mut device,
+            &mut control,
+            &mut data,
+            &mut notify,
+            CompletesOnExpiry(device_ptr),
+        );
+        engine.start(RequestId::new(9), read(0)).ok().unwrap();
+        engine.control.write_u8(16, 0)?;
+
+        let (id, done) = engine.reap().expect("the final poll observes the completion");
+
+        assert_eq!(id, RequestId::new(9));
+        assert_eq!(done.result, Ok(()));
+        Ok(())
+    }
+
+    #[test]
+    fn queue_depth() -> Result<(), VirtioError> {
         assert_eq!(clamp_queue(256)?, queue::MAX_SIZE);
         Ok(())
     }
