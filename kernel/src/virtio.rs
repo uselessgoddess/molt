@@ -1,20 +1,34 @@
+use alloc::boxed::Box;
+
 use molt_arch::dma::Arena;
 use molt_arch::memory::{Inventory, Owner, Rights};
 use molt_arch::{BootInfo, FrameAllocator, Platform, SerialWriter};
-use molt_block::{Device, SECTOR};
+use molt_block::{BlockOp, Device, Queue, RequestId, SECTOR};
 use molt_kernel::report;
 use molt_pci::{Bus, Command, bus_span};
-use molt_virtio::{Block, Transport};
+use molt_virtio::{Arrivals, Block, Iommu, Transport};
 
 use crate::device;
 
 /// QEMU's modern virtio-blk-pci function (`disable-legacy=on`).
 const VIRTIO_VENDOR: u16 = 0x1af4;
 const VIRTIO_BLOCK: u16 = 0x1042;
+const VIRTIO_IOMMU: u16 = 0x1057;
 
 const SIGNATURE: [u8; 8] = molt_fs::MAGIC;
 const DMA_FRAMES: usize = 12;
+const IOMMU_FRAMES: usize = 8;
 const BLOCK_TAG: u32 = 0xb10c;
+const IOMMU_TAG: u32 = 0x10aa;
+
+struct Poll;
+
+impl Arrivals for Poll {
+    fn wait(&mut self) -> u64 {
+        core::hint::spin_loop();
+        0
+    }
+}
 
 pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let Ok(space) = platform.config_space(boot_info) else {
@@ -32,16 +46,44 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
 
     let mut bus = Bus::new(&window, 0);
     let mut target = None;
+    let mut controller = None;
     while let Some(function) = bus.function() {
-        if function.vendor() == VIRTIO_VENDOR && function.device() == VIRTIO_BLOCK {
-            target = Some(function);
-            break;
+        if function.vendor() == VIRTIO_VENDOR {
+            match function.device() {
+                VIRTIO_BLOCK => target = Some(function),
+                VIRTIO_IOMMU => controller = Some(function),
+                _ => {}
+            }
         }
     }
-    let Some(mut function) = target else {
-        report!(platform, "MOLT_VIRTIO_SKIPPED: no virtio-blk device on bus zero");
+    let (Some(mut function), Some(mut iommu_function)) = (target, controller) else {
+        report!(platform, "MOLT_VIRTIO_SKIPPED: no virtio-blk/IOMMU pair on bus zero");
         return;
     };
+
+    let iommu_transport =
+        Transport::probe(&iommu_function).expect("the IOMMU describes its structures");
+    let iommu_bar_index = iommu_transport.common().bar();
+    assert!(
+        iommu_transport.notify().bar() == iommu_bar_index
+            && iommu_transport.device().bar() == iommu_bar_index,
+        "IOMMU structures split across BARs",
+    );
+    let (iommu_bar, iommu_registers) =
+        device::map_bar(platform, &inventory, &mut iommu_function, iommu_bar_index);
+    let iommu_command = iommu_function.command().expect("the IOMMU command register");
+    iommu_function
+        .set_command(
+            iommu_command
+                .with(Command::MEMORY)
+                .with(Command::BUS_MASTER)
+                .with(Command::INTX_DISABLE),
+        )
+        .expect("a writable IOMMU command register");
+    let iommu_delta = device::delta(iommu_bar);
+    let iommu_common = device::subwindow(&iommu_registers, iommu_delta, iommu_transport.common());
+    let iommu_notify = device::subwindow(&iommu_registers, iommu_delta, iommu_transport.notify());
+    let iommu_config = device::subwindow(&iommu_registers, iommu_delta, iommu_transport.device());
 
     let transport = Transport::probe(&function).expect("a modern device describes its structures");
     let bar_index = transport.common().bar();
@@ -59,14 +101,12 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
         (table_bar, Some(mapping))
     };
 
-    // `INTX_DISABLE` goes on with the rest: a function left free to assert a
-    // pin interrupt as well would deliver the same queue twice.
+    // The endpoint cannot initiate DMA until it has an isolated domain and all
+    // of its queue mappings. INTx is disabled before MSI-X is enabled.
     let command = function.command().expect("the command register");
-    function
-        .set_command(
-            command.with(Command::MEMORY).with(Command::BUS_MASTER).with(Command::INTX_DISABLE),
-        )
-        .expect("a writable command register");
+    let quiesced =
+        command.with(Command::MEMORY).with(Command::INTX_DISABLE).without(Command::BUS_MASTER);
+    function.set_command(quiesced).expect("a writable command register");
     report!(
         platform,
         "MOLT_VIRTIO_OK: {} {:04x}:{:04x} bar {bar_index} at {:#x}",
@@ -84,21 +124,81 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let config = device::subwindow(&registers, delta, transport.device());
 
     let mut allocator = FrameAllocator::resume(boot_info.memory_map(), cursor);
+    let mut iommu_slots: [Option<Owner>; IOMMU_FRAMES] = [None; IOMMU_FRAMES];
+    let iommu_arena = Arena::claim(&mut allocator, offset, IOMMU_TAG, &mut iommu_slots)
+        .expect("contiguous frames for the IOMMU control queues");
     let mut slots: [Option<Owner>; DMA_FRAMES] = [None; DMA_FRAMES];
     let arena = Arena::claim(&mut allocator, offset, BLOCK_TAG, &mut slots)
         .expect("contiguous device frames past the kernel's own");
 
-    let mut block = Block::start(
+    let endpoint = device::requester(function.address());
+    let mut iommu = Iommu::start(
+        iommu_common,
+        iommu_notify,
+        iommu_config,
+        iommu_transport.notify_multiplier(),
+        u16::MAX,
+        Poll,
+        device::requester(iommu_function.address()),
+        iommu_arena,
+    )
+    .expect("the IOMMU completes its handshake");
+    iommu.attach(endpoint).expect("the block endpoint attaches to an isolated domain");
+    report!(platform, "MOLT_IOMMU_OK: block endpoint attached before bus mastering");
+
+    let mut block = Block::start_mapped(
         common,
         notify,
         config,
         transport.notify_multiplier(),
         vectored.index(),
         vectored.line(),
-        device::requester(function.address()),
+        endpoint,
         arena,
+        iommu,
     )
-    .expect("the device completes its handshake");
+    .expect("the mapped device completes its handshake");
+    function
+        .set_command(quiesced.with(Command::BUS_MASTER))
+        .expect("bus mastering enabled after mappings exist");
+    report!(platform, "MOLT_IOMMU_MAP_OK: {} block DMA regions installed", block.mapper().mapped(),);
+
+    let first = RequestId::new(0x10);
+    let second = RequestId::new(0x11);
+    assert!(
+        Queue::start(
+            &mut block,
+            first,
+            BlockOp::Read { sector: 0, bytes: SECTOR, buffer: Box::new([0; molt_block::BLOCK]) },
+        )
+        .is_ok(),
+        "the first depth probe submits"
+    );
+    assert!(
+        Queue::start(
+            &mut block,
+            second,
+            BlockOp::Read { sector: 1, bytes: SECTOR, buffer: Box::new([0; molt_block::BLOCK]) },
+        )
+        .is_ok(),
+        "the second depth probe submits before the first completes"
+    );
+    let mut first_seen = false;
+    for _ in 0..2 {
+        let (id, done) = Queue::reap(&mut block).expect("a depth probe completes");
+        done.result.expect("a depth probe read succeeds");
+        if id == first {
+            let bytes = done.buffer.expect("a read returns its buffer");
+            assert_eq!(&bytes[..SIGNATURE.len()], &SIGNATURE, "the first queued read was mixed up");
+            first_seen = true;
+        }
+    }
+    assert!(first_seen, "the first queued request never completed");
+    report!(
+        platform,
+        "MOLT_BLOCK_DEPTH_OK: two reads were live together at depth {}",
+        block.depth()
+    );
 
     let mut sector = [0u8; SECTOR];
     block.read(0, &mut sector).expect("sector zero reads back");
@@ -108,7 +208,20 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
 
     crate::init::smoke(platform, &mut block);
 
-    block.reset().expect("the device stops and its frames return");
+    let mut iommu = block.reset().expect("the device stops and its mappings return");
+    function.set_command(quiesced).expect("bus mastering stays off after reset");
+    assert!(iommu.poll_faults().expect("the fault queue remains valid").is_none());
+    report!(platform, "MOLT_IOMMU_FAULT_OK: no translation fault escaped the event queue");
+    iommu.detach().expect("the empty block domain detaches");
+    iommu.reset().expect("the IOMMU control queues stop and return");
+    iommu_function
+        .set_command(
+            iommu_command
+                .with(Command::MEMORY)
+                .with(Command::INTX_DISABLE)
+                .without(Command::BUS_MASTER),
+        )
+        .expect("IOMMU bus mastering stays off after reset");
     report!(platform, "MOLT_VIRTIO_RESET_OK: device stopped and frames reclaimed");
     vectored.stop(platform);
 }

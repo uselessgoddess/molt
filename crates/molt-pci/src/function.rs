@@ -147,7 +147,7 @@ impl<'w> Function<'w> {
     }
 
     /// Writes the command register whole.
-    pub fn set_command(&mut self, command: Command) -> Result<(), PciError> {
+    pub fn set_command(&self, command: Command) -> Result<(), PciError> {
         self.window.write_u16(register::COMMAND, command.bits())?;
         Ok(())
     }
@@ -282,7 +282,7 @@ mod tests {
     fn command_register_written_whole() -> Result<(), PciError> {
         let mut space = Space::new();
         space.function(0, 0).header(0x1234, 0x0001);
-        let mut function = Function::probe(space.config(0, 0), address())?.unwrap();
+        let function = Function::probe(space.config(0, 0), address())?.unwrap();
 
         let wanted = Command::MEMORY.with(Command::INTX_DISABLE);
         function.set_command(wanted)?;

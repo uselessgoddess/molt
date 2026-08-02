@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Run xtask's x86_64 smoke command against QEMU installed in a container.
+set -euo pipefail
+
+container="${MOLT_QEMU_CONTAINER:-molt-qemu}"
+guest_root="${MOLT_QEMU_GUEST_ROOT:-/work}"
+host_root="$(git rev-parse --show-toplevel)"
+arguments=()
+
+for argument in "$@"; do
+    arguments+=("${argument//"$host_root"/"$guest_root"}")
+done
+
+exec docker exec -i "$container" qemu-system-x86_64 "${arguments[@]}"
