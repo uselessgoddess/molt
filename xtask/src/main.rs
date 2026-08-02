@@ -378,7 +378,9 @@ fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
         "isa-debug-exit,iobase=0xf4,iosize=0x04",
     ]);
     command.arg("-drive").arg(format!("format=raw,file={}", image.display()));
-    command.arg("-drive").arg(format!("if=none,id=molt-disk,format=raw,file={}", disk.display()));
+    command
+        .arg("-drive")
+        .arg(format!("if=none,id=molt-disk,format=raw,cache=none,file={}", disk.display()));
     command.arg("-device").arg("virtio-iommu-pci");
     command
         .arg("-device")
