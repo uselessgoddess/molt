@@ -1,3 +1,5 @@
+use std::hint::black_box;
+
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use molt_block::{BLOCK, BlockOp, Buffer, Loopback, Queue, Queued, RequestId, SECTOR};
 
@@ -37,14 +39,14 @@ fn block_queue(criterion: &mut Criterion) {
         let mut next = 0;
         bencher.iter(|| {
             for _ in 0..BATCH {
-                criterion::black_box(cycle(&mut queue, &mut next));
+                black_box(cycle(&mut queue, &mut next));
             }
         });
     });
     group.bench_with_input(BenchmarkId::new("depth", 8), &(), |bencher, ()| {
         let mut queue = Queued::<_, 8>::new(Loopback::read(&image).unwrap());
         let mut next = 0;
-        bencher.iter(|| criterion::black_box(cycle(&mut queue, &mut next)));
+        bencher.iter(|| black_box(cycle(&mut queue, &mut next)));
     });
     group.finish();
 }
