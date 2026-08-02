@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{cargo, require_success, target_dir, workspace_root};
 
 /// Packages whose benches make up a run.
-const PACKAGES: [&str; 3] = ["molt-core", "molt-exec", "molt-fs"];
+const PACKAGES: [&str; 4] = ["molt-core", "molt-exec", "molt-block", "molt-fs"];
 
 /// Bumped when a field changes meaning, so an old record fails loudly.
 const SCHEMA: u32 = 1;
