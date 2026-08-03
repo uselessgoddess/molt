@@ -22,6 +22,7 @@ extern crate alloc;
 mod device;
 mod heap;
 mod init;
+mod isolation;
 mod network;
 mod nvme;
 mod pci;
