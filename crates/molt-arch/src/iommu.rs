@@ -275,6 +275,25 @@ pub trait Mapper {
     fn unmap(&mut self, mapping: Mapping) -> Result<Region, UnmapError>;
 }
 
+impl<M: Mapper + ?Sized> Mapper for &mut M {
+    fn access_platform(&self) -> bool {
+        (**self).access_platform()
+    }
+
+    fn map(
+        &mut self,
+        device: DeviceId,
+        region: Region,
+        perm: DmaPerm,
+    ) -> Result<Mapping, MapError> {
+        (**self).map(device, region, perm)
+    }
+
+    fn unmap(&mut self, mapping: Mapping) -> Result<Region, UnmapError> {
+        (**self).unmap(mapping)
+    }
+}
+
 /// A backend for machines where the device addresses physical memory directly.
 #[derive(Default)]
 pub struct Identity;

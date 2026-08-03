@@ -213,7 +213,7 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     function.set_command(quiesced).expect("bus mastering stays off after reset");
     assert!(iommu.poll_faults().expect("the fault queue remains valid").is_none());
     report!(platform, "MOLT_IOMMU_FAULT_OK: no translation fault escaped the event queue");
-    iommu.detach().expect("the empty block domain detaches");
+    iommu.detach(endpoint).expect("the empty block domain detaches");
     iommu.reset().expect("the IOMMU control queues stop and return");
     iommu_function
         .set_command(
