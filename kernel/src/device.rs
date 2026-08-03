@@ -131,3 +131,9 @@ impl molt_nvme::Arrivals for Line {
         crate::pci::wait(self.token, self.ticks)
     }
 }
+
+impl molt_nvme::Arrivals for Line {
+    fn wait(&mut self) -> u64 {
+        crate::pci::wait(self.token, self.ticks)
+    }
+}
