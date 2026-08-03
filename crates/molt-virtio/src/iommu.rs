@@ -641,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn domains_isolate_endpoints() -> Result<(), crate::VirtioError> {
+    fn domain_isolation() -> Result<(), crate::VirtioError> {
         let mut domains = Domains::<2>::new(7, 8);
         let first = DeviceId::new(0x18);
         let second = DeviceId::new(0x20);
@@ -655,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn domain_reuses_release() -> Result<(), crate::VirtioError> {
+    fn domain_reuse() -> Result<(), crate::VirtioError> {
         let mut domains = Domains::<2>::new(4, 5);
         let first = DeviceId::new(1);
         domains.reserve(first)?;

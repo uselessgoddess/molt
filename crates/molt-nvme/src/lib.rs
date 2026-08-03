@@ -485,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn read_command_encodes_lba_and_count() {
+    fn command_encode() {
         let mut page = Page([0; 4096]);
         let bytes = &mut page.0;
         let queue = mapping(bytes, 0x1000, DmaPerm::READ);
@@ -502,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn namespace_reports_four_kib_geometry() {
+    fn namespace_4k() {
         let mut page = Page([0; 4096]);
         let bytes = &mut page.0;
         bytes[..8].copy_from_slice(&32u64.to_le_bytes());
@@ -516,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn namespace_rejects_metadata() {
+    fn metadata_rejected() {
         let mut page = Page([0; 4096]);
         let bytes = &mut page.0;
         bytes[..8].copy_from_slice(&32u64.to_le_bytes());

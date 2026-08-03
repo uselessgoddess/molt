@@ -418,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn completions_match_reordered_commands() {
+    fn reordered_completions() {
         let mut registers = Aligned([0; 0x2000]);
         let mut sq = Aligned([0; 4096]);
         let mut cq = Aligned([0; 4096]);
@@ -449,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn device_status_fails_request() {
+    fn status_failure() {
         let mut registers = Aligned([0; 0x2000]);
         let mut sq = Aligned([0; 4096]);
         let mut cq = Aligned([0; 4096]);
@@ -469,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn four_kib_namespace_rejects_partial_lba() {
+    fn partial_lba_rejected() {
         let mut registers = Aligned([0; 0x2000]);
         let mut sq = Aligned([0; 4096]);
         let mut cq = Aligned([0; 4096]);

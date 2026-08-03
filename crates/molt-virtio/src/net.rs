@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn mapped_net_requires_platform_feature() {
+    fn mapped_net_feature() {
         assert_eq!(require_features(REQUIRED_FEATURES, true), Err(VirtioError::Features));
         assert_eq!(require_features(REQUIRED_FEATURES | VIRTIO_F_ACCESS_PLATFORM, true), Ok(()));
     }
