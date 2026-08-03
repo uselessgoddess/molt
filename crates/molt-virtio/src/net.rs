@@ -27,6 +27,7 @@ const VIRTIO_NET_F_MAC: u64 = 1 << 5;
 
 /// The device uses the complete modern header, including `num_buffers`.
 const VIRTIO_NET_F_MRG_RXBUF: u64 = 1 << 15;
+const VIRTIO_F_ACCESS_PLATFORM: u64 = 1 << 33;
 
 const REQUIRED_FEATURES: u64 = VIRTIO_NET_F_MAC | VIRTIO_NET_F_MRG_RXBUF;
 
@@ -183,6 +184,29 @@ pub struct Nic<'w> {
     mac: MacAddr,
 }
 
+/// Transport windows and PCI identity needed to start one network function.
+pub struct NetConfig<'w> {
+    common: Mmio<'w>,
+    notify: Mmio<'w>,
+    device: Mmio<'w>,
+    notify_multiplier: u32,
+    vector: u16,
+    endpoint: DeviceId,
+}
+
+impl<'w> NetConfig<'w> {
+    pub const fn new(
+        common: Mmio<'w>,
+        notify: Mmio<'w>,
+        device: Mmio<'w>,
+        notify_multiplier: u32,
+        vector: u16,
+        endpoint: DeviceId,
+    ) -> Self {
+        Self { common, notify, device, notify_multiplier, vector, endpoint }
+    }
+}
+
 /// A VirtIO network device with preposted RX buffers and a staged TX ring.
 pub struct Net<'s, 'w, M: Mapper> {
     mapper: M,
@@ -194,23 +218,20 @@ pub struct Net<'s, 'w, M: Mapper> {
 
 impl<'s, 'w, M: Mapper> Net<'s, 'w, M> {
     /// Brings up queue pair zero and routes both queues through `vector`.
-    #[allow(clippy::too_many_arguments)] // FIXME: split into high-level types or reorganize 
     pub fn start(
-        common: Mmio<'w>,
-        notify: Mmio<'w>,
-        device: Mmio<'w>,
-        notify_multiplier: u32,
-        vector: u16,
-        endpoint: DeviceId,
+        config: NetConfig<'w>,
         mut mapper: M,
         mut arena: Arena<'s>,
     ) -> Result<Self, VirtioError> {
+        let NetConfig { common, notify, device, notify_multiplier, vector, endpoint } = config;
         let mut common = Common::new(common);
         common.reset()?;
         common.add_status(status::ACKNOWLEDGE)?;
         common.add_status(status::DRIVER)?;
-        let features = common.negotiate(REQUIRED_FEATURES)?;
-        require_features(features)?;
+        let platform = mapper.access_platform();
+        let wanted = REQUIRED_FEATURES | if platform { VIRTIO_F_ACCESS_PLATFORM } else { 0 };
+        let features = common.negotiate(wanted)?;
+        require_features(features, platform)?;
         if common.num_queues()? < 2 {
             return Err(VirtioError::Missing);
         }
@@ -258,7 +279,7 @@ impl<'s, 'w, M: Mapper> Net<'s, 'w, M> {
     }
 
     /// Stops DMA before returning every queue and buffer frame to its arena.
-    pub fn reset(self) -> Result<(), VirtioError> {
+    pub fn reset(self) -> Result<M, VirtioError> {
         let Self { mut nic, receive, transmit, mut mapper, mut arena, .. } = self;
         nic.common.reset()?;
         let released = receive
@@ -267,7 +288,8 @@ impl<'s, 'w, M: Mapper> Net<'s, 'w, M> {
             .map(|mapping| mapper.unmap(mapping).map_err(|error| error.error()))
             .try_for_each(|region| arena.release(region?));
         arena.reset();
-        Ok(released?)
+        released?;
+        Ok(mapper)
     }
 }
 
@@ -345,8 +367,10 @@ fn clamp_queue(device_max: u16) -> Result<u16, VirtioError> {
     Ok(size)
 }
 
-fn require_features(features: u64) -> Result<(), VirtioError> {
-    if features & REQUIRED_FEATURES != REQUIRED_FEATURES {
+fn require_features(features: u64, platform: bool) -> Result<(), VirtioError> {
+    if features & REQUIRED_FEATURES != REQUIRED_FEATURES
+        || platform && features & VIRTIO_F_ACCESS_PLATFORM == 0
+    {
         return Err(VirtioError::Features);
     }
     Ok(())
@@ -358,8 +382,8 @@ mod tests {
     use molt_arch::iommu::{DeviceId, DmaPerm, Identity, Mapper, Mapping};
 
     use super::{
-        BUFFER, HEADER, NETWORK_SIZE, REQUIRED_FEATURES, Receive, Transmit, VIRTIO_NET_F_MAC,
-        clamp_queue, require_features,
+        BUFFER, HEADER, NETWORK_SIZE, REQUIRED_FEATURES, Receive, Transmit,
+        VIRTIO_F_ACCESS_PLATFORM, VIRTIO_NET_F_MAC, clamp_queue, require_features,
     };
     use crate::VirtioError;
     use crate::queue::{Queue, device_bytes, driver_bytes};
@@ -431,8 +455,14 @@ mod tests {
 
     #[test]
     fn modern_header_requires_merge_buffer_format() {
-        assert_eq!(require_features(VIRTIO_NET_F_MAC), Err(VirtioError::Features));
-        assert_eq!(require_features(REQUIRED_FEATURES), Ok(()));
+        assert_eq!(require_features(VIRTIO_NET_F_MAC, false), Err(VirtioError::Features));
+        assert_eq!(require_features(REQUIRED_FEATURES, false), Ok(()));
+    }
+
+    #[test]
+    fn mapped_net_feature() {
+        assert_eq!(require_features(REQUIRED_FEATURES, true), Err(VirtioError::Features));
+        assert_eq!(require_features(REQUIRED_FEATURES | VIRTIO_F_ACCESS_PLATFORM, true), Ok(()));
     }
 
     #[test]

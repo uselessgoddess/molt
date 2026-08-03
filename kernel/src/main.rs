@@ -23,6 +23,7 @@ mod device;
 mod heap;
 mod init;
 mod network;
+mod nvme;
 mod pci;
 mod smp;
 mod virtio;
@@ -101,6 +102,7 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
 
     pci::smoke(boot_info, platform);
     virtio::smoke(boot_info, platform);
+    nvme::smoke(boot_info, platform);
     network::smoke(boot_info, platform);
 }
 

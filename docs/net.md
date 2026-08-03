@@ -143,8 +143,9 @@ MSI-X -> InterruptSlab -> VirtIO RX queue -> molt-net IP ring -> molt-udp ring
    what the sockets produced, and polls again, so a send submitted against an
    established stream leaves within the call that accepted it. Restart aborts
    every stream the dead generation held.
-7. **Hardware proof.** The x86_64 smoke attaches modern VirtIO-net to QEMU's
-   user network. It resolves the gateway by ARP and sends a DNS request to the
+7. **Hardware proof.** The x86_64 smoke attaches modern VirtIO-net to its own
+   VirtIO-IOMMU domain before enabling bus mastering, then reaches QEMU's user
+   network. It resolves the gateway by ARP and sends a DNS request to the
    user-network DNS proxy: `MOLT_NET_OK` proves device startup, and
    `MOLT_UDP_OK` requires a checked DNS response to traverse the device, IP
    ring, and UDP ring. It then reconfigures for the slirp `fec0::/64` leg and
@@ -166,8 +167,9 @@ MSI-X -> InterruptSlab -> VirtIO RX queue -> molt-net IP ring -> molt-udp ring
   and without `alloc`: its socket set, slots, and send/receive rings are storage
   the caller lends it, so the stream path allocates no more than the datagram
   one.
-- **No IOMMU assumption.** The NIC's DMA is as trusted as the disk's until Stage
-  4.5 supplies device isolation; this is stated, not silently assumed.
+- **No ambient DMA authority.** A translated network startup must negotiate
+  `ACCESS_PLATFORM`; every queue and packet buffer is mapped for the NIC's own
+  requester before its PCI function may bus-master.
 - **No device polling.** Receive work is drained only after `InterruptSlab`
   reports MSI-X activity, and the block driver now waits the same way — the
   used-ring poll that was networking's one exception is gone.

@@ -435,11 +435,18 @@ unchanged.
 
 ### Stage 4.6 — Hardware breadth
 
-- [ ] NVMe and selected real NIC/storage targets
+- [x] NVMe Identify, admin/I/O queue pairs, eight live block operations, and
+      read/write/flush behind `molt_block::Queue`
+- [x] VirtIO block, VirtIO network, and NVMe requester IDs isolated in distinct
+      bounded IOMMU domains
+- [x] QEMU NVMe smoke with mappings before bus mastering and reset before unmap
+- [ ] selected real NIC/storage targets
 
-Next, implement NVMe behind the existing `molt_block::Queue` and `Mapper`
-boundaries. Namespace discovery and PRP/queue-pair setup are driver work, not a
-new filesystem operation or a reason to bypass typed DMA ownership.
+NVMe reuses the existing `molt_block::Queue` and `Mapper` boundaries. Namespace
+discovery and PRP/queue-pair setup remain driver work; no filesystem operation
+or raw DMA escape was added. Both storage drivers expose depth eight so the
+current comparison is like-for-like queue occupancy. Real-hardware throughput
+and tail latency remain Stage 4.7 measurements.
 
 ### Stage 4.7 — Numbers
 

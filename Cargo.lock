@@ -571,6 +571,7 @@ dependencies = [
  "molt-exec",
  "molt-fs",
  "molt-net",
+ "molt-nvme",
  "molt-pci",
  "molt-riscv",
  "molt-shell",
@@ -584,6 +585,15 @@ dependencies = [
 name = "molt-net"
 version = "0.1.0"
 dependencies = [
+ "molt-core",
+]
+
+[[package]]
+name = "molt-nvme"
+version = "0.1.0"
+dependencies = [
+ "molt-arch",
+ "molt-block",
  "molt-core",
 ]
 

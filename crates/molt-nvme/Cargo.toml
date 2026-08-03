@@ -1,0 +1,17 @@
+[package]
+name = "molt-nvme"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+molt-arch.workspace = true
+molt-block.workspace = true
+molt-core.workspace = true
+
+[lib]
+bench = false

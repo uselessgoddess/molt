@@ -9,6 +9,7 @@ members = [
     "crates/molt-exec",
     "crates/molt-fs",
     "crates/molt-net",
+    "crates/molt-nvme",
     "crates/molt-pci",
     "crates/molt-shell",
     "crates/molt-tcp",
@@ -26,6 +27,7 @@ default-members = [
     "crates/molt-exec",
     "crates/molt-fs",
     "crates/molt-net",
+    "crates/molt-nvme",
     "crates/molt-pci",
     "crates/molt-shell",
     "crates/molt-tcp",
@@ -47,6 +49,7 @@ molt-core = { path = "crates/molt-core" }
 molt-exec = { path = "crates/molt-exec" }
 molt-fs = { path = "crates/molt-fs", default-features = false }
 molt-net = { path = "crates/molt-net" }
+molt-nvme = { path = "crates/molt-nvme" }
 molt-pci = { path = "crates/molt-pci" }
 molt-shell = { path = "crates/molt-shell" }
 molt-tcp = { path = "crates/molt-tcp" }

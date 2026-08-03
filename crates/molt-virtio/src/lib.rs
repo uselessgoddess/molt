@@ -39,7 +39,7 @@ pub use crate::block::Block;
 pub use crate::config::Common;
 pub use crate::interrupt::Arrivals;
 pub use crate::iommu::{Fault, Iommu};
-pub use crate::net::Net;
+pub use crate::net::{Net, NetConfig};
 pub use crate::notify::Notify;
 pub use crate::queue::{Queue, Segment, Used};
 pub use crate::transport::{Location, Structure, Transport};

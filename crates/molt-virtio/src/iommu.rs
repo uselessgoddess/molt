@@ -43,7 +43,8 @@ const MAP_WRITE: u32 = 2;
 
 const REQUEST_BYTES: u64 = 40;
 const EVENT_BYTES: u64 = 24;
-const ACTIVE: usize = 16;
+const ACTIVE: usize = 32;
+const ENDPOINTS: usize = 8;
 const PREFERRED_IOVA: u64 = 1 << 32;
 
 #[derive(Clone, Copy)]
@@ -58,9 +59,65 @@ struct Config {
 #[derive(Clone, Copy)]
 struct Active {
     device: DeviceId,
+    domain: u32,
     iova: Iova,
     len: u64,
     perm: DmaPerm,
+}
+
+#[derive(Clone, Copy)]
+struct Attachment {
+    device: DeviceId,
+    domain: u32,
+}
+
+struct Domains<const N: usize> {
+    start: u32,
+    end: u32,
+    entries: [Option<Attachment>; N],
+}
+
+impl<const N: usize> Domains<N> {
+    const fn new(start: u32, end: u32) -> Self {
+        Self { start, end, entries: [None; N] }
+    }
+
+    fn reserve(&mut self, device: DeviceId) -> Result<u32, VirtioError> {
+        if self.domain(device).is_some() {
+            return Err(VirtioError::Device);
+        }
+        let slot = self.entries.iter().position(Option::is_none);
+        let Some(slot) = slot else {
+            return Err(VirtioError::Full);
+        };
+        let mut domain = self.start;
+        while domain <= self.end {
+            if !self.entries.iter().flatten().any(|entry| entry.domain == domain) {
+                self.entries[slot] = Some(Attachment { device, domain });
+                return Ok(domain);
+            }
+            domain = domain.checked_add(1).ok_or(VirtioError::Device)?;
+        }
+        Err(VirtioError::Full)
+    }
+
+    fn domain(&self, device: DeviceId) -> Option<u32> {
+        self.entries.iter().flatten().find(|entry| entry.device == device).map(|entry| entry.domain)
+    }
+
+    fn release(&mut self, device: DeviceId) -> Result<u32, VirtioError> {
+        let slot = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_some_and(|entry| entry.device == device))
+            .ok_or(VirtioError::Device)?;
+        let domain = slot.take().unwrap().domain;
+        Ok(domain)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.iter().all(Option::is_none)
+    }
 }
 
 /// One asynchronous translation fault reported by the IOMMU.
@@ -90,7 +147,7 @@ impl Fault {
     }
 }
 
-/// A VirtIO IOMMU controlling one isolated endpoint.
+/// A VirtIO IOMMU controlling several isolated endpoint domains.
 pub struct Iommu<'slots, 'window, A> {
     common: Common<'window>,
     notify: Notify<'window>,
@@ -106,8 +163,7 @@ pub struct Iommu<'slots, 'window, A> {
     request_notify: u16,
     event_notify: u16,
     page: u64,
-    domain: u32,
-    endpoint: Option<DeviceId>,
+    domains: Domains<ENDPOINTS>,
     last_fault: Option<Fault>,
 }
 
@@ -144,8 +200,8 @@ impl<'slots, 'window, A: Arrivals> Iommu<'slots, 'window, A> {
         let config = read_config(&common, &device)?;
         let page = page_size(config.page_size_mask)?;
         let (space_start, space_end) = aperture(config.input_start, config.input_end, page)?;
-        let domain = config.domain_start.max(1);
-        if domain > config.domain_end {
+        let domain_start = config.domain_start.max(1);
+        if domain_start > config.domain_end {
             return Err(VirtioError::Device);
         }
 
@@ -194,32 +250,31 @@ impl<'slots, 'window, A: Arrivals> Iommu<'slots, 'window, A> {
             request_notify,
             event_notify,
             page,
-            domain,
-            endpoint: None,
+            domains: Domains::new(domain_start, config.domain_end),
             last_fault: None,
         })
     }
 
     /// Attaches an endpoint to the isolated translation domain.
     pub fn attach(&mut self, endpoint: DeviceId) -> Result<(), VirtioError> {
-        if self.endpoint.is_some() {
-            return Err(VirtioError::Device);
+        let domain = self.domains.reserve(endpoint)?;
+        let attached = encode_attach(&self.request, domain, endpoint)
+            .and_then(|()| self.command(STATUS_AT_ATTACH));
+        if attached.is_err() {
+            self.domains.release(endpoint).ok();
         }
-        encode_attach(&self.request, self.domain, endpoint)?;
-        self.command(STATUS_AT_ATTACH)?;
-        self.endpoint = Some(endpoint);
-        Ok(())
+        attached
     }
 
     /// Detaches the endpoint once all of its mappings are gone.
-    pub fn detach(&mut self) -> Result<(), VirtioError> {
-        if self.active.iter().any(Option::is_some) {
+    pub fn detach(&mut self, endpoint: DeviceId) -> Result<(), VirtioError> {
+        if self.active.iter().flatten().any(|entry| entry.device == endpoint) {
             return Err(VirtioError::Device);
         }
-        let endpoint = self.endpoint.ok_or(VirtioError::Device)?;
-        encode_detach(&self.request, self.domain, endpoint)?;
+        let domain = self.domains.domain(endpoint).ok_or(VirtioError::Device)?;
+        encode_detach(&self.request, domain, endpoint)?;
         self.command(STATUS_AT_ATTACH)?;
-        self.endpoint = None;
+        self.domains.release(endpoint)?;
         Ok(())
     }
 
@@ -231,6 +286,11 @@ impl<'slots, 'window, A: Arrivals> Iommu<'slots, 'window, A> {
     /// Number of device mappings currently installed in the domain.
     pub fn mapped(&self) -> usize {
         self.active.iter().filter(|entry| entry.is_some()).count()
+    }
+
+    /// Number of mappings installed for `endpoint`.
+    pub fn mapped_for(&self, endpoint: DeviceId) -> usize {
+        self.active.iter().flatten().filter(|entry| entry.device == endpoint).count()
     }
 
     /// Polls and replenishes the fault queue.
@@ -255,7 +315,7 @@ impl<'slots, 'window, A: Arrivals> Iommu<'slots, 'window, A> {
 
     /// Resets the control device and gives its identity-mapped frames back.
     pub fn reset(self) -> Result<(), VirtioError> {
-        if self.endpoint.is_some() || self.active.iter().any(Option::is_some) {
+        if !self.domains.is_empty() || self.active.iter().any(Option::is_some) {
             return Err(VirtioError::Device);
         }
         let Self { mut common, request_queue, event_queue, request, events, mut arena, .. } = self;
@@ -314,9 +374,9 @@ impl<A: Arrivals> Mapper for Iommu<'_, '_, A> {
         perm: DmaPerm,
     ) -> Result<Mapping, MapError> {
         let len = region.len();
-        if self.endpoint != Some(device) {
+        let Some(domain) = self.domains.domain(device) else {
             return Err(MapError::new(DmaError::NotMapped, region));
-        }
+        };
         if region.physical() % self.page != 0 || len == 0 || len % self.page != 0 {
             return Err(MapError::new(DmaError::Alignment, region));
         }
@@ -327,14 +387,14 @@ impl<A: Arrivals> Mapper for Iommu<'_, '_, A> {
             Ok(iova) => iova,
             Err(error) => return Err(MapError::new(error, region)),
         };
-        if encode_map(&self.request, self.domain, iova, region.physical(), len, perm)
+        if encode_map(&self.request, domain, iova, region.physical(), len, perm)
             .and_then(|()| self.command(STATUS_AT_MAP))
             .is_err()
         {
             self.space.release(iova, len).ok();
             return Err(MapError::new(DmaError::Backend, region));
         }
-        self.active[slot] = Some(Active { device, iova, len, perm });
+        self.active[slot] = Some(Active { device, domain, iova, len, perm });
         // SAFETY: the completed MAP request installed this exact device,
         // address, length, physical backing, and permission tuple.
         Ok(unsafe { Mapping::from_backend(region, device, iova, perm) })
@@ -352,7 +412,8 @@ impl<A: Arrivals> Mapper for Iommu<'_, '_, A> {
         let Some(slot) = slot else {
             return Err(UnmapError::new(DmaError::NotMapped, mapping));
         };
-        if encode_unmap(&self.request, self.domain, mapping.iova(), mapping.len())
+        let domain = self.active[slot].unwrap().domain;
+        if encode_unmap(&self.request, domain, mapping.iova(), mapping.len())
             .and_then(|()| self.command(STATUS_AT_UNMAP))
             .is_err()
         {
@@ -527,7 +588,7 @@ mod tests {
     use molt_arch::dma::Region;
     use molt_arch::iommu::{DeviceId, DmaPerm, Identity, Iova, Mapper, Mapping};
 
-    use super::{EVENT_BYTES, aperture, encode_map, parse_fault, queue_size};
+    use super::{Domains, EVENT_BYTES, aperture, encode_map, parse_fault, queue_size};
 
     fn mapping(bytes: &mut [u8]) -> Mapping {
         // SAFETY: the array stays live and uniquely borrowed through the test.
@@ -577,5 +638,30 @@ mod tests {
         assert_eq!(queue_size(256, 2), Ok(32));
         assert_eq!(queue_size(17, 2), Ok(16));
         assert!(queue_size(1, 2).is_err());
+    }
+
+    #[test]
+    fn domain_isolation() -> Result<(), crate::VirtioError> {
+        let mut domains = Domains::<2>::new(7, 8);
+        let first = DeviceId::new(0x18);
+        let second = DeviceId::new(0x20);
+
+        assert_eq!(domains.reserve(first)?, 7);
+        assert_eq!(domains.reserve(second)?, 8);
+        assert_eq!(domains.domain(first), Some(7));
+        assert_eq!(domains.domain(second), Some(8));
+        assert!(domains.reserve(DeviceId::new(0x28)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn domain_reuse() -> Result<(), crate::VirtioError> {
+        let mut domains = Domains::<2>::new(4, 5);
+        let first = DeviceId::new(1);
+        domains.reserve(first)?;
+        domains.release(first)?;
+
+        assert_eq!(domains.reserve(DeviceId::new(2))?, 4);
+        Ok(())
     }
 }
