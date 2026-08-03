@@ -396,14 +396,10 @@ impl<'a, 'window, A: Arrivals> Admin<'a, 'window, A> {
         namespace(self.identify)
     }
 
-    fn set_one_queue_pair(&mut self) -> Result<(), NvmeError> {
+    fn set_one_queue_pair(&mut self) -> Result<(u32, u32), NvmeError> {
         let command =
             Command { opcode: SET_FEATURES, cdw10: FEATURE_QUEUES, cdw11: 0, ..Command::default() };
-        let allocated = self.submit(command)?;
-        if allocated & 0xffff != 0 || allocated >> 16 != 0 {
-            return Err(NvmeError::Device);
-        }
-        Ok(())
+        Ok(queue_pair_result(self.submit(command)?))
     }
 
     fn create_io_cq(&mut self, address: u64, vector: u16) -> Result<(), NvmeError> {
@@ -468,12 +464,18 @@ impl<'a, 'window, A: Arrivals> Admin<'a, 'window, A> {
     }
 }
 
+fn queue_pair_result(allocated: u32) -> (u32, u32) {
+    // Both fields are zero-based counts, so every successful completion
+    // grants at least one queue even when the controller reports its maximum.
+    ((allocated & 0xffff) + 1, (allocated >> 16) + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use molt_arch::dma::Region;
     use molt_arch::iommu::{DeviceId, DmaPerm, Identity, Mapper, Mapping};
 
-    use super::{Command, Namespace, namespace, write_command};
+    use super::{Command, Namespace, namespace, queue_pair_result, write_command};
 
     #[repr(align(4096))]
     struct Page([u8; 4096]);
@@ -525,5 +527,10 @@ mod tests {
         let identify = mapping(bytes, 0x1000, DmaPerm::WRITE);
 
         assert!(namespace(&identify).is_err());
+    }
+
+    #[test]
+    fn extra_queues_ok() {
+        assert_eq!(queue_pair_result(0x003f_003f), (64, 64));
     }
 }
