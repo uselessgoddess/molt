@@ -121,6 +121,10 @@ that cannot tell "the board did not come up" from "the code is wrong" trains
 everyone to ignore it. Molt has no boards and no serial capture equipment yet.
 Until it does, QEMU is the honest limit, and the roadmap records the hardware
 result as pending rather than claiming it.
+[`docs/hardware.md`](hardware.md) prices the boards, designs the rig that would
+capture their serial output with the markers this suite already defines, and
+argues that the first such run should be a `just board` a person invokes — never
+a merge gate — because a lab of one board has no queue to retry into.
 
 ## Boot tests
 

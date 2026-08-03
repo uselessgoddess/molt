@@ -36,6 +36,9 @@ documented.
 - [x] per-cell arena ownership and deterministic restart sequence
 - [x] QEMU tests for exception, timer, cancellation, stale completion, and restart
 - [ ] documented real-hardware boot on one named x86_64 machine
+      ([`docs/hardware.md`](hardware.md) costs it out and argues this is the
+      cheapest real-hardware result available, and cheaper than any RISC-V
+      board)
 
 Acceptance: the kernel boots without polling for device work, completes timer
 futures through a ring, recovers a test cell without accepting stale results,
@@ -440,7 +443,13 @@ unchanged.
 - [x] VirtIO block, VirtIO network, and NVMe requester IDs isolated in distinct
       bounded IOMMU domains
 - [x] QEMU NVMe smoke with mappings before bus mastering and reset before unmap
-- [ ] selected real NIC/storage targets
+- [x] one module owns IOMMU bring-up and teardown for every endpoint
+      (`kernel/src/isolation.rs`), so the ordering that is the isolation
+      guarantee exists in one place rather than once per driver
+- [ ] selected real NIC/storage targets ([`docs/hardware.md`](hardware.md):
+      no board in the affordable RISC-V class enumerates PCI the way this
+      kernel does, and none has an IOMMU, so the selection waits on a
+      non-ECAM host-bridge path)
 
 NVMe reuses the existing `molt_block::Queue` and `Mapper` boundaries. Namespace
 discovery and PRP/queue-pair setup remain driver work; no filesystem operation
@@ -465,3 +474,27 @@ came first anyway, because the executor could not be made faster without it.
 - [ ] signed object loading with W^X mappings
 - [ ] dependency namespaces and state migration
 - [ ] atomic cutover, rollback, and fault-injection tests
+
+### Stage 5.1 — The user binary ABI
+
+- [x] [`docs/abi.md`](abi.md): LFI as the isolation mechanism, a `molt-abi`
+      crate for the versioned `repr(C)` descriptors, rings instead of syscalls,
+      and channels that keep the kernel off the IPC data path
+- [x] [`docs/userspace.md`](userspace.md): a custom target JSON with
+      `-Z build-std`, no compiler fork, and no `uutils` in the kernel
+- [x] [`experiments/lfi-target`](../experiments/lfi-target): stock rustc holds
+      back the registers LFI-RISCV reserves
+- [ ] `molt-abi` with asserted layouts, and `molt-user` over it
+- [ ] a verifier in Rust, agreeing with the reference on its own corpus
+- [ ] a sandbox that loads, runs, and exits (`MOLT_SANDBOX_OK`)
+- [ ] a rejected image that never becomes executable
+      (`MOLT_SANDBOX_REJECT_OK`)
+- [ ] `molt-shell` running in a sandbox against the real filesystem ring
+      (`MOLT_USER_SHELL_OK`)
+
+riscv64 leads this stage, which is the reverse of every stage before it: a
+stock rustc can reserve the registers LFI-RISCV needs and cannot reserve the
+ones LFI-x64 needs. The limit worth writing down is not the 4 GiB per sandbox
+the scheme imposes but the 44 GiB of address space each one reserves, which
+Sv39 has room for roughly five of; Sv48 in the RISC-V paging module is the fix,
+and it is Molt's own code.
