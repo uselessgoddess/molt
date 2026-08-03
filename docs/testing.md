@@ -192,6 +192,15 @@ MSI-X vector fired and the line counted it. The marker names the vector that
 answered, and its value is that removing the interrupt path — not just breaking
 it — now fails the smoke instead of falling back to a slower success.
 
+**NVMe repeats the storage proof through a different transport.** QEMU receives
+a second raw MoltFS image through its NVMe controller. `MOLT_NVME_IOMMU_OK`
+requires all queue and PRP pages to be mapped before bus mastering;
+`MOLT_NVME_DEPTH_OK` requires two commands live together; `MOLT_NVME_OK`
+requires Identify plus read, write, flush, and readback; and
+`MOLT_NVME_RESET_OK` requires controller disable before unmap and detach. Host
+tests separately exercise command encoding, namespace formats, reordered
+completion IDs, and failed status fields.
+
 **The smoke disk is a filesystem, not a pattern.** Stage 2.4 replaced the signed
 sector the virtio smoke used to read with a real MoltFS image: `cargo xtask
 mkfs <tree> <image>` lays a host directory tree out as a mountable volume, and

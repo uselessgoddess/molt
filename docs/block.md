@@ -1,9 +1,9 @@
 # Block I/O and DMA isolation
 
-Status: Stage 4.5 implementation record, August 2026.
+Status: Stage 4.6 implementation record, August 2026.
 
-This is the stable boundary shared by VirtIO block today and an NVMe driver
-later. It records what owns a request, which address a descriptor may contain,
+This is the stable boundary shared by VirtIO block and NVMe. It records what
+owns a request, which address a descriptor or PRP may contain,
 and the order that makes unmap and frame reuse safe. The VirtIO transport
 details remain in [`virtio.md`](virtio.md).
 
@@ -20,11 +20,12 @@ details remain in [`virtio.md`](virtio.md).
 
 A hardware driver implements `molt_block::Queue`: `start` takes ownership,
 `reap` returns the same operation's buffer and result, and `depth` states the
-real number of requests the device can own. The VirtIO adapter has eight
-independent request slots. Each has its own header, status byte, bounce window,
-descriptor head, and generation-stamped request token. Several chains can
-therefore be published before an interrupt; a used-ring head selects the right
-slot even if completions are reordered.
+real number of requests the device can own. Both hardware adapters expose eight
+independent request slots. VirtIO matches a used-ring head to its header,
+status, bounce window, and generation-stamped token. NVMe uses the slot as its
+command identifier and matches it from the completion queue. Several commands
+can therefore be published before an interrupt, and neither adapter assumes
+completion order.
 
 Device status other than `VIRTIO_BLK_S_OK` becomes `BlockError::Device`.
 Malformed completions are rejected. `Arrivals` is the normal completion path;
@@ -74,11 +75,11 @@ without hardware.
 
 `molt_virtio::Iommu` drives VirtIO device ID 23. Its own request and event
 queues are identity-mapped, polling control-plane memory; the QEMU PCI function
-does not require MSI-X. For the block endpoint it:
+does not require MSI-X. For each attached endpoint it:
 
 1. negotiates input range, domain range, and map/unmap support;
-2. attaches the PCI requester to a non-bypass domain while PCI bus mastering
-   is still disabled;
+2. allocates a distinct non-bypass domain and attaches the PCI requester while
+   PCI bus mastering is still disabled;
 3. allocates page-aligned IOVAs, preferring an aperture above 4 GiB so an
    accidental physical-address descriptor is visible in QEMU;
 4. sends synchronous MAP/UNMAP commands with inclusive ends and exact device
@@ -89,10 +90,12 @@ does not require MSI-X. For the block endpoint it:
 Mapped drivers must negotiate `VIRTIO_F_ACCESS_PLATFORM`; startup fails if the
 device does not offer it. The x86_64 smoke boots QEMU `q35` with
 `virtio-iommu-pci` and a block endpoint configured with `iommu_platform=on`.
-Only after attach and all five block mappings complete does the kernel set the
-endpoint's PCI `BUS_MASTER` bit. Shutdown reverses the dependency: reset the
-block device, unmap every region, disable bus mastering, detach the empty
-domain, then reset the IOMMU control device.
+Only after attach and all mappings complete does the kernel set an endpoint's
+PCI `BUS_MASTER` bit. The same path isolates VirtIO block, VirtIO network, and
+NVMe requester IDs without sharing translations. Detach releases only that
+endpoint's empty domain. Shutdown reverses the dependency: reset the endpoint,
+unmap every region, disable bus mastering, detach the empty domain, then reset
+the IOMMU control device.
 
 Run the complete path with:
 
@@ -111,23 +114,33 @@ attaches them; that is compatibility, not isolation for those devices.
 
 ## Verification and measurement
 
-Host tests cover IOVA overlap/reuse, double release, device scoping,
+Host tests cover IOVA overlap/reuse, double release, device and domain scoping,
 permissions, request encodings, event parsing, cyclic descriptor rejection,
 two requests published together, reordered reads, and device error status.
-The x86_64 smoke requires attach, five installed mappings, two simultaneous
-reads, interrupt completion, a clean event queue, ordered teardown, and the
-existing MoltFS write/restart markers.
+The x86_64 smoke requires each endpoint to attach before bus mastering, two
+simultaneous reads on both storage transports, interrupt completion, clean
+fault queues, ordered teardown, and the existing MoltFS write/restart markers.
 
 `cargo xtask bench` retains the four filesystem measurements and adds
 `block_queue/depth/{1,8}`. This host benchmark measures the stable queue and
 buffer path; it does not pretend to be a QEMU or hardware latency number.
 
-## NVMe extension point
+## NVMe queue
 
-NVMe does not require a second filesystem contract. A future driver can own
-its submission/completion queues and PRP-backed mappings, implement
-`molt_block::Queue`, return `BlockDone` by `RequestId`, and use the same
-`Mapper` selected by the platform. Controller reset must quiesce DMA before
-consuming unmaps exactly as VirtIO reset does. Namespace discovery, queue-pair
-creation, and real-hardware validation belong to Stage 4.6; MoltFS format and
-ordering do not change.
+`molt-nvme` drives namespace 1 through one admin pair and one I/O pair. It
+validates the NVM command set and 4 KiB page support, identifies controller and
+namespace, accepts metadata-free 512-byte through 4 KiB LBA formats, negotiates
+one queue pair, and creates a nine-entry hardware queue. The ninth entry keeps
+the ring's required empty slot while eight `BlockOp`s are live. Each command
+has one private 4 KiB PRP-backed page; reads, writes, and flushes retain the
+same sector and durability contract as VirtIO.
+
+Preparation and enablement are separate types. `Prepared::prepare` disables
+the controller, maps six regions for the NVMe requester, and programs the admin
+queue addresses while PCI bus mastering is clear. Only after the kernel grants
+that bit can `Prepared::enable` set `CC.EN` and issue Identify and queue-creation
+commands. Reset clears `CC.EN`, waits for `CSTS.RDY` to clear, consumes every
+unmap, and only then returns the frames. The QEMU smoke uses a second raw MoltFS
+image and requires Identify, two live reads, write/flush/readback, a clean IOMMU
+event queue, and ordered reset. VirtIO and NVMe both expose depth eight; this is
+a bounded-driver comparison, not a throughput claim.

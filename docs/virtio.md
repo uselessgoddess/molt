@@ -1,6 +1,6 @@
 # VirtIO devices
 
-Status: Stage 4.5 block/IOMMU and Stage 3 network implementation record, August 2026.
+Status: Stage 4.6 isolated block/network implementation record, August 2026.
 
 Why a queue is built out of frames the kernel owns, how mappings turn those
 frames into device-scoped IOVAs, what the request semantics promise, and how
@@ -150,13 +150,13 @@ zero. The stable `BlockOp` contract exposes both without exposing a virtqueue.
 Its driver runs flush alone; reads and writes can complete out of order. MoltFS
 places explicit flushes between log data and the superblock that names it.
 
-**Bus mastering follows isolation.** On the x86_64 smoke the kernel keeps the
-block function's `BUS_MASTER` bit clear, attaches its requester to a
-VirtIO-IOMMU domain, installs all queue and buffer mappings, and negotiates
-`ACCESS_PLATFORM`. Only then may the function initiate transactions. It is
-disabled again after block reset and before the empty domain is detached. The
-identity backend remains available for platforms without an IOMMU and makes no
-claim that bus mastering is isolated.
+**Bus mastering follows isolation.** On the x86_64 smoke the kernel keeps each
+block or network function's `BUS_MASTER` bit clear, attaches its requester to a
+distinct VirtIO-IOMMU domain, installs all queue and buffer mappings, and
+negotiates `ACCESS_PLATFORM`. Only then may the function initiate transactions.
+It is disabled again after device reset and before the empty domain is
+detached. The identity backend remains available for platforms without an
+IOMMU and makes no claim that bus mastering is isolated.
 
 **Block completion is interrupt-driven with a final polling fallback.** Queue
 zero is routed through MSI-X. The driver polls before waiting and once after an
@@ -168,8 +168,11 @@ point of failure for a completion already visible in the used ring.
 `molt_virtio::Net` reuses the same transport, split queue, and DMA arena but
 programs receive queue 0 and transmit queue 1. Both queue configuration records
 name one MSI-X table entry, which the kernel binds to `InterruptSlab` before it
-enables the device. The PCI command grants memory decode and bus mastering and
-disables INTx, so there is one unambiguous completion path.
+enables the device. The PCI command initially grants memory decode and disables
+INTx while leaving bus mastering clear. Startup receives a `NetConfig` plus its
+mapper, requires `ACCESS_PLATFORM` for a translated mapper, and returns that
+mapper only after reset. Bus mastering is granted only after both queues and
+all packet buffers are installed.
 
 The driver requires `VIRTIO_F_VERSION_1`, `VIRTIO_NET_F_MAC`, and
 `VIRTIO_NET_F_MRG_RXBUF`. The merged-buffer feature makes the modern 12-byte
@@ -207,7 +210,8 @@ five installed mappings, two simultaneous reads, block IRQ completion, the
 existing filesystem write/restart path, a clean fault event queue, and ordered
 reset/unmap/detach. The full list and its meaning are in [`block.md`](block.md).
 
-The same smoke then brings up modern VirtIO-net over a second twelve-frame arena.
+The same smoke then brings up modern VirtIO-net over a second twelve-frame arena
+and isolated domain. `MOLT_NET_IOMMU_OK` requires mapping before bus mastering;
 `MOLT_NET_OK` requires its two queues and MSI-X route to complete startup.
 `MOLT_UDP_OK` requires an ARP exchange followed by a DNS response through
 Ethernet, IPv4, the nested IP ring, and the capability-addressed UDP ring. Host

@@ -2,8 +2,8 @@
 //!
 //! [`Device`] is the read contract; [`Disk`] adds sector writes and a
 //! durability boundary. `molt-virtio` implements them over a virtqueue,
-//! [`Loopback`] over bytes already in memory, and a future NVMe or SD driver
-//! over whatever it likes — none of which the filesystem above has to know.
+//! `molt-nvme` over a submission/completion pair, and [`Loopback`] over bytes
+//! already in memory — none of which the filesystem above has to know.
 //!
 //! Both traits block. [`channel`] puts a ring in front of a [`Queue`] so the
 //! filesystem submits and awaits instead, and only [`Backing`] still touches
