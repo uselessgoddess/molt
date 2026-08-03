@@ -184,6 +184,7 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
             "MOLT_FS_RESTART_OK:",
             "MOLT_VIRTIO_RESET_OK:",
             "MOLT_IOMMU_FAULT_OK:",
+            "MOLT_NET_IOMMU_OK:",
             "MOLT_NET_OK:",
             "MOLT_UDP_OK:",
             "MOLT_NDP_OK:",
@@ -389,9 +390,9 @@ fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
     // connection and pipes the stream through it, so it answers with the bytes
     // it was sent without the host having to listen anywhere.
     command.args(["-netdev", "user,id=molt-net,guestfwd=tcp:10.0.2.100:80-cmd:cat"]);
-    command
-        .arg("-device")
-        .arg("virtio-net-pci,netdev=molt-net,disable-legacy=on,mac=52:54:00:12:34:56");
+    command.arg("-device").arg(
+        "virtio-net-pci,netdev=molt-net,disable-legacy=on,iommu_platform=on,mac=52:54:00:12:34:56",
+    );
     Ok(command)
 }
 
