@@ -11,7 +11,7 @@ use molt_net::{Config, Ip, IpAddr, IpDone, IpError, IpOp, Ipv4Addr, Ipv6Addr, Li
 use molt_pci::{Bus, Command, bus_span};
 use molt_tcp::{SocketStorage, Tcp, TcpDone, TcpError, TcpOp};
 use molt_udp::{Endpoint, Scratch, Udp, UdpDone, UdpError, UdpOp};
-use molt_virtio::{Net, Transport};
+use molt_virtio::{Net, NetConfig, Transport};
 
 use crate::device::{self, Line};
 
@@ -111,12 +111,14 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let arena = Arena::claim(&mut allocator, offset, NET_TAG, &mut slots)
         .expect("a contiguous network DMA span");
     let net = Net::start(
-        common,
-        notify,
-        config,
-        transport.notify_multiplier(),
-        vectored.index(),
-        device::requester(function.address()),
+        NetConfig::new(
+            common,
+            notify,
+            config,
+            transport.notify_multiplier(),
+            vectored.index(),
+            device::requester(function.address()),
+        ),
         iommu::Identity,
         arena,
     )
@@ -140,7 +142,7 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let (net, echoed) = tcp_echo(&vectored.line(), ip.into_link(), config);
     report!(platform, "MOLT_TCP_OK: {ECHO} echoed {echoed} bytes");
 
-    net.reset().expect("the network device stops before DMA frames return");
+    let _ = net.reset().expect("the network device stops before DMA frames return");
     vectored.stop(platform);
 }
 
