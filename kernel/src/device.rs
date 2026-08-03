@@ -1,9 +1,6 @@
 //! What bringing a PCI device up takes, before any driver sees it.
 //!
-//! Both VirtIO functions the kernel starts want the same four things: their
-//! BARs mapped, their structures cut out of one, a vector routed to a line the
-//! slab owns, and that line given back once the device has stopped. Written
-//! once here so the two smokes differ only in the device they find.
+//! PCI drivers share BAR mapping, MSI-X routing, and line release here.
 
 use molt_arch::iommu::DeviceId;
 use molt_arch::memory::{Inventory, Rights};
@@ -124,6 +121,12 @@ impl Line {
 }
 
 impl Arrivals for Line {
+    fn wait(&mut self) -> u64 {
+        crate::pci::wait(self.token, self.ticks)
+    }
+}
+
+impl molt_nvme::Arrivals for Line {
     fn wait(&mut self) -> u64 {
         crate::pci::wait(self.token, self.ticks)
     }

@@ -184,6 +184,10 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
             "MOLT_FS_RESTART_OK:",
             "MOLT_VIRTIO_RESET_OK:",
             "MOLT_IOMMU_FAULT_OK:",
+            "MOLT_NVME_IOMMU_OK:",
+            "MOLT_NVME_DEPTH_OK:",
+            "MOLT_NVME_OK:",
+            "MOLT_NVME_RESET_OK:",
             "MOLT_NET_IOMMU_OK:",
             "MOLT_NET_OK:",
             "MOLT_UDP_OK:",
@@ -357,7 +361,8 @@ fn run_qemu_interactive(image: &Path) -> Result<(), String> {
 }
 
 fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
-    let disk = virtio_disk()?;
+    let disk = smoke_disk("molt-disk.img")?;
+    let nvme = smoke_disk("molt-nvme.img")?;
     let qemu = env::var_os("MOLT_QEMU").unwrap_or_else(|| OsString::from("qemu-system-x86_64"));
     let mut command = Command::new(qemu);
     if let Some(firmware) = env::var_os("MOLT_QEMU_FIRMWARE") {
@@ -382,10 +387,14 @@ fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
     command
         .arg("-drive")
         .arg(format!("if=none,id=molt-disk,format=raw,cache=none,file={}", disk.display()));
+    command
+        .arg("-drive")
+        .arg(format!("if=none,id=molt-nvme,format=raw,cache=none,file={}", nvme.display()));
     command.arg("-device").arg("virtio-iommu-pci");
     command
         .arg("-device")
         .arg("virtio-blk-pci,drive=molt-disk,disable-legacy=on,iommu_platform=on");
+    command.arg("-device").arg("nvme,serial=molt,drive=molt-nvme");
     // `cat` behind the forwarder is the TCP smoke's peer: slirp runs one per
     // connection and pipes the stream through it, so it answers with the bytes
     // it was sent without the host having to listen anywhere.
@@ -400,12 +409,12 @@ fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
 ///
 /// It is a real MoltFS image rather than a signed pattern, so block I/O, a
 /// durable runtime write, and the shell's `cat` prove the same disk end to end.
-fn virtio_disk() -> Result<PathBuf, String> {
+fn smoke_disk(name: &str) -> Result<PathBuf, String> {
     let root = workspace_root();
     let image_dir = target_dir(&root).join("molt");
     fs::create_dir_all(&image_dir)
         .map_err(|error| format!("failed to create {}: {error}", image_dir.display()))?;
-    let path = image_dir.join("molt-disk.img");
+    let path = image_dir.join(name);
 
     let image = lay_out(&root.join(DISK_TREE))?;
     fs::write(&path, &image)
@@ -483,16 +492,35 @@ fn cargo() -> OsString {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use molt_block::{Loopback, Serial};
     use molt_core::CellId;
     use molt_core::buffer::{BufferOperation, BufferRegistry};
     use molt_fs::{Fs, FsDone, FsOp, Handle, Kind, Name};
 
-    use super::{DISK_TREE, lay_out, workspace_root};
+    use super::{DISK_TREE, lay_out, qemu_x86_64_command, workspace_root};
 
     const OWNER: CellId = CellId::new(1);
     const WINDOW: usize = 64;
+
+    #[test]
+    fn x86_devices_isolated() {
+        let command = qemu_x86_64_command(Path::new("boot.img")).unwrap();
+        let args: Vec<_> = command.get_args().map(|arg| arg.to_string_lossy()).collect();
+
+        assert!(args.iter().any(|arg| arg.as_ref() == "nvme,serial=molt,drive=molt-nvme"));
+        assert!(
+            args.iter().any(|arg| arg.contains("id=molt-disk") && arg.contains("molt-disk.img"))
+        );
+        assert!(
+            args.iter().any(|arg| arg.contains("id=molt-nvme") && arg.contains("molt-nvme.img"))
+        );
+        assert!(args.iter().any(|arg| {
+            arg.as_ref()
+                == "virtio-net-pci,netdev=molt-net,disable-legacy=on,iommu_platform=on,mac=52:54:00:12:34:56"
+        }));
+    }
 
     #[test]
     fn smoke_disk_mounts_reads_and_writes() {
