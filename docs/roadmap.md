@@ -475,6 +475,48 @@ came first anyway, because the executor could not be made faster without it.
 - [ ] dependency namespaces and state migration
 - [ ] atomic cutover, rollback, and fault-injection tests
 
+### Stage 5.0 — The SASOS foundation
+
+- [x] [`docs/address-space.md`](address-space.md): every candidate for going
+      past 4 GiB, and the decision — one global address space, three tiers
+      (cell, LFI aperture, hardware-protected domain), with the tier a
+      build-time choice because all three speak the same `molt-abi` rings
+- [x] [`docs/va-allocator.md`](va-allocator.md): the subsystem the tiering
+      rests on, designed on its own — three alignment arenas, address-ordered
+      first fit, epoch quarantine, and no compaction ever
+- [x] [`docs/threat-model.md`](threat-model.md): the adversary's side of the
+      tier-2 safety claims, including the six rules a ring shared with a
+      hostile domain has to obey
+- [x] `satp` MODE probed widest first, Sv57 where the hart has it
+      (`MOLT_SATP_MODE: sv57`), with the boot mapping check performed at
+      `1 << 54` so `MOLT_MAPPING_OK` is evidence rather than a claim
+- [x] a global VA allocator handing out extents, not pages, cut from the
+      probed width inside a booted kernel (`MOLT_VA_OK`)
+- [x] the tag budget read off the hardware rather than assumed, on both ports
+      (`MOLT_ASID_OK`)
+- [ ] 1 GiB and 2 MiB leaves on demand (`MOLT_HUGE_MAP_OK`)
+- [ ] refcounts keyed on the mapped leaf, not the frame
+- [ ] a file mapped as an extent and read at its address (`MOLT_FILE_MAP_OK`)
+- [ ] a second view with no kernel leaf in it, and a fault that stays inside
+      (`MOLT_DOMAIN_OK`, `MOLT_DOMAIN_ABSENT_OK`, `MOLT_DOMAIN_FAULT_OK`)
+- [ ] extent grant and revoke between domains (`MOLT_GRANT_OK`, `MOLT_REVOKE_OK`)
+- [ ] a cross-domain ring that survives a producer publishing a tail it never
+      earned (`MOLT_RING_FAULT_OK`)
+
+First, and before the sandbox, which is the one ordering decision in this stage
+that is not obvious. The reason is that 4 GiB is only a tier-1 property: the ABI
+below assumes a global address, a ring that a hostile end cannot corrupt, and
+extents that are already resident and already IOMMU-mapped. Building the
+sandbox first would mean building it against a 512 GiB Sv39 space and a ring
+type whose safety contract names a trusted producer, then rebuilding both.
+
+The costs are named in `docs/address-space.md` rather than discovered later:
+refcounts, which [`docs/memory.md`](memory.md) had deliberately omitted and
+which are keyed on the mapped leaf rather than the frame; a global VA allocator
+with real fragmentation, which is why it has its own document; and TLB
+shootdown plus ASID recycling, which is Stage 4 cross-hart machinery rather than
+new invention.
+
 ### Stage 5.1 — The user binary ABI
 
 - [x] [`docs/abi.md`](abi.md): LFI as the isolation mechanism, a `molt-abi`
@@ -497,26 +539,18 @@ stock rustc can reserve the registers LFI-RISCV needs and cannot reserve the
 ones LFI-x64 needs. The 4 GiB per sandbox is a real limit and it is not the one
 that binds sandbox count: guard cost is architecture-specific, and on riscv64 it
 is a page per side rather than the spec's x86-64 figure of 40 GiB. What bound
-the count was Sv39, and Stage 5.2 removes it.
+the count was Sv39, and Stage 5.0 removed it.
 
-### Stage 5.2 — The address space
+### Stage 5.2 — One ABI, three tiers
 
-- [x] [`docs/address-space.md`](address-space.md): every candidate for going
-      past 4 GiB, and the decision — one global address space, three tiers
-      (cell, LFI aperture, hardware-protected domain), with the tier a
-      build-time choice because all three speak the same `molt-abi` rings
-- [x] `satp` MODE probed widest first, Sv57 where the hart has it
-      (`MOLT_SATP_MODE: sv57`), with the boot mapping check performed at
-      `1 << 54` so `MOLT_MAPPING_OK` is evidence rather than a claim
-- [ ] a global VA allocator handing out extents, not pages
-- [ ] 1 GiB and 2 MiB leaves on demand (`MOLT_HUGE_MAP_OK`)
-- [ ] a file mapped as an extent and read at its address (`MOLT_FILE_MAP_OK`)
-- [ ] a second view with its own ASID, and a fault that stays inside it
-      (`MOLT_DOMAIN_OK`, `MOLT_DOMAIN_FAULT_OK`)
-- [ ] extent grant and revoke between domains (`MOLT_GRANT_OK`)
+- [ ] an aperture nested inside a domain (`MOLT_SANDBOX_OK` under a domain)
 - [ ] one cell built for all three tiers unchanged (`MOLT_TIER_PARITY_OK`)
+- [ ] the tier chosen per program at build time: a coreutil as an aperture, a
+      100 GB log analyzer as a domain, a driver as a cell
 
-The costs are named in that document rather than discovered later: per-frame
-refcounts, which [`docs/memory.md`](memory.md) had deliberately omitted; a
-global VA allocator with real fragmentation; and TLB shootdown plus ASID
-recycling, which is Stage 4 cross-hart machinery rather than new invention.
+The claim that makes Stage 5 a tiering rather than three unrelated isolation
+mechanisms, and the last one to become testable: the same source, built three
+ways, behaving identically. Until `MOLT_TIER_PARITY_OK` exists, "the tier is a
+build-time decision" is a design intention; after it, it is a property, and the
+assignment table in [`docs/address-space.md`](address-space.md) stops being a
+plan.

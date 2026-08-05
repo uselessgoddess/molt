@@ -78,6 +78,17 @@ narrowing.
 512 GiB became 128 PiB — 2^39 to 2^57, a factor of 262,144 — and it is Molt's
 own code, which is what [`docs/abi.md`](abi.md) said the fix would be.
 
+Two more subsystems shipped behind it, both by the same rule that a width is
+probed rather than declared. `Platform::address_space` answers with the address
+bits *and* the tag bits the hardware admitted to: on RISC-V the second half is a
+live probe of `satp`'s ASID field, which the specification leaves WARL and
+UNSPECIFIED in width, so the kernel writes sixteen ones and counts what stayed;
+on x86_64 both halves are readable without probing (`CR4.LA57` for the mode the
+loader left on, `CPUID.01H:ECX[17]` for whether PCIDs exist at all). And the
+global VA allocator of [`docs/va-allocator.md`](va-allocator.md) is now cut from
+that probed width inside a booted kernel rather than from a constant. The two
+markers are below, and both print numbers that came from the machine.
+
 ## The candidates
 
 Every option that was actually considered, with the reason it is or is not the
@@ -249,6 +260,12 @@ hit for costs it does not want to pay.
 
 ## Safety, which is not negotiated away
 
+Five claims, in summary form. The adversary's side of each — what an attacker at
+each tier holds, which mechanism takes it away, what is left over, and the six
+rules a ring shared with a hostile domain has to obey — is
+[`docs/threat-model.md`](threat-model.md), written before the code so the code
+can be reviewed against it.
+
 **The kernel is not reachable.** Kernel memory is *absent* from a domain's view,
 not merely marked supervisor-only — no PTE, no address to speculate against, and
 `SUM` stays clear so even a kernel bug cannot casually dereference a domain
@@ -265,7 +282,11 @@ handle space.
 LFI's window, MPK's key register — is enforcement against a *program*, and both
 are soft against speculative side channels in a way page tables and ASIDs are
 not. That is a second reason tier 2 exists: code that is merely untrusted can
-run in an aperture, and code that is actively hostile gets a domain.
+run in an aperture, and code that is actively hostile gets a domain. (The two
+examples are not equally soft, and
+[`docs/threat-model.md`](threat-model.md#tier-1-is-softer-but-be-precise-about-why)
+says why the sturdier argument is about trusted computing bases rather than
+about speculation.)
 
 **Devices are already contained.** Stage 4.5/4.6 put every endpoint in its own
 IOMMU domain, so widening what a program can address does not widen what a
@@ -282,24 +303,106 @@ is how that is proven to still work.
 Three things in the existing design have to change, and it is better to name
 them here than to discover them.
 
-**Per-frame refcounts.** [`docs/memory.md`](memory.md) deliberately omitted them
-— "there is no `mmap`, no copy-on-write, and no sharing between address spaces,
-so the count would be 0 or 1". A granted extent is exactly a frame with two
-holders, so the count stops being 0 or 1 and the omission stops being free. The
-shape to copy is the one that document already surveyed — Redox's two-word
-`PageInfo`, whose second word doubles as the freelist link while the frame is
-free — and its warning about "511 or in the extreme case 262,143 useless
-PageInfos" per large page applies directly to the huge leaves above.
+**Refcounts on leaves, not on frames.** [`docs/memory.md`](memory.md)
+deliberately omitted them — "there is no `mmap`, no copy-on-write, and no
+sharing between address spaces, so the count would be 0 or 1". A granted extent
+is exactly memory with two holders, so the count stops being 0 or 1 and the
+omission stops being free. But the unit is the *leaf that was mapped*, not the
+frame: a 1 GiB leaf is one entry installed and one entry revoked, so it is one
+count, and 262 144 counts behind it would be 262 143 words of bookkeeping that
+can never disagree with each other. That is exactly the waste Redox's `PageInfo`
+survey warned about — "511 or in the extreme case 262,143 useless PageInfos" per
+large page — met by keying the count on the level the mapping was made at
+(4 KiB, 2 MiB, 1 GiB) rather than on the smallest unit the hardware has.
+
+The consequence to accept up front: a shared 1 GiB leaf cannot be un-shared one
+page at a time. Revoking a subrange of a granted extent means splitting the leaf
+into the next level down first, which is a real operation with a real cost — and
+it is a cost paid only by the caller who asks for the odd shape, instead of by
+every mapping in the machine.
 
 **A global VA allocator.** One authority, allocating extents rather than pages,
 with alignment classes so a 1 GiB-mappable extent gets a 1 GiB-aligned address.
 Fragmentation and address recycling become real problems that a per-process
-design does not have.
+design does not have. This is the piece the whole tiering rests on, so it has
+its own design document — [`docs/va-allocator.md`](va-allocator.md) — covering
+the policy, why buddy and slab were both rejected, why compaction is never an
+option, and what happens to a freed address before it is reused. It is code and
+tests today ([`crates/molt-arch/src/va.rs`](../crates/molt-arch/src/va.rs)) and
+`MOLT_VA_OK` prints a live carve from a booted kernel.
 
 **TLB shootdown and ASID lifetime.** Revocation must reach every hart that could
 have cached the entry, and ASIDs are a finite tag space, so rollover means a
 flush. Both are cross-hart protocols, which is Stage 4 machinery
-([`docs/smp.md`](smp.md)), not new invention.
+([`docs/smp.md`](smp.md)), not new invention. The arithmetic is in
+[the tag budget](#the-tag-budget-counted-not-assumed) below, and the one thing
+worth correcting early is that **a tag is spent per domain, not per grant**: a
+grant or a revoke changes what a view maps and costs a shootdown, and it does
+not consume an ASID at all.
+
+## The tag budget, counted not assumed
+
+"ASIDs are finite" is not a design; a number is. The number is now measured on
+both ports, and it decides how many domains can be resident at once and what a
+rollover costs.
+
+**What a tag is spent on.** One per *live domain*, and nothing else. It is worth
+being explicit because the opposite is an easy assumption to make: a grant, a
+revoke, a map, and an unmap all change what a view contains and all cost a
+shootdown, and **none of them consumes a tag**. That is what makes the budget
+tractable — the churny operations are exactly the ones that are not charged
+against it.
+
+**What the machine says.** `satp`'s ASID field is bits 59:44, so sixteen bits at
+most on RV64, and the specification declines to say how many a hart implements:
+the field is WARL and its width is UNSPECIFIED. So the kernel writes ones into
+the whole field, reads back what stuck, and counts the low contiguous run —
+[`Asid::width`](../crates/platforms/riscv/src/satp.rs). Only the *contiguous*
+run counts, because WARL lets a hart keep a high bit it does not decode, and two
+domains whose tags alias in the bits that do decode is worse than no tags at
+all. QEMU's `virt` answers 16, so 65 535 concurrent domains with tag 0 reserved
+for the kernel. x86_64's equivalent is PCID: 12 bits, 4 095 domains, on hardware
+that has it — QEMU's default model does not, and there the honest answer is 0.
+
+**What a rollover costs, on the workload that provokes it.** Take the one worth
+worrying about: 32 harts, domains created and destroyed continuously. Tags are
+handed out until the space wraps; the wrap bumps a generation and every hart
+must flush, because there is no per-tag invalidate cheaper than the flush at
+that point ([`crates/molt-arch/src/asid.rs`](../crates/molt-arch/src/asid.rs)).
+So the cost is one all-hart flush per 65 535 domain creations. A workload that
+creates a domain every microsecond — which would be extraordinary, since a
+domain is a page table and a set of capabilities — reaches a rollover every
+65 milliseconds and pays 32 cold TLBs for it. Anything realistic is orders of
+magnitude below that, and the reason is the paragraph above: the operations a
+busy system actually repeats are grants and revokes, and they cost zero tags.
+
+**And when there are no tags at all.** A hart with a 0-bit field, which is what
+the x86_64 smoke exercises today, flushes on every domain switch. That is slower
+and exactly as safe: `Asids::assign` returns `Flush::Everything`, the switch
+pays a cold TLB, and nothing about isolation changes. It is a performance floor,
+not a correctness fork, and having both paths under CI on different ports is why
+that can be stated rather than hoped.
+
+`MOLT_ASID_OK: bits=16 domains=65535` on riscv64 and `bits=0 domains=0` on
+x86_64 are the two ends of that range, printed by the kernel that will use them.
+
+## Which tier a program actually gets
+
+The tiering is only real if the assignment is obvious for concrete programs.
+Three, which are the ones this design was argued against:
+
+| Program | Tier | Why that one |
+| --- | --- | --- |
+| a `uutils` coreutil — `ls`, `wc`, `sort` on ordinary files | **1 — aperture** | its whole working set fits in 4 GiB with room to spare, and it starts and exits often enough that the cheap entry matters more than reach |
+| a log analyzer with 100 GB mapped at once | **2 — domain** | the requirement *is* the reach; at tier 1 it would page through a window, which is the design being avoided |
+| the NVMe driver | **0 — cell** | it is trusted by construction, needs the kernel's own structures, and an isolation boundary would buy nothing and cost a crossing per submission |
+
+The claim that makes this a tiering rather than three unrelated mechanisms is
+that all three speak the same `molt-abi` ring ABI, so the tier is a build-time
+decision and the coreutil can be rebuilt as a domain — or the analyzer as a cell
+— without touching its source. That is what `MOLT_TIER_PARITY_OK` is for: one
+cell, built for all three, proving the same behaviour in each. Until that marker
+exists, the table above is a plan; after it, it is a property.
 
 ## What ships instead, in order
 
@@ -307,7 +410,8 @@ flush. Both are cross-hart protocols, which is Stage 4 machinery
 | --- | --- | --- |
 | widest `satp` mode probed at boot | `MOLT_SATP_MODE: sv57` | shipped: 512 GiB → 128 PiB |
 | a translation above 512 GiB, performed | `MOLT_MAPPING_OK` | shipped: probe at `1 << 54` |
-| global VA allocator with extents | host tests | one authority, alignment classes |
+| global VA allocator with extents | `MOLT_VA_OK` | shipped: 100 GiB in 100 leaves, from a probed width |
+| the tag budget, read off the hardware | `MOLT_ASID_OK` | shipped: 65 535 domains on riscv64, 0 on x86_64 |
 | 1 GiB and 2 MiB leaves on demand | `MOLT_HUGE_MAP_OK` | one PTE per gibibyte, not 262,144 |
 | a file mapped as an extent, read at its address | `MOLT_FILE_MAP_OK` | the requirement, minimally |
 | a second view with its own ASID | `MOLT_DOMAIN_OK` | tier 2 exists |

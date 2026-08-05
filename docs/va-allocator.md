@@ -11,6 +11,16 @@ program.
 The code is [`crates/molt-arch/src/va.rs`](../crates/molt-arch/src/va.rs); the
 claims below are pinned by [`crates/molt-arch/tests/va.rs`](../crates/molt-arch/tests/va.rs).
 
+The host tests are not the whole evidence. `MOLT_VA_OK` runs the same round trip
+inside a booted kernel, over a `Space` cut from the width the hardware admitted
+to rather than a constant: carve the 100 GiB the tier-2 example asks for, prove
+it came back aligned and in 100 leaves, release it, prove the addresses are
+*not* reissued before a sweep, retire the epoch, and prove the exact same
+address comes back afterwards. On riscv64 that prints `57 address bits, 100 GiB
+at 0xe0000000000000 in 100 leaves`; on x86_64, 48 bits and
+`0x700000000000`. Both are in the marker list `xtask` requires, so the
+allocator is a shipped subsystem rather than a tested library.
+
 ## The questions, answered first
 
 | Question | Answer | Section |
@@ -348,9 +358,6 @@ flushed through, which is the same shape as the shootdown protocol in
 
 ## What is not done yet
 
-- **No boot evidence.** The allocator is host-tested only; `MOLT_VA_OK` — the
-  arena bounds and a live carve, printed from a booted kernel — is the marker
-  that turns it from a tested library into a shipped subsystem.
 - **No consumer.** Nothing maps through it yet; `map_range` still takes
   addresses from its caller. Wiring it is Stage 5.0.
 - **`O(holes)` search.** Fine at 64 slots, wrong at 64 000. If a real workload

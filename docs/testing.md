@@ -183,6 +183,16 @@ is 16 PiB and untranslatable under Sv39, so `MOLT_MAPPING_OK` on riscv64 is a
 translation the hardware performed at an address only the wide mode reaches. See
 [`address-space.md`](address-space.md).
 
+**`MOLT_VA_OK` and `MOLT_ASID_OK` print numbers the hardware supplied.** Neither
+is a fixed string: the first cuts the global VA allocator from the address width
+the platform probed and carves the 100 GiB of
+[`va-allocator.md`](va-allocator.md)'s worked example out of it, and the second
+reports how many domain tags the hart actually implements. Both markers appear
+on both platforms with different numbers — 57 bits and 65 535 tags on riscv64,
+48 bits and none at all on x86_64's default model — which is the point: the
+tagless path is not skipped, it is exercised, and the kernel that flushes on
+every switch is proven to still work rather than assumed to.
+
 **The x86_64 smoke boots `q35` with `-device edu`.** Both halves are load-bearing.
 The default `pc` machine publishes no ACPI `MCFG` table, so there is no
 configuration space to enumerate and the PCI smoke would pass by skipping
