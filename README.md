@@ -71,9 +71,11 @@ suite is for, [the block and DMA boundary](docs/block.md) for the stable storage
 contract shared by VirtIO and NVMe, and [the style guide](docs/style.md) for the
 conventions rustfmt and clippy cannot check.
 
-The next stage is decided in three documents: [the user binary
+The next stage is decided in four documents: [the user binary
 ABI](docs/abi.md) picks LFI, a versioned `repr(C)` format, and rings instead of
 syscalls; [userspace and its toolchain](docs/userspace.md) picks a custom target
-over a compiler fork and explains why coreutils is not the first program; and
+over a compiler fork and explains why coreutils is not the first program; [the
+address space](docs/address-space.md) answers what a program does when 4 GiB is
+not enough, with one global address space and three tiers of isolation; and
 [real hardware](docs/hardware.md) costs out the boards that would run any of it
 outside QEMU.

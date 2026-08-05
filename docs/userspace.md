@@ -143,7 +143,10 @@ does not have them.
 Keeping the user vocabulary equal to the kernel vocabulary has a second payoff:
 a cell can move from inside the kernel to inside a sandbox, or back, as a
 build-time decision. `molt-shell` is the test of that claim and it should be
-kept true.
+kept true. [`docs/address-space.md`](address-space.md) adds a third destination
+— a hardware-protected domain with the full address space, for the programs a
+4 GiB sandbox cannot hold — without changing the vocabulary that makes the move
+possible.
 
 ## coreutils
 

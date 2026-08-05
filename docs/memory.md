@@ -105,6 +105,11 @@ caller to protect against yet, and retyping without one is ceremony); no
 per-frame refcount (there is no `mmap`, no copy-on-write, and no sharing
 between address spaces, so the count would be 0 or 1).
 
+The third omission has a stated expiry. [`docs/address-space.md`](address-space.md)
+decides that mapped file extents and cross-domain grants both exist, and a
+granted extent is exactly a frame with more than one holder — so the refcount
+comes back when the first grant does, in the two-word shape Redox uses above.
+
 ## The model
 
 `molt-arch::memory` separates three things that are easy to collapse and

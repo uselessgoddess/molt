@@ -494,7 +494,29 @@ came first anyway, because the executor could not be made faster without it.
 
 riscv64 leads this stage, which is the reverse of every stage before it: a
 stock rustc can reserve the registers LFI-RISCV needs and cannot reserve the
-ones LFI-x64 needs. The limit worth writing down is not the 4 GiB per sandbox
-the scheme imposes but the 44 GiB of address space each one reserves, which
-Sv39 has room for roughly five of; Sv48 in the RISC-V paging module is the fix,
-and it is Molt's own code.
+ones LFI-x64 needs. The 4 GiB per sandbox is a real limit and it is not the one
+that binds sandbox count: guard cost is architecture-specific, and on riscv64 it
+is a page per side rather than the spec's x86-64 figure of 40 GiB. What bound
+the count was Sv39, and Stage 5.2 removes it.
+
+### Stage 5.2 — The address space
+
+- [x] [`docs/address-space.md`](address-space.md): every candidate for going
+      past 4 GiB, and the decision — one global address space, three tiers
+      (cell, LFI aperture, hardware-protected domain), with the tier a
+      build-time choice because all three speak the same `molt-abi` rings
+- [x] `satp` MODE probed widest first, Sv57 where the hart has it
+      (`MOLT_SATP_MODE: sv57`), with the boot mapping check performed at
+      `1 << 54` so `MOLT_MAPPING_OK` is evidence rather than a claim
+- [ ] a global VA allocator handing out extents, not pages
+- [ ] 1 GiB and 2 MiB leaves on demand (`MOLT_HUGE_MAP_OK`)
+- [ ] a file mapped as an extent and read at its address (`MOLT_FILE_MAP_OK`)
+- [ ] a second view with its own ASID, and a fault that stays inside it
+      (`MOLT_DOMAIN_OK`, `MOLT_DOMAIN_FAULT_OK`)
+- [ ] extent grant and revoke between domains (`MOLT_GRANT_OK`)
+- [ ] one cell built for all three tiers unchanged (`MOLT_TIER_PARITY_OK`)
+
+The costs are named in that document rather than discovered later: per-frame
+refcounts, which [`docs/memory.md`](memory.md) had deliberately omitted; a
+global VA allocator with real fragmentation; and TLB shootdown plus ASID
+recycling, which is Stage 4 cross-hart machinery rather than new invention.

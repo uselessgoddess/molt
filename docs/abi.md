@@ -109,38 +109,43 @@ verifier and the code pattern, and both exist for both of Molt's targets.
 
 ## The address-space budget, which is the real limit
 
-The issue's concern is the 4 GiB. The 4 GiB is not the limit that binds.
+The issue's concern is the 4 GiB. The 4 GiB is not the limit that binds; the
+address space each sandbox reserves is, and how much it reserves depends on the
+architecture in a way that is easy to get wrong.
 
-Each sandbox costs 4 GiB of mapped window plus 80 GiB of guard: 44 GiB of
-address space apiece, counting one guard per neighbour. The spec draws the
-conclusion for Linux: "up to 2,977 sandboxes … within a standard 47-bit x86-64
-userspace". Molt has no user/kernel split, so on x86_64 the figure is the same
-order and irrelevant in practice.
+On x86-64 the spec requires 40 GiB unmapped on each side, because x86-64
+addressing modes allow a scaled index and a 32-bit displacement, and it draws
+the conclusion for Linux: "one sandbox to be allocated for every 44GiB … up to
+2,977 sandboxes … within a standard 47-bit x86-64 userspace". Arm64 is a
+different number for the same reason — 80 KiB of guard in dense mode, 65,535
+sandboxes.
 
-On riscv64 it is not irrelevant. `crates/platforms/riscv/src/paging.rs`
-implements Sv39 and only Sv39 — `SATP_MODE_SV39: u64 = 8 << 60` — which is
-512 GiB of address space in total, and Molt's device windows are placed at
-128 GiB. **Five sandboxes, give or take, is what Sv39 has room for**, and fewer
-below the device window.
+**There is no RISC-V runtime chapter in the spec at all**, and the x86-64 figure
+does not carry over: a verified RISC-V memory operand is `N(x18)` or `N(sp)`
+with `N` a signed 12-bit immediate, so the widest producible address is
+`base + 2^32 + 2 KiB` and one page of guard on each side is sufficient.
+Per-sandbox cost on riscv64 is 4 GiB plus a rounding error, not 44 GiB.
+[`docs/address-space.md`](address-space.md) derives this and explains why an
+earlier revision of this section said five.
 
-So the honest statement of the limit is: *4 GiB per program is not a constraint
-for a teaching OS whose heap donation is measured in mebibytes; 44 GiB of
-reserved address space per program is a constraint, and on Molt's RISC-V port it
-binds at single digits.* Three things could move it, in increasing order of
-work:
+What is left of the budget question is total address space, and that is now
+answered in code: `crates/platforms/riscv/src/paging.rs` probes `satp` widest
+first and takes Sv57 where the hart has it, asserted in the smoke as
+`MOLT_SATP_MODE: sv57`. 512 GiB became 128 PiB, so sandbox count is not a
+constraint on either port.
 
-1. Implement Sv48 in the RISC-V paging module. 256 TiB puts riscv64 in the same
-   bracket as x86_64. This is the fix, and it is Molt's own code.
-2. `lfi-rewrite --p2size=variable` exists alongside `--p2size=32`, so a
+Two things could still move the per-sandbox window itself, neither urgent:
+
+1. `lfi-rewrite --p2size=variable` exists alongside `--p2size=32`, so a
    different power-of-two window is something the toolchain contemplates. What
    it costs in emitted code is not documented in the README and would have to be
    measured before relying on it.
-3. Unmap idle sandboxes and reclaim their address space. Cheap to say, and it
+2. Unmap idle sandboxes and reclaim their address space. Cheap to say, and it
    makes sandbox count a scheduling problem rather than a static one.
 
-None of that is urgent. A design that supports five concurrent user programs on
-one port is not a design that has failed; it is one that should say five out
-loud, which the roadmap entry below does.
+A program that genuinely needs more than 4 GiB does not get it from either:
+it gets a tier-2 domain with the full 57 bits, which is what
+[`docs/address-space.md`](address-space.md) decides.
 
 ## The image and its descriptors
 
