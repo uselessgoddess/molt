@@ -77,6 +77,36 @@ impl Class {
     }
 }
 
+/// What one machine's translation hardware turned out to be able to do.
+///
+/// Both numbers are probed rather than assumed — a hart reports its widest
+/// `satp` mode, an x86-64 core its `CR4.LA57` and its PCID support — because
+/// both decide how much of the design is available: the address width is what
+/// [`Space::over`] cuts, and the tag width is how many domains can hold a
+/// translation at once (see [`Asids`](crate::asid::Asids)).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Widths {
+    address: u32,
+    asid: u32,
+}
+
+impl Widths {
+    pub const fn new(address: u32, asid: u32) -> Self {
+        Self { address, asid }
+    }
+
+    /// How many virtual address bits translation resolves.
+    pub const fn address(self) -> u32 {
+        self.address
+    }
+
+    /// How many tag bits keep two views of one address apart. Zero is a real
+    /// answer: it means every view switch is a flush.
+    pub const fn asid(self) -> u32 {
+        self.asid
+    }
+}
+
 /// A shootdown generation.
 ///
 /// A freed range carries the epoch whose flush has to finish before its

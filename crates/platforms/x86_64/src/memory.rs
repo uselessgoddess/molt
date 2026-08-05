@@ -12,7 +12,7 @@ use molt_arch::{
     BootInfo, FrameAllocator as BootFrameAllocator, FrameCursor, MapPermissions, MappingError,
     MemoryMap, Mmio, PageProtection, PlatformError, UsableRegions,
 };
-use x86_64::registers::control::{Cr3, Cr3Flags};
+use x86_64::registers::control::{Cr3, Cr3Flags, Cr4, Cr4Flags};
 use x86_64::structures::paging::mapper::{MapToError, TranslateResult};
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags, PhysFrame,
@@ -115,6 +115,26 @@ fn active() -> Result<&'static mut Space, PlatformError> {
     // SAFETY: single boot CPU, interrupt handlers do not touch this cell, and
     // the returned borrow is confined to one call.
     unsafe { &mut *ACTIVE.0.get() }.as_mut().ok_or(PlatformError::Mapping(MappingError::Unmapped))
+}
+
+/// What this machine's translation hardware can do, read out of the registers
+/// that already say so.
+///
+/// The address width is whatever paging mode the loader left on: `CR4.LA57`
+/// selects five levels and 57 bits, and its absence is four levels and 48. The
+/// kernel does not switch modes to find out, because unlike RISC-V's `satp`
+/// probe, changing it means rebuilding the tree the running code is translating
+/// through.
+///
+/// The tag width is a capability, not a state: `CPUID.01H:ECX[17]` says the
+/// machine has PCIDs, and enabling them is `CR4.PCIDE`, which this kernel does
+/// not do until domains exist. Twelve bits is what it will get when it does; a
+/// machine without the bit gets zero, and pays a flush per view switch.
+pub fn widths() -> molt_arch::va::Widths {
+    let address = if Cr4::read().contains(Cr4Flags::L5_PAGING) { 57 } else { 48 };
+    let features = core::arch::x86_64::__cpuid(1);
+    let asid = if features.ecx & (1 << 17) != 0 { 12 } else { 0 };
+    molt_arch::va::Widths::new(address, asid)
 }
 
 /// A cursor past the RAM the address space is already built out of.

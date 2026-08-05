@@ -7,7 +7,9 @@ use core::pin::pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 
+use molt_arch::asid::{Asids, Flush};
 use molt_arch::memory::{Error, FrameTable, Inventory, Kind, Owner, Span};
+use molt_arch::va::{Class, Hole, Space};
 use molt_arch::{
     BootInfo, ExitStatus, FRAME_SIZE, Platform, SerialPort, SerialWriter, UsableRegions,
 };
@@ -65,6 +67,8 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
 
     platform.verify_owned_mapping(boot_info).expect("owned W^X mapping probe");
     report!(platform, "MOLT_MAPPING_OK");
+
+    verify_address_space(platform);
 
     platform.verify_image_protection(boot_info).expect("kernel image obeys W^X");
     report!(platform, "MOLT_WX_OK");
@@ -163,6 +167,72 @@ fn verify_heap<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     assert_eq!(heap::used(), 0, "a dropped box left the heap holding bytes");
 
     report!(platform, "MOLT_HEAP_OK: {bytes} bytes");
+}
+
+/// What the tier-2 example in `docs/address-space.md` asks for: a log analyzer
+/// that wants a hundred gigabytes of logs addressable at once.
+const ANALYZER: u64 = 100 << 30;
+
+/// Free ranges per class, which is the budget `docs/va-allocator.md` sizes:
+/// 24 bytes apiece, 64 per class, 4 608 bytes of kernel stack in total.
+const HOLES: usize = 3 * 64;
+
+/// Cuts the one global address space out of what the hardware turned out to
+/// support, and proves an extent survives the round trip that a revoke is.
+///
+/// The claim is not that the allocator works — `molt-arch` tests that on the
+/// host — but that the width it was cut from is the machine's own answer, and
+/// that the addresses a booted kernel hands out of it are the ones the tests
+/// describe. See `docs/va-allocator.md`.
+fn verify_address_space<P: Platform>(platform: &mut P) {
+    let widths = platform.address_space().expect("the platform probed its own translation");
+    let mut holes = [Hole::EMPTY; HOLES];
+    let mut space = Space::over(widths.address(), &mut holes).expect("a space wide enough to cut");
+
+    // A hart that implements only Sv39 has a 32 GiB gigabyte arena and cannot
+    // seat the analyzer. It proves the same round trip with what it does have,
+    // and the marker prints which it was.
+    let wanted = ANALYZER.min(space.largest(Class::Giga));
+    let extent = space.allocate(Class::Giga, wanted).expect("room in the gigabyte arena");
+    let start = extent.start();
+    let leaves = extent.leaves();
+    assert_eq!(start % Class::Giga.granule(), 0, "a gigabyte extent came back unaligned");
+    assert_eq!(leaves, wanted.div_ceil(Class::Giga.granule()), "the extent needs other leaves");
+
+    // Giving it back does not give the addresses back: until every hart has
+    // flushed, one of them may still translate through the mapping that was
+    // revoked, and handing the range to someone else would hand them the pages.
+    space.release(extent).expect("an extent this space issued");
+    let during = space.allocate(Class::Giga, wanted).expect("room beside the quarantined range");
+    assert_ne!(during.start(), start, "an unflushed range was handed out again");
+    space.release(during).expect("an extent this space issued");
+
+    let epoch = space.sweep();
+    space.retire(epoch);
+    let again = space.allocate(Class::Giga, wanted).expect("the flushed range, back in service");
+    assert_eq!(again.start(), start, "a flushed range did not come back");
+    assert_eq!(space.quarantined(Class::Giga), 0, "a retired epoch left bytes in quarantine");
+
+    report!(
+        platform,
+        "MOLT_VA_OK: {} address bits, {} GiB at {start:#x} in {} leaves",
+        widths.address(),
+        wanted >> 30,
+        leaves,
+    );
+
+    // The tag budget is the domain budget: a grant or a revoke costs the
+    // shootdown above, not a tag, so this counts domains and nothing else.
+    let mut asids = Asids::new(widths.asid());
+    let grant = asids.assign();
+    assert!(asids.live(grant.asid()), "a fresh tag was born stale");
+    assert_eq!(
+        grant.flush() == Flush::Everything,
+        asids.capacity() == 0,
+        "a hart with tags to give still flushed, or one without tags did not"
+    );
+
+    report!(platform, "MOLT_ASID_OK: bits={} domains={}", widths.asid(), asids.capacity());
 }
 
 /// Starts this core's tick and its executor, and proves a task runs on it.

@@ -1,4 +1,4 @@
-//! Host-testable `satp` MODE encoding.
+//! Host-testable `satp` field encoding: MODE, and the ASID beside it.
 //!
 //! How wide the supervisor's address space is comes down to four bits in one
 //! CSR, and the privileged specification makes those bits discoverable instead
@@ -6,6 +6,12 @@
 //! at all, so whatever reads back afterwards is the answer. [`Mode::WIDEST`] is
 //! the order that probe runs in and [`Mode::level`] is the depth the page-table
 //! code walks; everything else about a mode follows from those two.
+//!
+//! [`Asid`] is the field below it, and it is discoverable the same way for the
+//! same reason: the specification leaves the number of implemented bits
+//! UNSPECIFIED and the field WARL, so writing sixteen ones and counting what
+//! stayed is the only honest way to learn how many domains a hart can keep
+//! translations for at once.
 
 /// A `satp` MODE the kernel is willing to run in.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -96,9 +102,43 @@ impl Mode {
     }
 }
 
+/// The ASID field of `satp`: bits 59:44, sixteen bits at most on RV64.
+///
+/// The kernel never asserts a width here. It writes ones into the whole field,
+/// reads back what stuck, and counts — see [`Asid::width`].
+pub struct Asid;
+
+impl Asid {
+    /// Bits 59:44 of `satp`.
+    const SHIFT: u32 = 44;
+
+    /// Every bit the field could possibly hold, which is what the probe writes.
+    pub const MASK: u64 = 0xffff << Self::SHIFT;
+
+    /// A tag, already shifted where `satp` wants it.
+    pub const fn field(value: u16) -> u64 {
+        (value as u64) << Self::SHIFT
+    }
+
+    /// The tag a `satp` value reads back with.
+    pub const fn from_satp(satp: u64) -> u16 {
+        ((satp & Self::MASK) >> Self::SHIFT) as u16
+    }
+
+    /// How many tag bits a hart implements, given a `satp` it read back after
+    /// [`MASK`](Self::MASK) was written into it.
+    ///
+    /// Only the low contiguous run counts. The field is WARL, so a hart is free
+    /// to leave a high bit set that it does not actually decode, and a tag whose
+    /// low bits alias another domain's is worse than no tag at all.
+    pub const fn width(live: u64) -> u32 {
+        Self::from_satp(live).trailing_ones()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Mode;
+    use super::{Asid, Mode};
 
     #[test]
     fn field_round_trips_through_satp() {
@@ -128,6 +168,34 @@ mod tests {
         for pair in Mode::WIDEST.windows(2) {
             assert!(pair[0] > pair[1], "{pair:?} is not descending");
         }
+    }
+
+    #[test]
+    fn a_tag_round_trips_beside_the_mode() {
+        let satp = Mode::Sv57.field() | Asid::field(0xbeef) | 0x8_0000;
+
+        assert_eq!(Asid::from_satp(satp), 0xbeef);
+        assert_eq!(Mode::from_satp(satp), Some(Mode::Sv57), "the tag disturbed the mode");
+        assert_eq!(
+            satp & !(Asid::MASK | Mode::Sv57.field()),
+            0x8_0000,
+            "the tag disturbed the root"
+        );
+    }
+
+    #[test]
+    fn the_probe_counts_the_bits_that_stuck() {
+        // What QEMU's `virt` hart answers with, and what a narrower one would.
+        assert_eq!(Asid::width(Asid::MASK), 16);
+        assert_eq!(Asid::width(Asid::field(0x1ff)), 9);
+        assert_eq!(Asid::width(0), 0, "a hart with no field was read as having one");
+    }
+
+    #[test]
+    fn a_hole_in_the_field_ends_the_count() {
+        // WARL lets a hart keep a bit it does not decode; anything above a gap
+        // would hand two domains tags that alias in the bits that do decode.
+        assert_eq!(Asid::width(Asid::field(0b1000_1111)), 4);
     }
 
     #[test]

@@ -21,7 +21,7 @@ use molt_arch::{
     Mmio, PageProtection, PhysicalFrame, PlatformError, UsableRegions,
 };
 
-use crate::satp::Mode;
+use crate::satp::{Asid, Mode};
 
 const PTE_V: u64 = 1 << 0;
 const PTE_R: u64 = 1 << 1;
@@ -77,6 +77,10 @@ struct BootPaging {
     /// accepted. Every walk in this module starts from it.
     top: usize,
     mode: Mode,
+    /// How many ASID bits the hart turned out to implement, from
+    /// [`probe_asids`]. Zero is a legal answer and means every view switch
+    /// costs a flush.
+    asid_bits: u32,
     cursor: FrameCursor,
     /// Table frames drained out of the boot allocator while the memory map was
     /// still borrowable, for mappings made after it is gone.
@@ -148,6 +152,10 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
     // mapped, so translation can be switched on in place.
     let (root, mode) = unsafe { enable(root, &mut frames)? };
 
+    // SAFETY: `enable` returned, so this hart is translating through `root`, and
+    // the probe puts `satp` back the way it found it.
+    let asid_bits = unsafe { probe_asids(mode.field() | (root as u64 >> 12)) };
+
     let mut pool = FramePool::empty();
     pool.fill(&mut frames);
 
@@ -158,6 +166,7 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
             root,
             top: mode.level(),
             mode,
+            asid_bits,
             cursor,
             pool,
             log,
@@ -237,6 +246,40 @@ unsafe fn switch(mode: Mode, root_phys: u64) -> bool {
     live == wanted
 }
 
+/// Counts the ASID bits the hart implements, and leaves `satp` as it found it.
+///
+/// The width is UNSPECIFIED and the field WARL, so the only way to learn it is
+/// to write ones into all sixteen and read back which ones stayed. Nothing else
+/// in `satp` moves: the same root stays rooted, so the two writes translate
+/// through the same tree and the hart never stops being able to fetch its next
+/// instruction. What does change is the tag those translations are cached
+/// under, which is why both writes are flushed.
+///
+/// # Safety
+///
+/// `live` must be the `satp` this hart is currently translating through, or the
+/// restore leaves it running on someone else's tree.
+unsafe fn probe_asids(live: u64) -> u32 {
+    let wanted = live | Asid::MASK;
+    let read: u64;
+    // SAFETY: the flushes bracket both writes, so no translation cached under
+    // the probe's tag outlives it, and the root PPN is unchanged throughout.
+    unsafe {
+        asm!(
+            "csrw satp, {wanted}",
+            "sfence.vma",
+            "csrr {read}, satp",
+            "csrw satp, {live}",
+            "sfence.vma",
+            wanted = in(reg) wanted,
+            live = in(reg) live,
+            read = out(reg) read,
+            options(nostack),
+        );
+    }
+    Asid::width(read)
+}
+
 fn map_section(
     root: *mut u64,
     frames: &mut dyn Frames,
@@ -266,6 +309,11 @@ pub fn satp() -> Option<u64> {
 /// The translation mode the boot hart accepted, once [`init`] has run.
 pub fn mode() -> Option<Mode> {
     active().ok().map(|state| state.mode)
+}
+
+/// How many ASID bits the hart implements, as [`probe_asids`] measured them.
+pub fn asid_bits() -> Option<u32> {
+    active().ok().map(|state| state.asid_bits)
 }
 
 /// A cursor past the RAM the boot address space is already built out of.

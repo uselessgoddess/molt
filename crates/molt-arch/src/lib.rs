@@ -2,6 +2,7 @@
 
 //! Hardware-independent contracts shared by the kernel and architecture crates.
 
+pub mod asid;
 pub mod audit;
 pub mod cpu;
 pub mod dma;
@@ -594,6 +595,17 @@ pub trait Platform: DeviceMapper + InterruptFabric + Local + Smp {
     /// Sends every interrupt line this platform raises to `sink`.
     fn route_interrupts(&mut self, _sink: &'static dyn Sink) -> Result<(), PlatformError> {
         Err(PlatformError::Unsupported)
+    }
+
+    /// What this machine's translation hardware turned out to be able to do,
+    /// once [`initialize`](Self::initialize) has probed it.
+    ///
+    /// The global VA allocator is cut from the address width and the domain
+    /// budget follows from the tag width, so both are asked of the hardware
+    /// rather than assumed. A port that has not probed yet returns `None`, and
+    /// the kernel hands out no addresses on it.
+    fn address_space(&self) -> Option<va::Widths> {
+        None
     }
 
     /// A cursor past the RAM the kernel's own tables and image already own.

@@ -51,7 +51,7 @@ mod imp {
         BootInfo, ConfigSpace, CpuId, DeviceMapper, Entry, ExitStatus, FRAME_SIZE, FabricError,
         FrameCursor, InterruptFabric, Local, MappingError, MemoryMap, MemoryRegion,
         MemoryRegionKind, Mmio, MsiMessage, Platform, PlatformError, SerialPort, SerialWriter,
-        Sink, Smp, SmpError, Stack,
+        Sink, Smp, SmpError, Stack, va,
     };
 
     use crate::{ap, csr, fdt, paging, percpu, sbi, trap};
@@ -356,6 +356,13 @@ _start:
         /// [`InterruptFabric`] for why there is nothing to route yet.
         fn route_interrupts(&mut self, _sink: &'static dyn Sink) -> Result<(), PlatformError> {
             Err(PlatformError::Fabric(FabricError::Unsupported))
+        }
+
+        /// Both halves come from the probes [`paging::init`] already ran: the
+        /// address width from the `satp` MODE the hart accepted, the tag width
+        /// from the ASID bits it kept.
+        fn address_space(&self) -> Option<va::Widths> {
+            Some(va::Widths::new(paging::mode()?.bits(), paging::asid_bits()?))
         }
 
         fn free_frames(&self) -> Option<FrameCursor> {

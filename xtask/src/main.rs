@@ -21,6 +21,8 @@ const BOOT_MARKERS: &[&str] = &[
     "MOLT_EXCEPTION_OK",
     "MOLT_HEAP_OK",
     "MOLT_MAPPING_OK",
+    "MOLT_VA_OK",
+    "MOLT_ASID_OK",
     "MOLT_WX_OK",
     "MOLT_DEVICE_WINDOW_OK",
     "MOLT_EXEC_OK",

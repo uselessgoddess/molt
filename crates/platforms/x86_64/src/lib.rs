@@ -26,7 +26,7 @@ use molt_arch::memory::{Device, Rights, Span};
 use molt_arch::{
     BootInfo, ConfigSpace, CpuId, DeviceMapper, Entry, ExitStatus, FabricError, FrameCursor,
     ImageRange, InterruptFabric, Local, MappingError, MemoryMap, MemoryRegion, MemoryRegionKind,
-    Mmio, MsiMessage, Platform, PlatformError, SerialPort, Sink, Smp, SmpError, Stack,
+    Mmio, MsiMessage, Platform, PlatformError, SerialPort, Sink, Smp, SmpError, Stack, va,
 };
 
 /// Fixed boot-stack window cloned into kernel-owned page tables.
@@ -231,6 +231,13 @@ impl Platform for X86_64 {
 
     fn verify_device_window(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
         memory::verify_device_window(boot_info)
+    }
+
+    /// Always answers: unlike the RISC-V port, neither half needs a probe that
+    /// has to have run first. The address width is the paging mode the loader
+    /// left on, and the tag width is a CPUID capability bit.
+    fn address_space(&self) -> Option<va::Widths> {
+        Some(memory::widths())
     }
 
     fn free_frames(&self) -> Option<FrameCursor> {
