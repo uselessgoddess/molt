@@ -63,6 +63,8 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     assert!(platform.verify_exception_path(), "breakpoint handler did not return");
     report!(platform, "MOLT_EXCEPTION_OK");
 
+    report_ram(boot_info, platform);
+
     verify_heap(boot_info, platform);
 
     platform.verify_owned_mapping(boot_info).expect("owned W^X mapping probe");
@@ -152,6 +154,26 @@ fn verify_frame_ownership(span: Span) {
 
     frames.release(claimed).expect("frames this table issued");
     assert_eq!(frames.claimed(), 0, "released frames stayed claimed");
+}
+
+/// Prints how much RAM firmware said the machine has.
+///
+/// This is a marker rather than a log line because it is the only evidence that
+/// the number came from firmware at all. A kernel that carries a constant boots
+/// identically on the machine the constant was written for, and silently wastes
+/// or invents memory everywhere else; a number that tracks `-m` cannot be that
+/// constant. Both platforms print it, and neither computes it.
+fn report_ram<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
+    let map = boot_info.memory_map();
+    let (mut usable, mut top) = (0u64, 0);
+    for range in UsableRegions::above(map, FRAME_SIZE) {
+        usable += range.end() - range.start();
+        top = top.max(range.end());
+    }
+
+    // The top comes first because it is the part a test can pin: how much is
+    // usable moves with the size of the image sitting in front of it.
+    report!(platform, "MOLT_RAM_OK: top {top:#x}, {} MiB usable", usable >> 20);
 }
 
 /// Donates the boot heap and proves an allocation round-trips through it.

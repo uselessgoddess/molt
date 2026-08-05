@@ -19,6 +19,7 @@ const DISK_TREE: &str = "disk";
 
 const BOOT_MARKERS: &[&str] = &[
     "MOLT_EXCEPTION_OK",
+    "MOLT_RAM_OK",
     "MOLT_HEAP_OK",
     "MOLT_MAPPING_OK",
     "MOLT_VA_OK",
@@ -168,9 +169,15 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
         // rv64 CPU implements every mode, so anything narrower means the probe
         // in `paging::enable` stopped early and the address space Molt plans to
         // spend is not there.
-        (Arch::Riscv64, Case::Boot) => {
-            &["MOLT_SBI_CONSOLE:", "MOLT_SATP_MODE: sv57", "MOLT_UART_WINDOW:"]
-        }
+        // The RAM top is likewise an assertion: QEMU was given 2 GiB above
+        // `0x8000_0000`, so a kernel that read the device tree prints exactly
+        // this, and one that fell back to its own constant prints `0x88000000`.
+        (Arch::Riscv64, Case::Boot) => &[
+            "MOLT_SBI_CONSOLE:",
+            "MOLT_SATP_MODE: sv57",
+            "MOLT_RAM_OK: top 0x100000000",
+            "MOLT_UART_WINDOW:",
+        ],
         (Arch::X86_64, Case::Boot) => &[
             "MOLT_BAR_OK:",
             "MOLT_MSI_OK:",
@@ -435,7 +442,10 @@ fn qemu_riscv64_command(kernel: &Path) -> Command {
         env::var_os("MOLT_QEMU_RISCV64").unwrap_or_else(|| OsString::from("qemu-system-riscv64"));
     let mut command = Command::new(qemu);
     // OpenSBI loads the ELF at its S-mode payload address.
-    command.args(["-machine", "virt", "-smp", CORES, "-display", "none"]);
+    // More than the 128 MiB default, and not a round power of the fallback the
+    // kernel used to carry: `MOLT_RAM_OK` can only print this if the device
+    // tree was read. It is also the least that lets a 1 GiB leaf exist.
+    command.args(["-machine", "virt", "-smp", CORES, "-m", "2G", "-display", "none"]);
     command.args(["-no-reboot", "-bios", "default"]);
     command.arg("-kernel").arg(kernel);
     command

@@ -193,6 +193,16 @@ on both platforms with different numbers — 57 bits and 65 535 tags on riscv64,
 tagless path is not skipped, it is exercised, and the kernel that flushes on
 every switch is proven to still work rather than assumed to.
 
+**`MOLT_RAM_OK` catches a constant pretending to be a measurement.** The riscv64
+kernel used to carry the QEMU `virt` default — RAM ends at `0x8800_0000` — which
+boots identically on that one machine and is wrong on every other, in both
+directions: more memory goes unused, less has the frame allocator hand out
+addresses that decode to nothing. The smoke now starts QEMU with `-m 2G` and the
+marker list demands `MOLT_RAM_OK: top 0x100000000`, a number the kernel can only
+print by reading the `/memory` node of the device tree firmware passed. The
+usable byte count follows the top rather than leading it, because that part moves
+whenever the image in front of it changes size and is not something to pin.
+
 **The x86_64 smoke boots `q35` with `-device edu`.** Both halves are load-bearing.
 The default `pc` machine publishes no ACPI `MCFG` table, so there is no
 configuration space to enumerate and the PCI smoke would pass by skipping

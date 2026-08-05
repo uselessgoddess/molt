@@ -56,7 +56,8 @@ mod imp {
 
     use crate::{ap, csr, fdt, paging, percpu, sbi, trap};
 
-    /// End of the QEMU `virt` board's default RAM.
+    /// End of the QEMU `virt` board's default RAM, used only when there is no
+    /// device tree to read it from.
     const RAM_END: u64 = 0x8800_0000;
 
     global_asm!(
@@ -93,7 +94,7 @@ _start:
         // how every layer above finds anything, including the panic path.
         // SAFETY: this is the hart firmware entered, and this is its only call.
         unsafe { percpu::attach(CpuId::BOOT, hartid as u64) };
-        let memory_map = RiscVMemoryMap::new();
+        let memory_map = RiscVMemoryMap::new(device_tree);
         // Every mode this kernel enables identity-maps physical memory, so the
         // physical offset is zero whichever one the hart took.
         let boot_info = BootInfo::new(&memory_map, Some(0));
@@ -109,19 +110,36 @@ _start:
         molt_arch::panic_handler::<RiscV>(info)
     }
 
-    /// Usable RAM after the loaded image.
+    /// Usable RAM after the loaded image, bounded by the bank it sits in.
     struct RiscVMemoryMap {
         usable_start: u64,
+        usable_end: u64,
     }
 
     impl RiscVMemoryMap {
-        fn new() -> Self {
+        /// Reads how much RAM the board has instead of assuming a board.
+        ///
+        /// The constant this replaces was the QEMU `virt` default, which made
+        /// `-m` a lie in both directions: more RAM went unused, and less would
+        /// have had the frame allocator hand out addresses that decode to
+        /// nothing. Firmware knows the answer and puts it in the tree, so the
+        /// constant is now only what a hart entered without a tree falls back
+        /// to — the machine that shape of boot is likeliest to be.
+        fn new(device_tree: usize) -> Self {
             unsafe extern "C" {
                 static __kernel_end: u8;
             }
             let end = (&raw const __kernel_end) as u64;
             let usable_start = (end + FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
-            Self { usable_start }
+            // The image is inside the bank that matters, which is what makes
+            // the bank identifiable on a board that has several.
+            // SAFETY: firmware's pointer, or zero, which `ram_at` refuses
+            // before any load.
+            let bank = unsafe { fdt::ram_at(device_tree, end) };
+            // A bank ending mid-frame would otherwise become a frame that is
+            // half real.
+            let usable_end = bank.map_or(RAM_END, |bank| bank.end()) & !(FRAME_SIZE - 1);
+            Self { usable_start, usable_end }
         }
     }
 
@@ -132,7 +150,11 @@ _start:
 
         fn region(&self, index: usize) -> Option<MemoryRegion> {
             match index {
-                0 => Some(MemoryRegion::new(self.usable_start, RAM_END, MemoryRegionKind::Usable)),
+                0 => Some(MemoryRegion::new(
+                    self.usable_start,
+                    self.usable_end,
+                    MemoryRegionKind::Usable,
+                )),
                 _ => None,
             }
         }
