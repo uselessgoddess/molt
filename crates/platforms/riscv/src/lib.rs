@@ -17,6 +17,9 @@ pub mod fdt;
 mod paging;
 #[cfg(target_arch = "riscv64")]
 mod percpu;
+// The `satp` MODE encoding is arithmetic on one CSR field, so it is tested on
+// the host like the SBI codes and the device tree.
+pub mod satp;
 #[cfg(target_arch = "riscv64")]
 mod sbi;
 #[cfg(target_arch = "riscv64")]
@@ -91,7 +94,8 @@ _start:
         // SAFETY: this is the hart firmware entered, and this is its only call.
         unsafe { percpu::attach(CpuId::BOOT, hartid as u64) };
         let memory_map = RiscVMemoryMap::new();
-        // Sv39 identity-maps physical memory, so the physical offset is zero.
+        // Every mode this kernel enables identity-maps physical memory, so the
+        // physical offset is zero whichever one the hart took.
         let boot_info = BootInfo::new(&memory_map, Some(0));
         // The pointer is kept rather than read here: the tree is the only
         // description of where PCI lives, and nothing has asked for PCI yet.
@@ -297,7 +301,18 @@ _start:
             // to land.
             unsafe { csr::enable_software_interrupts() };
             self.declare_cpus();
-            paging::init(boot_info)
+            paging::init(boot_info)?;
+            // Which mode the hart took decides how much address space there is
+            // to hand out, so it is reported rather than assumed.
+            if let Some(mode) = paging::mode() {
+                let _ = writeln!(
+                    SerialWriter::new(&mut self.serial),
+                    "MOLT_SATP_MODE: {} ({} address bits)",
+                    mode.name(),
+                    mode.bits(),
+                );
+            }
+            Ok(())
         }
 
         fn verify_exception_path(&mut self) -> bool {

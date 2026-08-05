@@ -174,6 +174,15 @@ hardware-boot item follows: a marker asserts a property the machine actually
 has, and a machine that lacks it says so on the serial line rather than being
 excused quietly.
 
+**`MOLT_SATP_MODE: sv57` is an assertion about a value, not about a line.** The
+riscv64 boot prints whichever paging mode the hart accepted, and the marker list
+demands the widest one, so a probe that stopped early fails the smoke rather than
+reporting a narrower address space in passing. It has a partner that is harder to
+fake: `verify_owned_mapping` writes and reads its probe value at `1 << 54`, which
+is 16 PiB and untranslatable under Sv39, so `MOLT_MAPPING_OK` on riscv64 is a
+translation the hardware performed at an address only the wide mode reaches. See
+[`address-space.md`](address-space.md).
+
 **The x86_64 smoke boots `q35` with `-device edu`.** Both halves are load-bearing.
 The default `pc` machine publishes no ACPI `MCFG` table, so there is no
 configuration space to enumerate and the PCI smoke would pass by skipping

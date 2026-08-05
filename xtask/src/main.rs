@@ -162,7 +162,13 @@ impl Case {
 
 fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
     match (arch, case) {
-        (Arch::Riscv64, Case::Boot) => &["MOLT_SBI_CONSOLE:", "MOLT_UART_WINDOW:"],
+        // `sv57` is an assertion, not a report: the QEMU `virt` board's default
+        // rv64 CPU implements every mode, so anything narrower means the probe
+        // in `paging::enable` stopped early and the address space Molt plans to
+        // spend is not there.
+        (Arch::Riscv64, Case::Boot) => {
+            &["MOLT_SBI_CONSOLE:", "MOLT_SATP_MODE: sv57", "MOLT_UART_WINDOW:"]
+        }
         (Arch::X86_64, Case::Boot) => &[
             "MOLT_BAR_OK:",
             "MOLT_MSI_OK:",
