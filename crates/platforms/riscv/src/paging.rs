@@ -35,6 +35,7 @@ const PTE_RWX: u64 = PTE_R | PTE_W | PTE_X;
 
 const PAGE_4K: usize = 4096;
 const PAGE_2M: usize = 2 * 1024 * 1024;
+const PAGE_1G: usize = 1024 * 1024 * 1024;
 
 const PROBE_VALUE: u64 = 0x004d_4f4c_545f_5758;
 
@@ -417,6 +418,31 @@ pub fn verify_image_protection(boot_info: &BootInfo<'_>) -> Result<(), PlatformE
     walk_leaves(state.root, state.top, &state.log.audit(), &inventory)
 }
 
+/// The largest leaf covering RAM, found by walking the live tables.
+///
+/// Every address in every usable range is accounted for, one leaf at a time, so
+/// the answer cannot come from a lucky probe: an unmapped page inside a range
+/// the log declared is a hole, and the walk stops on it rather than stepping
+/// over it and reporting the gigapage next door.
+pub fn largest_ram_leaf(boot_info: &BootInfo<'_>) -> Result<Leaf, PlatformError> {
+    let state = active()?;
+    let inventory = Inventory::new(boot_info.memory_map());
+    let walk = TableWalk { root: state.root, top: state.top, inventory: &inventory };
+
+    let mut largest: Option<Leaf> = None;
+    for range in UsableRegions::above(boot_info.memory_map(), bound!(__kernel_end) as u64) {
+        let mut address = range.start();
+        while address < range.end() {
+            let leaf = walk.leaf(address).ok_or(PlatformError::Mapping(MappingError::Unmapped))?;
+            if largest.is_none_or(|it| it.size() < leaf.size()) {
+                largest = Some(leaf);
+            }
+            address = leaf.end().max(address + 1);
+        }
+    }
+    largest.ok_or(PlatformError::Mapping(MappingError::Unmapped))
+}
+
 const UART_MMIO: u64 = 0x1000_0000;
 const UART_WINDOW: usize = 0x3000_0000;
 const UART_THR: usize = 0;
@@ -673,13 +699,31 @@ fn map_range(
     let mut va = align_down(start, PAGE_4K);
     let end = align_up(end, PAGE_4K).ok_or(PlatformError::Mapping(MappingError::InvalidAddress))?;
     while va < end {
-        let level = (granularity == Granularity::LargeOk
-            && va % PAGE_2M == 0
-            && end - va >= PAGE_2M) as usize;
+        let level = leaf_level(va, end, granularity);
         map_leaf(root, top, frames, va, va as u64, flags, level)?;
-        va += if level == 1 { PAGE_2M } else { PAGE_4K };
+        va += PAGE_4K << (9 * level);
     }
     Ok(())
+}
+
+/// The biggest leaf that starts at `va` without running past `end`.
+///
+/// A gigapage is worth asking for and not only for the table frames it saves:
+/// one TLB entry covers what 262 144 pages would, so a program walking a
+/// hundred gigabytes of RAM — the tier-2 example in `docs/address-space.md` —
+/// stops spending most of its cycles in the page walker. Nothing here splits a
+/// leaf later, so a range that only *starts* aligned still gets the small
+/// leaves it needs at the ends.
+fn leaf_level(va: usize, end: usize, granularity: Granularity) -> usize {
+    if granularity == Granularity::Small {
+        return 0;
+    }
+    for (level, span) in [(2, PAGE_1G), (1, PAGE_2M)] {
+        if va % span == 0 && end - va >= span {
+            return level;
+        }
+    }
+    0
 }
 
 fn map_leaf(

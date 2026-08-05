@@ -75,6 +75,8 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     platform.verify_image_protection(boot_info).expect("kernel image obeys W^X");
     report!(platform, "MOLT_WX_OK");
 
+    report_huge_map(boot_info, platform);
+
     platform.verify_device_window(boot_info).expect("device window mapped and reachable");
     report!(platform, "MOLT_DEVICE_WINDOW_OK");
 
@@ -174,6 +176,31 @@ fn report_ram<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     // The top comes first because it is the part a test can pin: how much is
     // usable moves with the size of the image sitting in front of it.
     report!(platform, "MOLT_RAM_OK: top {top:#x}, {} MiB usable", usable >> 20);
+}
+
+/// Prints the biggest leaf RAM is mapped through, read back out of the tables.
+///
+/// A mapper that quietly fell back to small pages boots identically and passes
+/// every other marker, so nothing else here would notice: the cost shows up
+/// only as TLB misses under a program touching more memory than the boot smoke
+/// ever does. The size is asked of the platform, which reads it back from the
+/// live tables, so this is what the hardware translates through, not what the
+/// mapper meant to write.
+fn report_huge_map<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
+    let leaf = platform.largest_ram_leaf(boot_info).expect("RAM leaves readable back");
+    let (size, unit) = scale(leaf.size());
+    report!(platform, "MOLT_HUGE_MAP_OK: {size} {unit} leaf at {:#x}", leaf.start());
+}
+
+/// The largest binary unit `bytes` divides evenly, so a marker reads `1 GiB`
+/// rather than `1048576 KiB` and stays legible when the leaf size changes.
+fn scale(bytes: u64) -> (u64, &'static str) {
+    for (unit, name) in [(1 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")] {
+        if bytes % unit == 0 {
+            return (bytes / unit, name);
+        }
+    }
+    (bytes, "B")
 }
 
 /// Donates the boot heap and proves an allocation round-trips through it.

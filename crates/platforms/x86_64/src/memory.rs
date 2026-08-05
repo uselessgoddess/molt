@@ -486,6 +486,33 @@ pub fn verify_device_window(_boot_info: &BootInfo<'_>) -> Result<(), PlatformErr
     sweep(state.offset, state.root, &audit)
 }
 
+/// The largest leaf covering RAM, found by walking the live tables.
+///
+/// Every address of every direct-mapped range is accounted for, one leaf at a
+/// time, so the answer cannot come from a lucky probe: a hole inside a range
+/// `direct_map` claims to have mapped stops the walk instead of being stepped
+/// over on the way to the bigger leaf next door.
+pub fn largest_ram_leaf(boot_info: &BootInfo<'_>) -> Result<Leaf, PlatformError> {
+    let state = active()?;
+    let space = state.mapper();
+    let walk = MapperWalk { mapper: &space };
+
+    let mut largest: Option<Leaf> = None;
+    for region in UsableRegions::above(boot_info.memory_map(), 0) {
+        // Same bounds `direct_map` used; anything outside them was never mapped.
+        let (start, end) = (align_up(region.start())?, align_down(region.end()));
+        let mut address = state.offset + start;
+        while address < state.offset + end {
+            let leaf = walk.leaf(address).ok_or(MappingError::Unmapped)?;
+            if largest.is_none_or(|it| it.size() < leaf.size()) {
+                largest = Some(leaf);
+            }
+            address = leaf.end().max(address + 1);
+        }
+    }
+    largest.ok_or(PlatformError::Mapping(MappingError::Unmapped))
+}
+
 impl Space {
     fn mapper(&self) -> OffsetPageTable<'static> {
         // SAFETY: the boot CPU is the only writer, `root` is this address

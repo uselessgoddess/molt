@@ -46,6 +46,7 @@ mod imp {
     use core::arch::{asm, global_asm};
     use core::fmt::Write as _;
 
+    use molt_arch::audit::Leaf;
     use molt_arch::memory::{Device, Rights, Span};
     use molt_arch::{
         BootInfo, ConfigSpace, CpuId, DeviceMapper, Entry, ExitStatus, FRAME_SIZE, FabricError,
@@ -354,6 +355,10 @@ _start:
 
         fn verify_device_window(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
             paging::verify_device_window(boot_info)
+        }
+
+        fn largest_ram_leaf(&mut self, boot_info: &BootInfo<'_>) -> Result<Leaf, PlatformError> {
+            paging::largest_ram_leaf(boot_info)
         }
 
         /// The ECAM window the device tree describes, if firmware described one.

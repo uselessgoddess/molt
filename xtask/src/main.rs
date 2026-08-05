@@ -25,6 +25,7 @@ const BOOT_MARKERS: &[&str] = &[
     "MOLT_VA_OK",
     "MOLT_ASID_OK",
     "MOLT_WX_OK",
+    "MOLT_HUGE_MAP_OK",
     "MOLT_DEVICE_WINDOW_OK",
     "MOLT_EXEC_OK",
     "MOLT_SMP_OK",
@@ -172,13 +173,20 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
         // The RAM top is likewise an assertion: QEMU was given 2 GiB above
         // `0x8000_0000`, so a kernel that read the device tree prints exactly
         // this, and one that fell back to its own constant prints `0x88000000`.
+        // The leaf size is per-arch because the mappers differ: the RISC-V port
+        // reaches for a gigapage and the 2 GiB QEMU is given leaves room for
+        // exactly one, while the x86_64 direct map stops at 2 MiB. Both are
+        // pinned so a port that silently fell back to 4 KiB pages fails here
+        // instead of only showing up as TLB misses years later.
         (Arch::Riscv64, Case::Boot) => &[
             "MOLT_SBI_CONSOLE:",
             "MOLT_SATP_MODE: sv57",
             "MOLT_RAM_OK: top 0x100000000",
+            "MOLT_HUGE_MAP_OK: 1 GiB leaf",
             "MOLT_UART_WINDOW:",
         ],
         (Arch::X86_64, Case::Boot) => &[
+            "MOLT_HUGE_MAP_OK: 2 MiB leaf",
             "MOLT_BAR_OK:",
             "MOLT_MSI_OK:",
             "MOLT_INTERRUPT_OK:",

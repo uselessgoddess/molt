@@ -494,7 +494,10 @@ came first anyway, because the executor could not be made faster without it.
       probed width inside a booted kernel (`MOLT_VA_OK`)
 - [x] the tag budget read off the hardware rather than assumed, on both ports
       (`MOLT_ASID_OK`)
-- [ ] 1 GiB and 2 MiB leaves on demand (`MOLT_HUGE_MAP_OK`)
+- [x] the boot mapping of RAM read back out of the live tables, largest leaf
+      first (`MOLT_HUGE_MAP_OK`: a gigapage on riscv64, 2 MiB on x86_64), on a
+      machine given enough memory for a gigapage to exist (`MOLT_RAM_OK`, which
+      comes from the device tree rather than a constant)
 - [ ] refcounts keyed on the mapped leaf, not the frame
 - [ ] a file mapped as an extent and read at its address (`MOLT_FILE_MAP_OK`)
 - [ ] a second view with no kernel leaf in it, and a fault that stays inside

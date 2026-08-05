@@ -22,6 +22,7 @@ use bootloader_api::info::{MemoryRegionKind as BootMemoryRegionKind, MemoryRegio
 pub use bootloader_api::{
     BootInfo as BootloaderInfo, BootloaderConfig, entry_point as __bootloader_entry_point,
 };
+use molt_arch::audit::Leaf;
 use molt_arch::memory::{Device, Rights, Span};
 use molt_arch::{
     BootInfo, ConfigSpace, CpuId, DeviceMapper, Entry, ExitStatus, FabricError, FrameCursor,
@@ -231,6 +232,10 @@ impl Platform for X86_64 {
 
     fn verify_device_window(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
         memory::verify_device_window(boot_info)
+    }
+
+    fn largest_ram_leaf(&mut self, boot_info: &BootInfo<'_>) -> Result<Leaf, PlatformError> {
+        memory::largest_ram_leaf(boot_info)
     }
 
     /// Always answers: unlike the RISC-V port, neither half needs a probe that

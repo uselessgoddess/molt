@@ -587,6 +587,20 @@ pub trait Platform: DeviceMapper + InterruptFabric + Local + Smp {
         Err(PlatformError::Unsupported)
     }
 
+    /// The largest leaf the boot mapping of RAM actually ended up using.
+    ///
+    /// Read back out of the live tables rather than remembered while building
+    /// them: what the mapper meant to do is not evidence that the hardware
+    /// translates that way. A platform whose tables cannot be walked returns
+    /// [`PlatformError::Unsupported`], and the kernel reports that instead of
+    /// a size it did not check.
+    fn largest_ram_leaf(
+        &mut self,
+        _boot_info: &BootInfo<'_>,
+    ) -> Result<audit::Leaf, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
     /// The PCI configuration space firmware described, if there is one.
     fn config_space(&mut self, _boot_info: &BootInfo<'_>) -> Result<ConfigSpace, PlatformError> {
         Err(PlatformError::MissingConfigSpace)

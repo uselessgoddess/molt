@@ -203,6 +203,19 @@ print by reading the `/memory` node of the device tree firmware passed. The
 usable byte count follows the top rather than leading it, because that part moves
 whenever the image in front of it changes size and is not something to pin.
 
+**`MOLT_HUGE_MAP_OK` is read back, not remembered.** The size it prints does not
+come from a variable the mapper set while building the tables — that would only
+prove the mapper's intent — but from walking the live tables afterwards and
+asking each address of every usable range which leaf translates it, which is the
+same `PageWalk` the W^X audit uses. The walk stops on an unmapped page inside a
+range the kernel declared rather than stepping over it, so a hole cannot hide
+behind the bigger leaf next door. The asserted size differs per port because the
+mappers do: riscv64 must show `1 GiB leaf`, which the smoke's `-m 2G` leaves
+exactly one room for, and x86_64 must show `2 MiB leaf`, the largest its direct
+map builds. Without this, a port that quietly fell back to 4 KiB pages would
+still pass every other marker and cost only TLB misses, in a program nobody has
+written yet.
+
 **The x86_64 smoke boots `q35` with `-device edu`.** Both halves are load-bearing.
 The default `pc` machine publishes no ACPI `MCFG` table, so there is no
 configuration space to enumerate and the PCI smoke would pass by skipping
