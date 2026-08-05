@@ -11,6 +11,7 @@ pub mod memory;
 pub mod mmio;
 pub mod pci;
 pub mod smp;
+pub mod va;
 
 use core::fmt;
 
