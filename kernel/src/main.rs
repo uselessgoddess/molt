@@ -10,6 +10,7 @@ use core::task::{Context, Poll, Waker};
 use molt_arch::asid::{Asids, Flush};
 use molt_arch::memory::{Error, FrameTable, Inventory, Kind, Owner, Span};
 use molt_arch::refcount::{self, Leaves, Run};
+use molt_arch::shootdown::Shootdown;
 use molt_arch::va::{Class, Extent, Hole, Region, Space};
 use molt_arch::{
     BootInfo, ExitStatus, FRAME_SIZE, Platform, SerialPort, SerialWriter, UsableRegions,
@@ -87,6 +88,8 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
 
     let (running, answered) = verify_smp(platform, exec);
     report!(platform, "MOLT_SMP_OK: cores={running} answered={answered}");
+
+    verify_shootdown(platform, exec);
 
     run_timer_future(exec);
     report!(platform, "MOLT_TIMER_OK");
@@ -336,6 +339,66 @@ fn verify_refcounts<P: Platform>(platform: &mut P, analyzer: &Extent) {
         analyzer.bytes() >> 30,
         Class::FANOUT,
         leaves.runs(),
+    );
+}
+
+/// Frees an extent the way a revoke does, and holds its addresses back until
+/// every core has flushed for real.
+///
+/// This is the one property the host tests cannot show, because it needs other
+/// cores: the epoch is retired by acknowledgements that came from the cores
+/// themselves, each having run the flush instruction on its own hardware. The
+/// order is the one `docs/threat-model.md` asks after — the leaf goes first, the
+/// shootdown second, and [`retire`](Space::retire) only once nobody owes a
+/// flush. Reversing the last two is a use-after-free the hardware performs for
+/// whoever reads the address next.
+fn verify_shootdown<P: Platform>(platform: &mut P, exec: &Executor) {
+    let widths = platform.address_space().expect("the platform probed its own translation");
+    let mut holes = [Hole::EMPTY; HOLES];
+    let mut space = Space::over(widths.address(), &mut holes).expect("a space wide enough to cut");
+
+    let wanted = ANALYZER.min(space.largest(Class::Giga));
+    let extent = space.allocate(Class::Giga, wanted).expect("room in the gigabyte arena");
+    let start = extent.start();
+
+    // The revoke: the addresses leave the view and join the batch a flush has to
+    // cover before any of them can be handed out again.
+    space.release(extent).expect("an extent this space issued");
+    let epoch = space.sweep();
+
+    let mut shootdown = Shootdown::new();
+    let cores = shootdown.begin(epoch, smp::attending()).expect("a core to flush");
+    assert!(shootdown.pending(smp::cpu()), "the core that did the unmapping was trusted");
+
+    // Meanwhile the range is nobody's to give: an allocation of the same size
+    // has to come back from somewhere else entirely.
+    let elsewhere = space.allocate(Class::Giga, wanted).expect("room beside the quarantined range");
+    assert_ne!(elsewhere.start(), start, "an unflushed range was handed out again");
+
+    let (flushed, asked) = smp::flush(exec);
+    assert_eq!(flushed.len() as u16, asked + 1, "a core took the flush and never answered");
+
+    let mut retirable = None;
+    for cpu in flushed {
+        assert!(retirable.is_none(), "the round closed with cores still owing a flush");
+        retirable = shootdown.acknowledge(cpu).expect("a core this round asked");
+    }
+    let retired = retirable.expect("the epoch every core has now flushed");
+
+    assert_eq!(retired, epoch, "a round retired an epoch it was not opened for");
+    assert_eq!(shootdown.outstanding(), 0, "a core still owes a flush for a retired epoch");
+    assert_eq!(space.quarantined(Class::Giga), wanted, "the freed range left quarantine early");
+
+    space.retire(retired);
+    assert_eq!(space.quarantined(Class::Giga), 0, "a flushed range stayed in quarantine");
+    let again = space.allocate(Class::Giga, wanted).expect("the flushed range, back in service");
+    assert_eq!(again.start(), start, "a flushed range did not come back");
+
+    report!(
+        platform,
+        "MOLT_SHOOTDOWN_OK: {} GiB at {start:#x} held over {cores} cores until epoch {} flushed",
+        wanted >> 30,
+        retired.get(),
     );
 }
 

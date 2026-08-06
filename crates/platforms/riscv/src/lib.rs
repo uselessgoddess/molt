@@ -52,7 +52,7 @@ mod imp {
         BootInfo, ConfigSpace, CpuId, DeviceMapper, Entry, ExitStatus, FRAME_SIZE, FabricError,
         FrameCursor, InterruptFabric, Local, MappingError, MemoryMap, MemoryRegion,
         MemoryRegionKind, Mmio, MsiMessage, Platform, PlatformError, SerialPort, SerialWriter,
-        Sink, Smp, SmpError, Stack, va,
+        Sink, Smp, SmpError, Stack, Tlb, va,
     };
 
     use crate::{ap, csr, fdt, paging, percpu, sbi, trap};
@@ -230,6 +230,24 @@ _start:
 
         fn release(&mut self, _line: u16) -> Result<(), FabricError> {
             Err(FabricError::Unsupported)
+        }
+    }
+
+    /// `sfence.vma` with both operands zero, which the ISA defines as ordering
+    /// every prior page-table store against every translation this hart has
+    /// cached, for every address and every ASID.
+    ///
+    /// The whole-hart form is the one molt uses rather than the per-address
+    /// `sfence.vma a0, x0`: what is being freed is an extent of up to a hundred
+    /// gigabyte leaves, and invalidating them one address at a time costs more
+    /// than the refill of a TLB that was about to lose those entries anyway.
+    // SAFETY: the unqualified form leaves the hart with no translation cached
+    // from before it, global entries included, before the instruction retires.
+    unsafe impl Tlb for RiscV {
+        fn flush() {
+            // SAFETY: `sfence.vma` is a supervisor instruction molt runs in
+            // S-mode, and it touches no memory the compiler tracks.
+            unsafe { asm!("sfence.vma", options(nostack)) };
         }
     }
 

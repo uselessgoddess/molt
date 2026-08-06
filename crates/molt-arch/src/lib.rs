@@ -12,6 +12,7 @@ pub mod memory;
 pub mod mmio;
 pub mod pci;
 pub mod refcount;
+pub mod shootdown;
 pub mod smp;
 pub mod va;
 
@@ -24,6 +25,7 @@ pub use crate::irq::{FabricError, InterruptFabric, MsiMessage, Sink};
 pub use crate::memory::Cache;
 pub use crate::mmio::{DeviceMapper, Mmio, MmioError};
 pub use crate::pci::ConfigSpace;
+pub use crate::shootdown::Tlb;
 pub use crate::smp::{Entry, Smp, SmpError, Stack, number};
 
 /// Architecture-neutral information passed from a platform boot adapter.

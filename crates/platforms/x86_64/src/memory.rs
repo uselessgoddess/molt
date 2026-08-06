@@ -137,6 +137,30 @@ pub fn widths() -> molt_arch::va::Widths {
     molt_arch::va::Widths::new(address, asid)
 }
 
+/// Drops every translation this CPU has cached, global entries included.
+///
+/// Reloading `CR3` is the usual whole-TLB flush and it is not the whole flush:
+/// entries marked global survive it by design, which is the point of the bit.
+/// `CR4.PGE` is the switch that does not spare them, so where it is on, turning
+/// it off and back on is the flush. Where it is off there is nothing global to
+/// keep, and writing `CR3` with the root it already holds invalidates the rest.
+pub fn flush() {
+    let cr4 = Cr4::read();
+    if cr4.contains(Cr4Flags::PAGE_GLOBAL) {
+        // SAFETY: paging stays on and the mode is untouched — the bit is put
+        // back the way it was found, and only the TLB moves in between.
+        unsafe {
+            Cr4::write(cr4.difference(Cr4Flags::PAGE_GLOBAL));
+            Cr4::write(cr4);
+        }
+        return;
+    }
+    let (root, flags) = Cr3::read();
+    // SAFETY: the root that is already live, written back unchanged, so the
+    // code performing the write keeps translating through the same tables.
+    unsafe { Cr3::write(root, flags) };
+}
+
 /// A cursor past the RAM the address space is already built out of.
 ///
 /// Boot drained tables and cloned windows up to this point; a driver resumes a

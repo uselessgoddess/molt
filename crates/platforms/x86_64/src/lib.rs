@@ -27,7 +27,7 @@ use molt_arch::memory::{Device, Rights, Span};
 use molt_arch::{
     BootInfo, ConfigSpace, CpuId, DeviceMapper, Entry, ExitStatus, FabricError, FrameCursor,
     ImageRange, InterruptFabric, Local, MappingError, MemoryMap, MemoryRegion, MemoryRegionKind,
-    Mmio, MsiMessage, Platform, PlatformError, SerialPort, Sink, Smp, SmpError, Stack, va,
+    Mmio, MsiMessage, Platform, PlatformError, SerialPort, Sink, Smp, SmpError, Stack, Tlb, va,
 };
 
 /// Fixed boot-stack window cloned into kernel-owned page tables.
@@ -273,6 +273,14 @@ impl DeviceMapper for X86_64 {
         rights: Rights,
     ) -> Result<Mmio<'static>, MappingError> {
         memory::map_device(window, rights)
+    }
+}
+
+// SAFETY: `memory::flush` leaves this CPU with nothing cached from before the
+// call, global entries included, before it returns.
+unsafe impl Tlb for X86_64 {
+    fn flush() {
+        memory::flush();
     }
 }
 
