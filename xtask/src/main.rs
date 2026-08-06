@@ -212,6 +212,7 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
             "hello, molt",
             "MOLT_SHELL_OK:",
             "MOLT_FS_RESTART_OK:",
+            "MOLT_FILE_MAP_OK:",
             "MOLT_VIRTIO_RESET_OK:",
             "MOLT_IOMMU_FAULT_OK:",
             "MOLT_NVME_IOMMU_OK:",

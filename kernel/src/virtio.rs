@@ -153,6 +153,7 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     report!(platform, "MOLT_BLK_IRQ_OK: queue zero answered on vector {}", vectored.index());
 
     crate::init::smoke(platform, &mut block);
+    crate::filemap::smoke(boot_info, platform, &mut block);
 
     let iommu = block.reset().expect("the device stops and its mappings return");
     function.set_command(quiesced).expect("bus mastering stays off after reset");
