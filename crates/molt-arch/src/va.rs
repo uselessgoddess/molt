@@ -58,9 +58,36 @@ impl Class {
     /// Every class, smallest granule first.
     pub const ALL: [Self; 3] = [Self::Page, Self::Mega, Self::Giga];
 
+    /// How many leaves of the class below fit in one leaf of a class: the
+    /// entries in a page table, on every architecture molt maps with.
+    pub const FANOUT: u64 = 512;
+
     /// The leaf size, one page-table level apart from the next.
     pub const fn granule(self) -> u64 {
         FRAME_SIZE << (9 * self.level())
+    }
+
+    /// The class one page-table level down, or `None` at the leaves.
+    ///
+    /// This is what revoking part of a gigabyte costs: the leaf that covers it
+    /// has to become [`FANOUT`](Self::FANOUT) leaves of this class before any
+    /// of them can be treated separately.
+    pub const fn smaller(self) -> Option<Self> {
+        match self {
+            Self::Page => None,
+            Self::Mega => Some(Self::Page),
+            Self::Giga => Some(Self::Mega),
+        }
+    }
+
+    /// The class one page-table level up, or `None` at the largest leaf molt
+    /// maps with.
+    pub const fn larger(self) -> Option<Self> {
+        match self {
+            Self::Page => Some(Self::Mega),
+            Self::Mega => Some(Self::Giga),
+            Self::Giga => None,
+        }
     }
 
     /// The page-table level the leaf sits at, counting from the leaves.

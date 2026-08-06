@@ -9,7 +9,8 @@ use core::task::{Context, Poll, Waker};
 
 use molt_arch::asid::{Asids, Flush};
 use molt_arch::memory::{Error, FrameTable, Inventory, Kind, Owner, Span};
-use molt_arch::va::{Class, Hole, Space};
+use molt_arch::refcount::{self, Leaves, Run};
+use molt_arch::va::{Class, Extent, Hole, Region, Space};
 use molt_arch::{
     BootInfo, ExitStatus, FRAME_SIZE, Platform, SerialPort, SerialWriter, UsableRegions,
 };
@@ -70,7 +71,8 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     platform.verify_owned_mapping(boot_info).expect("owned W^X mapping probe");
     report!(platform, "MOLT_MAPPING_OK");
 
-    verify_address_space(platform);
+    let analyzer = verify_address_space(platform);
+    verify_refcounts(platform, &analyzer);
 
     platform.verify_image_protection(boot_info).expect("kernel image obeys W^X");
     report!(platform, "MOLT_WX_OK");
@@ -233,7 +235,7 @@ const HOLES: usize = 3 * 64;
 /// host — but that the width it was cut from is the machine's own answer, and
 /// that the addresses a booted kernel hands out of it are the ones the tests
 /// describe. See `docs/va-allocator.md`.
-fn verify_address_space<P: Platform>(platform: &mut P) {
+fn verify_address_space<P: Platform>(platform: &mut P) -> Extent {
     let widths = platform.address_space().expect("the platform probed its own translation");
     let mut holes = [Hole::EMPTY; HOLES];
     let mut space = Space::over(widths.address(), &mut holes).expect("a space wide enough to cut");
@@ -282,6 +284,59 @@ fn verify_address_space<P: Platform>(platform: &mut P) {
     );
 
     report!(platform, "MOLT_ASID_OK: bits={} domains={}", widths.asid(), asids.capacity());
+
+    again
+}
+
+/// How many records the leaf counts get: three per class is enough for the
+/// splits a revoke of part of one leaf goes through, with room to spare.
+const RUNS: usize = 16;
+
+/// Counts the leaves of that same extent the way a grant and a revoke would.
+///
+/// The claim under test is the keying, not the arithmetic — `molt-arch` tests
+/// the arithmetic on the host. What a booted kernel shows is the size of the
+/// thing being counted: a hundred gigabytes shared with a second view is one
+/// record holding the number two, and the 26 million frames underneath it never
+/// get a record at all. See `docs/address-space.md`.
+fn verify_refcounts<P: Platform>(platform: &mut P, analyzer: &Extent) {
+    let mut runs = [Run::EMPTY; RUNS];
+    let mut leaves = Leaves::over(&mut runs);
+    let start = analyzer.start();
+
+    leaves.map(start, analyzer.class(), analyzer.leaves()).expect("leaves nobody counts yet");
+    let mapped = leaves.leaves();
+    let frames = leaves.frames();
+    assert_eq!(leaves.runs(), 1, "leaves mapped together were counted apart");
+
+    // A grant of the whole extent into a second view: every leaf gains the same
+    // holder, so the accounting still fits in the one record it started in.
+    leaves.share(analyzer.region()).expect("every leaf of a mapped extent");
+    let shared = leaves.runs();
+    assert_eq!(shared, 1, "a grant of everything fragmented the accounting");
+    assert_eq!(leaves.count(start), Some(2), "the second view was not counted");
+    assert_eq!(leaves.count(analyzer.end() - 1), Some(2), "the grant stopped short of the end");
+
+    // Revoking part of a gigabyte leaf is a question the tables cannot answer
+    // either, until the leaf becomes the 512 below it.
+    let part = Region::new(start, start + 2 * Class::Mega.granule()).expect("two megabytes");
+    assert_eq!(leaves.share(part), Err(refcount::Error::Straddle), "half a leaf was counted");
+    assert_eq!(leaves.split(start), Ok(Class::Mega), "a gigabyte leaf did not split");
+    assert_eq!(leaves.leaves(), mapped - 1 + Class::FANOUT, "the split lost addresses");
+
+    let reclaimed = leaves.release(part).expect("leaves the second view holds");
+    assert!(reclaimed.is_empty(), "a leaf the first view still holds was reported free");
+    assert_eq!(leaves.count(start), Some(1), "the revoke did not reach the second view");
+    assert_eq!(leaves.count(start + part.bytes()), Some(2), "the revoke reached past its range");
+
+    report!(
+        platform,
+        "MOLT_REFCOUNT_OK: {} GiB in {mapped} leaves and {shared} record, {frames} frames \
+         uncounted; revoking 2 MiB split one leaf into {} and left {} records",
+        analyzer.bytes() >> 30,
+        Class::FANOUT,
+        leaves.runs(),
+    );
 }
 
 /// Starts this core's tick and its executor, and proves a task runs on it.

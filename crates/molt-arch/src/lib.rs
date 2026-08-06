@@ -11,6 +11,7 @@ pub mod irq;
 pub mod memory;
 pub mod mmio;
 pub mod pci;
+pub mod refcount;
 pub mod smp;
 pub mod va;
 
