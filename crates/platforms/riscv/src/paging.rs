@@ -478,10 +478,11 @@ impl PageWalk for ViewWalk {
                 let span = 1u64 << (12 + 9 * level);
                 let rights =
                     PageProtection::new(entry & PTE_R != 0, entry & PTE_W != 0, entry & PTE_X != 0);
-                return Some(Leaf::new(
+                return Some(Leaf::backed(
                     address & !(span - 1),
                     span,
                     rights.cached(Cache::WriteBack),
+                    ((entry >> 10) << 12) & !(span - 1),
                 ));
             }
             if level == 0 {

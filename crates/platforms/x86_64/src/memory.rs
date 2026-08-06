@@ -667,7 +667,13 @@ impl PageWalk for ViewWalk {
             }
             if level == 0 || flags.contains(PageTableFlags::HUGE_PAGE) {
                 let size = 1u64 << (12 + 9 * level);
-                return Some(Leaf::new(address & !(size - 1), size, protection(flags, size)));
+                let base = entry.addr().as_u64() & !(size - 1);
+                return Some(Leaf::backed(
+                    address & !(size - 1),
+                    size,
+                    protection(flags, size),
+                    base,
+                ));
             }
             frame = PhysFrame::containing_address(entry.addr());
             level -= 1;

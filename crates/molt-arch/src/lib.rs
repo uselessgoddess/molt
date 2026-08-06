@@ -4,6 +4,7 @@
 
 pub mod asid;
 pub mod audit;
+pub mod cache;
 pub mod cpu;
 pub mod dma;
 pub mod iommu;
