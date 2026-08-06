@@ -7,6 +7,7 @@ use core::pin::pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 
+use molt_abi::{Call, Channel, Fault, Handle, Next, Op, Reject, Reply};
 use molt_arch::asid::{Asids, Flush};
 use molt_arch::memory::{Error, FrameTable, Inventory, Kind, Owner, Rights, Span};
 use molt_arch::refcount::{self, Leaves, Run};
@@ -92,6 +93,7 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
 
     verify_shootdown(platform, exec);
     verify_domain(boot_info, platform, exec);
+    verify_ring(platform);
 
     run_timer_future(exec);
     report!(platform, "MOLT_TIMER_OK");
@@ -524,6 +526,83 @@ fn verify_domain<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P, exec: 
          flushed",
         view.index(),
         retired.get(),
+    );
+}
+
+/// Slots in the channel the smoke drives.
+///
+/// Four, because the interesting numbers are the small ones: a tail five ahead
+/// of a four-slot ring is a lie the ring's own length makes checkable, and a
+/// longer ring would only make the arithmetic longer.
+const SLOTS: usize = 4;
+
+/// Drives a ring whose other end is hostile.
+///
+/// The six rules in `docs/threat-model.md` are claims about what a domain
+/// cannot do to the kernel through a shared page, and this is where they stop
+/// being a document. The channel is the one a real domain gets — it lives in
+/// the domain's own extent, so every word the kernel reads may have changed
+/// since the last one it read — and the sequence here is honest work, then a
+/// submission that does not parse, then the lie.
+///
+/// What has to be true at the end is that the kernel is still running. A domain
+/// that publishes submissions it never wrote is asking the kernel to read a
+/// slot with nothing in it; what it gets is a fault, which is fatal to the
+/// domain and costs the kernel one ring.
+fn verify_ring<P: Platform>(platform: &mut P) {
+    let channel = Channel::<SLOTS>::new();
+    let (mut submissions, mut completions) = channel.kernel();
+    let mut domain = channel.domain();
+
+    // Honest work first, so that what follows is a ring known to have been
+    // running rather than one that never worked.
+    domain.submit(Call::new(1, Op::Timer { ticks: 7 }));
+    let Ok(Next::Ready(call)) = submissions.take() else {
+        panic!("an honest submission did not arrive");
+    };
+    assert_eq!(call.op(), Op::Timer { ticks: 7 }, "a submission changed on the way in");
+    completions.publish(Reply::new(call.id(), 0)).expect("room in an empty completion ring");
+    assert_eq!(domain.reply(), Some(Reply::new(1, 0)), "the completion never came back");
+
+    // Rule 5, run the way the kernel would run it. The buffer is inside the
+    // aperture, so the submission parses; it is outside the extent the
+    // capability actually names, so the one masked check refuses it.
+    // `molt_abi`'s, and not the one `molt_arch::va` calls a region: this is an
+    // offset into the domain's aperture, which is what a submission can name.
+    let buf = molt_abi::Region::new(0, 4096);
+    domain.submit(Call::new(2, Op::Read { cap: Handle::new(0), offset: 0, buf }));
+    let Ok(Next::Ready(read)) = submissions.take() else {
+        panic!("a well-formed read did not arrive");
+    };
+    let named = read.op().region().expect("a read names a buffer");
+    assert!(named.within(buf.len() as u64).is_some(), "a buffer inside its extent was refused");
+    assert!(named.within(buf.len() as u64 - 1).is_none(), "a buffer past its extent was allowed");
+
+    // A tag this kernel has none of. One rejection, one completion saying so,
+    // and the ring keeps going: a domain that guesses wrong is wrong about one
+    // submission and not about the connection.
+    domain.write([3, 4096, 0, 0, 0, 0, 0, 0]);
+    let Ok(Next::Rejected { id, reject }) = submissions.take() else {
+        panic!("a slot that parses to nothing was accepted");
+    };
+    completions.publish(Reply::rejected(id, reject)).expect("room in the completion ring");
+    assert_eq!(
+        domain.reply(),
+        Some(Reply::rejected(3, Reject::Tag)),
+        "a rejection went unanswered"
+    );
+
+    // And the lie: five submissions published into four slots, at least one of
+    // which was never written by anybody.
+    let claimed = SLOTS as u32 + 1;
+    domain.claim(claimed);
+    assert_eq!(submissions.take(), Err(Fault::Tail), "the kernel read a slot nobody wrote");
+    assert_eq!(submissions.take(), Err(Fault::Tail), "a ring that faulted was read again");
+
+    report!(
+        platform,
+        "MOLT_RING_FAULT_OK: {} calls taken, then a tail {claimed} ahead over {SLOTS} slots faulted",
+        submissions.taken(),
     );
 }
 

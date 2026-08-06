@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/molt-abi",
     "crates/molt-alloc",
     "crates/molt-arch",
     "xtask",
@@ -20,6 +21,7 @@ members = [
 ]
 default-members = [
     "xtask",
+    "crates/molt-abi",
     "crates/molt-alloc",
     "crates/molt-arch",
     "crates/molt-block",
@@ -42,6 +44,7 @@ edition = "2024"
 rust-version = "1.85"
 
 [workspace.dependencies]
+molt-abi = { path = "crates/molt-abi" }
 molt-alloc = { path = "crates/molt-alloc" }
 molt-arch = { path = "crates/molt-arch" }
 molt-block = { path = "crates/molt-block" }
