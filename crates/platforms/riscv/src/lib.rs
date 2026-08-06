@@ -46,13 +46,14 @@ mod imp {
     use core::arch::{asm, global_asm};
     use core::fmt::Write as _;
 
+    use molt_arch::asid::Asid;
     use molt_arch::audit::Leaf;
     use molt_arch::memory::{Device, Rights, Span};
     use molt_arch::{
         BootInfo, ConfigSpace, CpuId, DeviceMapper, Entry, ExitStatus, FRAME_SIZE, FabricError,
         FrameCursor, InterruptFabric, Local, MappingError, MemoryMap, MemoryRegion,
         MemoryRegionKind, Mmio, MsiMessage, Platform, PlatformError, SerialPort, SerialWriter,
-        Sink, Smp, SmpError, Stack, Tlb, va,
+        Sink, Smp, SmpError, Stack, Tlb, View, va,
     };
 
     use crate::{ap, csr, fdt, paging, percpu, sbi, trap};
@@ -420,6 +421,28 @@ _start:
             count: u64,
         ) -> Result<Span, PlatformError> {
             paging::claim_ram(boot_info, count)
+        }
+
+        fn open_view(&mut self, asid: Asid) -> Result<View, PlatformError> {
+            paging::open_view(asid)
+        }
+
+        fn grant(
+            &mut self,
+            view: View,
+            extent: &va::Extent,
+            span: Span,
+            rights: Rights,
+        ) -> Result<(), PlatformError> {
+            paging::grant(view, extent, span, rights)
+        }
+
+        fn revoke(&mut self, view: View, extent: &va::Extent) -> Result<u64, PlatformError> {
+            paging::revoke(view, extent)
+        }
+
+        fn resident(&self, view: View, address: u64) -> Option<Leaf> {
+            paging::resident(view, address)
         }
 
         fn terminate(&mut self, status: ExitStatus) -> ! {

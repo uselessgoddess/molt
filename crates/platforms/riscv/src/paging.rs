@@ -14,14 +14,17 @@
 use core::arch::asm;
 use core::cell::UnsafeCell;
 
+use molt_arch::asid::Asid;
 use molt_arch::audit::{Audit, Declared, Leaf, MappedRange, PageWalk};
 use molt_arch::memory::{Cache, Device, Inventory, Kind, Rights, Span};
+use molt_arch::va::Extent;
+use molt_arch::view::{self, VIEWS};
 use molt_arch::{
     BootInfo, FrameAllocator, FrameCursor, FramePool, ImageSection, MapPermissions, MappingError,
-    Mmio, PageProtection, PhysicalFrame, PlatformError, UsableRegions,
+    Mmio, PageProtection, PhysicalFrame, PlatformError, UsableRegions, View,
 };
 
-use crate::satp::{Asid, Mode};
+use crate::satp::{Asid as AsidField, Mode};
 
 const PTE_V: u64 = 1 << 0;
 const PTE_R: u64 = 1 << 1;
@@ -91,6 +94,9 @@ struct BootPaging {
     /// The next free device address; bumps forward and never back, so a window
     /// handed out once is never handed out again.
     devices: usize,
+    /// The root of each open tier-2 view, beside the kernel's own. Empty when
+    /// opened, and only ever holding what was granted into it.
+    views: [Option<*mut u64>; VIEWS],
 }
 
 struct Active(UnsafeCell<Option<BootPaging>>);
@@ -172,6 +178,7 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
             pool,
             log,
             devices: DEVICE_REGION,
+            views: [None; VIEWS],
         });
     }
     Ok(())
@@ -261,7 +268,7 @@ unsafe fn switch(mode: Mode, root_phys: u64) -> bool {
 /// `live` must be the `satp` this hart is currently translating through, or the
 /// restore leaves it running on someone else's tree.
 unsafe fn probe_asids(live: u64) -> u32 {
-    let wanted = live | Asid::MASK;
+    let wanted = live | AsidField::MASK;
     let read: u64;
     // SAFETY: the flushes bracket both writes, so no translation cached under
     // the probe's tag outlives it, and the root PPN is unchanged throughout.
@@ -278,7 +285,7 @@ unsafe fn probe_asids(live: u64) -> u32 {
             options(nostack),
         );
     }
-    Asid::width(read)
+    AsidField::width(read)
 }
 
 fn map_section(
@@ -333,9 +340,157 @@ pub fn free_frames() -> Option<FrameCursor> {
 pub fn claim_ram(boot_info: &BootInfo<'_>, count: u64) -> Result<Span, PlatformError> {
     let state = active()?;
     let mut frames = FrameAllocator::resume(boot_info.memory_map(), state.cursor);
-    let span = frames.run(count)?;
+    let span = frames.contiguous(count)?;
     state.cursor = frames.cursor();
     Ok(span)
+}
+
+/// Opens an empty view of the one address space, tagged `asid`.
+///
+/// The root is a single zeroed frame, which is what makes the claim true: an
+/// empty level-`top` table translates nothing at all, so the kernel's text, its
+/// stack, and every device window are absent from the view because they were
+/// never put in it — not because something removed them afterwards.
+pub fn open_view(asid: Asid) -> Result<View, PlatformError> {
+    let state = active()?;
+    let index = state
+        .views
+        .iter()
+        .position(Option::is_none)
+        .ok_or(PlatformError::View(view::Error::Capacity))?;
+
+    let root = alloc_table(&mut state.pool)?;
+    state.views[index] = Some(root);
+    Ok(View::new(index as u16, asid))
+}
+
+/// Maps `extent` into `view` at the extent's own leaf size.
+///
+/// Nothing about the kernel's tables moves: the frames stay mapped where they
+/// already were, and the domain reaches them at the same global address the
+/// kernel calls them by. That is the whole trick of one address space — the
+/// grant is a page-table entry, not a copy and not a relocation.
+pub fn grant(view: View, extent: &Extent, span: Span, rights: Rights) -> Result<(), PlatformError> {
+    let granule = extent.class().granule();
+    let level = extent.class().level() as usize;
+    if span.bytes() < extent.bytes() || span.start() % granule != 0 || extent.start() % granule != 0
+    {
+        return Err(PlatformError::View(view::Error::Backing));
+    }
+
+    let state = active()?;
+    let root = root_of(state, view)?;
+    let flags = leaf_flags(rights);
+    for leaf in 0..extent.leaves() {
+        let offset = leaf * granule;
+        let va = usize::try_from(extent.start() + offset).map_err(|_| address_error())?;
+        map_leaf(root, state.top, &mut state.pool, va, span.start() + offset, flags, level)?;
+    }
+    Ok(())
+}
+
+/// Clears `extent` out of `view`, and says how many leaves went.
+///
+/// Only the leaves: the tables above them stay, because a table that held one
+/// leaf will hold the next, and freeing it would cost a second shootdown to
+/// make safe. Nothing here flushes, and nothing here touches the allocator —
+/// see [`molt_arch::view`] for why the caller owes both, in that order.
+pub fn revoke(view: View, extent: &Extent) -> Result<u64, PlatformError> {
+    let granule = extent.class().granule();
+    let level = extent.class().level() as usize;
+
+    let state = active()?;
+    let root = root_of(state, view)?;
+    for leaf in 0..extent.leaves() {
+        let va = usize::try_from(extent.start() + leaf * granule).map_err(|_| address_error())?;
+        unmap_leaf(root, state.top, va, level)?;
+    }
+    Ok(extent.leaves())
+}
+
+/// What `view` translates `address` through, read back out of its own tables.
+pub fn resident(view: View, address: u64) -> Option<Leaf> {
+    let state = active().ok()?;
+    let root = root_of(state, view).ok()?;
+    ViewWalk { root, top: state.top }.leaf(address)
+}
+
+/// The root of a view this platform opened.
+fn root_of(state: &BootPaging, view: View) -> Result<*mut u64, PlatformError> {
+    state
+        .views
+        .get(view.index() as usize)
+        .copied()
+        .flatten()
+        .ok_or(PlatformError::View(view::Error::Unknown))
+}
+
+/// Invalidates the leaf covering `va`, refusing anything but a leaf at `level`.
+///
+/// A larger leaf higher up covers the address too, and clearing it would revoke
+/// addresses nobody asked about; that is [`view::Error::Absent`] rather than a
+/// silent over-revoke, because the caller asked about a range it does not own
+/// alone.
+fn unmap_leaf(root: *mut u64, top: usize, va: usize, level: usize) -> Result<(), PlatformError> {
+    let mut table = root;
+    for above in ((level + 1)..=top).rev() {
+        // SAFETY: `table` points at a 512-entry table frame, identity mapped
+        // read/write, and the index is masked to nine bits.
+        let entry = unsafe { *table.add(index(va, above)) };
+        if entry & PTE_V == 0 || entry & PTE_RWX != 0 {
+            return Err(PlatformError::View(view::Error::Absent));
+        }
+        table = ((entry >> 10) << 12) as *mut u64;
+    }
+    // SAFETY: `table` is the level-`level` table covering `va`.
+    let entry = unsafe { &mut *table.add(index(va, level)) };
+    if *entry & PTE_V == 0 {
+        return Err(PlatformError::View(view::Error::Absent));
+    }
+    *entry = 0;
+    Ok(())
+}
+
+/// A walk of a view's tables, which hold granted RAM and nothing else.
+///
+/// The kernel's own walk asks the firmware map which physical memory a leaf
+/// covers, because it maps device windows as well as RAM. A view is only ever
+/// granted RAM, so its leaves are write-back by construction and there is no
+/// map to consult — [`resident`] is answerable long after boot info is gone.
+struct ViewWalk {
+    root: *const u64,
+    top: usize,
+}
+
+impl PageWalk for ViewWalk {
+    fn leaf(&self, address: u64) -> Option<Leaf> {
+        let va = usize::try_from(address).ok()?;
+        let mut table = self.root;
+        let mut level = self.top;
+        loop {
+            // SAFETY: `table` is a readable 512-entry root or identity-mapped
+            // child, and the index is masked to nine bits.
+            let entry = unsafe { *table.add(index(va, level)) };
+            if entry & PTE_V == 0 {
+                return None;
+            }
+            if entry & PTE_RWX != 0 {
+                let span = 1u64 << (12 + 9 * level);
+                let rights =
+                    PageProtection::new(entry & PTE_R != 0, entry & PTE_W != 0, entry & PTE_X != 0);
+                return Some(Leaf::new(
+                    address & !(span - 1),
+                    span,
+                    rights.cached(Cache::WriteBack),
+                ));
+            }
+            if level == 0 {
+                return None;
+            }
+            table = ((entry >> 10) << 12) as *const u64;
+            level -= 1;
+        }
+    }
 }
 
 pub fn verify_owned_mapping(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {

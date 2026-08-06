@@ -31,6 +31,10 @@ const BOOT_MARKERS: &[&str] = &[
     "MOLT_EXEC_OK",
     "MOLT_SMP_OK",
     "MOLT_SHOOTDOWN_OK",
+    "MOLT_DOMAIN_OK",
+    "MOLT_DOMAIN_ABSENT_OK",
+    "MOLT_GRANT_OK",
+    "MOLT_REVOKE_OK",
     "MOLT_TIMER_OK",
     "MOLT_CANCELLATION_OK",
     "MOLT_STALE_COMPLETION_OK",
@@ -400,6 +404,13 @@ fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
         // ever runs on two is a crossing that never had to pick a target.
         "-smp",
         CORES,
+        // The same two gigabytes the RISC-V machine gets. QEMU's default is a
+        // hundred and twenty-eight megabytes, which the loader has mostly spent
+        // by the time the kernel runs: a machine with no contiguous megabyte
+        // left cannot back a megabyte leaf, and a grant of addresses nothing
+        // backs would prove nothing about a grant.
+        "-m",
+        "2G",
         "-device",
         "edu",
         "-display",

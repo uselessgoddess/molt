@@ -6,11 +6,14 @@
 
 use core::cell::UnsafeCell;
 
+use molt_arch::asid::Asid;
 use molt_arch::audit::{Audit, Contents, Declared, Leaf, MappedRange, PageWalk};
 use molt_arch::memory::{Cache, Device, Inventory, Rights, Span};
+use molt_arch::va::Extent;
+use molt_arch::view::{self, VIEWS};
 use molt_arch::{
     BootInfo, FrameAllocator as BootFrameAllocator, FrameCursor, MapPermissions, MappingError,
-    MemoryMap, Mmio, PageProtection, PlatformError, UsableRegions,
+    MemoryMap, Mmio, PageProtection, PlatformError, UsableRegions, View,
 };
 use x86_64::registers::control::{Cr3, Cr3Flags, Cr4, Cr4Flags};
 use x86_64::structures::paging::mapper::{MapToError, TranslateResult};
@@ -34,8 +37,18 @@ const APIC_WINDOW: u64 = 0xffff_9200_0000_0000;
 const DEVICE_REGION: u64 = 0xffff_9300_0000_0000;
 const DEVICE_REGION_END: u64 = DEVICE_REGION + (1 << 30);
 
-/// How many page-table frames are set aside for device mappings.
-const DEVICE_TABLE_FRAMES: usize = 32;
+/// How many page-table frames are set aside for mappings made after the
+/// firmware memory map is gone: device windows, and the tables of every view a
+/// domain is opened with.
+const DEVICE_TABLE_FRAMES: usize = 64;
+
+/// The level the root of an address space sits at, which is four-level paging.
+///
+/// `init` builds through [`OffsetPageTable`], which is a level-4 walk, so this
+/// is a property of the tree this module makes rather than of the machine —
+/// a `CR4.LA57` host still runs the kernel on four levels until the loader
+/// hands over five.
+const TOP: usize = 3;
 
 /// How far up an application processor's first instruction may live: a core
 /// coming out of reset starts at `vector << 12`, and the vector is one byte.
@@ -59,6 +72,9 @@ struct Space {
     devices: u64,
     /// The low frame reserved for starting the other cores, if there was one.
     trampoline: Option<u64>,
+    /// The root of each open tier-2 view, beside the kernel's own. Empty when
+    /// opened, and only ever holding what was granted into it.
+    views: [Option<PhysFrame<Size4KiB>>; VIEWS],
 }
 
 /// The frame an application processor's first instruction runs from.
@@ -180,7 +196,7 @@ pub fn free_frames() -> Option<FrameCursor> {
 pub fn claim_ram(map: &dyn MemoryMap, count: u64) -> Result<Span, PlatformError> {
     let state = active()?;
     let mut frames = BootFrameAllocator::resume(map, state.cursor);
-    let span = frames.run(count)?;
+    let span = frames.contiguous(count)?;
     state.cursor = frames.cursor();
     Ok(span)
 }
@@ -254,8 +270,16 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<u64, PlatformError> {
     unsafe { Cr3::write(root, Cr3Flags::empty()) };
     // SAFETY: same reasoning as `active`; this runs once on the boot CPU.
     unsafe {
-        *ACTIVE.0.get() =
-            Some(Space { root, offset, cursor, log, pool, devices: DEVICE_REGION, trampoline })
+        *ACTIVE.0.get() = Some(Space {
+            root,
+            offset,
+            cursor,
+            log,
+            pool,
+            devices: DEVICE_REGION,
+            trampoline,
+            views: [None; VIEWS],
+        })
     };
     Ok(APIC_WINDOW)
 }
@@ -452,6 +476,203 @@ fn map_4k(
     // while it changes, and every caller maps each virtual page exactly once.
     unsafe { space.map_to(page, frame, flags, frames) }.map_err(map_error)?.ignore();
     Ok(())
+}
+
+/// Opens an empty tier-2 view, tagged `asid`.
+///
+/// Empty is the whole point: the root is a zeroed frame, so nothing the kernel
+/// maps is reachable through it, and the only addresses that ever become
+/// reachable are the ones [`grant`] puts there.
+pub fn open_view(asid: Asid) -> Result<View, PlatformError> {
+    let state = active()?;
+    let index = state
+        .views
+        .iter()
+        .position(Option::is_none)
+        .ok_or(PlatformError::View(view::Error::Capacity))?;
+
+    let root = PoolFrames(&mut state.pool).allocate_frame().ok_or(out_of_frames())?;
+    // SAFETY: the frame came out of the pool `init` drained, so nothing else
+    // owns it, and `offset` direct-maps every frame of usable RAM.
+    unsafe { &mut *table_pointer(state.offset, root) }.zero();
+    state.views[index] = Some(root);
+    Ok(View::new(index as u16, asid))
+}
+
+/// Maps `extent` into `view` at the extent's own leaf size.
+///
+/// Nothing about the kernel's tables moves: the frames stay mapped where they
+/// already were, and the domain reaches them at the same global address the
+/// kernel calls them by. That is the whole trick of one address space — the
+/// grant is a page-table entry, not a copy and not a relocation.
+pub fn grant(view: View, extent: &Extent, span: Span, rights: Rights) -> Result<(), PlatformError> {
+    let granule = extent.class().granule();
+    let level = extent.class().level() as usize;
+    if span.bytes() < extent.bytes() || span.start() % granule != 0 || extent.start() % granule != 0
+    {
+        return Err(PlatformError::View(view::Error::Backing));
+    }
+
+    let state = active()?;
+    let root = root_of(state, view)?;
+    let flags = leaf_flags(rights, Cache::WriteBack);
+    let offset = state.offset;
+    let mut frames = PoolFrames(&mut state.pool);
+    for leaf in 0..extent.leaves() {
+        let stride = leaf * granule;
+        map_leaf(
+            offset,
+            root,
+            &mut frames,
+            extent.start() + stride,
+            span.start() + stride,
+            flags,
+            level,
+        )?;
+    }
+    Ok(())
+}
+
+/// Clears `extent` out of `view`, and says how many leaves went.
+///
+/// Only the leaves: the tables above them stay, because a table that held one
+/// leaf will hold the next, and freeing it would cost a second shootdown to
+/// make safe. Nothing here flushes, and nothing here touches the allocator —
+/// see [`molt_arch::view`] for why the caller owes both, in that order.
+pub fn revoke(view: View, extent: &Extent) -> Result<u64, PlatformError> {
+    let granule = extent.class().granule();
+    let level = extent.class().level() as usize;
+
+    let state = active()?;
+    let root = root_of(state, view)?;
+    for leaf in 0..extent.leaves() {
+        unmap_leaf(state.offset, root, extent.start() + leaf * granule, level)?;
+    }
+    Ok(extent.leaves())
+}
+
+/// What `view` translates `address` through, read back out of its own tables.
+pub fn resident(view: View, address: u64) -> Option<Leaf> {
+    let state = active().ok()?;
+    let root = root_of(state, view).ok()?;
+    ViewWalk { offset: state.offset, root }.leaf(address)
+}
+
+/// The root of a view this platform opened.
+fn root_of(state: &Space, view: View) -> Result<PhysFrame<Size4KiB>, PlatformError> {
+    state
+        .views
+        .get(view.index() as usize)
+        .copied()
+        .flatten()
+        .ok_or(PlatformError::View(view::Error::Unknown))
+}
+
+/// Which entry of the level-`level` table covers `address`.
+const fn table_index(address: u64, level: usize) -> usize {
+    ((address >> (12 + 9 * level)) & 0x1ff) as usize
+}
+
+/// Maps one leaf of `level` at `address`, building the tables above it.
+fn map_leaf(
+    offset: u64,
+    root: PhysFrame<Size4KiB>,
+    frames: &mut PoolFrames<'_>,
+    address: u64,
+    physical: u64,
+    flags: PageTableFlags,
+    level: usize,
+) -> Result<(), PlatformError> {
+    let mut frame = root;
+    for above in ((level + 1)..=TOP).rev() {
+        // SAFETY: `frame` holds a 512-entry table direct-mapped at `offset`,
+        // and the index is masked to nine bits.
+        let entry = &mut unsafe { &mut *table_pointer(offset, frame) }[table_index(address, above)];
+        if !entry.flags().contains(PageTableFlags::PRESENT) {
+            let next = frames.allocate_frame().ok_or(out_of_frames())?;
+            // SAFETY: a fresh pool frame, direct-mapped like every other.
+            unsafe { &mut *table_pointer(offset, next) }.zero();
+            entry.set_frame(next, PageTableFlags::PRESENT | PageTableFlags::WRITABLE);
+        } else if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            // A larger leaf already covers this address; splitting one is not
+            // something a grant is allowed to do behind the holder's back.
+            return Err(PlatformError::Mapping(MappingError::Backend));
+        }
+        frame = PhysFrame::containing_address(entry.addr());
+    }
+    let flags = match level {
+        0 => flags,
+        _ => flags | PageTableFlags::HUGE_PAGE,
+    };
+    // SAFETY: `frame` is the level-`level` table covering `address`.
+    let entry = &mut unsafe { &mut *table_pointer(offset, frame) }[table_index(address, level)];
+    entry.set_addr(PhysAddr::new(physical), flags);
+    Ok(())
+}
+
+/// Invalidates the leaf covering `address`, refusing anything but a leaf at
+/// `level`.
+///
+/// A larger leaf higher up covers the address too, and clearing it would revoke
+/// addresses nobody asked about; that is [`view::Error::Absent`] rather than a
+/// silent over-revoke, because the caller asked about a range it does not own
+/// alone.
+fn unmap_leaf(
+    offset: u64,
+    root: PhysFrame<Size4KiB>,
+    address: u64,
+    level: usize,
+) -> Result<(), PlatformError> {
+    let mut frame = root;
+    for above in ((level + 1)..=TOP).rev() {
+        // SAFETY: `frame` holds a 512-entry table direct-mapped at `offset`.
+        let entry = &unsafe { &*table_pointer(offset, frame) }[table_index(address, above)];
+        let flags = entry.flags();
+        if !flags.contains(PageTableFlags::PRESENT) || flags.contains(PageTableFlags::HUGE_PAGE) {
+            return Err(PlatformError::View(view::Error::Absent));
+        }
+        frame = PhysFrame::containing_address(entry.addr());
+    }
+    // SAFETY: `frame` is the level-`level` table covering `address`.
+    let entry = &mut unsafe { &mut *table_pointer(offset, frame) }[table_index(address, level)];
+    if !entry.flags().contains(PageTableFlags::PRESENT) {
+        return Err(PlatformError::View(view::Error::Absent));
+    }
+    entry.set_unused();
+    Ok(())
+}
+
+/// A walk of a view's tables, which hold granted RAM and nothing else.
+///
+/// [`MapperWalk`] answers for the kernel's own tables, which this cannot borrow
+/// for: a view root is not the live one, so there is no `OffsetPageTable` over
+/// it to translate through, only the frames themselves.
+struct ViewWalk {
+    offset: u64,
+    root: PhysFrame<Size4KiB>,
+}
+
+impl PageWalk for ViewWalk {
+    fn leaf(&self, address: u64) -> Option<Leaf> {
+        let mut frame = self.root;
+        let mut level = TOP;
+        loop {
+            // SAFETY: `frame` holds a 512-entry table direct-mapped at
+            // `self.offset`, and the index is masked to nine bits.
+            let entry =
+                &unsafe { &*table_pointer(self.offset, frame) }[table_index(address, level)];
+            let flags = entry.flags();
+            if !flags.contains(PageTableFlags::PRESENT) {
+                return None;
+            }
+            if level == 0 || flags.contains(PageTableFlags::HUGE_PAGE) {
+                let size = 1u64 << (12 + 9 * level);
+                return Some(Leaf::new(address & !(size - 1), size, protection(flags, size)));
+            }
+            frame = PhysFrame::containing_address(entry.addr());
+            level -= 1;
+        }
+    }
 }
 
 pub fn verify_owned_mapping(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {

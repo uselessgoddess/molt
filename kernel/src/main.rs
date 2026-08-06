@@ -8,12 +8,13 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use molt_arch::asid::{Asids, Flush};
-use molt_arch::memory::{Error, FrameTable, Inventory, Kind, Owner, Span};
+use molt_arch::memory::{Error, FrameTable, Inventory, Kind, Owner, Rights, Span};
 use molt_arch::refcount::{self, Leaves, Run};
 use molt_arch::shootdown::Shootdown;
 use molt_arch::va::{Class, Extent, Hole, Region, Space};
 use molt_arch::{
-    BootInfo, ExitStatus, FRAME_SIZE, Platform, SerialPort, SerialWriter, UsableRegions,
+    BootInfo, ExitStatus, FRAME_SIZE, Platform, PlatformError, SerialPort, SerialWriter,
+    UsableRegions, view,
 };
 use molt_core::capability::{CapabilityError, CapabilityTable, ReadWrite};
 use molt_core::cell::{Cell, CellId, Handler, RestartHooks, Supervisor};
@@ -90,6 +91,7 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     report!(platform, "MOLT_SMP_OK: cores={running} answered={answered}");
 
     verify_shootdown(platform, exec);
+    verify_domain(boot_info, platform, exec);
 
     run_timer_future(exec);
     report!(platform, "MOLT_TIMER_OK");
@@ -398,6 +400,129 @@ fn verify_shootdown<P: Platform>(platform: &mut P, exec: &Executor) {
         platform,
         "MOLT_SHOOTDOWN_OK: {} GiB at {start:#x} held over {cores} cores until epoch {} flushed",
         wanted >> 30,
+        retired.get(),
+    );
+}
+
+/// The class a grant is proven at.
+///
+/// Megabytes and not gigabytes because this extent is backed for real: the
+/// smoke gives QEMU two gigabytes, so there are no frames behind a gigabyte
+/// leaf, and granting addresses nothing backs would prove nothing about a
+/// grant.
+const GRANTED: Class = Class::Mega;
+
+/// Opens a second view, moves an extent into it, and takes it back.
+///
+/// This is tier 2 of `docs/address-space.md` doing the thing it exists for. The
+/// claim being demonstrated is not that a mapping can be made — the kernel's own
+/// tables show that at boot — but that a *second* view exists which does not
+/// contain the kernel, that an extent can enter it without a byte moving, and
+/// that it can be taken back out in the order a revoke has to go in.
+///
+/// The grant is real memory at a real address: frames claimed out of the same
+/// RAM the kernel maps, reached from the view at the same global address the
+/// kernel calls them by, which is the whole of what one address space buys.
+fn verify_domain<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P, exec: &Executor) {
+    let widths = platform.address_space().expect("the platform probed its own translation");
+    let grant = Asids::new(widths.asid()).assign();
+    let view = platform.open_view(grant.asid()).expect("a root for a second view");
+
+    // What a fresh view holds, which is nothing. Three addresses the kernel is
+    // demonstrably using right now — the code running this, the stack it runs
+    // on, and the heap it allocates from — and not one of them is reachable
+    // from the view that was just opened.
+    let here = verify_domain::<P> as *const () as u64;
+    let stack = (&raw const widths) as u64;
+    let heap = Box::into_raw(Box::new(0u64));
+    for (address, what) in
+        [(here, "kernel text"), (stack, "the kernel stack"), (heap as u64, "the kernel heap")]
+    {
+        assert!(platform.resident(view, address).is_none(), "a fresh view could reach {what}");
+    }
+    // SAFETY: the box was leaked one statement ago and nothing else holds it.
+    drop(unsafe { Box::from_raw(heap) });
+
+    report!(
+        platform,
+        "MOLT_DOMAIN_OK: view {} tagged {} in generation {}",
+        view.index(),
+        grant.asid().value(),
+        grant.asid().generation(),
+    );
+    report!(platform, "MOLT_DOMAIN_ABSENT_OK: kernel text, stack, and heap unreachable from it");
+
+    // The backing. Twice the leaf is claimed and the leaf is cut out of the
+    // aligned part of it, because a firmware map starts a usable region wherever
+    // it likes and a megabyte leaf has to begin on a megabyte.
+    let granule = GRANTED.granule();
+    let claimed =
+        platform.claim_ram(boot_info, 2 * granule / FRAME_SIZE).expect("RAM to back a grant");
+    let base =
+        molt_arch::align_up(claimed.start(), granule).expect("an aligned base below the end");
+    let span = Span::new(base, base + granule).expect("a leaf's worth of claimed frames");
+
+    let mut holes = [Hole::EMPTY; HOLES];
+    let mut space = Space::over(widths.address(), &mut holes).expect("a space wide enough to cut");
+    let extent = space.allocate(GRANTED, granule).expect("room in the megabyte arena");
+    let start = extent.start();
+
+    platform.grant(view, &extent, span, Rights::READ_WRITE).expect("a leaf the view lacked");
+    let leaf = platform.resident(view, start).expect("the granted address, in the view's tables");
+    assert_eq!(leaf.start(), start, "the grant landed somewhere else");
+    assert_eq!(leaf.size(), granule, "the grant was cut smaller than the extent asked for");
+    assert!(leaf.protection().is_write(), "a read-write grant arrived read-only");
+    assert!(!leaf.protection().is_execute(), "a data grant arrived executable");
+    assert!(platform.resident(view, extent.end() - 1).is_some(), "the grant stopped short");
+    assert!(platform.resident(view, extent.end()).is_none(), "the grant ran past its extent");
+    assert!(platform.resident(view, here).is_none(), "a grant of RAM brought the kernel along");
+
+    report!(
+        platform,
+        "MOLT_GRANT_OK: {} MiB at {start:#x} from frames at {base:#x}, in {} leaf",
+        extent.bytes() >> 20,
+        extent.leaves(),
+    );
+
+    // The revoke, in the order `molt_arch::view` spells out. Step one clears the
+    // leaves and nothing else: the addresses are still spoken for, because a
+    // core that walked them a moment ago may still hold the translation.
+    let cleared = platform.revoke(view, &extent).expect("leaves this view holds");
+    assert_eq!(cleared, extent.leaves(), "a revoke took a different number of leaves");
+    assert!(platform.resident(view, start).is_none(), "a revoked address still translated");
+    assert!(
+        matches!(platform.revoke(view, &extent), Err(PlatformError::View(view::Error::Absent))),
+        "a second revoke found something left to take"
+    );
+
+    space.release(extent).expect("an extent this space issued");
+    let epoch = space.sweep();
+    let mut shootdown = Shootdown::new();
+    let cores = shootdown.begin(epoch, smp::attending()).expect("a core to flush");
+    let held = space.allocate(GRANTED, granule).expect("room beside the quarantined range");
+    assert_ne!(held.start(), start, "a revoked range was handed out before the flush");
+    space.release(held).expect("an extent this space issued");
+
+    // Step two: every core drops what it cached, and says so itself.
+    let (flushed, asked) = smp::flush(exec);
+    assert_eq!(flushed.len() as u16, asked + 1, "a core took the flush and never answered");
+    let mut retirable = None;
+    for cpu in flushed {
+        assert!(retirable.is_none(), "the round closed with cores still owing a flush");
+        retirable = shootdown.acknowledge(cpu).expect("a core this round asked");
+    }
+    let retired = retirable.expect("the epoch every core has now flushed");
+
+    // Step three, and not one instruction sooner.
+    space.retire(retired);
+    let again = space.allocate(GRANTED, granule).expect("the flushed range, back in service");
+    assert_eq!(again.start(), start, "a flushed range did not come back");
+
+    report!(
+        platform,
+        "MOLT_REVOKE_OK: {cleared} leaf out of view {}, held over {cores} cores until epoch {} \
+         flushed",
+        view.index(),
         retired.get(),
     );
 }
