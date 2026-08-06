@@ -838,8 +838,13 @@ line editor away and needs a serial `read` before it is worth writing.
   extent record covering a run to stay resident while that run streams past —
   and it is a window, not a cache: it holds what one mount is doing now, and
   forgets it when the slot is worth more. A cache that outlives the operation is
-  the page cache below, which needs the writeback policy this stage does not
-  have.
+  the page cache below. That cache now exists —
+  [`molt_arch::cache`](../crates/molt-arch/src/cache.rs), which remembers which
+  window of which file is mapped at which address, so a second domain asking for
+  it is told the address the first was told and no bytes move — but it is read
+  only, and deliberately: a mapped window that a domain may write is a dirty page
+  the filesystem has to find, order, and flush, and that is the writeback policy
+  this stage still does not have.
 - **No scrub.** Mount verifies the complete metadata tree and payload-log
   structure; payload chunks are verified on first read or compaction. A
   background walk that proactively reports which object owns a damaged range

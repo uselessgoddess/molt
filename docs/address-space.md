@@ -237,6 +237,23 @@ code with `level == 2`: **a 1 TiB file is 1024 page-table entries and 1024 TLB
 entries, not 268 million of either.** For a workload that walks a large file,
 the difference is not the fault count, it is that the TLB stops missing.
 
+**The page cache is the mapping.** A read costs two copies on a system with more
+than one address space — once into the kernel's page cache, once out to wherever
+the caller asked, because the caller's address for those bytes is not the
+kernel's address for them. The second copy pays for the disagreement, not for the
+file. Molt has no disagreement to pay for: a window of a file is read into frames
+once, given an address out of the same allocator everything else uses, and that
+address is what the window is called in every view that holds it. Handing it to a
+second domain adds a leaf and moves no bytes, so `copy_from_user` has nothing to
+do — the buffer is already at the address both ends name it by.
+[`crates/molt-arch/src/cache.rs`](../crates/molt-arch/src/cache.rs) is the
+bookkeeping and nothing more: which windows are cached, at which addresses, over
+which frames, and how many views hold each. Reading the bytes in stays the
+filesystem's, mapping them stays `Platform::grant`, and counting the leaves a
+grant shares stays [`refcount`](../crates/molt-arch/src/refcount.rs). Eviction
+hands the extent back out rather than dropping it, because the caller still owes
+the unmap, the shootdown, and the retire, in that order.
+
 **Sharing is sharing a pointer.** Two domains granted the same extent see it at
 the same address, so a structure containing pointers can be handed over as-is.
 This is the porting requirement met at the mechanism level: code written against
@@ -412,11 +429,13 @@ exists, the table above is a plan; after it, it is a property.
 | a translation above 512 GiB, performed | `MOLT_MAPPING_OK` | shipped: probe at `1 << 54` |
 | global VA allocator with extents | `MOLT_VA_OK` | shipped: 100 GiB in 100 leaves, from a probed width |
 | the tag budget, read off the hardware | `MOLT_ASID_OK` | shipped: 65 535 domains on riscv64, 0 on x86_64 |
-| 1 GiB and 2 MiB leaves on demand | `MOLT_HUGE_MAP_OK` | one PTE per gibibyte, not 262,144 |
-| a file mapped as an extent, read at its address | `MOLT_FILE_MAP_OK` | the requirement, minimally |
-| a second view with its own ASID | `MOLT_DOMAIN_OK` | tier 2 exists |
-| a fault in a domain that stays there | `MOLT_DOMAIN_FAULT_OK` | the view is a boundary |
-| grant and revoke of an extent between domains | `MOLT_GRANT_OK` | sharing needs a right |
+| 1 GiB and 2 MiB leaves on demand | `MOLT_HUGE_MAP_OK` | shipped: one PTE per gibibyte, not 262,144 |
+| a freed range held until every core flushed | `MOLT_SHOOTDOWN_OK` | shipped: the order the rest of this table rests on |
+| refcounts on the mapped leaf, not the frame | `MOLT_REFCOUNT_OK` | shipped: 100 GiB in 100 records, not 26 million |
+| a file mapped as an extent, read at its address | `MOLT_FILE_MAP_OK` | shipped: one window, two domains, one device read, no copy |
+| a second view with its own ASID | `MOLT_DOMAIN_OK` | shipped: tier 2 exists, with no kernel leaf in it |
+| a fault in a domain that stays there | `MOLT_DOMAIN_FAULT_OK` | the view is a boundary — needs the switch Stage 5.1 brings |
+| grant and revoke of an extent between domains | `MOLT_GRANT_OK`, `MOLT_REVOKE_OK` | shipped: sharing needs a right, and taking it back needs an order |
 | an aperture inside a domain | `MOLT_SANDBOX_OK` | tier 1 nests in tier 2 |
 | the same cell built for all three tiers | `MOLT_TIER_PARITY_OK` | the claim, made testable |
 

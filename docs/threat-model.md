@@ -326,17 +326,28 @@ is a claim, and [`docs/testing.md`](testing.md) is why that is the standard.
 | --- | --- | --- |
 | `MOLT_ASID_OK` | the tag budget is what the hart implements, counted, not assumed | **shipped** |
 | `MOLT_VA_OK` | a freed address is not reissued before its epoch is retired | **shipped** |
-| `MOLT_DOMAIN_OK` | a second view exists with its own tag | planned |
-| `MOLT_DOMAIN_ABSENT_OK` | `Audit` walks a domain's live tree and finds no kernel leaf — including the physmap | planned |
+| `MOLT_SHOOTDOWN_OK` | a freed range is held until every attending core has acknowledged its own flush | **shipped** |
+| `MOLT_REFCOUNT_OK` | a shared leaf is counted per leaf, so no frame is reclaimed while a second view still names it | **shipped** |
+| `MOLT_DOMAIN_OK` | a second view exists with its own tag | **shipped** |
+| `MOLT_DOMAIN_ABSENT_OK` | `Audit` walks a domain's live tree and finds no kernel leaf — including the physmap | **shipped** |
 | `MOLT_DOMAIN_FAULT_OK` | a domain touching an absent address faults, and the fault stays in the domain | planned |
-| `MOLT_RING_FAULT_OK` | a published tail the producer never earned is a protocol fault, not an `assume_init_read` | planned |
-| `MOLT_GRANT_OK` | an extent becomes reachable in a second view only through a grant | planned |
-| `MOLT_REVOKE_OK` | after revoke, the second view faults — before the address is reissued to anyone | planned |
+| `MOLT_RING_FAULT_OK` | a published tail the producer never earned is a protocol fault, not an `assume_init_read` | **shipped** |
+| `MOLT_GRANT_OK` | an extent becomes reachable in a second view only through a grant | **shipped** |
+| `MOLT_REVOKE_OK` | after revoke, the second view faults — before the address is reissued to anyone | **shipped** |
+| `MOLT_FILE_MAP_OK` | two domains hold one cached window at one address, over the frames the filesystem read into | **shipped** |
 
-`MOLT_DOMAIN_ABSENT_OK` and `MOLT_RING_FAULT_OK` are new here; the rest already
-appear in [`docs/address-space.md`](address-space.md)'s staging table. Both are
-new because writing this document found the gaps they cover, which is the
-argument for having written it before the code rather than after.
+`MOLT_DOMAIN_ABSENT_OK` and `MOLT_RING_FAULT_OK` were new here; the rest
+already appeared in [`docs/address-space.md`](address-space.md)'s staging
+table. Both were new because writing this document found the gaps they cover,
+which is the argument for having written it before the code rather than after —
+and both now print out of a booted kernel, which is the part that makes the
+argument worth anything.
+
+`MOLT_DOMAIN_FAULT_OK` is the one left, and deliberately: it is the only claim
+here that cannot be checked from the kernel's side of the boundary, because it
+needs a switch into the domain and a trap taken inside it. Everything above it
+is checked by reading the domain's live tables, which is evidence about the
+tables. The fault is evidence about the hardware.
 
 ## The constraints this leaves on future code
 
@@ -358,8 +369,13 @@ questions for every commit in Stage 5.0 and after:
 
 ## What is not done yet
 
-- **None of it is code.** Domains do not exist; this is the model the code will
-  be reviewed against, and two of its markers are the review becoming testable.
+- **Nothing runs inside a domain yet.** The views exist, and grant, revoke,
+  shootdown, refcounts, the ring validator, and the mapped file are all checked
+  from a booted kernel — but every one of those checks is made from the outside,
+  by reading tables the kernel owns. No cell has been entered through a domain's
+  `satp`/`CR3`, so `MOLT_DOMAIN_FAULT_OK` stays open and the boundary is
+  evidenced structurally rather than by a trap. That switch is Stage 5.1's, with
+  the sandbox.
 - **No fuzzing of the ring validator.** The six rules deserve a host fuzzer over
   hostile index sequences before `MOLT_RING_FAULT_OK` means much; a single
   scripted attack proves the path, not the parser.

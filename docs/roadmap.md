@@ -498,12 +498,22 @@ came first anyway, because the executor could not be made faster without it.
       first (`MOLT_HUGE_MAP_OK`: a gigapage on riscv64, 2 MiB on x86_64), on a
       machine given enough memory for a gigapage to exist (`MOLT_RAM_OK`, which
       comes from the device tree rather than a constant)
-- [ ] refcounts keyed on the mapped leaf, not the frame
-- [ ] a file mapped as an extent and read at its address (`MOLT_FILE_MAP_OK`)
-- [ ] a second view with no kernel leaf in it, and a fault that stays inside
-      (`MOLT_DOMAIN_OK`, `MOLT_DOMAIN_ABSENT_OK`, `MOLT_DOMAIN_FAULT_OK`)
-- [ ] extent grant and revoke between domains (`MOLT_GRANT_OK`, `MOLT_REVOKE_OK`)
-- [ ] a cross-domain ring that survives a producer publishing a tail it never
+- [x] refcounts keyed on the mapped leaf, not the frame, counted inside a booted
+      kernel on a hundred gigabytes whose frames never get a record
+      (`MOLT_REFCOUNT_OK`)
+- [x] freed addresses held back until every core has acknowledged its own flush,
+      which is the ordering the rest of this list depends on
+      (`MOLT_SHOOTDOWN_OK`)
+- [x] a file mapped as an extent and read at its address, into two domains at
+      once, with the leaf's physical base read back out of both views to show
+      neither got a copy (`MOLT_FILE_MAP_OK`)
+- [x] a second view with no kernel leaf in it (`MOLT_DOMAIN_OK`,
+      `MOLT_DOMAIN_ABSENT_OK`)
+- [ ] a fault inside that view that stays inside it (`MOLT_DOMAIN_FAULT_OK`),
+      which needs the switch into the view that Stage 5.1 brings
+- [x] extent grant and revoke between domains, in the order a revoke has to go
+      in (`MOLT_GRANT_OK`, `MOLT_REVOKE_OK`)
+- [x] a cross-domain ring that survives a producer publishing a tail it never
       earned (`MOLT_RING_FAULT_OK`)
 
 First, and before the sandbox, which is the one ordering decision in this stage
