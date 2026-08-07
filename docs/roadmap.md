@@ -515,6 +515,10 @@ came first anyway, because the executor could not be made faster without it.
       in (`MOLT_GRANT_OK`, `MOLT_REVOKE_OK`)
 - [x] a cross-domain ring that survives a producer publishing a tail it never
       earned (`MOLT_RING_FAULT_OK`)
+- [x] every claim above put under seeded churn rather than chosen cases — the
+      allocator, the refcounts, a hostile ring producer, and the shootdown
+      protocol, each sweep named for what it must not find
+      ([`docs/testing.md`](testing.md#red-teaming-the-address-space))
 
 First, and before the sandbox, which is the one ordering decision in this stage
 that is not obvious. The reason is that 4 GiB is only a tier-1 property: the ABI
