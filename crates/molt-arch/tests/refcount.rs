@@ -189,6 +189,21 @@ fn a_hole_in_the_range_is_not_silently_skipped() -> Result<(), Error> {
 }
 
 #[test]
+fn a_refused_grant_spends_no_record() -> Result<(), Error> {
+    let mut runs = [Run::EMPTY; 8];
+    let mut leaves = Leaves::over(&mut runs);
+    leaves.map(BASE, Class::Giga, 2)?;
+
+    // The range starts inside what is counted and runs off the end of it, so
+    // the edge it asks for is one a refusal must not leave cut.
+    assert_eq!(leaves.share(region(BASE + GIGA, 2 * GIGA)), Err(Error::Untracked));
+
+    assert_eq!(leaves.runs(), 1, "the refusal kept the record it cut on the way in");
+    assert_eq!(leaves.count(BASE + GIGA), Some(1));
+    Ok(())
+}
+
+#[test]
 fn the_table_refuses_to_run_out_of_records_silently() -> Result<(), Error> {
     let mut runs = [Run::EMPTY; 2];
     let mut leaves = Leaves::over(&mut runs);

@@ -52,8 +52,6 @@ pub enum Error {
     Address,
     /// One more reference than a count can hold.
     Saturated,
-    /// The range is counted, but nobody claims to hold it.
-    Unreferenced,
 }
 
 /// A stretch of adjacent leaves of one class that share one count.
@@ -163,9 +161,18 @@ impl<'runs> Leaves<'runs> {
     /// [`split`](Self::split), because the page tables cannot hand out half a
     /// translation either.
     pub fn share(&mut self, region: Region) -> Result<(), Error> {
+        // Ask before counting: a grant that stopped at the record it could not
+        // count would hand out references the caller was told it did not get.
+        let saturated = self.runs[..self.len].iter().any(|run| {
+            run.count == u32::MAX && run.start < region.end() && run.end() > region.start()
+        });
+        if saturated {
+            return Err(Error::Saturated);
+        }
+
         let (first, last) = self.cover(region)?;
         for run in &mut self.runs[first..last] {
-            run.count = run.count.checked_add(1).ok_or(Error::Saturated)?;
+            run.count += 1;
         }
         self.coalesce();
         Ok(())
@@ -181,7 +188,9 @@ impl<'runs> Leaves<'runs> {
     pub fn release(&mut self, region: Region) -> Result<Reclaimed, Error> {
         let (first, last) = self.cover(region)?;
         for run in &mut self.runs[first..last] {
-            run.count = run.count.checked_sub(1).ok_or(Error::Unreferenced)?;
+            // A record exists because somebody holds it: `map` starts at one and
+            // the loop below drops what reaches zero.
+            run.count -= 1;
         }
 
         let mut reclaimed = Reclaimed::default();
@@ -213,11 +222,10 @@ impl<'runs> Leaves<'runs> {
         let index = self.find(address).ok_or(Error::Untracked)?;
         let run = self.runs[index];
         let child = run.class.smaller().ok_or(Error::Granule)?;
-        let leaf = address - (address - run.start) % run.class.granule();
+        let leaf = address - address % run.class.granule();
+        let region = Region::new(leaf, leaf + run.class.granule()).map_err(|_| Error::Address)?;
 
-        self.cut(leaf)?;
-        self.cut(leaf + run.class.granule())?;
-        let index = self.find(leaf).ok_or(Error::Untracked)?;
+        let (index, _) = self.cover(region)?;
         self.runs[index] = Self::run(leaf, child, Class::FANOUT, run.count)?;
         self.coalesce();
         Ok(child)
@@ -235,11 +243,13 @@ impl<'runs> Leaves<'runs> {
         let parent = run.class.larger().ok_or(Error::Granule)?;
         let group = address - address % parent.granule();
         let region = Region::new(group, group + parent.granule()).map_err(|_| Error::Address)?;
-
-        let (first, last) = self.cover(region)?;
-        if last != first + 1 || self.runs[first].class.larger() != Some(parent) {
+        // One record over the whole group is the group agreeing: same class,
+        // same count, nothing in it a parent leaf could not say.
+        if run.start > group || run.end() < region.end() {
             return Err(Error::Uneven);
         }
+
+        let (first, _) = self.cover(region)?;
         let count = self.runs[first].count;
         self.runs[first] = Self::run(group, parent, 1, count)?;
         self.coalesce();
@@ -311,46 +321,52 @@ impl<'runs> Leaves<'runs> {
 
     /// The half-open range of records that covers `region` exactly, after
     /// cutting records at both of its edges.
+    ///
+    /// Every reason to refuse is found before the first cut is made. A request
+    /// that stopped halfway would leave records split around something that
+    /// never happened: same counts, more slots, and the slots are what the next
+    /// request needs.
     fn cover(&mut self, region: Region) -> Result<(usize, usize), Error> {
-        self.cut(region.start())?;
-        self.cut(region.end())?;
+        let mut reached = self.runs[self.find(region.start()).ok_or(Error::Untracked)?].end();
+        while reached < region.end() {
+            let next = self.find(reached).ok_or(Error::Untracked)?;
+            reached = self.runs[next].end();
+        }
+        let cuts =
+            usize::from(self.splits(region.start())?) + usize::from(self.splits(region.end())?);
+        if self.len + cuts > self.runs.len() {
+            return Err(Error::Storage);
+        }
+
+        for address in [region.start(), region.end()] {
+            let Some(index) = self.find(address) else { continue };
+            let run = self.runs[index];
+            if run.start == address {
+                continue;
+            }
+            let before = (address - run.start) / run.class.granule();
+            self.runs[index].leaves = before;
+            self.insert(index + 1, Run { start: address, leaves: run.leaves - before, ..run })?;
+        }
 
         let first = self.find(region.start()).ok_or(Error::Untracked)?;
         let mut last = first;
-        let mut reached = self.runs[first].start;
-        while last < self.len && self.runs[last].start == reached {
-            reached = self.runs[last].end();
+        while self.runs[last].end() < region.end() {
             last += 1;
-            if reached >= region.end() {
-                break;
-            }
         }
-        if reached < region.end() {
-            return Err(Error::Untracked);
-        }
-        Ok((first, last))
+        Ok((first, last + 1))
     }
 
-    /// Makes `address` a record boundary, so a request can stop there.
-    fn cut(&mut self, address: u64) -> Result<(), Error> {
+    /// Whether a record has to be cut for a request to stop at `address`.
+    fn splits(&self, address: u64) -> Result<bool, Error> {
         let Some(index) = self.find(address) else {
-            return Ok(());
+            return Ok(false);
         };
         let run = self.runs[index];
-        if run.start == address {
-            return Ok(());
-        }
         if address % run.class.granule() != 0 {
             return Err(Error::Straddle);
         }
-        // Refuse before touching anything: a record shortened without its other
-        // half being stored is leaves nobody counts any more.
-        if self.len == self.runs.len() {
-            return Err(Error::Storage);
-        }
-        let before = (address - run.start) / run.class.granule();
-        self.runs[index].leaves = before;
-        self.insert(index + 1, Run { start: address, leaves: run.leaves - before, ..run })
+        Ok(run.start != address)
     }
 
     fn find(&self, address: u64) -> Option<usize> {
