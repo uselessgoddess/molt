@@ -343,9 +343,9 @@ earlier `bounds` that put the Sv39 range on top of `paging::DEVICE_REGION`.
 
 ## Concurrency
 
-The `Space` is `&mut`-driven and holds no interior mutability, so the kernel
-wraps exactly one behind exactly one lock. That is defensible only because of
-the churn argument: allocation happens at mapping creation, not per message, per
+A `Space` is `&mut`-driven and holds no interior mutability, so a kernel that
+shares one wraps it in exactly one lock. That is defensible only because of the
+churn argument: allocation happens at mapping creation, not per message, per
 page, or per grant, so the lock is not on any hot path. `Extent` is non-`Copy`
 and `#[must_use]` for the same reason `Frames` is — a dropped extent is address
 space nobody will ever hand out again, and the type system is the cheapest place
@@ -358,8 +358,11 @@ flushed through, which is the same shape as the shootdown protocol in
 
 ## What is not done yet
 
-- **No consumer.** Nothing maps through it yet; `map_range` still takes
-  addresses from its caller. Wiring it is Stage 5.0.
+- **No single one of it.** Stage 5.0 wired the consumers — the addresses in
+  `MOLT_GRANT_OK` and `MOLT_FILE_MAP_OK` are cut here and mapped by
+  [`grant`](../crates/molt-arch/src/lib.rs) — but each does it over a `Space` of
+  its own. One machine-wide instance is what the uniqueness claim actually
+  needs, and it arrives with the thing that would share it.
 - **`O(holes)` search.** Fine at 64 slots, wrong at 64 000. If a real workload
   ever needs the latter, the fix is a size-indexed structure *inside* an arena;
   the `Space` interface does not change.
