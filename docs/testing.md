@@ -363,6 +363,13 @@ the only honest way — from every state the churn reaches, drive the protocol
 forward and see that it goes. `Shootdown` is `Copy`, so the escape runs on a
 copy and the churn carries on from where it was.
 
+Two of the four found bugs, which is their own evidence. The other two found
+nothing, and that reads the same as a sweep generating nothing — so
+[`experiments/sweep-mutations`](../experiments/sweep-mutations) puts a bug back
+into each and expects the sweep to fail. It is the rule the whole section rests
+on: a passing sweep is a claim about the sweep, not about the code, until
+something has been seen to fail it.
+
 ## Conventions
 
 Test naming and shape are in [the style guide](style.md). Two rules matter more
