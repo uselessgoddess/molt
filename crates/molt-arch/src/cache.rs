@@ -1,41 +1,31 @@
 //! Files, cached where they are already addressable.
 //!
 //! Reading a file costs two copies on a system with more than one address
-//! space: the bytes land in the kernel's page cache, and then they land again
-//! wherever the caller asked for them, because the caller's address for those
-//! bytes is not the kernel's address for them. The second copy pays for the
-//! disagreement, not for the file.
+//! space: the bytes land in the kernel's page cache, then again wherever the
+//! caller asked for them, because the caller's address for those bytes is not
+//! the kernel's. The second copy pays for the disagreement, not for the file.
 //!
 //! Molt has one address space, so there is no disagreement to pay for. A window
-//! of a file is read into frames once and given *an* address, and that address
-//! is what the window is called everywhere — handing it to a domain adds a leaf
-//! to that domain's view and moves no bytes. `copy_from_user` has nothing to do,
-//! because the buffer is already at the address both ends name it by.
-//!
-//! What that buys shows up at size. A gigabyte-class window is one page-table
-//! entry per gigabyte in every view that holds it, so a domain mapping a hundred
-//! gigabytes of logs costs a hundred entries and one flush, rather than 26
-//! million page-cache lookups and a copy per page.
+//! is read into frames once and given *an* address, and that address is what it
+//! is called everywhere — handing it to a domain adds a leaf and moves no
+//! bytes. So a domain mapping a hundred gigabytes of logs costs a hundred
+//! gigabyte-class entries and one flush, rather than 26 million page-cache
+//! lookups and a copy per page.
 //!
 //! # What this module is and is not
 //!
 //! It is the bookkeeping: which windows are cached, at which addresses, over
 //! which frames, and how many views hold each. Reading the bytes in is the
 //! filesystem's, mapping them is [`Platform::grant`], and counting the leaves a
-//! grant shares is [`refcount`] — this says only where a window is, so that the
-//! second domain to ask for it is told the same address as the first.
+//! grant shares is [`refcount`]. Nothing here allocates: a caller supplies the
+//! slice the windows live in, the way [`Space`](crate::va::Space) is handed its
+//! holes.
 //!
-//! Nothing here allocates: a caller supplies the slice the windows live in, the
-//! way [`Space`](crate::va::Space) is handed its holes.
-//!
-//! # Order
-//!
-//! A window's addresses are the allocator's and go back the way any other
-//! extent does. [`evict`](Windows::evict) hands the [`Extent`] out rather than
-//! dropping it, because the caller still owes the unmap, the shootdown, and the
-//! retire, in that order — see [`view`](crate::view) for why the order is not
-//! negotiable. It refuses while anybody still has the window mapped, which is
-//! the one thing this module can enforce on its own.
+//! [`evict`](Windows::evict) hands the [`Extent`] out rather than dropping it,
+//! because the caller still owes the unmap, the shootdown and the retire, in
+//! that order — see [`view`](crate::view) for why the order is not negotiable.
+//! It refuses while anybody still has the window mapped, which is the one thing
+//! this module can enforce on its own.
 //!
 //! [`Platform::grant`]: crate::Platform::grant
 //! [`refcount`]: crate::refcount
@@ -68,9 +58,8 @@ pub enum Error {
 /// Whose bytes a window holds.
 ///
 /// A number and nothing else: which files exist is the filesystem's business,
-/// and a page cache that knew would be a page cache with a filesystem inside
-/// it. What this module needs is only that two requests for the same file agree
-/// on the number.
+/// and a page cache that knew would be a page cache with a filesystem in it.
+/// All this module needs is that two requests for one file agree on the number.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct File(u64);
 

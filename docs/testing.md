@@ -339,6 +339,30 @@ running costs. They earn those costs against a parser that takes input from
 somewhere less bounded than a 1514-byte frame, which is Stage 4's NVMe and real
 NIC work at the earliest. The cheap half runs on every push today.
 
+## Red teaming the address space
+
+Stage 5 pointed the same shape at what a hostile domain can reach. Each sweep is
+an ordinary `#[test]` over a seeded xorshift, each asserts a floor on what it
+covered, and each is named for the thing it is trying to break:
+
+| Sweep | What it must not find |
+| --- | --- |
+| `molt-arch/tests/va_noise.rs` | an address handed out twice, or an arena that does not come back whole |
+| `molt-arch/tests/refcount_noise.rs` | a count the model disagrees with, after any order of grant, revoke, split and merge |
+| `molt-abi/tests/noise.rs` | a lying producer read past its fault, or a corrupt head starving the kernel end |
+| `molt-arch/tests/shootdown_noise.rs` | a round nobody can close, or an address stuck in quarantine |
+
+The refcount sweep carries a model that knows only which bytes are held how many
+times — no classes, no records — so anything the table does with either, a split
+that loses a count or a refusal that spends a slot, shows up as the two
+disagreeing.
+
+The last two are liveness claims, and a tracker that wedges does not crash: it
+stops, and the addresses it holds are never handed out again. So they are made
+the only honest way — from every state the churn reaches, drive the protocol
+forward and see that it goes. `Shootdown` is `Copy`, so the escape runs on a
+copy and the churn carries on from where it was.
+
 ## Conventions
 
 Test naming and shape are in [the style guide](style.md). Two rules matter more
