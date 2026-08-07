@@ -1,4 +1,4 @@
-use molt_arch::va::{Class, Error, Hole, Space};
+use molt_arch::va::{Class, Error, Extent, Hole, Space};
 
 /// The width QEMU's `virt` hart reports, and the one the smoke runs at.
 const SV57: u32 = 57;
@@ -160,22 +160,28 @@ fn a_full_free_list_refuses_rather_than_loses_the_range() -> Result<(), Error> {
     // Three slots per class: the range above what is taken, and two islands.
     let mut holes = [Hole::EMPTY; 9];
     let mut space = space(&mut holes);
-    let mut taken: [_; 6] = core::array::from_fn(|_| {
+    let mut taken = [(); 6].map(|()| {
         Some(space.allocate(Class::Page, Class::Page.granule()).expect("a free page extent"))
     });
-    let mut give = |space: &mut Space<'_>, index: usize| {
-        space.release(taken[index].take().expect("an extent this test took"))
+    let give = |space: &mut Space<'_>, extent: Option<Extent>| {
+        space.release(extent.expect("an extent this test took"))
     };
     // Freeing every other extent makes each freed range an island of its own.
-    give(&mut space, 0)?;
-    give(&mut space, 2)?;
+    give(&mut space, taken[0].take())?;
+    give(&mut space, taken[2].take())?;
     let free = space.free(Class::Page);
 
-    let refused = space.release(taken[4].take().expect("the fifth extent"));
+    let refused = give(&mut space, taken[4].take());
 
-    assert_eq!(refused, Err(Error::Full), "an island went in with no slot to record it");
+    let Err((error, extent)) = refused else { panic!("an island went in with no slot for it") };
+    assert_eq!(error, Error::Full);
     assert_eq!(space.free(Class::Page), free, "the refused release changed the free list");
     assert_eq!(space.holes(Class::Page), 3);
+    // The extent came back, so the addresses are still nameable: the range
+    // between the islands joins them into one hole, and the slot that frees is
+    // the one this extent goes in.
+    give(&mut space, taken[1].take())?;
+    give(&mut space, Some(extent))?;
     Ok(())
 }
 
@@ -191,7 +197,11 @@ fn a_range_that_is_already_free_is_refused() -> Result<(), Error> {
     // released extent can name such a range, which is why the check is here.
     let extent = mine.allocate(Class::Page, 2 * Class::Page.granule())?;
 
-    assert_eq!(theirs.release(extent), Err(Error::Overlap), "a live range was marked free");
+    let refused = theirs.release(extent);
+
+    let Err((error, extent)) = refused else { panic!("a live range was marked free") };
+    assert_eq!(error, Error::Overlap);
+    mine.release(extent)?;
     Ok(())
 }
 

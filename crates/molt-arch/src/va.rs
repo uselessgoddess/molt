@@ -39,6 +39,14 @@ pub enum Error {
     Overlap,
 }
 
+impl From<(Error, Extent)> for Error {
+    /// Drops the extent a refused [`release`](Space::release) handed back, so a
+    /// caller that has nothing better to do with it can write `?`.
+    fn from((error, _): (Error, Extent)) -> Self {
+        error
+    }
+}
+
 /// The leaf size an extent will be mapped with, and so the alignment it needs.
 ///
 /// One class per page-table level: a mapping that wants gigabyte leaves has to
@@ -315,13 +323,18 @@ impl<'holes> Arena<'holes> {
     /// Only neighbours waiting on the same epoch are coalesced. Merging a
     /// quarantined range into a free one would have to take the later epoch of
     /// the two, and one freed gigabyte would put the whole rest of the arena
-    /// behind the next flush; merging the other way would hand out addresses a
-    /// hart may still have cached. Ranges freed in one batch do join each
-    /// other, and [`settle`](Self::settle) merges the batch into its
-    /// neighbours once the flush retires.
-    fn release(&mut self, extent: Extent, ready: Epoch) -> Result<(), Error> {
+    /// behind the next flush. Ranges freed in one batch do join each other, and
+    /// [`settle`](Self::settle) merges the batch into its neighbours once the
+    /// flush retires.
+    ///
+    /// A free list with no slot left is the exception: there the choice is
+    /// between merging across epochs and having nowhere to put the range at
+    /// all, and a neighbour held back one flush longer than it had to be is
+    /// cheaper than a range nobody can name again. A refusal hands the extent
+    /// back for the same reason.
+    fn release(&mut self, extent: Extent, ready: Epoch) -> Result<(), (Error, Extent)> {
         if extent.class != self.class || !self.bounds.covers(extent.region) {
-            return Err(Error::Foreign);
+            return Err((Error::Foreign, extent));
         }
         let (start, end) = (extent.region.start, extent.region.end);
 
@@ -329,23 +342,25 @@ impl<'holes> Arena<'holes> {
         // Everything below `at` ends at or before `end`; only the range just
         // below it can still reach into what is being freed.
         if at > 0 && self.holes[at - 1].end > start {
-            return Err(Error::Overlap);
+            return Err((Error::Overlap, extent));
         }
 
-        let joins_below =
-            at > 0 && self.holes[at - 1].end == start && self.holes[at - 1].ready == ready;
-        let joins_above =
-            at < self.len && self.holes[at].start == end && self.holes[at].ready == ready;
-        match (joins_below, joins_above) {
+        let full = self.len == self.holes.len();
+        let joins = |hole: Hole| full || hole.ready == ready;
+        let below = at > 0 && self.holes[at - 1].end == start && joins(self.holes[at - 1]);
+        let above = at < self.len && self.holes[at].start == end && joins(self.holes[at]);
+
+        // `ready` is the open epoch, so it is the latest of whatever merges.
+        match (below, above) {
             (true, true) => {
-                self.holes[at - 1].end = self.holes[at].end;
+                self.holes[at - 1] = Hole { end: self.holes[at].end, ready, ..self.holes[at - 1] };
                 self.remove(at);
             }
-            (true, false) => self.holes[at - 1].end = end,
-            (false, true) => self.holes[at].start = start,
+            (true, false) => self.holes[at - 1] = Hole { end, ready, ..self.holes[at - 1] },
+            (false, true) => self.holes[at] = Hole { start, ready, ..self.holes[at] },
             (false, false) => {
-                if self.len == self.holes.len() {
-                    return Err(Error::Full);
+                if full {
+                    return Err((Error::Full, extent));
                 }
                 self.holes.copy_within(at..self.len, at + 1);
                 self.holes[at] = Hole { start, end, ready };
@@ -485,7 +500,12 @@ impl<'holes> Space<'holes> {
     /// [`sweep`](Self::sweep)ed and the flush it names is
     /// [`retire`](Self::retire)d, because until then a hart may still hold a
     /// translation for them.
-    pub fn release(&mut self, extent: Extent) -> Result<(), Error> {
+    ///
+    /// A refusal hands the extent back, because nothing else can name that
+    /// range: dropping it there would leak the addresses for the life of the
+    /// machine. [`Error::Full`] is the recoverable one — the next release that
+    /// joins two free ranges leaves a slot to record this one in.
+    pub fn release(&mut self, extent: Extent) -> Result<(), (Error, Extent)> {
         let open = self.open;
         self.arenas[extent.class.index()].release(extent, open)
     }
