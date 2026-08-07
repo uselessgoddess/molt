@@ -94,15 +94,16 @@ impl File {
 pub struct Window {
     file: File,
     offset: u64,
-    extent: Option<Extent>,
-    frames: Option<Span>,
+    /// The addresses and the frames under them, together because a window has
+    /// both or is an unused slot. Apart, a slot could hold one without the
+    /// other, and every reader would owe that state an answer.
+    backing: Option<(Extent, Span)>,
     holders: u32,
 }
 
 impl Window {
     /// An unused slot, so a caller can write `[const { Window::EMPTY }; 16]`.
-    pub const EMPTY: Self =
-        Self { file: File::new(0), offset: 0, extent: None, frames: None, holders: 0 };
+    pub const EMPTY: Self = Self { file: File::new(0), offset: 0, backing: None, holders: 0 };
 
     /// Which file the bytes came from.
     pub const fn file(&self) -> File {
@@ -120,27 +121,33 @@ impl Window {
     /// every time: a second domain asking for this window of this file is told
     /// this range, which is why the grant it gets copies nothing.
     pub const fn region(&self) -> Option<Region> {
-        match self.extent {
-            Some(ref extent) => Some(extent.region()),
+        match self.extent() {
+            Some(extent) => Some(extent.region()),
             None => None,
         }
     }
 
     /// The extent itself, for the [`grant`](crate::Platform::grant) that maps it.
     pub const fn extent(&self) -> Option<&Extent> {
-        self.extent.as_ref()
+        match self.backing {
+            Some((ref extent, _)) => Some(extent),
+            None => None,
+        }
     }
 
     /// The frames the bytes were read into.
     pub const fn frames(&self) -> Option<Span> {
-        self.frames
+        match self.backing {
+            Some((_, frames)) => Some(frames),
+            None => None,
+        }
     }
 
     /// The leaf size the window is mapped with, which is also what its offset
     /// has to be a multiple of.
     pub const fn class(&self) -> Option<Class> {
-        match self.extent {
-            Some(ref extent) => Some(extent.class()),
+        match self.extent() {
+            Some(extent) => Some(extent.class()),
             None => None,
         }
     }
@@ -152,14 +159,14 @@ impl Window {
 
     /// How much of the address space the window covers.
     pub const fn bytes(&self) -> u64 {
-        match self.extent {
-            Some(ref extent) => extent.bytes(),
+        match self.extent() {
+            Some(extent) => extent.bytes(),
             None => 0,
         }
     }
 
     const fn is(&self, file: File, offset: u64) -> bool {
-        self.extent.is_some() && self.file.0 == file.0 && self.offset == offset
+        self.backing.is_some() && self.file.0 == file.0 && self.offset == offset
     }
 }
 
@@ -212,8 +219,7 @@ impl<'windows> Windows<'windows> {
         }
 
         let at = self.len;
-        self.windows[at] =
-            Window { file, offset, extent: Some(extent), frames: Some(frames), holders: 1 };
+        self.windows[at] = Window { file, offset, backing: Some((extent, frames)), holders: 1 };
         self.len += 1;
         Ok(&self.windows[at])
     }
@@ -271,12 +277,8 @@ impl<'windows> Windows<'windows> {
         let evicted = core::mem::replace(&mut self.windows[at], Window::EMPTY);
         self.len -= 1;
         self.windows.swap(at, self.len);
-        match (evicted.extent, evicted.frames) {
-            (Some(extent), Some(frames)) => Ok((extent, frames)),
-            // Unreachable while every cached slot is filled by `insert`, which
-            // writes both or neither.
-            _ => Err(Error::Unknown),
-        }
+        // `find` matches filled slots only, so this is the window it named.
+        evicted.backing.ok_or(Error::Unknown)
     }
 
     /// How many holds found a window already cached.
