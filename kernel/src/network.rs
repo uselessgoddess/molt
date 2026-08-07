@@ -8,18 +8,17 @@ use molt_core::buffer::{BufferOperation, BufferRegistry};
 use molt_core::ring::{IoRing, RequestId, Submission};
 use molt_kernel::report;
 use molt_net::{Config, Ip, IpAddr, IpDone, IpError, IpOp, Ipv4Addr, Ipv6Addr, Link};
-use molt_pci::{Bus, Command, bus_span};
+use molt_pci::{Command, bus_span};
 use molt_tcp::{SocketStorage, Tcp, TcpDone, TcpError, TcpOp};
 use molt_udp::{Endpoint, Scratch, Udp, UdpDone, UdpError, UdpOp};
-use molt_virtio::{Arrivals, Iommu, Net, NetConfig, Transport};
+use molt_virtio::{Net, NetConfig, Transport};
 
 use crate::device::{self, Line};
+use crate::isolation;
 
 const VIRTIO_VENDOR: u16 = 0x1af4;
 const VIRTIO_NET: u16 = 0x1041;
-const VIRTIO_IOMMU: u16 = 0x1057;
 const DMA_FRAMES: usize = 12;
-const IOMMU_FRAMES: usize = 8;
 const NET_TAG: u32 = 0x6e65_7400;
 const IOMMU_TAG: u32 = 0x10ab;
 const OWNER: CellId = CellId::new(3);
@@ -55,15 +54,6 @@ const DNS_QUERY: [u8; 29] = [
     0x00, 0x01, // IN
 ];
 
-struct Poll;
-
-impl Arrivals for Poll {
-    fn wait(&mut self) -> u64 {
-        core::hint::spin_loop();
-        0
-    }
-}
-
 pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let Ok(space) = platform.config_space(boot_info) else {
         return;
@@ -76,46 +66,14 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let bus_zero = bus_span(space, space.first_bus()).expect("bus zero inside the ECAM window");
     let ecam = inventory.device(bus_zero).expect("the ECAM window is not kernel RAM");
     let window = platform.map_device(ecam, Rights::READ_WRITE).expect("a mappable ECAM window");
-    let mut bus = Bus::new(&window, space.first_bus());
-    let mut target = None;
-    let mut controller = None;
-    while let Some(function) = bus.function() {
-        if function.vendor() == VIRTIO_VENDOR {
-            match function.device() {
-                VIRTIO_NET => target = Some(function),
-                VIRTIO_IOMMU => controller = Some(function),
-                _ => {}
-            }
-        }
-    }
-    let (Some(mut function), Some(mut iommu_function)) = (target, controller) else {
+    let found = isolation::pair(&window, space.first_bus(), |function| {
+        function.vendor() == VIRTIO_VENDOR && function.device() == VIRTIO_NET
+    });
+    let Some((mut function, controller)) = found else {
         report!(platform, "MOLT_NET_SKIPPED: no virtio-net/IOMMU pair on bus zero");
         return;
     };
-
-    let iommu_transport =
-        Transport::probe(&iommu_function).expect("the network IOMMU describes its structures");
-    let iommu_bar_index = iommu_transport.common().bar();
-    assert!(
-        iommu_transport.notify().bar() == iommu_bar_index
-            && iommu_transport.device().bar() == iommu_bar_index,
-        "IOMMU structures split across BARs",
-    );
-    let (iommu_bar, iommu_registers) =
-        device::map_bar(platform, &inventory, &mut iommu_function, iommu_bar_index);
-    let iommu_command = iommu_function.command().expect("the network IOMMU command register");
-    iommu_function
-        .set_command(
-            iommu_command
-                .with(Command::MEMORY)
-                .with(Command::BUS_MASTER)
-                .with(Command::INTX_DISABLE),
-        )
-        .expect("network IOMMU decode and DMA authority");
-    let iommu_delta = device::delta(iommu_bar);
-    let iommu_common = device::subwindow(&iommu_registers, iommu_delta, iommu_transport.common());
-    let iommu_notify = device::subwindow(&iommu_registers, iommu_delta, iommu_transport.notify());
-    let iommu_config = device::subwindow(&iommu_registers, iommu_delta, iommu_transport.device());
+    let control = isolation::Control::open(platform, &inventory, controller);
 
     let transport = Transport::probe(&function).expect("a modern network transport");
     let transport_bar = transport.common().bar();
@@ -145,25 +103,13 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let notify = device::subwindow(&registers, delta, transport.notify());
     let config = device::subwindow(&registers, delta, transport.device());
     let mut allocator = FrameAllocator::resume(boot_info.memory_map(), cursor);
-    let mut iommu_slots: [Option<Owner>; IOMMU_FRAMES] = [None; IOMMU_FRAMES];
-    let iommu_arena = Arena::claim(&mut allocator, offset, IOMMU_TAG, &mut iommu_slots)
-        .expect("contiguous frames for network IOMMU queues");
+    let mut iommu_slots = isolation::SLOTS;
+    let iommu_arena = isolation::arena(&mut allocator, offset, IOMMU_TAG, &mut iommu_slots);
     let mut slots: [Option<Owner>; DMA_FRAMES] = [None; DMA_FRAMES];
     let arena = Arena::claim(&mut allocator, offset, NET_TAG, &mut slots)
         .expect("a contiguous network DMA span");
     let endpoint = device::requester(function.address());
-    let mut iommu = Iommu::start(
-        iommu_common,
-        iommu_notify,
-        iommu_config,
-        iommu_transport.notify_multiplier(),
-        u16::MAX,
-        Poll,
-        device::requester(iommu_function.address()),
-        iommu_arena,
-    )
-    .expect("the network IOMMU completes its handshake");
-    iommu.attach(endpoint).expect("network endpoint attaches while quiesced");
+    let iommu = control.start(iommu_arena, endpoint);
     let net = Net::start(
         NetConfig::new(
             common,
@@ -200,19 +146,9 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let (net, echoed) = tcp_echo(&vectored.line(), ip.into_link(), config);
     report!(platform, "MOLT_TCP_OK: {ECHO} echoed {echoed} bytes");
 
-    let mut iommu = net.reset().expect("the network device stops before DMA frames return");
+    let iommu = net.reset().expect("the network device stops before DMA frames return");
     function.set_command(quiesced).expect("network bus mastering stays off after reset");
-    assert!(iommu.poll_faults().expect("the network fault queue remains valid").is_none());
-    iommu.detach(endpoint).expect("the empty network domain detaches");
-    iommu.reset().expect("the network IOMMU stops after its endpoint");
-    iommu_function
-        .set_command(
-            iommu_command
-                .with(Command::MEMORY)
-                .with(Command::INTX_DISABLE)
-                .without(Command::BUS_MASTER),
-        )
-        .expect("network IOMMU bus mastering stays off after reset");
+    control.stop(iommu, endpoint);
     vectored.stop(platform);
 }
 

@@ -121,6 +121,10 @@ that cannot tell "the board did not come up" from "the code is wrong" trains
 everyone to ignore it. Molt has no boards and no serial capture equipment yet.
 Until it does, QEMU is the honest limit, and the roadmap records the hardware
 result as pending rather than claiming it.
+[`docs/hardware.md`](hardware.md) prices the boards, designs the rig that would
+capture their serial output with the markers this suite already defines, and
+argues that the first such run should be a `just board` a person invokes — never
+a merge gate — because a lab of one board has no queue to retry into.
 
 ## Boot tests
 
@@ -169,6 +173,48 @@ the RISC-V-only `MOLT_SBI_CONSOLE:`. The rule this follows is the same one the
 hardware-boot item follows: a marker asserts a property the machine actually
 has, and a machine that lacks it says so on the serial line rather than being
 excused quietly.
+
+**`MOLT_SATP_MODE: sv57` is an assertion about a value, not about a line.** The
+riscv64 boot prints whichever paging mode the hart accepted, and the marker list
+demands the widest one, so a probe that stopped early fails the smoke rather than
+reporting a narrower address space in passing. It has a partner that is harder to
+fake: `verify_owned_mapping` writes and reads its probe value at `1 << 54`, which
+is 16 PiB and untranslatable under Sv39, so `MOLT_MAPPING_OK` on riscv64 is a
+translation the hardware performed at an address only the wide mode reaches. See
+[`address-space.md`](address-space.md).
+
+**`MOLT_VA_OK` and `MOLT_ASID_OK` print numbers the hardware supplied.** Neither
+is a fixed string: the first cuts the global VA allocator from the address width
+the platform probed and carves the 100 GiB of
+[`va-allocator.md`](va-allocator.md)'s worked example out of it, and the second
+reports how many domain tags the hart actually implements. Both markers appear
+on both platforms with different numbers — 57 bits and 65 535 tags on riscv64,
+48 bits and none at all on x86_64's default model — which is the point: the
+tagless path is not skipped, it is exercised, and the kernel that flushes on
+every switch is proven to still work rather than assumed to.
+
+**`MOLT_RAM_OK` catches a constant pretending to be a measurement.** The riscv64
+kernel used to carry the QEMU `virt` default — RAM ends at `0x8800_0000` — which
+boots identically on that one machine and is wrong on every other, in both
+directions: more memory goes unused, less has the frame allocator hand out
+addresses that decode to nothing. The smoke now starts QEMU with `-m 2G` and the
+marker list demands `MOLT_RAM_OK: top 0x100000000`, a number the kernel can only
+print by reading the `/memory` node of the device tree firmware passed. The
+usable byte count follows the top rather than leading it, because that part moves
+whenever the image in front of it changes size and is not something to pin.
+
+**`MOLT_HUGE_MAP_OK` is read back, not remembered.** The size it prints does not
+come from a variable the mapper set while building the tables — that would only
+prove the mapper's intent — but from walking the live tables afterwards and
+asking each address of every usable range which leaf translates it, which is the
+same `PageWalk` the W^X audit uses. The walk stops on an unmapped page inside a
+range the kernel declared rather than stepping over it, so a hole cannot hide
+behind the bigger leaf next door. The asserted size differs per port because the
+mappers do: riscv64 must show `1 GiB leaf`, which the smoke's `-m 2G` leaves
+exactly one room for, and x86_64 must show `2 MiB leaf`, the largest its direct
+map builds. Without this, a port that quietly fell back to 4 KiB pages would
+still pass every other marker and cost only TLB misses, in a program nobody has
+written yet.
 
 **The x86_64 smoke boots `q35` with `-device edu`.** Both halves are load-bearing.
 The default `pc` machine publishes no ACPI `MCFG` table, so there is no
@@ -292,6 +338,37 @@ budget, and crash triage are the other half, and they are infrastructure with
 running costs. They earn those costs against a parser that takes input from
 somewhere less bounded than a 1514-byte frame, which is Stage 4's NVMe and real
 NIC work at the earliest. The cheap half runs on every push today.
+
+## Red teaming the address space
+
+Stage 5 pointed the same shape at what a hostile domain can reach. Each sweep is
+an ordinary `#[test]` over a seeded xorshift, each asserts a floor on what it
+covered, and each is named for the thing it is trying to break:
+
+| Sweep | What it must not find |
+| --- | --- |
+| `molt-arch/tests/va_noise.rs` | an address handed out twice, or an arena that does not come back whole |
+| `molt-arch/tests/refcount_noise.rs` | a count the model disagrees with, after any order of grant, revoke, split and merge |
+| `molt-abi/tests/noise.rs` | a lying producer read past its fault, or a corrupt head starving the kernel end |
+| `molt-arch/tests/shootdown_noise.rs` | a round nobody can close, or an address stuck in quarantine |
+
+The refcount sweep carries a model that knows only which bytes are held how many
+times — no classes, no records — so anything the table does with either, a split
+that loses a count or a refusal that spends a slot, shows up as the two
+disagreeing.
+
+The last two are liveness claims, and a tracker that wedges does not crash: it
+stops, and the addresses it holds are never handed out again. So they are made
+the only honest way — from every state the churn reaches, drive the protocol
+forward and see that it goes. `Shootdown` is `Copy`, so the escape runs on a
+copy and the churn carries on from where it was.
+
+Two of the four found bugs, which is their own evidence. The other two found
+nothing, and that reads the same as a sweep generating nothing — so
+[`experiments/sweep-mutations`](../experiments/sweep-mutations) puts a bug back
+into each and expects the sweep to fail. It is the rule the whole section rests
+on: a passing sweep is a claim about the sweep, not about the code, until
+something has been seen to fail it.
 
 ## Conventions
 

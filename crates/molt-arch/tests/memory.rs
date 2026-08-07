@@ -195,6 +195,23 @@ fn run_across_gap_refused() {
 }
 
 #[test]
+fn contiguous_looks_past_a_gap() {
+    let map = TestMap([
+        MemoryRegion::new(0, 0x1000, MemoryRegionKind::Reserved),
+        MemoryRegion::new(0x4000, 0x5000, MemoryRegionKind::Usable),
+        MemoryRegion::new(0x9000, 0xb000, MemoryRegionKind::Usable),
+    ]);
+    let mut allocator = FrameAllocator::new(&map);
+
+    // The region the walk starts in holds one frame, which is not the two
+    // asked for; the next one holds exactly two.
+    let span = allocator.contiguous(2).unwrap();
+
+    assert_eq!((span.start(), span.count()), (0x9000, 2));
+    assert_eq!(allocator.contiguous(1), Err(RunError::OutOfFrames), "the map had more to give");
+}
+
+#[test]
 fn run_past_map_refused() {
     let map = TestMap([
         MemoryRegion::new(0, 0x1000, MemoryRegionKind::Reserved),

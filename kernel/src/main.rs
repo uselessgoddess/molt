@@ -7,9 +7,15 @@ use core::pin::pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use molt_arch::memory::{Error, FrameTable, Inventory, Kind, Owner, Span};
+use molt_abi::{Call, Channel, Fault, Handle, Next, Op, Reject, Reply};
+use molt_arch::asid::{Asids, Flush};
+use molt_arch::memory::{Error, FrameTable, Inventory, Kind, Owner, Rights, Span};
+use molt_arch::refcount::{self, Leaves, Run};
+use molt_arch::shootdown::Shootdown;
+use molt_arch::va::{Class, Extent, Hole, Region, Space};
 use molt_arch::{
-    BootInfo, ExitStatus, FRAME_SIZE, Platform, SerialPort, SerialWriter, UsableRegions,
+    BootInfo, ExitStatus, FRAME_SIZE, Platform, PlatformError, SerialPort, SerialWriter,
+    UsableRegions, view,
 };
 use molt_core::capability::{CapabilityError, CapabilityTable, ReadWrite};
 use molt_core::cell::{Cell, CellId, Handler, RestartHooks, Supervisor};
@@ -20,8 +26,10 @@ use molt_exec::Executor;
 extern crate alloc;
 
 mod device;
+mod filemap;
 mod heap;
 mod init;
+mod isolation;
 mod network;
 mod nvme;
 mod pci;
@@ -60,13 +68,20 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     assert!(platform.verify_exception_path(), "breakpoint handler did not return");
     report!(platform, "MOLT_EXCEPTION_OK");
 
+    report_ram(boot_info, platform);
+
     verify_heap(boot_info, platform);
 
     platform.verify_owned_mapping(boot_info).expect("owned W^X mapping probe");
     report!(platform, "MOLT_MAPPING_OK");
 
+    let analyzer = verify_address_space(platform);
+    verify_refcounts(platform, &analyzer);
+
     platform.verify_image_protection(boot_info).expect("kernel image obeys W^X");
     report!(platform, "MOLT_WX_OK");
+
+    report_huge_map(boot_info, platform);
 
     platform.verify_device_window(boot_info).expect("device window mapped and reachable");
     report!(platform, "MOLT_DEVICE_WINDOW_OK");
@@ -76,6 +91,10 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
 
     let (running, answered) = verify_smp(platform, exec);
     report!(platform, "MOLT_SMP_OK: cores={running} answered={answered}");
+
+    verify_shootdown(platform, exec);
+    verify_domain(boot_info, platform, exec);
+    verify_ring(platform);
 
     run_timer_future(exec);
     report!(platform, "MOLT_TIMER_OK");
@@ -149,6 +168,51 @@ fn verify_frame_ownership(span: Span) {
     assert_eq!(frames.claimed(), 0, "released frames stayed claimed");
 }
 
+/// Prints how much RAM firmware said the machine has.
+///
+/// This is a marker rather than a log line because it is the only evidence that
+/// the number came from firmware at all. A kernel that carries a constant boots
+/// identically on the machine the constant was written for, and silently wastes
+/// or invents memory everywhere else; a number that tracks `-m` cannot be that
+/// constant. Both platforms print it, and neither computes it.
+fn report_ram<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
+    let map = boot_info.memory_map();
+    let (mut usable, mut top) = (0u64, 0);
+    for range in UsableRegions::above(map, FRAME_SIZE) {
+        usable += range.end() - range.start();
+        top = top.max(range.end());
+    }
+
+    // The top comes first because it is the part a test can pin: how much is
+    // usable moves with the size of the image sitting in front of it.
+    report!(platform, "MOLT_RAM_OK: top {top:#x}, {} MiB usable", usable >> 20);
+}
+
+/// Prints the biggest leaf RAM is mapped through, read back out of the tables.
+///
+/// A mapper that quietly fell back to small pages boots identically and passes
+/// every other marker, so nothing else here would notice: the cost shows up
+/// only as TLB misses under a program touching more memory than the boot smoke
+/// ever does. The size is asked of the platform, which reads it back from the
+/// live tables, so this is what the hardware translates through, not what the
+/// mapper meant to write.
+fn report_huge_map<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
+    let leaf = platform.largest_ram_leaf(boot_info).expect("RAM leaves readable back");
+    let (size, unit) = scale(leaf.size());
+    report!(platform, "MOLT_HUGE_MAP_OK: {size} {unit} leaf at {:#x}", leaf.start());
+}
+
+/// The largest binary unit `bytes` divides evenly, so a marker reads `1 GiB`
+/// rather than `1048576 KiB` and stays legible when the leaf size changes.
+fn scale(bytes: u64) -> (u64, &'static str) {
+    for (unit, name) in [(1 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")] {
+        if bytes % unit == 0 {
+            return (bytes / unit, name);
+        }
+    }
+    (bytes, "B")
+}
+
 /// Donates the boot heap and proves an allocation round-trips through it.
 fn verify_heap<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let bytes = heap::init(boot_info, platform).expect("RAM for the kernel heap");
@@ -162,6 +226,385 @@ fn verify_heap<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     assert_eq!(heap::used(), 0, "a dropped box left the heap holding bytes");
 
     report!(platform, "MOLT_HEAP_OK: {bytes} bytes");
+}
+
+/// What the tier-2 example in `docs/address-space.md` asks for: a log analyzer
+/// that wants a hundred gigabytes of logs addressable at once.
+const ANALYZER: u64 = 100 << 30;
+
+/// Free ranges per class, which is the budget `docs/va-allocator.md` sizes:
+/// 24 bytes apiece, 64 per class, 4 608 bytes of kernel stack in total.
+const HOLES: usize = 3 * 64;
+
+/// Cuts the one global address space out of what the hardware turned out to
+/// support, and proves an extent survives the round trip that a revoke is.
+///
+/// The claim is not that the allocator works — `molt-arch` tests that on the
+/// host — but that the width it was cut from is the machine's own answer, and
+/// that the addresses a booted kernel hands out of it are the ones the tests
+/// describe. See `docs/va-allocator.md`.
+fn verify_address_space<P: Platform>(platform: &mut P) -> Extent {
+    let widths = platform.address_space().expect("the platform probed its own translation");
+    let mut holes = [Hole::EMPTY; HOLES];
+    let mut space = Space::over(widths.address(), &mut holes).expect("a space wide enough to cut");
+
+    // A hart that implements only Sv39 has a 32 GiB gigabyte arena and cannot
+    // seat the analyzer. It proves the same round trip with what it does have,
+    // and the marker prints which it was.
+    let wanted = ANALYZER.min(space.largest(Class::Giga));
+    let extent = space.allocate(Class::Giga, wanted).expect("room in the gigabyte arena");
+    let start = extent.start();
+    let leaves = extent.leaves();
+    assert_eq!(start % Class::Giga.granule(), 0, "a gigabyte extent came back unaligned");
+    assert_eq!(leaves, wanted.div_ceil(Class::Giga.granule()), "the extent needs other leaves");
+
+    // Giving it back does not give the addresses back: until every hart has
+    // flushed, one of them may still translate through the mapping that was
+    // revoked, and handing the range to someone else would hand them the pages.
+    space.release(extent).expect("an extent this space issued");
+    let during = space.allocate(Class::Giga, wanted).expect("room beside the quarantined range");
+    assert_ne!(during.start(), start, "an unflushed range was handed out again");
+    space.release(during).expect("an extent this space issued");
+
+    let epoch = space.sweep();
+    space.retire(epoch);
+    let again = space.allocate(Class::Giga, wanted).expect("the flushed range, back in service");
+    assert_eq!(again.start(), start, "a flushed range did not come back");
+    assert_eq!(space.quarantined(Class::Giga), 0, "a retired epoch left bytes in quarantine");
+
+    report!(
+        platform,
+        "MOLT_VA_OK: {} address bits, {} GiB at {start:#x} in {} leaves",
+        widths.address(),
+        wanted >> 30,
+        leaves,
+    );
+
+    // The tag budget is the domain budget: a grant or a revoke costs the
+    // shootdown above, not a tag, so this counts domains and nothing else.
+    let mut asids = Asids::new(widths.asid());
+    let grant = asids.assign();
+    assert!(asids.live(grant.asid()), "a fresh tag was born stale");
+    assert_eq!(
+        grant.flush() == Flush::Everything,
+        asids.capacity() == 0,
+        "a hart with tags to give still flushed, or one without tags did not"
+    );
+
+    report!(platform, "MOLT_ASID_OK: bits={} domains={}", widths.asid(), asids.capacity());
+
+    again
+}
+
+/// How many records the leaf counts get: three per class is enough for the
+/// splits a revoke of part of one leaf goes through, with room to spare.
+const RUNS: usize = 16;
+
+/// Counts the leaves of that same extent the way a grant and a revoke would.
+///
+/// The claim under test is the keying, not the arithmetic — `molt-arch` tests
+/// the arithmetic on the host. What a booted kernel shows is the size of the
+/// thing being counted: a hundred gigabytes shared with a second view is one
+/// record holding the number two, and the 26 million frames underneath it never
+/// get a record at all. See `docs/address-space.md`.
+fn verify_refcounts<P: Platform>(platform: &mut P, analyzer: &Extent) {
+    let mut runs = [Run::EMPTY; RUNS];
+    let mut leaves = Leaves::over(&mut runs);
+    let start = analyzer.start();
+
+    leaves.map(start, analyzer.class(), analyzer.leaves()).expect("leaves nobody counts yet");
+    let mapped = leaves.leaves();
+    let frames = leaves.frames();
+    assert_eq!(leaves.runs(), 1, "leaves mapped together were counted apart");
+
+    // A grant of the whole extent into a second view: every leaf gains the same
+    // holder, so the accounting still fits in the one record it started in.
+    leaves.share(analyzer.region()).expect("every leaf of a mapped extent");
+    let shared = leaves.runs();
+    assert_eq!(shared, 1, "a grant of everything fragmented the accounting");
+    assert_eq!(leaves.count(start), Some(2), "the second view was not counted");
+    assert_eq!(leaves.count(analyzer.end() - 1), Some(2), "the grant stopped short of the end");
+
+    // Revoking part of a gigabyte leaf is a question the tables cannot answer
+    // either, until the leaf becomes the 512 below it.
+    let part = Region::new(start, start + 2 * Class::Mega.granule()).expect("two megabytes");
+    assert_eq!(leaves.share(part), Err(refcount::Error::Straddle), "half a leaf was counted");
+    assert_eq!(leaves.split(start), Ok(Class::Mega), "a gigabyte leaf did not split");
+    assert_eq!(leaves.leaves(), mapped - 1 + Class::FANOUT, "the split lost addresses");
+
+    let reclaimed = leaves.release(part).expect("leaves the second view holds");
+    assert!(reclaimed.is_empty(), "a leaf the first view still holds was reported free");
+    assert_eq!(leaves.count(start), Some(1), "the revoke did not reach the second view");
+    assert_eq!(leaves.count(start + part.bytes()), Some(2), "the revoke reached past its range");
+
+    report!(
+        platform,
+        "MOLT_REFCOUNT_OK: {} GiB in {mapped} leaves and {shared} record, {frames} frames \
+         uncounted; revoking 2 MiB split one leaf into {} and left {} records",
+        analyzer.bytes() >> 30,
+        Class::FANOUT,
+        leaves.runs(),
+    );
+}
+
+/// Frees an extent the way a revoke does, and holds its addresses back until
+/// every core has flushed for real.
+///
+/// This is the one property the host tests cannot show, because it needs other
+/// cores: the epoch is retired by acknowledgements that came from the cores
+/// themselves, each having run the flush instruction on its own hardware. The
+/// order is the one `docs/threat-model.md` asks after — the leaf goes first, the
+/// shootdown second, and [`retire`](Space::retire) only once nobody owes a
+/// flush. Reversing the last two is a use-after-free the hardware performs for
+/// whoever reads the address next.
+fn verify_shootdown<P: Platform>(platform: &mut P, exec: &Executor) {
+    let widths = platform.address_space().expect("the platform probed its own translation");
+    let mut holes = [Hole::EMPTY; HOLES];
+    let mut space = Space::over(widths.address(), &mut holes).expect("a space wide enough to cut");
+
+    let wanted = ANALYZER.min(space.largest(Class::Giga));
+    let extent = space.allocate(Class::Giga, wanted).expect("room in the gigabyte arena");
+    let start = extent.start();
+
+    // The revoke: the addresses leave the view and join the batch a flush has to
+    // cover before any of them can be handed out again.
+    space.release(extent).expect("an extent this space issued");
+    let epoch = space.sweep();
+
+    let mut shootdown = Shootdown::new();
+    let cores = shootdown.begin(epoch, smp::attending()).expect("a core to flush");
+    assert!(shootdown.pending(smp::cpu()), "the core that did the unmapping was trusted");
+
+    // Meanwhile the range is nobody's to give: an allocation of the same size
+    // has to come back from somewhere else entirely.
+    let elsewhere = space.allocate(Class::Giga, wanted).expect("room beside the quarantined range");
+    assert_ne!(elsewhere.start(), start, "an unflushed range was handed out again");
+
+    let (flushed, asked) = smp::flush(exec);
+    assert_eq!(flushed.len() as u16, asked + 1, "a core took the flush and never answered");
+
+    let mut retirable = None;
+    for cpu in flushed {
+        assert!(retirable.is_none(), "the round closed with cores still owing a flush");
+        retirable = shootdown.acknowledge(cpu).expect("a core this round asked");
+    }
+    let retired = retirable.expect("the epoch every core has now flushed");
+
+    assert_eq!(retired, epoch, "a round retired an epoch it was not opened for");
+    assert_eq!(shootdown.outstanding(), 0, "a core still owes a flush for a retired epoch");
+    assert_eq!(space.quarantined(Class::Giga), wanted, "the freed range left quarantine early");
+
+    space.retire(retired);
+    assert_eq!(space.quarantined(Class::Giga), 0, "a flushed range stayed in quarantine");
+    let again = space.allocate(Class::Giga, wanted).expect("the flushed range, back in service");
+    assert_eq!(again.start(), start, "a flushed range did not come back");
+
+    report!(
+        platform,
+        "MOLT_SHOOTDOWN_OK: {} GiB at {start:#x} held over {cores} cores until epoch {} flushed",
+        wanted >> 30,
+        retired.get(),
+    );
+}
+
+/// The class a grant is proven at.
+///
+/// Megabytes and not gigabytes because this extent is backed for real: the
+/// smoke gives QEMU two gigabytes, so there are no frames behind a gigabyte
+/// leaf, and granting addresses nothing backs would prove nothing about a
+/// grant.
+const GRANTED: Class = Class::Mega;
+
+/// Opens a second view, moves an extent into it, and takes it back.
+///
+/// This is tier 2 of `docs/address-space.md` doing the thing it exists for. The
+/// claim being demonstrated is not that a mapping can be made — the kernel's own
+/// tables show that at boot — but that a *second* view exists which does not
+/// contain the kernel, that an extent can enter it without a byte moving, and
+/// that it can be taken back out in the order a revoke has to go in.
+///
+/// The grant is real memory at a real address: frames claimed out of the same
+/// RAM the kernel maps, reached from the view at the same global address the
+/// kernel calls them by, which is the whole of what one address space buys.
+fn verify_domain<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P, exec: &Executor) {
+    let widths = platform.address_space().expect("the platform probed its own translation");
+    let grant = Asids::new(widths.asid()).assign();
+    let view = platform.open_view(grant.asid()).expect("a root for a second view");
+
+    // What a fresh view holds, which is nothing. Three addresses the kernel is
+    // demonstrably using right now — the code running this, the stack it runs
+    // on, and the heap it allocates from — and not one of them is reachable
+    // from the view that was just opened.
+    let here = verify_domain::<P> as *const () as u64;
+    let stack = (&raw const widths) as u64;
+    let heap = Box::into_raw(Box::new(0u64));
+    for (address, what) in
+        [(here, "kernel text"), (stack, "the kernel stack"), (heap as u64, "the kernel heap")]
+    {
+        assert!(platform.resident(view, address).is_none(), "a fresh view could reach {what}");
+    }
+    // SAFETY: the box was leaked one statement ago and nothing else holds it.
+    drop(unsafe { Box::from_raw(heap) });
+
+    report!(
+        platform,
+        "MOLT_DOMAIN_OK: view {} tagged {} in generation {}",
+        view.index(),
+        grant.asid().value(),
+        grant.asid().generation(),
+    );
+    report!(platform, "MOLT_DOMAIN_ABSENT_OK: kernel text, stack, and heap unreachable from it");
+
+    // The backing. Twice the leaf is claimed and the leaf is cut out of the
+    // aligned part of it, because a firmware map starts a usable region wherever
+    // it likes and a megabyte leaf has to begin on a megabyte.
+    let granule = GRANTED.granule();
+    let claimed =
+        platform.claim_ram(boot_info, 2 * granule / FRAME_SIZE).expect("RAM to back a grant");
+    let base =
+        molt_arch::align_up(claimed.start(), granule).expect("an aligned base below the end");
+    let span = Span::new(base, base + granule).expect("a leaf's worth of claimed frames");
+
+    let mut holes = [Hole::EMPTY; HOLES];
+    let mut space = Space::over(widths.address(), &mut holes).expect("a space wide enough to cut");
+    let extent = space.allocate(GRANTED, granule).expect("room in the megabyte arena");
+    let start = extent.start();
+
+    platform.grant(view, &extent, span, Rights::READ_WRITE).expect("a leaf the view lacked");
+    let leaf = platform.resident(view, start).expect("the granted address, in the view's tables");
+    assert_eq!(leaf.start(), start, "the grant landed somewhere else");
+    assert_eq!(leaf.size(), granule, "the grant was cut smaller than the extent asked for");
+    assert!(leaf.protection().is_write(), "a read-write grant arrived read-only");
+    assert!(!leaf.protection().is_execute(), "a data grant arrived executable");
+    assert!(platform.resident(view, extent.end() - 1).is_some(), "the grant stopped short");
+    assert!(platform.resident(view, extent.end()).is_none(), "the grant ran past its extent");
+    assert!(platform.resident(view, here).is_none(), "a grant of RAM brought the kernel along");
+
+    report!(
+        platform,
+        "MOLT_GRANT_OK: {} MiB at {start:#x} from frames at {base:#x}, in {} leaf",
+        extent.bytes() >> 20,
+        extent.leaves(),
+    );
+
+    // The revoke, in the order `molt_arch::view` spells out. Step one clears the
+    // leaves and nothing else: the addresses are still spoken for, because a
+    // core that walked them a moment ago may still hold the translation.
+    let cleared = platform.revoke(view, &extent).expect("leaves this view holds");
+    assert_eq!(cleared, extent.leaves(), "a revoke took a different number of leaves");
+    assert!(platform.resident(view, start).is_none(), "a revoked address still translated");
+    assert!(
+        matches!(platform.revoke(view, &extent), Err(PlatformError::View(view::Error::Absent))),
+        "a second revoke found something left to take"
+    );
+
+    space.release(extent).expect("an extent this space issued");
+    let epoch = space.sweep();
+    let mut shootdown = Shootdown::new();
+    let cores = shootdown.begin(epoch, smp::attending()).expect("a core to flush");
+    let held = space.allocate(GRANTED, granule).expect("room beside the quarantined range");
+    assert_ne!(held.start(), start, "a revoked range was handed out before the flush");
+    space.release(held).expect("an extent this space issued");
+
+    // Step two: every core drops what it cached, and says so itself.
+    let (flushed, asked) = smp::flush(exec);
+    assert_eq!(flushed.len() as u16, asked + 1, "a core took the flush and never answered");
+    let mut retirable = None;
+    for cpu in flushed {
+        assert!(retirable.is_none(), "the round closed with cores still owing a flush");
+        retirable = shootdown.acknowledge(cpu).expect("a core this round asked");
+    }
+    let retired = retirable.expect("the epoch every core has now flushed");
+
+    // Step three, and not one instruction sooner.
+    space.retire(retired);
+    let again = space.allocate(GRANTED, granule).expect("the flushed range, back in service");
+    assert_eq!(again.start(), start, "a flushed range did not come back");
+
+    report!(
+        platform,
+        "MOLT_REVOKE_OK: {cleared} leaf out of view {}, held over {cores} cores until epoch {} \
+         flushed",
+        view.index(),
+        retired.get(),
+    );
+}
+
+/// Slots in the channel the smoke drives.
+///
+/// Four, because the interesting numbers are the small ones: a tail five ahead
+/// of a four-slot ring is a lie the ring's own length makes checkable, and a
+/// longer ring would only make the arithmetic longer.
+const SLOTS: usize = 4;
+
+/// Drives a ring whose other end is hostile.
+///
+/// The six rules in `docs/threat-model.md` are claims about what a domain
+/// cannot do to the kernel through a shared page, and this is where they stop
+/// being a document. The channel is the one a real domain gets — it lives in
+/// the domain's own extent, so every word the kernel reads may have changed
+/// since the last one it read — and the sequence here is honest work, then a
+/// submission that does not parse, then the lie.
+///
+/// What has to be true at the end is that the kernel is still running. A domain
+/// that publishes submissions it never wrote is asking the kernel to read a
+/// slot with nothing in it; what it gets is a fault, which is fatal to the
+/// domain and costs the kernel one ring.
+fn verify_ring<P: Platform>(platform: &mut P) {
+    let channel = Channel::<SLOTS>::new();
+    let (mut submissions, mut completions) = channel.kernel();
+    let mut domain = channel.domain();
+
+    // Honest work first, so that what follows is a ring known to have been
+    // running rather than one that never worked.
+    domain.submit(Call::new(1, Op::Timer { ticks: 7 }));
+    let Ok(Next::Ready(call)) = submissions.take() else {
+        panic!("an honest submission did not arrive");
+    };
+    assert_eq!(call.op(), Op::Timer { ticks: 7 }, "a submission changed on the way in");
+    completions.publish(Reply::new(call.id(), 0)).expect("room in an empty completion ring");
+    assert_eq!(domain.reply(), Some(Reply::new(1, 0)), "the completion never came back");
+
+    // Rule 5, run the way the kernel would run it. The buffer is inside the
+    // aperture, so the submission parses; it is outside the extent the
+    // capability actually names, so the one masked check refuses it.
+    // `molt_abi`'s, and not the one `molt_arch::va` calls a region: this is an
+    // offset into the domain's aperture, which is what a submission can name.
+    let buf = molt_abi::Region::new(0, 4096);
+    domain.submit(Call::new(2, Op::Read { cap: Handle::new(0), offset: 0, buf }));
+    let Ok(Next::Ready(read)) = submissions.take() else {
+        panic!("a well-formed read did not arrive");
+    };
+    let named = read.op().region().expect("a read names a buffer");
+    assert!(named.within(buf.len() as u64).is_some(), "a buffer inside its extent was refused");
+    assert!(named.within(buf.len() as u64 - 1).is_none(), "a buffer past its extent was allowed");
+
+    // A tag this kernel has none of. One rejection, one completion saying so,
+    // and the ring keeps going: a domain that guesses wrong is wrong about one
+    // submission and not about the connection.
+    domain.write([3, 4096, 0, 0, 0, 0, 0, 0]);
+    let Ok(Next::Rejected { id, reject }) = submissions.take() else {
+        panic!("a slot that parses to nothing was accepted");
+    };
+    completions.publish(Reply::rejected(id, reject)).expect("room in the completion ring");
+    assert_eq!(
+        domain.reply(),
+        Some(Reply::rejected(3, Reject::Tag)),
+        "a rejection went unanswered"
+    );
+
+    // And the lie: five submissions published into four slots, at least one of
+    // which was never written by anybody.
+    let claimed = SLOTS as u32 + 1;
+    domain.claim(claimed);
+    assert_eq!(submissions.take(), Err(Fault::Tail), "the kernel read a slot nobody wrote");
+    assert_eq!(submissions.take(), Err(Fault::Tail), "a ring that faulted was read again");
+
+    report!(
+        platform,
+        "MOLT_RING_FAULT_OK: {} calls taken, then a tail {claimed} ahead over {SLOTS} slots faulted",
+        submissions.taken(),
+    );
 }
 
 /// Starts this core's tick and its executor, and proves a task runs on it.

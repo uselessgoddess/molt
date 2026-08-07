@@ -3,6 +3,13 @@
 //! The queue is split into non-cloneable endpoints. This makes the SPSC
 //! contract a property of the safe API instead of a convention callers must
 //! remember.
+//!
+//! **Both endpoints are trusted.** The indices live beside the slots, so a
+//! producer that publishes a `tail` it never wrote makes the consumer read a
+//! slot that was never initialised. That is fine here — `split` hands out one
+//! endpoint each, inside the kernel — and it is why a ring shared with a
+//! sandbox or a domain must not be this type: see `docs/threat-model.md`, which
+//! states the rules such a ring obeys instead.
 
 use core::mem::MaybeUninit;
 use core::ops::Deref;
