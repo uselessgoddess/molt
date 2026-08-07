@@ -53,8 +53,10 @@ pub enum Error {
 pub struct Shootdown {
     asked: u64,
     flushed: u64,
-    epoch: Epoch,
-    open: bool,
+    /// The epoch of the open round, and whether one is open: the same fact, so
+    /// one field. Apart, a closed tracker still names an epoch, and every reader
+    /// has to know not to believe it.
+    epoch: Option<Epoch>,
     retired: Epoch,
     rounds: u64,
 }
@@ -72,14 +74,7 @@ impl Shootdown {
     /// A tracker with nothing outstanding, which is where a boot starts: no
     /// address has been freed, so no core owes anything.
     pub const fn new() -> Self {
-        Self {
-            asked: 0,
-            flushed: 0,
-            epoch: Epoch::FIRST,
-            open: false,
-            retired: Epoch::FIRST,
-            rounds: 0,
-        }
+        Self { asked: 0, flushed: 0, epoch: None, retired: Epoch::FIRST, rounds: 0 }
     }
 
     /// Opens a round: `epoch` stays unretired until every core in `cores` has
@@ -96,7 +91,7 @@ impl Shootdown {
         epoch: Epoch,
         cores: impl Iterator<Item = CpuId>,
     ) -> Result<u32, Error> {
-        if self.open {
+        if self.epoch.is_some() {
             return Err(Error::Open);
         }
         if epoch <= self.retired {
@@ -118,8 +113,7 @@ impl Shootdown {
 
         self.asked = asked;
         self.flushed = 0;
-        self.epoch = epoch;
-        self.open = true;
+        self.epoch = Some(epoch);
         Ok(asked.count_ones())
     }
 
@@ -128,9 +122,9 @@ impl Shootdown {
     /// Returns the epoch that became safe to retire, which is `Some` exactly
     /// once per round: on the acknowledgement that leaves nobody owing.
     pub fn acknowledge(&mut self, cpu: CpuId) -> Result<Option<Epoch>, Error> {
-        if !self.open {
+        let Some(epoch) = self.epoch else {
             return Err(Error::Closed);
-        }
+        };
         if cpu.index() >= Self::LIMIT as usize || !self.in_round(cpu) {
             return Err(Error::Foreign);
         }
@@ -143,31 +137,28 @@ impl Shootdown {
             return Ok(None);
         }
 
-        self.open = false;
-        self.retired = self.epoch;
+        self.epoch = None;
+        self.retired = epoch;
         self.rounds += 1;
-        Ok(Some(self.epoch))
+        Ok(Some(epoch))
     }
 
     /// The epoch the open round covers, if a round is open.
     pub const fn epoch(&self) -> Option<Epoch> {
-        match self.open {
-            true => Some(self.epoch),
-            false => None,
-        }
+        self.epoch
     }
 
     /// How many cores still owe the open round a flush.
     pub const fn outstanding(&self) -> u32 {
-        match self.open {
-            true => (self.asked & !self.flushed).count_ones(),
-            false => 0,
+        match self.epoch {
+            Some(_) => (self.asked & !self.flushed).count_ones(),
+            None => 0,
         }
     }
 
     /// Whether `cpu` still owes the open round a flush.
     pub const fn pending(&self, cpu: CpuId) -> bool {
-        self.open && self.in_round(cpu) && !self.has_flushed(cpu)
+        self.epoch.is_some() && self.in_round(cpu) && !self.has_flushed(cpu)
     }
 
     /// The last epoch every core it was asked of has flushed.
