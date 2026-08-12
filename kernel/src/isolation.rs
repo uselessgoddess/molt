@@ -79,6 +79,38 @@ pub(crate) fn arena<'slots>(
     Arena::claim(allocator, offset, tag, slots).expect("contiguous frames for the IOMMU queues")
 }
 
+/// Shows on the machine what `Domains::reserve` shows in a unit test: which
+/// domain an endpoint lands in is the kernel's choice and nothing else's.
+///
+/// `ahead` is a second endpoint on the same controller, quiesced, and it has
+/// to carry the higher requester ID of the two. It is attached first, so it
+/// takes the lower domain and `endpoint` — re-attached behind it — takes the
+/// higher one. The numbers therefore come out opposite to the identifiers the
+/// devices carry, which is the whole claim: the order is a line of kernel
+/// code, and a device has no way to be earlier than the kernel put it.
+///
+/// Nothing lasting changes. `endpoint` has no mappings yet, which is why it
+/// can be detached at all, and it comes back attached to a domain of its own;
+/// `ahead` gives its domain back before this returns, because this kernel
+/// does not drive it. Returns the two domains, `ahead`'s first.
+pub(crate) fn ordered(
+    iommu: &mut Iommu<'_, '_, Poll>,
+    endpoint: DeviceId,
+    ahead: DeviceId,
+) -> (u32, u32) {
+    assert!(ahead.get() > endpoint.get(), "the witness carries the lower requester ID");
+    iommu.detach(endpoint).expect("an endpoint with no mappings detaches");
+    iommu.attach(ahead).expect("a second endpoint attaches to a domain of its own");
+    iommu.attach(endpoint).expect("the endpoint attaches behind it");
+
+    let first = iommu.domain_of(ahead).expect("the witness is attached");
+    let second = iommu.domain_of(endpoint).expect("the endpoint is attached");
+    assert!(first != 0 && second != 0, "an endpoint landed in the domain molt never hands out");
+    assert!(first < second, "the endpoint that attached first did not take the lower domain");
+    iommu.detach(ahead).expect("the witness gives its domain back");
+    (first, second)
+}
+
 /// A mapped IOMMU function, before and after its queues are running.
 ///
 /// The registers stay here rather than in the [`Iommu`], which borrows them:
@@ -138,7 +170,7 @@ impl<'bus> Control<'bus> {
             self.transport.notify_multiplier(),
             u16::MAX,
             Poll,
-            device::requester(self.function.address()),
+            self.function.address().requester(),
             arena,
         )
         .expect("the IOMMU completes its handshake");

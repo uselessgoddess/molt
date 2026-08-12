@@ -441,7 +441,11 @@ unchanged.
 - [x] NVMe Identify, admin/I/O queue pairs, eight live block operations, and
       read/write/flush behind `molt_block::Queue`
 - [x] VirtIO block, VirtIO network, and NVMe requester IDs isolated in distinct
-      bounded IOMMU domains
+      bounded IOMMU domains, each requester ID derived from the bus address the
+      kernel enumerated and each domain number from the kernel's own table:
+      the smoke attaches a second endpoint ahead of the block function and
+      requires the higher requester ID to hold the lower domain
+      (`MOLT_IOMMU_DOMAIN_OK`)
 - [x] QEMU NVMe smoke with mappings before bus mastering and reset before unmap
 - [x] one module owns IOMMU bring-up and teardown for every endpoint
       (`kernel/src/isolation.rs`), so the ordering that is the isolation

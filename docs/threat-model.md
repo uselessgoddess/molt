@@ -152,6 +152,26 @@ refuses everything else. Widening what a *program* can address did not widen
 what a *device* can address, which is the property that had to survive this
 design and does.
 
+Which domain an endpoint lands in is decided by the kernel and by nothing else,
+which is what keeps "one domain per endpoint" from being one domain per two.
+The identifier an endpoint is isolated by is
+[`Address::requester`](../crates/molt-pci/src/lib.rs) — bus, device, and
+function packed into disjoint fields, read off where the function answered
+rather than out of anything it reported about itself, so two functions cannot
+become one endpoint by claiming the same name. The number it is attached to is
+the lowest one no live attachment holds, taken from the kernel's own table
+([`Domains::reserve`](../crates/molt-virtio/src/iommu.rs)), which refuses a
+second domain to a device that already has one and never hands out domain zero
+— the identifier an ATTACH request that was never encoded would carry.
+
+That the number follows the order the kernel attached in and not the identifier
+the device carries is checked on the machine and not only in a unit test. The
+block smoke borrows the NIC as a second quiesced endpoint, attaches it first,
+and prints `MOLT_IOMMU_DOMAIN_OK`: the device with the *higher* requester ID
+holds the *lower* domain, which no property of either device could have
+arranged. Then it gives the domain back, because this kernel does not drive
+that device.
+
 ## The rings are the real attack surface
 
 The mechanisms above are about memory the attacker cannot touch. The ring is
@@ -413,9 +433,11 @@ questions for every commit in Stage 5.0 and after:
   hostile index sequences before `MOLT_RING_FAULT_OK` means much; a single
   scripted attack proves the path, not the parser.
 - **No quotas, no metering, no preemption**, as above.
-- **Nothing about the IOMMU's own state.** The endpoint isolation shipped;
-  whether a domain can influence *which* IOMMU domain a device lands in is a
-  question for whenever a domain gets to own a device.
+- **The IOMMU's own state is only half answered.** Which domain an endpoint
+  lands in is the kernel's alone, and the boot proves it (below). What no
+  device has yet is an owner: when a domain gets to drive one, the question
+  becomes whether it can influence the *timing* of an attach, and that answer
+  is not written.
 - **The tagged x86_64 path needs a machine with PCIDs to be exercised.**
   `CR4.PCIDE` is set on every core now, but QEMU's TCG emulates no PCIDs at all,
   so the default smoke boots the untagged floor; the 12-bit answer comes from

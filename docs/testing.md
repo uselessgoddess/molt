@@ -242,6 +242,16 @@ is attached and its five DMA regions are mapped, and must negotiate
 reaped; and `MOLT_IOMMU_FAULT_OK` requires the replenished event queue to remain
 clean through filesystem I/O and block reset. See [`block.md`](block.md).
 
+**`MOLT_IOMMU_DOMAIN_OK` is where the domain numbers come from.** The smoke
+borrows the NIC — quiesced, and detached again a few lines later — as a second
+endpoint, attaches it ahead of the block function, and requires the device with
+the higher requester ID to hold the lower domain. Both orders are legal
+outputs of an allocator that reads the identifier; only one is possible from an
+allocator that reads its own table, and that is the one the marker pins. The
+same property is checked without hardware in `molt-virtio`'s
+`domains_follow_arrival_not_identity`, and the identifiers themselves in
+`molt-pci`'s `requester_ids_are_distinct_per_address`.
+
 **`MOLT_BLK_IRQ_OK` is a marker about an absence.** The block driver's used-ring
 poll is gone, so a sector read that returns at all returns because queue zero's
 MSI-X vector fired and the line counted it. The marker names the vector that

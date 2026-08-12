@@ -201,6 +201,10 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
             "MOLT_AFFINITY_OK:",
             "MOLT_VIRTIO_OK:",
             "MOLT_IOMMU_OK:",
+            // Two endpoints, and the one the kernel attached first holding the
+            // lower domain although its requester ID is the higher: the
+            // assignment follows kernel order, not device identity.
+            "MOLT_IOMMU_DOMAIN_OK:",
             "MOLT_IOMMU_MAP_OK:",
             "MOLT_BLOCK_OK:",
             "MOLT_BLOCK_DEPTH_OK:",

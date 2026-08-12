@@ -68,7 +68,7 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let mut slots: [Option<Owner>; DMA_FRAMES] = [None; DMA_FRAMES];
     let arena = Arena::claim(&mut allocator, offset, DMA_TAG, &mut slots)
         .expect("contiguous frames for NVMe queues and payloads");
-    let endpoint = device::requester(function.address());
+    let endpoint = function.address().requester();
     let iommu = control.start(iommu_arena, endpoint);
     let prepared = Prepared::prepare(
         Config::new(registers, endpoint, vectored.index(), vectored.line()),

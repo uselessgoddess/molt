@@ -14,6 +14,9 @@ use crate::{device, isolation};
 /// QEMU's modern virtio-blk-pci function (`disable-legacy=on`).
 const VIRTIO_VENDOR: u16 = 0x1af4;
 const VIRTIO_BLOCK: u16 = 0x1042;
+/// The NIC, which the block smoke borrows as a second endpoint before the
+/// network smoke drives it.
+const VIRTIO_NET: u16 = 0x1041;
 
 const SIGNATURE: [u8; 8] = molt_fs::MAGIC;
 const DMA_FRAMES: usize = 12;
@@ -88,9 +91,32 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let arena = Arena::claim(&mut allocator, offset, BLOCK_TAG, &mut slots)
         .expect("contiguous device frames past the kernel's own");
 
-    let endpoint = device::requester(function.address());
-    let iommu = control.start(iommu_arena, endpoint);
+    let endpoint = function.address().requester();
+    let mut iommu = control.start(iommu_arena, endpoint);
     report!(platform, "MOLT_IOMMU_OK: block endpoint attached before bus mastering");
+
+    // A second quiesced endpoint, borrowed for the length of one proof: which
+    // domain a device lands in follows the order the kernel attached in, so
+    // the one with the higher requester ID takes the lower domain when the
+    // kernel puts it there first. It has to be a function that is really on
+    // the bus — the controller answers ATTACH for endpoints it can see.
+    let witness = isolation::pair(&window, space.first_bus(), |function| {
+        function.vendor() == VIRTIO_VENDOR && function.device() == VIRTIO_NET
+    })
+    .map(|(net, _)| net.address().requester())
+    .filter(|witness| witness.get() > endpoint.get());
+    match witness {
+        Some(witness) => {
+            let (first, second) = isolation::ordered(&mut iommu, endpoint, witness);
+            report!(
+                platform,
+                "MOLT_IOMMU_DOMAIN_OK: endpoint {:#x} took domain {first} ahead of {:#x} in {second}",
+                witness.get(),
+                endpoint.get(),
+            );
+        }
+        None => report!(platform, "MOLT_IOMMU_DOMAIN_SKIPPED: no later endpoint on bus zero"),
+    }
 
     let mut block = Block::start_mapped(
         common,
