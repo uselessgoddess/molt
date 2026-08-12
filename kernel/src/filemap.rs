@@ -26,7 +26,7 @@ use molt_arch::cache::{self, Window, Windows};
 use molt_arch::memory::{Rights, Span};
 use molt_arch::refcount::{Leaves, Run};
 use molt_arch::shootdown::Shootdown;
-use molt_arch::va::{Class, Hole, Space};
+use molt_arch::va::{Class, Space};
 use molt_arch::{BootInfo, FRAME_SIZE, Platform, SerialWriter, View};
 use molt_block::Queue;
 use molt_core::CellId;
@@ -34,7 +34,7 @@ use molt_core::buffer::{BufferOperation, BufferRegistry};
 use molt_fs::{Fs, FsDone, FsOp, Handle, Name};
 use molt_kernel::report;
 
-use crate::smp;
+use crate::{smp, space};
 
 /// Whose buffer the window is read into: the kernel's page cache, which is not
 /// any domain's, which is why no domain had to ask for the read.
@@ -51,7 +51,6 @@ const HANDLES: usize = 4;
 /// same one entry per view, and `molt-arch` tests it on the host.
 const MAPPED: Class = Class::Mega;
 
-const HOLES: usize = 3 * 8;
 const RUNS: usize = 4;
 /// One window, and a slot to prove the second domain does not take another.
 const SLOTS: usize = 2;
@@ -97,8 +96,7 @@ pub fn smoke<P: Platform, Q: Queue>(boot_info: &BootInfo<'_>, platform: &mut P, 
     };
     let read = fill(&mut fs, offset, span);
 
-    let mut holes = [Hole::EMPTY; HOLES];
-    let mut space = Space::over(widths.address(), &mut holes).expect("a space wide enough to cut");
+    let mut space = space::global();
     let mut slots = [const { Window::EMPTY }; SLOTS];
     let mut windows = Windows::over(&mut slots);
     let mut runs = [Run::EMPTY; RUNS];
@@ -273,8 +271,14 @@ fn unmap<P: Platform>(
     }
     let retired = retirable.expect("the epoch every core has now flushed");
 
+    // The addresses come back to the space they came from, and not one flush
+    // sooner. Bytes rather than the address itself because the space is the
+    // machine's: what this smoke released is one range among whatever else the
+    // kernel is holding, and the claim is that the range rejoins the free ones.
+    let circulating = space.free(MAPPED);
     space.retire(retired);
-    let again = space.allocate(MAPPED, MAPPED.granule()).expect("the flushed range, back");
-    assert_eq!(again.start(), start, "a flushed window did not come back");
-    space.release(again).expect("an extent this space issued");
+    assert!(
+        space.free(MAPPED) >= circulating + MAPPED.granule(),
+        "a flushed window stayed out of circulation"
+    );
 }

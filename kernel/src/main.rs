@@ -12,7 +12,7 @@ use molt_arch::asid::{Asids, Flush};
 use molt_arch::memory::{Error, FrameTable, Inventory, Kind, Owner, Rights, Span};
 use molt_arch::refcount::{self, Leaves, Run};
 use molt_arch::shootdown::Shootdown;
-use molt_arch::va::{Class, Extent, Hole, Region, Space};
+use molt_arch::va::{Class, Extent, Region};
 use molt_arch::{
     BootInfo, ExitStatus, FRAME_SIZE, Platform, PlatformError, SerialPort, SerialWriter,
     UsableRegions, view,
@@ -34,6 +34,7 @@ mod network;
 mod nvme;
 mod pci;
 mod smp;
+mod space;
 mod virtio;
 
 use molt_kernel::report;
@@ -75,8 +76,12 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     platform.verify_owned_mapping(boot_info).expect("owned W^X mapping probe");
     report!(platform, "MOLT_MAPPING_OK");
 
+    // Everything below allocates addresses out of this one space, because there
+    // is only one for the machine to have.
+    space::cut(platform.address_space().expect("the platform probed its own translation"));
+
     let analyzer = verify_address_space(platform);
-    verify_refcounts(platform, &analyzer);
+    verify_refcounts(platform, analyzer);
 
     platform.verify_image_protection(boot_info).expect("kernel image obeys W^X");
     report!(platform, "MOLT_WX_OK");
@@ -232,12 +237,8 @@ fn verify_heap<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
 /// that wants a hundred gigabytes of logs addressable at once.
 const ANALYZER: u64 = 100 << 30;
 
-/// Free ranges per class, which is the budget `docs/va-allocator.md` sizes:
-/// 24 bytes apiece, 64 per class, 4 608 bytes of kernel stack in total.
-const HOLES: usize = 3 * 64;
-
-/// Cuts the one global address space out of what the hardware turned out to
-/// support, and proves an extent survives the round trip that a revoke is.
+/// Proves an extent out of the machine's one address space survives the round
+/// trip that a revoke is.
 ///
 /// The claim is not that the allocator works — `molt-arch` tests that on the
 /// host — but that the width it was cut from is the machine's own answer, and
@@ -245,8 +246,7 @@ const HOLES: usize = 3 * 64;
 /// describe. See `docs/va-allocator.md`.
 fn verify_address_space<P: Platform>(platform: &mut P) -> Extent {
     let widths = platform.address_space().expect("the platform probed its own translation");
-    let mut holes = [Hole::EMPTY; HOLES];
-    let mut space = Space::over(widths.address(), &mut holes).expect("a space wide enough to cut");
+    let mut space = space::global();
 
     // A hart that implements only Sv39 has a 32 GiB gigabyte arena and cannot
     // seat the analyzer. It proves the same round trip with what it does have,
@@ -307,7 +307,7 @@ const RUNS: usize = 16;
 /// thing being counted: a hundred gigabytes shared with a second view is one
 /// record holding the number two, and the 26 million frames underneath it never
 /// get a record at all. See `docs/address-space.md`.
-fn verify_refcounts<P: Platform>(platform: &mut P, analyzer: &Extent) {
+fn verify_refcounts<P: Platform>(platform: &mut P, analyzer: Extent) {
     let mut runs = [Run::EMPTY; RUNS];
     let mut leaves = Leaves::over(&mut runs);
     let start = analyzer.start();
@@ -345,6 +345,16 @@ fn verify_refcounts<P: Platform>(platform: &mut P, analyzer: &Extent) {
         Class::FANOUT,
         leaves.runs(),
     );
+
+    // The analyzer is done with its hundred gigabytes, and the space it took
+    // them from is the one every later smoke allocates out of. Nothing else is
+    // running yet — the other cores start further down — so no core can be
+    // holding a translation for the range, and the flush it waits on is one
+    // nobody owes.
+    let mut space = space::global();
+    space.release(analyzer).expect("an extent this space issued");
+    let epoch = space.sweep();
+    space.retire(epoch);
 }
 
 /// Frees an extent the way a revoke does, and holds its addresses back until
@@ -354,13 +364,11 @@ fn verify_refcounts<P: Platform>(platform: &mut P, analyzer: &Extent) {
 /// cores: the epoch is retired by acknowledgements that came from the cores
 /// themselves, each having run the flush instruction on its own hardware. The
 /// order is the one `docs/threat-model.md` asks after — the leaf goes first, the
-/// shootdown second, and [`retire`](Space::retire) only once nobody owes a
+/// shootdown second, and [`retire`](molt_arch::va::Space::retire) only once nobody owes a
 /// flush. Reversing the last two is a use-after-free the hardware performs for
 /// whoever reads the address next.
 fn verify_shootdown<P: Platform>(platform: &mut P, exec: &Executor) {
-    let widths = platform.address_space().expect("the platform probed its own translation");
-    let mut holes = [Hole::EMPTY; HOLES];
-    let mut space = Space::over(widths.address(), &mut holes).expect("a space wide enough to cut");
+    let mut space = space::global();
 
     let wanted = ANALYZER.min(space.largest(Class::Giga));
     let extent = space.allocate(Class::Giga, wanted).expect("room in the gigabyte arena");
@@ -465,8 +473,7 @@ fn verify_domain<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P, exec: 
         molt_arch::align_up(claimed.start(), granule).expect("an aligned base below the end");
     let span = Span::new(base, base + granule).expect("a leaf's worth of claimed frames");
 
-    let mut holes = [Hole::EMPTY; HOLES];
-    let mut space = Space::over(widths.address(), &mut holes).expect("a space wide enough to cut");
+    let mut space = space::global();
     let extent = space.allocate(GRANTED, granule).expect("room in the megabyte arena");
     let start = extent.start();
 

@@ -15,6 +15,7 @@ pub mod completion;
 pub mod cpu;
 pub mod executor;
 pub mod interrupt;
+pub mod lock;
 pub mod peers;
 pub mod registry;
 pub mod ring;
