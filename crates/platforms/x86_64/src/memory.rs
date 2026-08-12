@@ -158,39 +158,82 @@ fn active() -> Result<&'static mut Space, PlatformError> {
 /// probe, changing it means rebuilding the tree the running code is translating
 /// through.
 ///
-/// The tag width is a capability, not a state: `CPUID.01H:ECX[17]` says the
-/// machine has PCIDs, and enabling them is `CR4.PCIDE`, which this kernel does
-/// not do until domains exist. Twelve bits is what it will get when it does; a
-/// machine without the bit gets zero, and pays a flush per view switch.
+/// The tag width is read the same way, off `CR4.PCIDE` rather than off CPUID:
+/// what a domain switch costs is decided by the bit this core is running with,
+/// not by the one it could have had. [`enable_tags`] is what turns it into
+/// [`PCID_BITS`], and a core that could not gets zero and a flush per switch.
 pub fn widths() -> molt_arch::va::Widths {
-    let address = if Cr4::read().contains(Cr4Flags::L5_PAGING) { 57 } else { 48 };
-    let features = core::arch::x86_64::__cpuid(1);
-    let asid = if features.ecx & (1 << 17) != 0 { 12 } else { 0 };
+    let cr4 = Cr4::read();
+    let address = if cr4.contains(Cr4Flags::L5_PAGING) { 57 } else { 48 };
+    let asid = if cr4.contains(Cr4Flags::PCID) { PCID_BITS } else { 0 };
     molt_arch::va::Widths::new(address, asid)
 }
 
-/// Drops every translation this CPU has cached, global entries included.
+/// The width of the tag `CR3` carries once `CR4.PCIDE` is on.
 ///
-/// Reloading `CR3` is the usual whole-TLB flush and it is not the whole flush:
-/// entries marked global survive it by design, which is the point of the bit.
-/// `CR4.PGE` is the switch that does not spare them, so where it is on, turning
-/// it off and back on is the flush. Where it is off there is nothing global to
-/// keep, and writing `CR3` with the root it already holds invalidates the rest.
+/// Twelve, always: the field is `CR3[11:0]` and the architecture does not let a
+/// machine implement fewer, which is why nothing probes it the way the RISC-V
+/// port has to probe `satp`'s WARL ASID field.
+pub const PCID_BITS: u32 = 12;
+
+/// `CPUID.01H:ECX[17]`, which is where a machine says it has PCIDs at all.
+const PCID_FEATURE: u32 = 1 << 17;
+
+/// Whether this machine implements PCIDs, which is a different question from
+/// whether this core is using them.
+fn tags_offered() -> bool {
+    core::arch::x86_64::__cpuid(1).ecx & PCID_FEATURE != 0
+}
+
+/// Turns tagging on for the core that calls it, and reports the tag width it
+/// ended up with.
+///
+/// Every core calls it, because `CR4` comes out of reset per core: the boot
+/// core in [`init`], and an application processor as soon as it is running Rust
+/// (see [`crate::ap`]). A machine where one core tags and another flushes is a
+/// machine where one view means two different things.
+///
+/// The write has one architectural precondition — `CR3[11:0]` must be zero,
+/// because the tag lives in the field the cache-control flags occupy while
+/// `PCIDE` is off — and [`init`] loads the root with neither flag set, so the
+/// only core that can fail here is one whose CPUID answer and whose `CR4`
+/// disagree.
+pub fn enable_tags() -> u32 {
+    let cr4 = Cr4::read();
+    if cr4.contains(Cr4Flags::PCID) {
+        return PCID_BITS;
+    }
+    if !tags_offered() || Cr3::read_raw().1 != 0 {
+        return 0;
+    }
+
+    // SAFETY: paging, its mode and its root are all untouched; the bit only
+    // widens `CR3` by a field that is zero in the root this core is running on,
+    // so the very next translation walks the same tables under tag zero.
+    unsafe { Cr4::write(cr4.union(Cr4Flags::PCID)) };
+    // Read back rather than assume: a core that dropped the bit would tag every
+    // later `CR3` write zero without saying so, and quietly share one TLB
+    // between views is the one failure this whole mechanism exists to prevent.
+    if Cr4::read().contains(Cr4Flags::PCID) { PCID_BITS } else { 0 }
+}
+
+/// Drops every translation this CPU has cached: global entries and every tag.
+///
+/// Reloading `CR3` is the usual whole-TLB flush and it is not the whole flush.
+/// Entries marked global survive it by design, which is the point of the bit,
+/// and once [`enable_tags`] has run it spares more still: a `CR3` write
+/// invalidates the tag it names and leaves the others cached. Changing
+/// `CR4.PGE` is the one thing that spares nothing — the manual has it
+/// invalidate every entry for every PCID — so the flush is that bit flipped and
+/// put back, whichever way round it sits.
 pub fn flush() {
     let cr4 = Cr4::read();
-    if cr4.contains(Cr4Flags::PAGE_GLOBAL) {
-        // SAFETY: paging stays on and the mode is untouched — the bit is put
-        // back the way it was found, and only the TLB moves in between.
-        unsafe {
-            Cr4::write(cr4.difference(Cr4Flags::PAGE_GLOBAL));
-            Cr4::write(cr4);
-        }
-        return;
+    // SAFETY: paging stays on and the mode is untouched — the bit is put back
+    // the way it was found, and only the TLB moves in between.
+    unsafe {
+        Cr4::write(cr4.symmetric_difference(Cr4Flags::PAGE_GLOBAL));
+        Cr4::write(cr4);
     }
-    let (root, flags) = Cr3::read();
-    // SAFETY: the root that is already live, written back unchanged, so the
-    // code performing the write keeps translating through the same tables.
-    unsafe { Cr3::write(root, flags) };
 }
 
 /// A cursor past the RAM the address space is already built out of.
@@ -284,6 +327,13 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<u64, PlatformError> {
     // translation can switch in place, and `Cr3Flags::empty()` leaves the table
     // walk write-back cacheable.
     unsafe { Cr3::write(root, Cr3Flags::empty()) };
+    // With the root loaded and its tag field zero, which is the one moment the
+    // bit can be set. A machine that offers PCIDs and then refuses them is
+    // describing itself wrongly, and every later `CR3` write would silently
+    // share one set of TLB entries between views.
+    if (enable_tags() != 0) != tags_offered() {
+        return Err(PlatformError::InvalidHardware);
+    }
     // SAFETY: same reasoning as `active`; this runs once on the boot CPU.
     unsafe {
         *ACTIVE.0.get() = Some(Space {

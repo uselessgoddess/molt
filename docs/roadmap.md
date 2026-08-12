@@ -492,8 +492,9 @@ came first anyway, because the executor could not be made faster without it.
       `1 << 54` so `MOLT_MAPPING_OK` is evidence rather than a claim
 - [x] a global VA allocator handing out extents, not pages, cut from the
       probed width inside a booted kernel (`MOLT_VA_OK`)
-- [x] the tag budget read off the hardware rather than assumed, on both ports
-      (`MOLT_ASID_OK`)
+- [x] the tag budget read off the hardware rather than assumed, on both ports,
+      with x86_64's PCIDs enabled on every core and the width read back out of
+      `CR4` afterwards (`MOLT_ASID_OK`)
 - [x] the boot mapping of RAM read back out of the live tables, largest leaf
       first (`MOLT_HUGE_MAP_OK`: a gigapage on riscv64, 2 MiB on x86_64), on a
       machine given enough memory for a gigapage to exist (`MOLT_RAM_OK`, which

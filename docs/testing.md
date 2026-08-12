@@ -130,7 +130,10 @@ a merge gate — because a lab of one board has no queue to retry into.
 
 The smoke runner boots a real image under QEMU and asserts serial markers
 through `MOLT_BOOT_OK`, with a hard 20-second timeout (`MOLT_SMOKE_TIMEOUT`
-raises it for a slow host) so a hang fails instead of occupying a runner.
+raises it for a slow host) so a hang fails instead of occupying a runner. It
+emulates by default and accelerates on request: `MOLT_QEMU_ACCEL=kvm` swaps TCG
+for the host's own CPU, which is the only way to boot x86_64 on a machine that
+has PCIDs at all.
 A timed-out run prints the serial log it captured, because the log is the only
 evidence of where the boot stopped; the pipe is drained by its own thread so a
 talkative guest cannot block on its own console and look like a hang. The smoke
@@ -187,11 +190,18 @@ translation the hardware performed at an address only the wide mode reaches. See
 is a fixed string: the first cuts the global VA allocator from the address width
 the platform probed and carves the 100 GiB of
 [`va-allocator.md`](va-allocator.md)'s worked example out of it, and the second
-reports how many domain tags the hart actually implements. Both markers appear
+reports how many domain tags the core came up running with. Both markers appear
 on both platforms with different numbers — 57 bits and 65 535 tags on riscv64,
-48 bits and none at all on x86_64's default model — which is the point: the
-tagless path is not skipped, it is exercised, and the kernel that flushes on
-every switch is proven to still work rather than assumed to.
+48 bits and no tags at all under QEMU's TCG, which emulates no PCIDs — which is
+the point: the tagless path is not skipped, it is exercised, and the kernel that
+flushes on every switch is proven to still work rather than assumed to.
+
+The tagged x86_64 path is the same smoke under `MOLT_QEMU_ACCEL=kvm`, which
+hands the host CPU's own features to the guest; on a host with PCIDs the kernel
+turns them on and prints 4 095 tags. The number is asserted either way, and from
+the accelerator rather than from the kernel's own output — a run that could have
+tagged and reported none is the failure this catches, and it is precisely the
+bug the enable was added to fix.
 
 **`MOLT_RAM_OK` catches a constant pretending to be a measurement.** The riscv64
 kernel used to carry the QEMU `virt` default — RAM ends at `0x8800_0000` — which

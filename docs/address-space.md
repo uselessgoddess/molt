@@ -84,7 +84,11 @@ bits *and* the tag bits the hardware admitted to: on RISC-V the second half is a
 live probe of `satp`'s ASID field, which the specification leaves WARL and
 UNSPECIFIED in width, so the kernel writes sixteen ones and counts what stayed;
 on x86_64 both halves are readable without probing (`CR4.LA57` for the mode the
-loader left on, `CPUID.01H:ECX[17]` for whether PCIDs exist at all). And the
+loader left on, `CR4.PCIDE` for whether this core tags). The x86_64 tag width is
+read off the state and not off `CPUID.01H:ECX[17]`, because what a switch costs
+is decided by the bit the core is running with and not by the one it could have
+had: `memory::enable_tags` sets it on every core, boot and application alike,
+and a core that could not gets zero and a flush per switch. And the
 global VA allocator of [`docs/va-allocator.md`](va-allocator.md) is now cut from
 that probed width inside a booted kernel rather than from a constant. The two
 markers are below, and both print numbers that came from the machine.
@@ -378,8 +382,10 @@ the whole field, reads back what stuck, and counts the low contiguous run —
 run counts, because WARL lets a hart keep a high bit it does not decode, and two
 domains whose tags alias in the bits that do decode is worse than no tags at
 all. QEMU's `virt` answers 16, so 65 535 concurrent domains with tag 0 reserved
-for the kernel. x86_64's equivalent is PCID: 12 bits, 4 095 domains, on hardware
-that has it — QEMU's default model does not, and there the honest answer is 0.
+for the kernel. x86_64's equivalent is PCID: 12 bits, 4 095 domains, and nothing
+probes it because the architecture fixes the field at `CR3[11:0]` and lets no
+machine implement fewer. What varies is whether the core turned it on, which is
+why the number the kernel prints is `CR4.PCIDE` read back after the write.
 
 **What a rollover costs, on the workload that provokes it.** Take the one worth
 worrying about: 32 harts, domains created and destroyed continuously. Tags are
@@ -393,15 +399,21 @@ domain is a page table and a set of capabilities — reaches a rollover every
 magnitude below that, and the reason is the paragraph above: the operations a
 busy system actually repeats are grants and revokes, and they cost zero tags.
 
-**And when there are no tags at all.** A hart with a 0-bit field, which is what
-the x86_64 smoke exercises today, flushes on every domain switch. That is slower
-and exactly as safe: `Asids::assign` returns `Flush::Everything`, the switch
-pays a cold TLB, and nothing about isolation changes. It is a performance floor,
-not a correctness fork, and having both paths under CI on different ports is why
-that can be stated rather than hoped.
+**And when there are no tags at all.** A core with a 0-bit field flushes on every
+domain switch. That is slower and exactly as safe: `Asids::assign` returns
+`Flush::Everything`, the switch pays a cold TLB, and nothing about isolation
+changes. It is a performance floor, not a correctness fork, and having both paths
+under CI is why that can be stated rather than hoped.
 
-`MOLT_ASID_OK: bits=16 domains=65535` on riscv64 and `bits=0 domains=0` on
-x86_64 are the two ends of that range, printed by the kernel that will use them.
+Both paths are the same x86_64 kernel under two accelerators. QEMU's TCG
+implements no PCIDs whatever `-cpu` asks for — it filters the feature out and
+says so on stderr — so the default smoke boots the untagged floor and prints
+`MOLT_ASID_OK: bits=0 domains=0`. `MOLT_QEMU_ACCEL=kvm just smoke-x86_64` hands
+the host CPU's features through, and the same kernel prints
+`bits=12 domains=4095`. CI runs both, and the smoke checks the number rather than
+the marker's name, so a machine with tags that reports none fails there.
+Meanwhile riscv64 prints `bits=16 domains=65535`, which is the other end of the
+range and the reason nothing here is a per-port fork.
 
 ## Which tier a program actually gets
 
@@ -428,7 +440,7 @@ exists, the table above is a plan; after it, it is a property.
 | widest `satp` mode probed at boot | `MOLT_SATP_MODE: sv57` | shipped: 512 GiB → 128 PiB |
 | a translation above 512 GiB, performed | `MOLT_MAPPING_OK` | shipped: probe at `1 << 54` |
 | global VA allocator with extents | `MOLT_VA_OK` | shipped: 100 GiB in 100 leaves, from a probed width |
-| the tag budget, read off the hardware | `MOLT_ASID_OK` | shipped: 65 535 domains on riscv64, 0 on x86_64 |
+| the tag budget, read off the hardware | `MOLT_ASID_OK` | shipped: 65 535 domains on riscv64, 4 095 on x86_64 where the machine has PCIDs |
 | 1 GiB and 2 MiB leaves on demand | `MOLT_HUGE_MAP_OK` | shipped: one PTE per gibibyte, not 262,144 |
 | a freed range held until every core flushed | `MOLT_SHOOTDOWN_OK` | shipped: the order the rest of this table rests on |
 | refcounts on the mapped leaf, not the frame | `MOLT_REFCOUNT_OK` | shipped: 100 GiB in 100 records, not 26 million |

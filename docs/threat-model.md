@@ -120,11 +120,26 @@ trace. Two things stop it, and both are needed — the generation check (a stale
 `Asid` cannot be presented as live) and the full flush on rollover (the hardware
 has no per-tag invalidate that is cheaper than the flush at that point).
 
-The budget is measured, not assumed: `MOLT_ASID_OK` prints what the hart
-implements, which is 16 bits / 65 535 concurrent domains on QEMU's `virt`, and 0
-bits / 0 domains on QEMU's default x86_64 model — where the correct behaviour is
-to flush on every switch, and does. That "0 domains" path is not a degraded
-security posture; it is the same posture, paid for in TLB misses.
+The budget is measured, not assumed: `MOLT_ASID_OK` prints what the core is
+running with, which is 16 bits / 65 535 concurrent domains on QEMU's `virt`, and
+12 bits / 4 095 domains on an x86_64 machine whose PCIDs the kernel turned on.
+On one that has none — QEMU's TCG emulates none — the same kernel prints 0 and
+flushes on every switch. That "0 domains" path is not a degraded security
+posture; it is the same posture, paid for in TLB misses.
+
+What is measured there is the state and not the capability. `CR4.PCIDE` comes
+out of reset clear and per core, so every core sets it for itself
+(`memory::enable_tags`, called from `init` on the boot core and from `ap::enter`
+on every other), the boot core refuses a machine whose CPUID answer and whose
+`CR4` disagree, and the width reported is the bit read back afterwards. A kernel
+that reported the capability instead would claim 12 bits while every switch was
+still a full flush — true about the machine, false about the isolation.
+
+One consequence is in `flush`. Once tagging is on, reloading `CR3` invalidates
+only the tag it names, so the whole-TLB flush is `CR4.PGE` toggled and put back,
+which the manual defines as invalidating every entry for every PCID. A flush
+that spared the tags would leave exactly the stale entries the generation check
+exists to make unreachable.
 
 ### 4. A device cannot be used as a proxy
 
@@ -341,7 +356,7 @@ is a claim, and [`docs/testing.md`](testing.md) is why that is the standard.
 
 | Marker | The claim it turns into evidence | Status |
 | --- | --- | --- |
-| `MOLT_ASID_OK` | the tag budget is what the hart implements, counted, not assumed | **shipped** |
+| `MOLT_ASID_OK` | the tag budget is what the core runs with, read back, not assumed | **shipped** |
 | `MOLT_VA_OK` | a freed address is not reissued before its epoch is retired | **shipped** |
 | `MOLT_SHOOTDOWN_OK` | a freed range is held until every attending core has acknowledged its own flush | **shipped** |
 | `MOLT_REFCOUNT_OK` | a shared leaf is counted per leaf, so no frame is reclaimed while a second view still names it | **shipped** |
@@ -401,9 +416,10 @@ questions for every commit in Stage 5.0 and after:
 - **Nothing about the IOMMU's own state.** The endpoint isolation shipped;
   whether a domain can influence *which* IOMMU domain a device lands in is a
   question for whenever a domain gets to own a device.
-- **x86_64 tags are probed but not enabled.** `CR4.PCIDE` stays off until
-  domains exist, so the x86_64 port flushes on every switch by design and the
-  tagged path is exercised only on RISC-V today.
+- **The tagged x86_64 path needs a machine with PCIDs to be exercised.**
+  `CR4.PCIDE` is set on every core now, but QEMU's TCG emulates no PCIDs at all,
+  so the default smoke boots the untagged floor; the 12-bit answer comes from
+  the KVM run CI adds beside it, and a host without `/dev/kvm` cannot see it.
 
 ## The decision, restated
 

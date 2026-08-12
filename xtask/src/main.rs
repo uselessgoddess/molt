@@ -288,6 +288,14 @@ fn smoke_case(arch: Arch, case: Case) -> Result<(), String> {
             return Err(format!("{name} {label} QEMU exited without the {marker} serial marker"));
         }
     }
+    // Checked apart from the list because it is a value and not a name: what the
+    // kernel prints depends on the machine QEMU built, and both answers are a
+    // pass — the failure this catches is a machine with tags that reports none.
+    if let Some(marker) = tag_marker(arch, case)
+        && !run.serial.contains(&marker)
+    {
+        return Err(format!("{name} {label} QEMU exited without the {marker} serial marker"));
+    }
     Ok(())
 }
 
@@ -392,6 +400,49 @@ fn run_qemu_interactive(image: &Path) -> Result<(), String> {
     check_exit_status(Arch::X86_64, Case::Boot, status)
 }
 
+/// The accelerator QEMU runs the x86_64 image under.
+///
+/// TCG by default, because that is what a machine without `/dev/kvm` has and
+/// what makes the smoke reproducible everywhere. `MOLT_QEMU_ACCEL=kvm` is the
+/// run that exercises tagged translation: TCG implements no PCIDs at all —
+/// QEMU lists `CPUID_EXT_PCID` among the features it does not emulate and
+/// filters it out of whatever `-cpu` asks for, warning as it goes — so under it
+/// the kernel has no tags to turn on, and under KVM it has the host's.
+fn accelerator() -> String {
+    env::var("MOLT_QEMU_ACCEL").unwrap_or_else(|_| "tcg".into())
+}
+
+/// The CPU model that goes with the accelerator: the machine's own under KVM,
+/// where passing its features through is the point, and otherwise the default
+/// model with PCIDs asked for, so the ask and its refusal are both in the log.
+fn cpu_model(accelerator: &str) -> &'static str {
+    match accelerator {
+        "kvm" => "host",
+        _ => "qemu64,+pcid",
+    }
+}
+
+/// What `MOLT_ASID_OK` has to print, for the runs where the machine's answer is
+/// known before it boots.
+///
+/// The kernel reports `CR4.PCIDE` rather than CPUID, so this pins the state and
+/// not the capability: a run on a CPU that has PCIDs and prints zero bits is a
+/// run where the bit never got set, and one that prints twelve is proof it did.
+fn tag_marker(arch: Arch, case: Case) -> Option<String> {
+    let (Arch::X86_64, Case::Boot) = (arch, case) else {
+        return None;
+    };
+    let tagged = match accelerator().as_str() {
+        // KVM hands the host CPU's features through, so the host's own flags
+        // are this machine's, and every x86_64 CPU since Westmere has PCIDs.
+        "kvm" => fs::read_to_string("/proc/cpuinfo").is_ok_and(|info| {
+            info.split(|byte: char| !byte.is_ascii_alphanumeric()).any(|flag| flag == "pcid")
+        }),
+        _ => false,
+    };
+    Some(format!("MOLT_ASID_OK: bits={}", if tagged { 12 } else { 0 }))
+}
+
 fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
     let disk = smoke_disk("molt-disk.img")?;
     let nvme = smoke_disk("molt-nvme.img")?;
@@ -400,6 +451,8 @@ fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
     if let Some(firmware) = env::var_os("MOLT_QEMU_FIRMWARE") {
         command.arg("-L").arg(firmware);
     }
+    let accelerator = accelerator();
+    command.args(["-accel", &accelerator, "-cpu", cpu_model(&accelerator)]);
     command.args([
         "-machine",
         "q35",
