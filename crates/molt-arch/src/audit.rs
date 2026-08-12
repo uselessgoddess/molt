@@ -12,11 +12,23 @@ pub struct Leaf {
     start: u64,
     size: u64,
     protection: PageProtection,
+    base: Option<u64>,
 }
 
 impl Leaf {
     pub const fn new(start: u64, size: u64, protection: PageProtection) -> Self {
-        Self { start, size, protection }
+        Self { start, size, protection, base: None }
+    }
+
+    /// The same leaf, with the physical address it translates to.
+    ///
+    /// Read back out of the entry rather than remembered from the mapping call,
+    /// so it answers a question no audit of sizes and rights can: whether the
+    /// leaf a view holds names the frames the kernel meant to hand over, or
+    /// somebody else's. A walk that does not bother to say returns
+    /// [`new`](Self::new) and claims nothing.
+    pub const fn backed(start: u64, size: u64, protection: PageProtection, base: u64) -> Self {
+        Self { start, size, protection, base: Some(base) }
     }
 
     pub const fn start(self) -> u64 {
@@ -29,6 +41,11 @@ impl Leaf {
 
     pub const fn protection(self) -> PageProtection {
         self.protection
+    }
+
+    /// Where the leaf points, for a walk that reported it.
+    pub const fn base(self) -> Option<u64> {
+        self.base
     }
 
     /// One past the last address the leaf translates.

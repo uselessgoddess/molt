@@ -22,11 +22,14 @@ use bootloader_api::info::{MemoryRegionKind as BootMemoryRegionKind, MemoryRegio
 pub use bootloader_api::{
     BootInfo as BootloaderInfo, BootloaderConfig, entry_point as __bootloader_entry_point,
 };
+use molt_arch::asid::Asid;
+use molt_arch::audit::Leaf;
 use molt_arch::memory::{Device, Rights, Span};
 use molt_arch::{
     BootInfo, ConfigSpace, CpuId, DeviceMapper, Entry, ExitStatus, FabricError, FrameCursor,
     ImageRange, InterruptFabric, Local, MappingError, MemoryMap, MemoryRegion, MemoryRegionKind,
-    Mmio, MsiMessage, Platform, PlatformError, SerialPort, Sink, Smp, SmpError, Stack,
+    Mmio, MsiMessage, Platform, PlatformError, SerialPort, Sink, Smp, SmpError, Stack, Tlb, View,
+    va,
 };
 
 /// Fixed boot-stack window cloned into kernel-owned page tables.
@@ -233,12 +236,45 @@ impl Platform for X86_64 {
         memory::verify_device_window(boot_info)
     }
 
+    fn largest_ram_leaf(&mut self, boot_info: &BootInfo<'_>) -> Result<Leaf, PlatformError> {
+        memory::largest_ram_leaf(boot_info)
+    }
+
+    /// Always answers: unlike the RISC-V port, neither half needs a probe that
+    /// has to have run first. The address width is the paging mode the loader
+    /// left on, and the tag width is a CPUID capability bit.
+    fn address_space(&self) -> Option<va::Widths> {
+        Some(memory::widths())
+    }
+
     fn free_frames(&self) -> Option<FrameCursor> {
         memory::free_frames()
     }
 
     fn claim_ram(&mut self, boot_info: &BootInfo<'_>, count: u64) -> Result<Span, PlatformError> {
         memory::claim_ram(boot_info.memory_map(), count)
+    }
+
+    fn open_view(&mut self, asid: Asid) -> Result<View, PlatformError> {
+        memory::open_view(asid)
+    }
+
+    fn grant(
+        &mut self,
+        view: View,
+        extent: &va::Extent,
+        span: Span,
+        rights: Rights,
+    ) -> Result<(), PlatformError> {
+        memory::grant(view, extent, span, rights)
+    }
+
+    fn revoke(&mut self, view: View, extent: &va::Extent) -> Result<u64, PlatformError> {
+        memory::revoke(view, extent)
+    }
+
+    fn resident(&self, view: View, address: u64) -> Option<Leaf> {
+        memory::resident(view, address)
     }
 
     fn terminate(&mut self, status: ExitStatus) -> ! {
@@ -261,6 +297,14 @@ impl DeviceMapper for X86_64 {
         rights: Rights,
     ) -> Result<Mmio<'static>, MappingError> {
         memory::map_device(window, rights)
+    }
+}
+
+// SAFETY: `memory::flush` leaves this CPU with nothing cached from before the
+// call, global entries included, before it returns.
+unsafe impl Tlb for X86_64 {
+    fn flush() {
+        memory::flush();
     }
 }
 

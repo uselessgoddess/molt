@@ -2,7 +2,9 @@
 
 //! Hardware-independent contracts shared by the kernel and architecture crates.
 
+pub mod asid;
 pub mod audit;
+pub mod cache;
 pub mod cpu;
 pub mod dma;
 pub mod iommu;
@@ -10,7 +12,11 @@ pub mod irq;
 pub mod memory;
 pub mod mmio;
 pub mod pci;
+pub mod refcount;
+pub mod shootdown;
 pub mod smp;
+pub mod va;
+pub mod view;
 
 use core::fmt;
 
@@ -21,7 +27,9 @@ pub use crate::irq::{FabricError, InterruptFabric, MsiMessage, Sink};
 pub use crate::memory::Cache;
 pub use crate::mmio::{DeviceMapper, Mmio, MmioError};
 pub use crate::pci::ConfigSpace;
+pub use crate::shootdown::Tlb;
 pub use crate::smp::{Entry, Smp, SmpError, Stack, number};
+pub use crate::view::View;
 
 /// Architecture-neutral information passed from a platform boot adapter.
 #[derive(Clone, Copy)]
@@ -297,6 +305,37 @@ impl<'m> FrameAllocator<'m> {
         memory::Span::frames(first, count).map_err(|_| RunError::OutOfFrames)
     }
 
+    /// Hands out `count` frames as one span, from wherever in the map one fits.
+    ///
+    /// [`run`](Self::run) takes what is next and refuses a gap; this keeps
+    /// looking past it. A firmware map is a list of what is usable and not a
+    /// promise about how it is arranged — the region a cursor happens to be
+    /// standing in may have four frames left in it — so a caller that needs a
+    /// contiguous span and does not care where it sits should ask for one
+    /// rather than be told the next four frames are not it.
+    ///
+    /// What is walked over is spent, the same as a failed [`run`](Self::run)
+    /// spends what it took before the gap. That is what makes this a claim and
+    /// not a search: it moves the cursor forward and never back.
+    pub fn contiguous(&mut self, count: u64) -> Result<memory::Span, RunError> {
+        if count == 0 {
+            return Err(RunError::Empty);
+        }
+        let mut first = self.allocate().ok_or(RunError::OutOfFrames)?.start();
+        let (mut previous, mut held) = (first, 1);
+        while held < count {
+            let frame = self.allocate().ok_or(RunError::OutOfFrames)?.start();
+            // The frame past a gap is the first of the next candidate and not a
+            // frame to give back: a region holding exactly `count` frames is
+            // still an answer, and retrying a whole `run` from here would have
+            // already spent its first frame on the attempt that found the gap.
+            (first, held) =
+                if frame == previous + FRAME_SIZE { (first, held + 1) } else { (frame, 1) };
+            previous = frame;
+        }
+        memory::Span::frames(first, count).map_err(|_| RunError::OutOfFrames)
+    }
+
     pub fn allocate(&mut self) -> Option<PhysicalFrame> {
         while self.region < self.map.len() {
             let range = self.map.region(self.region).and_then(|region| {
@@ -536,6 +575,8 @@ pub enum PlatformError {
     MissingConfigSpace,
     /// Free RAM could not cover a request for frames.
     Frames(RunError),
+    /// A view refused to be opened, filled, or emptied.
+    View(view::Error),
 }
 
 impl From<RunError> for PlatformError {
@@ -553,6 +594,12 @@ impl From<MappingError> for PlatformError {
 impl From<FabricError> for PlatformError {
     fn from(error: FabricError) -> Self {
         Self::Fabric(error)
+    }
+}
+
+impl From<view::Error> for PlatformError {
+    fn from(error: view::Error) -> Self {
+        Self::View(error)
     }
 }
 
@@ -585,6 +632,20 @@ pub trait Platform: DeviceMapper + InterruptFabric + Local + Smp {
         Err(PlatformError::Unsupported)
     }
 
+    /// The largest leaf the boot mapping of RAM actually ended up using.
+    ///
+    /// Read back out of the live tables rather than remembered while building
+    /// them: what the mapper meant to do is not evidence that the hardware
+    /// translates that way. A platform whose tables cannot be walked returns
+    /// [`PlatformError::Unsupported`], and the kernel reports that instead of
+    /// a size it did not check.
+    fn largest_ram_leaf(
+        &mut self,
+        _boot_info: &BootInfo<'_>,
+    ) -> Result<audit::Leaf, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
     /// The PCI configuration space firmware described, if there is one.
     fn config_space(&mut self, _boot_info: &BootInfo<'_>) -> Result<ConfigSpace, PlatformError> {
         Err(PlatformError::MissingConfigSpace)
@@ -593,6 +654,17 @@ pub trait Platform: DeviceMapper + InterruptFabric + Local + Smp {
     /// Sends every interrupt line this platform raises to `sink`.
     fn route_interrupts(&mut self, _sink: &'static dyn Sink) -> Result<(), PlatformError> {
         Err(PlatformError::Unsupported)
+    }
+
+    /// What this machine's translation hardware turned out to be able to do,
+    /// once [`initialize`](Self::initialize) has probed it.
+    ///
+    /// The global VA allocator is cut from the address width and the domain
+    /// budget follows from the tag width, so both are asked of the hardware
+    /// rather than assumed. A port that has not probed yet returns `None`, and
+    /// the kernel hands out no addresses on it.
+    fn address_space(&self) -> Option<va::Widths> {
+        None
     }
 
     /// A cursor past the RAM the kernel's own tables and image already own.
@@ -626,6 +698,51 @@ pub trait Platform: DeviceMapper + InterruptFabric + Local + Smp {
         _count: u64,
     ) -> Result<memory::Span, PlatformError> {
         Err(PlatformError::Unsupported)
+    }
+
+    /// Opens an empty view of the one address space, tagged `asid`.
+    ///
+    /// Empty means empty: the kernel's own text is not in it, which is the only
+    /// thing that makes a tier-2 domain a boundary rather than a convention.
+    /// See [`view`] for what a view is and why a grant into one costs no copy.
+    fn open_view(&mut self, _asid: asid::Asid) -> Result<View, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    /// Makes `extent` reachable from `view`, backed by `span`, with `rights`.
+    ///
+    /// The grant is at the extent's own class, so a gigabyte-class extent
+    /// becomes gigabyte leaves and costs one page-table entry per gigabyte. The
+    /// span has to cover the extent and share its alignment; anything else is
+    /// [`view::Error::Backing`], because a leaf whose physical base is not
+    /// aligned to the leaf size names memory nobody meant to hand over.
+    fn grant(
+        &mut self,
+        _view: View,
+        _extent: &va::Extent,
+        _span: memory::Span,
+        _rights: memory::Rights,
+    ) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    /// Takes `extent` back out of `view`, and says how many leaves went.
+    ///
+    /// This clears the leaves and stops. The flush every core owes and the
+    /// return of the addresses to the allocator are the caller's, in that
+    /// order, for the reason [`view`] spells out: a core that cached the leaf
+    /// before this call still translates through it afterwards.
+    fn revoke(&mut self, _view: View, _extent: &va::Extent) -> Result<u64, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    /// What `view` translates `address` through, read back out of its tables.
+    ///
+    /// `None` is the honest answer for an address the view cannot reach, which
+    /// is what a domain marker is evidence of: not that a grant was intended,
+    /// but that the hardware would or would not follow it.
+    fn resident(&self, _view: View, _address: u64) -> Option<audit::Leaf> {
+        None
     }
 
     fn terminate(&mut self, status: ExitStatus) -> !;

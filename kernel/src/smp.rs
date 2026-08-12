@@ -14,7 +14,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
 
-use molt_arch::{CpuId, Local, Platform, Smp, Stack};
+use molt_arch::{CpuId, Local, Platform, Smp, Stack, Tlb};
 use molt_core::peers::Peers;
 use molt_exec::{Executor, Handle, Machine};
 
@@ -126,6 +126,11 @@ pub(crate) fn here() -> usize {
     CORES.cpu().index()
 }
 
+/// Which core this is, as the rest of the kernel names cores.
+pub(crate) fn cpu() -> CpuId {
+    CORES.cpu()
+}
+
 /// This core's executor.
 pub(crate) fn current() -> &'static Executor {
     let block = Arch::block();
@@ -219,6 +224,36 @@ pub(crate) fn crossing(exec: &Executor) -> (u16, u16) {
 
     assert!(answers.iter().all(|&cpu| cpu != here), "a core answered as another");
     (answers.len() as u16, asked)
+}
+
+/// Drops every core's cached translations, and says which ones answered.
+///
+/// The shootdown half of a revoke. This core flushes inline — it is the one that
+/// just walked the tables, so it is the likeliest to hold the entry — and every
+/// other running core runs the same instruction as a task on its own executor.
+/// Each answers with the identity its own block reports, which is what makes an
+/// answer evidence that the flush happened *there* rather than that a counter
+/// moved here.
+///
+/// Returns the cores that flushed, this one first, and how many were asked. A
+/// core that was asked and did not answer is missing from the list, which is
+/// what keeps its epoch from being retired.
+pub(crate) fn flush(exec: &Executor) -> (Vec<CpuId>, u16) {
+    Arch::flush();
+    let (peers, asked) = ask(exec, peers(), CROSSING, || async {
+        Arch::flush();
+        CORES.cpu()
+    });
+
+    let mut flushed = vec![CORES.cpu()];
+    flushed.extend(peers);
+    (flushed, asked)
+}
+
+/// Every core a shootdown has to reach: this one, and each that reported an
+/// executor.
+pub(crate) fn attending() -> impl Iterator<Item = CpuId> {
+    core::iter::once(CORES.cpu()).chain(peers().map(|(index, _)| CpuId::new(index as u16)))
 }
 
 /// Every core that reported an executor, this one aside.

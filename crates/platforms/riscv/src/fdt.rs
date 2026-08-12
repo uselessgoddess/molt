@@ -6,14 +6,15 @@
 //! into such a slice. Everything here is host-testable because the blob is just
 //! bytes.
 //!
-//! Only the ECAM window is decoded. A general device tree API would be a larger
-//! and more speculative thing; the kernel currently needs one fact from
-//! firmware, so the walk answers that one question and forgets the tree. Two
+//! Three facts are decoded, one walk each: the ECAM window, the harts, and the
+//! RAM bank the kernel was loaded into. A general device tree API would be a
+//! larger and more speculative thing; the kernel needs these three from
+//! firmware, so each walk answers one question and forgets the tree. Two
 //! bounds — a token cap and a depth cap — mean a corrupt blob ends the walk
 //! with an error instead of spinning the boot hart forever.
 
-use molt_arch::ConfigSpace;
 use molt_arch::pci::BUS_STRIDE;
+use molt_arch::{ConfigSpace, MemoryRegion, MemoryRegionKind};
 
 /// Everything a blob can be wrong about, all of them a refusal to trust it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +46,9 @@ const ECAM: &[u8] = b"pci-host-ecam-generic";
 /// firmware will not run.
 const CPU: &[u8] = b"cpu";
 const DISABLED: &[u8] = b"disabled";
+
+/// The `device_type` of a node describing installed RAM.
+const MEMORY: &[u8] = b"memory";
 
 /// Bytes of the header, through `size_dt_struct`.
 const HEADER: usize = 40;
@@ -200,6 +204,72 @@ impl<'dtb> DeviceTree<'dtb> {
         Err(FdtError::Malformed)
     }
 
+    /// The RAM bank that contains `address`, as firmware described it.
+    ///
+    /// The argument is what makes this answerable without inventing a policy:
+    /// a board may have several banks, `MemoryMap` reports one region, and the
+    /// one that matters is the one the image was loaded into. A tree whose
+    /// banks do not contain the running kernel is describing a different
+    /// machine, and [`FdtError::Missing`] says so rather than picking a bank.
+    ///
+    /// Banks other than that one are ignored, which is a real limit and not a
+    /// safe default: memory the kernel never learns about is memory it never
+    /// allocates from. Fixing it is a `MemoryMap` that reports more than one
+    /// region, not a different walk.
+    pub fn ram(&self, address: u64) -> Result<MemoryRegion, FdtError> {
+        let structs = self.block(8, 36)?;
+        let strings = self.block(12, 32)?;
+
+        let mut cursor = 0;
+        let mut cells = [Cells::DEFAULT; MAX_DEPTH];
+        let mut depth = 0;
+        let mut node = Ram::new(Cells::DEFAULT);
+
+        for _ in 0..MAX_TOKENS {
+            let token = be32(structs, cursor)?;
+            cursor += 4;
+            match token {
+                BEGIN_NODE => {
+                    if let Some(bank) = node.bank(address) {
+                        return Ok(bank);
+                    }
+                    cursor = skip_name(structs, cursor)?;
+                    if depth >= MAX_DEPTH {
+                        return Err(FdtError::Malformed);
+                    }
+                    let parent = if depth == 0 { Cells::DEFAULT } else { cells[depth - 1] };
+                    cells[depth] = Cells::DEFAULT;
+                    node = Ram::new(parent);
+                    depth += 1;
+                }
+                PROP => {
+                    let len = be32(structs, cursor)? as usize;
+                    let nameoff = be32(structs, cursor + 4)? as usize;
+                    let start = cursor + 8;
+                    let end = start.checked_add(len).ok_or(FdtError::Truncated)?;
+                    let value = structs.get(start..end).ok_or(FdtError::Truncated)?;
+                    cursor = align(end)?;
+                    if depth == 0 {
+                        return Err(FdtError::Malformed);
+                    }
+                    node.property(name(strings, nameoff)?, value, &mut cells[depth - 1]);
+                }
+                END_NODE => {
+                    if let Some(bank) = node.bank(address) {
+                        return Ok(bank);
+                    }
+                    depth = depth.checked_sub(1).ok_or(FdtError::Malformed)?;
+                    node = Ram::new(Cells::DEFAULT);
+                }
+                NOP => {}
+                END => return Err(FdtError::Missing),
+                _ => return Err(FdtError::Malformed),
+            }
+        }
+
+        Err(FdtError::Malformed)
+    }
+
     /// One of the two blocks the header locates by offset and size.
     fn block(&self, offset_at: usize, size_at: usize) -> Result<&'dtb [u8], FdtError> {
         let offset = be32(self.bytes, offset_at)? as usize;
@@ -264,6 +334,21 @@ pub unsafe fn harts_at(address: usize, into: &mut [u64]) -> Result<usize, FdtErr
     // and the tree is only borrowed for this call.
     let tree = unsafe { at(address)? };
     tree.harts(into)
+}
+
+/// The RAM bank holding `address`, per the device tree firmware left.
+///
+/// # Safety
+/// `tree` must be zero, or the device tree pointer firmware passed, mapped and
+/// immutable for the duration of the call.
+pub unsafe fn ram_at(tree: usize, address: u64) -> Result<MemoryRegion, FdtError> {
+    if tree == 0 {
+        return Err(FdtError::Missing);
+    }
+    // SAFETY: the caller promises a mapped device tree at a non-zero address,
+    // and the tree is only borrowed for this call.
+    let tree = unsafe { at(tree)? };
+    tree.ram(address)
 }
 
 /// The `totalsize` of a blob whose magic and version we accept.
@@ -412,6 +497,52 @@ impl<'dtb> Cpu<'dtb> {
     }
 }
 
+/// A `memory` node, kept only until it closes.
+struct Ram<'dtb> {
+    matched: bool,
+    cells: Cells,
+    reg: Option<&'dtb [u8]>,
+}
+
+impl<'dtb> Ram<'dtb> {
+    fn new(cells: Cells) -> Self {
+        Self { matched: false, cells, reg: None }
+    }
+
+    fn property(&mut self, name: &[u8], value: &'dtb [u8], children: &mut Cells) {
+        match name {
+            b"device_type" => self.matched |= value.split(|&byte| byte == 0).any(|it| it == MEMORY),
+            b"reg" => self.reg = Some(value),
+            b"#address-cells" => children.address = cell(value).unwrap_or(children.address),
+            b"#size-cells" => children.size = cell(value).unwrap_or(children.size),
+            _ => {}
+        }
+    }
+
+    /// The bank this node described that holds `address`, if it described one.
+    ///
+    /// A `reg` on a memory node is a list of banks, not a single pair, so the
+    /// chunks are walked rather than the first one taken.
+    fn bank(&self, address: u64) -> Option<MemoryRegion> {
+        if !self.matched
+            || !(1..=2).contains(&self.cells.address)
+            || !(1..=2).contains(&self.cells.size)
+        {
+            return None;
+        }
+        let (address_width, size_width) =
+            (self.cells.address as usize * 4, self.cells.size as usize * 4);
+
+        self.reg?
+            .chunks_exact(address_width + size_width)
+            .map(|bank| (cells(&bank[..address_width]), cells(&bank[address_width..])))
+            .map(|(base, len)| {
+                MemoryRegion::new(base, base.saturating_add(len), MemoryRegionKind::Usable)
+            })
+            .find(|bank| (bank.start()..bank.end()).contains(&address))
+    }
+}
+
 /// Reads up to two big-endian cells as one number.
 fn cells(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0, |value, &byte| value << 8 | u64::from(byte))
@@ -552,6 +683,34 @@ mod tests {
         blob(&structs, &strings)
     }
 
+    /// A root holding one `memory` node per group of banks, alongside a device
+    /// node that also carries a `reg` and must not be mistaken for RAM.
+    fn memory(nodes: &[&[(u64, u64)]]) -> Vec<u8> {
+        let mut structs = Vec::new();
+        let mut strings = Vec::new();
+
+        begin(&mut structs, "");
+        property(&mut structs, &mut strings, "#address-cells", &2u32.to_be_bytes());
+        property(&mut structs, &mut strings, "#size-cells", &2u32.to_be_bytes());
+        begin(&mut structs, "uart@10000000");
+        property(&mut structs, &mut strings, "reg", &reg(0x1000_0000, 0x100));
+        end(&mut structs);
+        for banks in nodes {
+            begin(&mut structs, "memory@80000000");
+            property(&mut structs, &mut strings, "device_type", b"memory\0");
+            let mut value = Vec::new();
+            for &(base, size) in *banks {
+                value.extend_from_slice(&reg(base, size));
+            }
+            property(&mut structs, &mut strings, "reg", &value);
+            end(&mut structs);
+        }
+        end(&mut structs);
+        structs.extend_from_slice(&9u32.to_be_bytes());
+
+        blob(&structs, &strings)
+    }
+
     /// A `reg` of two address cells and two size cells, as QEMU `virt` emits.
     fn reg(base: u64, size: u64) -> [u8; 16] {
         let mut bytes = [0u8; 16];
@@ -676,6 +835,48 @@ mod tests {
 
         assert_eq!(DeviceTree::new(&bytes)?.harts(&mut harts)?, 2);
         Ok(())
+    }
+
+    #[test]
+    fn ram_is_the_bank_holding_the_kernel() -> Result<(), FdtError> {
+        let bytes = memory(&[&[(0x8000_0000, 0x8000_0000)]]);
+
+        let bank = DeviceTree::new(&bytes)?.ram(0x8020_0000)?;
+
+        assert_eq!((bank.start(), bank.end()), (0x8000_0000, 0x1_0000_0000));
+        Ok(())
+    }
+
+    #[test]
+    fn ram_picks_among_several_banks() -> Result<(), FdtError> {
+        // Two banks in one node's `reg`, and a second node besides, because a
+        // board with a hole in its map describes itself both ways.
+        let bytes = memory(&[
+            &[(0x8000_0000, 0x1000_0000), (0xa000_0000, 0x1000_0000)],
+            &[(0x1_0000_0000, 0x4000_0000)],
+        ]);
+        let tree = DeviceTree::new(&bytes)?;
+
+        assert_eq!(tree.ram(0xa000_1000)?.start(), 0xa000_0000);
+        assert_eq!(tree.ram(0x1_0000_0000)?.start(), 0x1_0000_0000);
+        Ok(())
+    }
+
+    #[test]
+    fn ram_outside_every_bank_is_missing() -> Result<(), FdtError> {
+        let bytes = memory(&[&[(0x8000_0000, 0x1000_0000)]]);
+
+        // The uart node has a `reg` covering this, and is not RAM.
+        assert_eq!(DeviceTree::new(&bytes)?.ram(0x1000_0000), Err(FdtError::Missing));
+        Ok(())
+    }
+
+    #[test]
+    fn ram_without_a_tree_pointer_is_missing() {
+        // SAFETY: zero is the one address `ram_at` answers without a load.
+        let bank = unsafe { super::ram_at(0, 0x8000_0000) };
+
+        assert_eq!(bank, Err(FdtError::Missing), "a hart entered without a tree");
     }
 
     #[test]

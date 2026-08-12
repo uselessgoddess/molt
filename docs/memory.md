@@ -105,6 +105,22 @@ caller to protect against yet, and retyping without one is ceremony); no
 per-frame refcount (there is no `mmap`, no copy-on-write, and no sharing
 between address spaces, so the count would be 0 or 1).
 
+The third omission has a stated expiry. [`docs/address-space.md`](address-space.md)
+decides that mapped file extents and cross-domain grants both exist, and a
+granted extent is exactly memory with more than one holder — so the count comes
+back when the first grant does, in the two-word shape Redox uses above.
+
+With one change of unit, decided there and repeated here because this is where
+someone will look for it: **the count is keyed on the leaf that was mapped, not
+on the frame.** A 1 GiB leaf is one page-table entry installed and one revoked,
+so it is one count; 262 144 counts behind it could never disagree with each
+other, and maintaining them is precisely the "511 or in the extreme case 262,143
+useless PageInfos" that Redox's own survey warns about. So the table is keyed by
+(address, level) over the three leaf sizes the hardware has — 4 KiB, 2 MiB,
+1 GiB — and the price is that un-sharing a subrange of a big leaf has to split
+it first, paid by the caller who asks for the odd shape rather than by every
+mapping in the machine.
+
 ## The model
 
 `molt-arch::memory` separates three things that are easy to collapse and

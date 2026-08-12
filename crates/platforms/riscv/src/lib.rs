@@ -17,6 +17,9 @@ pub mod fdt;
 mod paging;
 #[cfg(target_arch = "riscv64")]
 mod percpu;
+// The `satp` MODE encoding is arithmetic on one CSR field, so it is tested on
+// the host like the SBI codes and the device tree.
+pub mod satp;
 #[cfg(target_arch = "riscv64")]
 mod sbi;
 #[cfg(target_arch = "riscv64")]
@@ -43,17 +46,20 @@ mod imp {
     use core::arch::{asm, global_asm};
     use core::fmt::Write as _;
 
+    use molt_arch::asid::Asid;
+    use molt_arch::audit::Leaf;
     use molt_arch::memory::{Device, Rights, Span};
     use molt_arch::{
         BootInfo, ConfigSpace, CpuId, DeviceMapper, Entry, ExitStatus, FRAME_SIZE, FabricError,
         FrameCursor, InterruptFabric, Local, MappingError, MemoryMap, MemoryRegion,
         MemoryRegionKind, Mmio, MsiMessage, Platform, PlatformError, SerialPort, SerialWriter,
-        Sink, Smp, SmpError, Stack,
+        Sink, Smp, SmpError, Stack, Tlb, View, va,
     };
 
     use crate::{ap, csr, fdt, paging, percpu, sbi, trap};
 
-    /// End of the QEMU `virt` board's default RAM.
+    /// End of the QEMU `virt` board's default RAM, used only when there is no
+    /// device tree to read it from.
     const RAM_END: u64 = 0x8800_0000;
 
     global_asm!(
@@ -90,8 +96,9 @@ _start:
         // how every layer above finds anything, including the panic path.
         // SAFETY: this is the hart firmware entered, and this is its only call.
         unsafe { percpu::attach(CpuId::BOOT, hartid as u64) };
-        let memory_map = RiscVMemoryMap::new();
-        // Sv39 identity-maps physical memory, so the physical offset is zero.
+        let memory_map = RiscVMemoryMap::new(device_tree);
+        // Every mode this kernel enables identity-maps physical memory, so the
+        // physical offset is zero whichever one the hart took.
         let boot_info = BootInfo::new(&memory_map, Some(0));
         // The pointer is kept rather than read here: the tree is the only
         // description of where PCI lives, and nothing has asked for PCI yet.
@@ -105,19 +112,36 @@ _start:
         molt_arch::panic_handler::<RiscV>(info)
     }
 
-    /// Usable RAM after the loaded image.
+    /// Usable RAM after the loaded image, bounded by the bank it sits in.
     struct RiscVMemoryMap {
         usable_start: u64,
+        usable_end: u64,
     }
 
     impl RiscVMemoryMap {
-        fn new() -> Self {
+        /// Reads how much RAM the board has instead of assuming a board.
+        ///
+        /// The constant this replaces was the QEMU `virt` default, which made
+        /// `-m` a lie in both directions: more RAM went unused, and less would
+        /// have had the frame allocator hand out addresses that decode to
+        /// nothing. Firmware knows the answer and puts it in the tree, so the
+        /// constant is now only what a hart entered without a tree falls back
+        /// to — the machine that shape of boot is likeliest to be.
+        fn new(device_tree: usize) -> Self {
             unsafe extern "C" {
                 static __kernel_end: u8;
             }
             let end = (&raw const __kernel_end) as u64;
             let usable_start = (end + FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
-            Self { usable_start }
+            // The image is inside the bank that matters, which is what makes
+            // the bank identifiable on a board that has several.
+            // SAFETY: firmware's pointer, or zero, which `ram_at` refuses
+            // before any load.
+            let bank = unsafe { fdt::ram_at(device_tree, end) };
+            // A bank ending mid-frame would otherwise become a frame that is
+            // half real.
+            let usable_end = bank.map_or(RAM_END, |bank| bank.end()) & !(FRAME_SIZE - 1);
+            Self { usable_start, usable_end }
         }
     }
 
@@ -128,7 +152,11 @@ _start:
 
         fn region(&self, index: usize) -> Option<MemoryRegion> {
             match index {
-                0 => Some(MemoryRegion::new(self.usable_start, RAM_END, MemoryRegionKind::Usable)),
+                0 => Some(MemoryRegion::new(
+                    self.usable_start,
+                    self.usable_end,
+                    MemoryRegionKind::Usable,
+                )),
                 _ => None,
             }
         }
@@ -203,6 +231,24 @@ _start:
 
         fn release(&mut self, _line: u16) -> Result<(), FabricError> {
             Err(FabricError::Unsupported)
+        }
+    }
+
+    /// `sfence.vma` with both operands zero, which the ISA defines as ordering
+    /// every prior page-table store against every translation this hart has
+    /// cached, for every address and every ASID.
+    ///
+    /// The whole-hart form is the one molt uses rather than the per-address
+    /// `sfence.vma a0, x0`: what is being freed is an extent of up to a hundred
+    /// gigabyte leaves, and invalidating them one address at a time costs more
+    /// than the refill of a TLB that was about to lose those entries anyway.
+    // SAFETY: the unqualified form leaves the hart with no translation cached
+    // from before it, global entries included, before the instruction retires.
+    unsafe impl Tlb for RiscV {
+        fn flush() {
+            // SAFETY: `sfence.vma` is a supervisor instruction molt runs in
+            // S-mode, and it touches no memory the compiler tracks.
+            unsafe { asm!("sfence.vma", options(nostack)) };
         }
     }
 
@@ -297,7 +343,18 @@ _start:
             // to land.
             unsafe { csr::enable_software_interrupts() };
             self.declare_cpus();
-            paging::init(boot_info)
+            paging::init(boot_info)?;
+            // Which mode the hart took decides how much address space there is
+            // to hand out, so it is reported rather than assumed.
+            if let Some(mode) = paging::mode() {
+                let _ = writeln!(
+                    SerialWriter::new(&mut self.serial),
+                    "MOLT_SATP_MODE: {} ({} address bits)",
+                    mode.name(),
+                    mode.bits(),
+                );
+            }
+            Ok(())
         }
 
         fn verify_exception_path(&mut self) -> bool {
@@ -317,6 +374,10 @@ _start:
 
         fn verify_device_window(&mut self, boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
             paging::verify_device_window(boot_info)
+        }
+
+        fn largest_ram_leaf(&mut self, boot_info: &BootInfo<'_>) -> Result<Leaf, PlatformError> {
+            paging::largest_ram_leaf(boot_info)
         }
 
         /// The ECAM window the device tree describes, if firmware described one.
@@ -343,6 +404,13 @@ _start:
             Err(PlatformError::Fabric(FabricError::Unsupported))
         }
 
+        /// Both halves come from the probes [`paging::init`] already ran: the
+        /// address width from the `satp` MODE the hart accepted, the tag width
+        /// from the ASID bits it kept.
+        fn address_space(&self) -> Option<va::Widths> {
+            Some(va::Widths::new(paging::mode()?.bits(), paging::asid_bits()?))
+        }
+
         fn free_frames(&self) -> Option<FrameCursor> {
             paging::free_frames()
         }
@@ -353,6 +421,28 @@ _start:
             count: u64,
         ) -> Result<Span, PlatformError> {
             paging::claim_ram(boot_info, count)
+        }
+
+        fn open_view(&mut self, asid: Asid) -> Result<View, PlatformError> {
+            paging::open_view(asid)
+        }
+
+        fn grant(
+            &mut self,
+            view: View,
+            extent: &va::Extent,
+            span: Span,
+            rights: Rights,
+        ) -> Result<(), PlatformError> {
+            paging::grant(view, extent, span, rights)
+        }
+
+        fn revoke(&mut self, view: View, extent: &va::Extent) -> Result<u64, PlatformError> {
+            paging::revoke(view, extent)
+        }
+
+        fn resident(&self, view: View, address: u64) -> Option<Leaf> {
+            paging::resident(view, address)
         }
 
         fn terminate(&mut self, status: ExitStatus) -> ! {
