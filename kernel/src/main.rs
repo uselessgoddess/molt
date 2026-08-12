@@ -610,8 +610,14 @@ fn verify_ring<P: Platform>(platform: &mut P) {
         panic!("a well-formed read did not arrive");
     };
     let named = read.op().region().expect("a read names a buffer");
-    assert!(named.within(buf.len() as u64).is_some(), "a buffer inside its extent was refused");
-    assert!(named.within(buf.len() as u64 - 1).is_none(), "a buffer past its extent was allowed");
+    assert!(named.fits(buf.len() as u64), "a buffer inside its extent was refused");
+
+    // And the refusal is in the value, not only in the branch: what a caller
+    // would carry into the load is empty rather than out of range, which is
+    // what makes the check hold while the branch is still predicted.
+    let short = buf.len() as u64 - 1;
+    assert!(!named.fits(short), "a buffer past its extent was allowed");
+    assert!(named.within(short).is_empty(), "a refused buffer kept bytes to read");
 
     // A tag this kernel has none of. One rejection, one completion saying so,
     // and the ring keeps going: a domain that guesses wrong is wrong about one

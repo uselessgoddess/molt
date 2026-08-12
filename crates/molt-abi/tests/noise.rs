@@ -94,7 +94,7 @@ fn lying_producer_reaches_fault() {
                             if let Next::Ready(call) = next {
                                 let buf = call.op().region();
                                 assert!(
-                                    buf.is_none_or(|buf| buf.within(APERTURE).is_some()),
+                                    buf.is_none_or(|buf| buf.fits(APERTURE)),
                                     "an accepted call named a buffer outside the aperture"
                                 );
                                 counts[1] += 1;

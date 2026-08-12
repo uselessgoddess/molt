@@ -249,6 +249,23 @@ because x86_64 has `lfence` and RISC-V has no ratified speculation barrier to
 reach for. Masking is cheap, portable, and belongs in the validator itself
 rather than at its call sites.
 
+That is `molt_abi::nospec`, and it is one module because a mitigation spread
+over call sites is a mitigation nobody can audit. A comparison comes back as a
+`Mask` — all ones or nothing, computed from the bits rather than from an `if` —
+and the only way to get a value out of it is `Mask::apply`, which is the `&`
+that makes an out-of-range offset zero. The mask leaves the module through
+`black_box`, because otherwise the optimizer proves it is all ones on the path
+the check passed and deletes the mitigation; that barrier is also why the wire
+parser is no longer `const fn`. `Region::fits` is the answer to branch on and
+`Region::within` is the value to use, and the split is what keeps the two from
+being confused.
+
+Two sites take an index from a domain today, and both are accounted for: the
+region check above, and the ring's slot index, which needs no mask because the
+ring's length is a power of two and `index & (N - 1)` is in range on every path,
+speculated or not. Anything that later indexes with a domain's number — a
+capability table, above all — belongs in that list or behind `nospec`.
+
 **Spectre-v2 / branch-target injection across domains: unaddressed.** A domain
 switch is a `satp` write; it does not flush branch predictors, and that is
 exactly why the switch is fast. Two mutually hostile domains on one hart can
@@ -363,7 +380,8 @@ questions for every commit in Stage 5.0 and after:
   domain can write? Both are the same bug.
 - Does every submitted address get exactly one range check, on a kernel-local
   copy, against the extent of the capability that submitted it — with the
-  out-of-range case masked rather than branched?
+  out-of-range case masked through `molt_abi::nospec` rather than only branched
+  on?
 - Is any tag reused without a generation bump?
 - Does any new protection depend on an attacker not knowing an address?
 

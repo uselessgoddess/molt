@@ -6,6 +6,8 @@
 //! already copied, so there is no field left for the other end to change after
 //! the check.
 
+use crate::nospec;
+
 pub const SLOT_BYTES: usize = 64;
 pub const SLOT_WORDS: usize = SLOT_BYTES / 8;
 
@@ -56,25 +58,52 @@ impl Region {
         self.len == 0
     }
 
-    /// Bounds check against `bytes`.
-    pub const fn within(self, bytes: u64) -> Option<u64> {
-        /// Branchless `value <= limit`. Returns all 1s if true, 0 if false.
-        /// Uses sign bit of subtraction.
-        const fn fits(value: u64, limit: u64) -> u64 {
-            !(((limit.wrapping_sub(value) as i64) >> 63) as u64)
-        }
+    /// Whether this region lies inside `bytes`.
+    ///
+    /// The architectural answer, and the only thing here worth branching on:
+    /// what the branch then carries has to come from [`within`], because that
+    /// is what keeps the refusal true while the branch is still a guess.
+    ///
+    /// [`within`]: Region::within
+    #[inline(always)]
+    pub fn fits(self, bytes: u64) -> bool {
+        self.inside(bytes).passed()
+    }
 
-        let inside = fits(self.offset as u64 + self.len as u64, bytes);
-        if inside == 0 { None } else { Some(self.offset as u64 & inside) }
+    /// This region masked against `bytes`: itself when it fits, and the empty
+    /// region at offset zero when it does not.
+    ///
+    /// The value to hand to the load, whether or not [`fits`] has been asked
+    /// yet — that is the whole of the Spectre-v1 defence, and
+    /// [`nospec`] says why it is shaped this way.
+    ///
+    /// [`fits`]: Region::fits
+    /// [`nospec`]: crate::nospec
+    #[inline(always)]
+    pub fn within(self, bytes: u64) -> Self {
+        let inside = self.inside(bytes);
+        Self {
+            offset: inside.apply(self.offset as u64) as u32,
+            len: inside.apply(self.len as u64) as u32,
+        }
+    }
+
+    /// The one bounds check both of those come down to. The sum cannot wrap:
+    /// two `u32`s widened into a `u64` before they are added.
+    #[inline(always)]
+    fn inside(self, bytes: u64) -> nospec::Mask {
+        nospec::upto(self.offset as u64 + self.len as u64, bytes)
     }
 
     /// Reads a region out of one wire word, rejecting one outside the aperture.
-    const fn decode(word: u64) -> Result<Self, Reject> {
+    ///
+    /// The mask is applied above the branch and carried through it, so the
+    /// region an `Ok` hands on is masked on the path the processor guessed as
+    /// well as the one it takes.
+    fn decode(word: u64) -> Result<Self, Reject> {
         let region = Self { offset: word as u32, len: (word >> 32) as u32 };
-        match region.within(APERTURE) {
-            Some(_) => Ok(region),
-            None => Err(Reject::Region),
-        }
+        let masked = region.within(APERTURE);
+        if region.fits(APERTURE) { Ok(masked) } else { Err(Reject::Region) }
     }
 
     const fn encode(self) -> u64 {
@@ -174,7 +203,13 @@ impl Call {
 
     /// Parses a slot the kernel has already copied out of shared memory.
     /// no shared page in scope here to fetch a field from twice.
-    pub const fn parse(words: [u64; SLOT_WORDS]) -> Result<Self, Reject> {
+    ///
+    /// Not `const`: the region check ends in a mask the optimizer must not see
+    /// through, and an optimizer barrier is the one thing a const evaluator
+    /// cannot have ([`nospec`]).
+    ///
+    /// [`nospec`]: crate::nospec
+    pub fn parse(words: [u64; SLOT_WORDS]) -> Result<Self, Reject> {
         let (id, tag) = (words[0], words[1] as u32);
         // High half of tag and tail words are reserved for future fields.
         if (words[1] >> 32) != 0 || words[5] != 0 || words[6] != 0 || words[7] != 0 {
@@ -184,10 +219,7 @@ impl Call {
         let (first, second, third) = (words[2], words[3], words[4]);
         let op = match tag {
             1 | 2 => {
-                let buf = match Region::decode(third) {
-                    Ok(buf) => buf,
-                    Err(reject) => return Err(reject),
-                };
+                let buf = Region::decode(third)?;
                 let (cap, offset) = (Handle::new(first), second);
                 if tag == 1 {
                     Op::Read { cap, offset, buf }
@@ -209,10 +241,7 @@ impl Call {
                 if third != 0 {
                     return Err(Reject::Reserved);
                 }
-                let buf = match Region::decode(second) {
-                    Ok(buf) => buf,
-                    Err(reject) => return Err(reject),
-                };
+                let buf = Region::decode(second)?;
                 let cap = Handle::new(first);
                 match tag {
                     4 => Op::Open { dir: cap, name: buf },

@@ -13,6 +13,7 @@
 //!
 //! [`SpscRing`]: ../molt_core/ring/struct.SpscRing.html
 
+pub mod nospec;
 pub mod ring;
 pub mod wire;
 

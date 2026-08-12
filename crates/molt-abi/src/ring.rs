@@ -19,12 +19,15 @@
 //!    is closed by construction and not by care.
 //!
 //! Rule 5, the single masked range check against the submitting capability's
-//! extent, is [`Region::within`]. Rule 6 — the rings live in the domain's own
-//! extent, so what the kernel writes back is memory the domain could have
-//! written itself — is a placement decision the caller makes, not something a
-//! type can hold.
+//! extent, is [`Region::fits`] to decide and [`Region::within`] to carry the
+//! decision into the value ([`nospec`]). Rule 6 — the rings live in the
+//! domain's own extent, so what the kernel writes back is memory the domain
+//! could have written itself — is a placement decision the caller makes, not
+//! something a type can hold.
 //!
 //!
+//! [`nospec`]: crate::nospec
+//! [`Region::fits`]: crate::wire::Region::fits
 //! [`Region::within`]: crate::wire::Region::within
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -91,6 +94,9 @@ impl<const N: usize> Ring<N> {
     }
 
     fn read(&self, index: u32) -> [u64; SLOT_WORDS] {
+        // No `nospec` here, and none needed: the length is a power of two, so
+        // the `&` is unconditional and every index — speculated or taken — is
+        // already inside the slots.
         let slot = &self.slots[index as usize & (N - 1)];
         core::array::from_fn(|word| slot.0[word].load(Ordering::Acquire))
     }
