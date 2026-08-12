@@ -107,6 +107,17 @@ impl Class {
         }
     }
 
+    /// The class whose leaves sit at page-table `level`, if molt maps that
+    /// level. A port walking its own tables names levels, not classes.
+    pub const fn at(level: u32) -> Option<Self> {
+        match level {
+            0 => Some(Self::Page),
+            1 => Some(Self::Mega),
+            2 => Some(Self::Giga),
+            _ => None,
+        }
+    }
+
     const fn index(self) -> usize {
         self.level() as usize
     }

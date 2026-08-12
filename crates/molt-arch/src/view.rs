@@ -46,6 +46,9 @@ pub enum Error {
     Backing,
     /// The extent is not mapped in this view, so there is nothing to revoke.
     Absent,
+    /// The leaf is already the smallest the hardware maps, so there is nothing
+    /// to cut it into.
+    Granule,
 }
 
 /// One domain's view of the one address space.

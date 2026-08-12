@@ -736,6 +736,22 @@ pub trait Platform: DeviceMapper + InterruptFabric + Local + Smp {
         Err(PlatformError::Unsupported)
     }
 
+    /// Cuts the leaf covering `address` in `view` into [`Class::FANOUT`]
+    /// leaves of the class below, and says which class that is.
+    ///
+    /// This is the hardware half of [`Leaves::split`]: revoking one megabyte of
+    /// a gigabyte-class grant has to stop the gigabyte leaf translating the
+    /// other 1023 too. The address keeps translating to the same frame
+    /// throughout — the new table is filled before the entry above it is
+    /// replaced — so the caller owes a shootdown only because a core may still
+    /// hold the coarse entry, not because anything was unmapped.
+    ///
+    /// [`Class::FANOUT`]: va::Class::FANOUT
+    /// [`Leaves::split`]: refcount::Leaves::split
+    fn split_leaf(&mut self, _view: View, _address: u64) -> Result<va::Class, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
     /// What `view` translates `address` through, read back out of its tables.
     ///
     /// `None` is the honest answer for an address the view cannot reach, which

@@ -441,6 +441,10 @@ _start:
             paging::revoke(view, extent)
         }
 
+        fn split_leaf(&mut self, view: View, address: u64) -> Result<va::Class, PlatformError> {
+            paging::split_leaf(view, address)
+        }
+
         fn resident(&self, view: View, address: u64) -> Option<Leaf> {
             paging::resident(view, address)
         }

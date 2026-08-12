@@ -9,7 +9,7 @@ use core::cell::UnsafeCell;
 use molt_arch::asid::Asid;
 use molt_arch::audit::{Audit, Contents, Declared, Leaf, MappedRange, PageWalk};
 use molt_arch::memory::{Cache, Device, Inventory, Rights, Span};
-use molt_arch::va::Extent;
+use molt_arch::va::{Class, Extent};
 use molt_arch::view::{self, VIEWS};
 use molt_arch::{
     BootInfo, FrameAllocator as BootFrameAllocator, FrameCursor, MapPermissions, MappingError,
@@ -49,6 +49,22 @@ const DEVICE_TABLE_FRAMES: usize = 64;
 /// a `CR4.LA57` host still runs the kernel on four levels until the loader
 /// hands over five.
 const TOP: usize = 3;
+
+/// Leaf bits that mean the same thing at every level, and so survive a
+/// [`split_leaf`] unchanged.
+///
+/// The PAT bit is deliberately absent: it sits at bit 12 in a huge leaf and at
+/// bit 7 in a 4 KiB one, where bit 12 is address. Molt selects its memory types
+/// with `PCD|PWT` alone, so nothing is lost by refusing to carry it.
+const INHERITED: PageTableFlags = PageTableFlags::PRESENT
+    .union(PageTableFlags::WRITABLE)
+    .union(PageTableFlags::USER_ACCESSIBLE)
+    .union(PageTableFlags::WRITE_THROUGH)
+    .union(PageTableFlags::NO_CACHE)
+    .union(PageTableFlags::ACCESSED)
+    .union(PageTableFlags::DIRTY)
+    .union(PageTableFlags::GLOBAL)
+    .union(PageTableFlags::NO_EXECUTE);
 
 /// How far up an application processor's first instruction may live: a core
 /// coming out of reset starts at `vector << 12`, and the vector is one byte.
@@ -549,6 +565,62 @@ pub fn revoke(view: View, extent: &Extent) -> Result<u64, PlatformError> {
         unmap_leaf(state.offset, root, extent.start() + leaf * granule, level)?;
     }
     Ok(extent.leaves())
+}
+
+/// Cuts the leaf covering `address` in `view` into 512 smaller ones.
+///
+/// The address never stops translating to the frame it already did: the child
+/// table is filled with entries describing the same memory before the entry
+/// above it is replaced, and the replacement is one aligned quadword store, so a
+/// core walking concurrently reads either the old leaf or a table that says the
+/// same thing. What it may still hold is the coarse TLB entry, which is why the
+/// caller shoots down before treating any child separately.
+pub fn split_leaf(view: View, address: u64) -> Result<Class, PlatformError> {
+    let state = active()?;
+    let root = root_of(state, view)?;
+    let (offset, mut frame) = (state.offset, root);
+    let mut frames = PoolFrames(&mut state.pool);
+
+    for level in (0..=TOP).rev() {
+        // SAFETY: `frame` holds a 512-entry table direct-mapped at `offset`,
+        // and the index is masked to nine bits.
+        let entry = &mut unsafe { &mut *table_pointer(offset, frame) }[table_index(address, level)];
+        let flags = entry.flags();
+        if !flags.contains(PageTableFlags::PRESENT) {
+            return Err(PlatformError::View(view::Error::Absent));
+        }
+        if level > 0 && !flags.contains(PageTableFlags::HUGE_PAGE) {
+            frame = PhysFrame::containing_address(entry.addr());
+            continue;
+        }
+
+        let child = Class::at(level as u32)
+            .and_then(Class::smaller)
+            .ok_or(PlatformError::View(view::Error::Granule))?;
+        // A child that is still huge keeps the bit saying so; one at the leaves
+        // must not, because there bit 7 selects a PAT entry instead.
+        let inherited = match child.level() {
+            0 => flags & INHERITED,
+            _ => (flags & INHERITED) | PageTableFlags::HUGE_PAGE,
+        };
+        let base = entry.addr().as_u64();
+        let next = frames.allocate_frame().ok_or(out_of_frames())?;
+        // SAFETY: a fresh pool frame nothing else owns, direct-mapped like
+        // every other, and a page table is 512 entries at every level.
+        let table = unsafe { &mut *table_pointer(offset, next) };
+        for (slot, child_entry) in table.iter_mut().enumerate() {
+            child_entry.set_addr(PhysAddr::new(base + slot as u64 * child.granule()), inherited);
+        }
+        // The walk takes the most restrictive of every level, so a pointer that
+        // carried the leaf's `NO_EXECUTE` or lacked its user bit would revoke
+        // rights the split is not allowed to touch.
+        let pointer = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | (flags & PageTableFlags::USER_ACCESSIBLE);
+        entry.set_frame(next, pointer);
+        return Ok(child);
+    }
+    Err(PlatformError::View(view::Error::Absent))
 }
 
 /// What `view` translates `address` through, read back out of its own tables.

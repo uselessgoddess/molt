@@ -273,6 +273,10 @@ impl Platform for X86_64 {
         memory::revoke(view, extent)
     }
 
+    fn split_leaf(&mut self, view: View, address: u64) -> Result<va::Class, PlatformError> {
+        memory::split_leaf(view, address)
+    }
+
     fn resident(&self, view: View, address: u64) -> Option<Leaf> {
         memory::resident(view, address)
     }

@@ -17,7 +17,7 @@ use core::cell::UnsafeCell;
 use molt_arch::asid::Asid;
 use molt_arch::audit::{Audit, Declared, Leaf, MappedRange, PageWalk};
 use molt_arch::memory::{Cache, Device, Inventory, Kind, Rights, Span};
-use molt_arch::va::Extent;
+use molt_arch::va::{Class, Extent};
 use molt_arch::view::{self, VIEWS};
 use molt_arch::{
     BootInfo, FrameAllocator, FrameCursor, FramePool, ImageSection, MapPermissions, MappingError,
@@ -35,6 +35,11 @@ const PTE_D: u64 = 1 << 7;
 
 /// Non-zero permission bits distinguish a leaf from a table pointer.
 const PTE_RWX: u64 = PTE_R | PTE_W | PTE_X;
+
+/// Everything below the physical page number: rights, user, global, accessed,
+/// dirty, and the two bits the supervisor may use. A leaf cut into smaller ones
+/// hands all of it down rather than rebuilding what it thinks it should be.
+const LEAF_FLAGS: u64 = 0x3ff;
 
 const PAGE_4K: usize = 4096;
 const PAGE_2M: usize = 2 * 1024 * 1024;
@@ -406,6 +411,53 @@ pub fn revoke(view: View, extent: &Extent) -> Result<u64, PlatformError> {
         unmap_leaf(root, state.top, va, level)?;
     }
     Ok(extent.leaves())
+}
+
+/// Cuts the leaf covering `address` in `view` into 512 smaller ones.
+///
+/// The address never stops translating to the frame it already did: the child
+/// table is filled with entries describing the same memory before the entry
+/// above it is replaced, and the replacement is one aligned doubleword store, so
+/// a hart walking concurrently reads either the old leaf or a table that says
+/// the same thing. What it may still hold is the coarse TLB entry, which is why
+/// this fences and the caller shoots down before treating any child separately.
+pub fn split_leaf(view: View, address: u64) -> Result<Class, PlatformError> {
+    let state = active()?;
+    let root = root_of(state, view)?;
+    let va = usize::try_from(address).map_err(|_| address_error())?;
+
+    let mut table = root;
+    for level in (0..=state.top).rev() {
+        // SAFETY: `table` points at a 512-entry table frame, identity mapped
+        // read/write, and the index is masked to nine bits.
+        let entry = unsafe { &mut *table.add(index(va, level)) };
+        if *entry & PTE_V == 0 {
+            return Err(PlatformError::View(view::Error::Absent));
+        }
+        if *entry & PTE_RWX == 0 {
+            table = ((*entry >> 10) << 12) as *mut u64;
+            continue;
+        }
+
+        let child = Class::at(level as u32)
+            .and_then(Class::smaller)
+            .ok_or(PlatformError::View(view::Error::Granule))?;
+        let (base, flags) = ((*entry >> 10) << 12, *entry & LEAF_FLAGS);
+        let next = alloc_table(&mut state.pool)?;
+        for slot in 0..Class::FANOUT {
+            // SAFETY: `next` is a fresh identity-mapped table frame, and the
+            // fanout is the entry count every level of every mode has.
+            unsafe { next.add(slot as usize).write(pte(base + slot * child.granule(), flags)) };
+        }
+        // SAFETY: the fence orders the child entries before the pointer that
+        // reaches them, so no hart walks a table it can see but not read.
+        unsafe { asm!("sfence.vma", options(nostack)) };
+        *entry = pte(next as u64, 0);
+        // SAFETY: the same fence again, now for the entry itself.
+        unsafe { asm!("sfence.vma", options(nostack)) };
+        return Ok(child);
+    }
+    Err(PlatformError::View(view::Error::Absent))
 }
 
 /// What `view` translates `address` through, read back out of its own tables.

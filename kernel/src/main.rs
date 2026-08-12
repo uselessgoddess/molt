@@ -487,6 +487,33 @@ fn verify_domain<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P, exec: 
         extent.leaves(),
     );
 
+    // The hardware half of a partial revoke. One leaf becomes 512, all naming
+    // the frames they already did, so nothing the holder can read changes —
+    // what changes is that the kernel can now take one of them back without
+    // taking the other 511 with it.
+    let child = platform.split_leaf(view, start).expect("a leaf this view holds");
+    assert_eq!(child, GRANTED.smaller().expect("a class below the granted one"));
+    let cut = platform.resident(view, start).expect("the split address, still translated");
+    assert_eq!(cut.size(), child.granule(), "the split left the leaf the size it was");
+    assert_eq!(cut.base(), leaf.base(), "the first child came out over other frames");
+    assert!(cut.protection().is_write(), "the split dropped the rights it was cutting");
+    let last = extent.end() - child.granule();
+    let tail = platform.resident(view, last).expect("the last child of the split leaf");
+    assert_eq!(tail.base(), leaf.base().map(|base| base + granule - child.granule()));
+    assert!(platform.resident(view, extent.end()).is_none(), "the split ran past the leaf");
+    assert!(
+        matches!(platform.split_leaf(view, start), Err(PlatformError::View(view::Error::Granule))),
+        "a smallest leaf was cut into something smaller still"
+    );
+
+    report!(
+        platform,
+        "MOLT_SPLIT_OK: 1 leaf of {} KiB into {} of {} KiB at {start:#x}",
+        granule >> 10,
+        granule / child.granule(),
+        child.granule() >> 10,
+    );
+
     // The revoke, in the order `molt_arch::view` spells out. Step one clears the
     // leaves and nothing else: the addresses are still spoken for, because a
     // core that walked them a moment ago may still hold the translation.

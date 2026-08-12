@@ -34,6 +34,7 @@ const BOOT_MARKERS: &[&str] = &[
     "MOLT_DOMAIN_OK",
     "MOLT_DOMAIN_ABSENT_OK",
     "MOLT_GRANT_OK",
+    "MOLT_SPLIT_OK",
     "MOLT_REVOKE_OK",
     "MOLT_RING_FAULT_OK",
     "MOLT_TIMER_OK",
