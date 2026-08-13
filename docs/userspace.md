@@ -47,10 +47,12 @@ That the reservations work at all was measured rather than assumed —
 [`experiments/lfi-target`](../experiments/lfi-target):
 
 ```
---- stock: s2(x18)/s5(x21) uses ---
-4
---- reserved: s2(x18)/s5(x21) uses ---
+--- stock: instructions naming s2(x18)/s5(x21) ---
+12
+--- reserved: instructions naming s2(x18)/s5(x21) ---
 0
+--- zba in reserved (add.uw / sh1add) ---
+4
 ```
 
 With `-C target-feature=+zba,+reserve-x18,+reserve-x21`, rustc stops using the
