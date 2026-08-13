@@ -129,6 +129,10 @@ impl Reclaimed {
 }
 
 /// The counts this kernel keeps, keyed on the leaves it actually mapped.
+///
+/// Records are sorted by address and never overlap — `place` refuses an
+/// overlap, `insert` keeps the order — which is what lets every lookup bisect
+/// instead of walking the table.
 pub struct Leaves<'runs> {
     runs: &'runs mut [Run],
     len: usize,
@@ -308,8 +312,7 @@ impl<'runs> Leaves<'runs> {
 
     /// Where a new run belongs, refusing one that overlaps a counted leaf.
     fn place(&self, run: Run) -> Result<usize, Error> {
-        let at =
-            (0..self.len).find(|&index| self.runs[index].start >= run.start).unwrap_or(self.len);
+        let at = self.runs[..self.len].partition_point(|counted| counted.start < run.start);
         if at > 0 && self.runs[at - 1].end() > run.start {
             return Err(Error::Overlap);
         }
@@ -370,7 +373,12 @@ impl<'runs> Leaves<'runs> {
     }
 
     fn find(&self, address: u64) -> Option<usize> {
-        (0..self.len).find(|&index| self.runs[index].holds(address))
+        // The only record that can hold `address` is the last one starting at or
+        // below it, so the scan every other method leans on is a bisection: a
+        // hundred-gigabyte grant cuts records at both edges, and the walk over
+        // what it cut asks this question once per record it touched.
+        let at = self.runs[..self.len].partition_point(|run| run.start <= address);
+        at.checked_sub(1).filter(|&index| self.runs[index].holds(address))
     }
 
     fn insert(&mut self, at: usize, run: Run) -> Result<(), Error> {

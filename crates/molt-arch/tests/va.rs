@@ -186,6 +186,46 @@ fn a_full_free_list_refuses_rather_than_loses_the_range() -> Result<(), Error> {
 }
 
 #[test]
+fn a_full_free_list_merges_across_epochs() -> Result<(), Error> {
+    // Three slots per class again, which the two islands below fill.
+    let mut holes = [Hole::EMPTY; 9];
+    let mut space = space(&mut holes);
+    let page = Class::Page.granule();
+    let first = space.allocate(Class::Page, page)?;
+    let second = space.allocate(Class::Page, page)?;
+    let third = space.allocate(Class::Page, page)?;
+    // Held, so the islands stay clear of the free range above them.
+    let _fourth = space.allocate(Class::Page, page)?;
+    let start = first.start();
+    space.release(first)?;
+    space.release(third)?;
+    let waiting = space.sweep();
+
+    // The range between the islands is freed a batch later than they were, so
+    // joining it to them is joining two epochs. With no slot left to put it in
+    // on its own, that is the merge the free list has to make.
+    space.release(second)?;
+
+    assert_eq!(space.holes(Class::Page), 2, "a release with nowhere to go was refused");
+    assert_eq!(space.quarantined(Class::Page), 3 * page, "the islands did not join the range");
+
+    space.retire(waiting);
+
+    assert_eq!(
+        space.quarantined(Class::Page),
+        3 * page,
+        "the merged hole was handed out on the flush its neighbours were waiting for"
+    );
+    let closing = space.sweep();
+    space.retire(closing);
+
+    assert_eq!(space.quarantined(Class::Page), 0);
+    let reused = space.allocate(Class::Page, 3 * page)?;
+    assert_eq!(reused.start(), start, "the merged hole did not come back as one range");
+    Ok(())
+}
+
+#[test]
 fn a_range_that_is_already_free_is_refused() -> Result<(), Error> {
     let mut mine = [Hole::EMPTY; 12];
     let mut theirs = [Hole::EMPTY; 12];

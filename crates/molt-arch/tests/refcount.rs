@@ -7,6 +7,7 @@ const BASE: u64 = 100 << 30;
 
 const GIGA: u64 = Class::Giga.granule();
 const MEGA: u64 = Class::Mega.granule();
+const PAGE: u64 = Class::Page.granule();
 
 fn region(start: u64, bytes: u64) -> Region {
     Region::new(start, start + bytes).expect("a non-empty region")
@@ -141,6 +142,31 @@ fn merging_needs_a_whole_group_that_agrees() -> Result<(), Error> {
     assert_eq!(leaves.class(BASE), Some(Class::Giga), "the group did not become one leaf again");
     assert_eq!(leaves.runs(), 1, "the merged leaf did not rejoin its neighbour");
     assert_eq!(leaves.leaves(), 2);
+    Ok(())
+}
+
+#[test]
+fn merging_climbs_back_one_class_at_a_time() -> Result<(), Error> {
+    let mut runs = [Run::EMPTY; 8];
+    let mut leaves = Leaves::over(&mut runs);
+    leaves.map(BASE, Class::Giga, 1)?;
+    leaves.split(BASE)?;
+    leaves.split(BASE)?;
+    // One page held twice, which is three records: that page, the rest of its
+    // megabyte, and the rest of the gigabyte.
+    leaves.share(region(BASE, PAGE))?;
+
+    assert_eq!(leaves.runs(), 3);
+    assert_eq!(leaves.merge(BASE), Err(Error::Uneven), "pages that disagree were merged anyway");
+
+    leaves.release(region(BASE, PAGE))?;
+
+    assert_eq!(leaves.runs(), 2, "the pages that agree again were not rejoined");
+    assert_eq!(leaves.merge(BASE)?, Class::Mega, "a group in one record could not be merged");
+    assert_eq!(leaves.runs(), 1);
+    assert_eq!(leaves.merge(BASE)?, Class::Giga);
+    assert_eq!(leaves.class(BASE), Some(Class::Giga));
+    assert_eq!(leaves.leaves(), 1, "the climb back did not conserve the addresses covered");
     Ok(())
 }
 
