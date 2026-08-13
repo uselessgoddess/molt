@@ -352,10 +352,9 @@ pub fn claim_ram(boot_info: &BootInfo<'_>, count: u64) -> Result<Span, PlatformE
 
 /// Opens an empty view of the one address space, tagged `asid`.
 ///
-/// The root is a single zeroed frame, which is what makes the claim true: an
-/// empty level-`top` table translates nothing at all, so the kernel's text, its
-/// stack, and every device window are absent from the view because they were
-/// never put in it — not because something removed them afterwards.
+/// A zeroed level-`top` table translates nothing at all, so the kernel's text,
+/// its stack, and every device window are absent from the view because they
+/// were never put in it — not because something removed them afterwards.
 pub fn open_view(asid: Asid) -> Result<View, PlatformError> {
     let state = active()?;
     let pool = &mut state.pool;
@@ -363,11 +362,6 @@ pub fn open_view(asid: Asid) -> Result<View, PlatformError> {
 }
 
 /// Maps `extent` into `view` at the extent's own leaf size.
-///
-/// Nothing about the kernel's tables moves: the frames stay mapped where they
-/// already were, and the domain reaches them at the same global address the
-/// kernel calls them by. That is the whole trick of one address space — the
-/// grant is a page-table entry, not a copy and not a relocation.
 pub fn grant(view: View, extent: &Extent, span: Span, rights: Rights) -> Result<(), PlatformError> {
     let level = extent.class().level() as usize;
     let backing = view::backing(extent, span)?;
@@ -383,11 +377,6 @@ pub fn grant(view: View, extent: &Extent, span: Span, rights: Rights) -> Result<
 }
 
 /// Clears `extent` out of `view`, and says how many leaves went.
-///
-/// Only the leaves: the tables above them stay, because a table that held one
-/// leaf will hold the next, and freeing it would cost a second shootdown to
-/// make safe. Nothing here flushes, and nothing here touches the allocator —
-/// see [`molt_arch::view`] for why the caller owes both, in that order.
 pub fn revoke(view: View, extent: &Extent) -> Result<u64, PlatformError> {
     let level = extent.class().level() as usize;
 
@@ -402,12 +391,9 @@ pub fn revoke(view: View, extent: &Extent) -> Result<u64, PlatformError> {
 
 /// Cuts the leaf covering `address` in `view` into 512 smaller ones.
 ///
-/// The address never stops translating to the frame it already did: the child
-/// table is filled with entries describing the same memory before the entry
-/// above it is replaced, and the replacement is one aligned doubleword store, so
-/// a hart walking concurrently reads either the old leaf or a table that says
-/// the same thing. What it may still hold is the coarse TLB entry, which is why
-/// this fences and the caller shoots down before treating any child separately.
+/// The entry above the new table is replaced by one aligned doubleword store,
+/// fenced on both sides, so a hart walking concurrently reads either the old
+/// leaf or a table that says the same thing.
 pub fn split_leaf(view: View, address: u64) -> Result<Class, PlatformError> {
     let state = active()?;
     let root = state.views.root(view)?;
@@ -491,35 +477,38 @@ struct ViewWalk {
     top: usize,
 }
 
+/// Descends `root` to the leaf entry translating `address`, with its level.
+///
+/// The two walks in this file differ only in what they make of that entry, so
+/// only that difference is written twice.
+fn descend(root: *const u64, top: usize, address: u64) -> Option<(u64, usize)> {
+    let va = usize::try_from(address).ok()?;
+    let mut table = root;
+    let mut level = top;
+    loop {
+        // SAFETY: `table` is a readable 512-entry root or identity-mapped
+        // child, and the index is masked to nine bits.
+        let entry = unsafe { *table.add(index(va, level)) };
+        if entry & PTE_V == 0 {
+            return None;
+        }
+        if entry & PTE_RWX != 0 {
+            return Some((entry, level));
+        }
+        if level == 0 {
+            return None;
+        }
+        table = ((entry >> 10) << 12) as *const u64;
+        level -= 1;
+    }
+}
+
 impl PageWalk for ViewWalk {
     fn leaf(&self, address: u64) -> Option<Leaf> {
-        let va = usize::try_from(address).ok()?;
-        let mut table = self.root;
-        let mut level = self.top;
-        loop {
-            // SAFETY: `table` is a readable 512-entry root or identity-mapped
-            // child, and the index is masked to nine bits.
-            let entry = unsafe { *table.add(index(va, level)) };
-            if entry & PTE_V == 0 {
-                return None;
-            }
-            if entry & PTE_RWX != 0 {
-                let rights =
-                    PageProtection::new(entry & PTE_R != 0, entry & PTE_W != 0, entry & PTE_X != 0);
-                let leaf = Leaf::at(
-                    level as u32,
-                    address,
-                    rights.cached(Cache::WriteBack),
-                    (entry >> 10) << 12,
-                );
-                return Some(leaf);
-            }
-            if level == 0 {
-                return None;
-            }
-            table = ((entry >> 10) << 12) as *const u64;
-            level -= 1;
-        }
+        let (entry, level) = descend(self.root, self.top, address)?;
+        let rights =
+            PageProtection::new(entry & PTE_R != 0, entry & PTE_W != 0, entry & PTE_X != 0);
+        Some(Leaf::at(level as u32, address, rights.cached(Cache::WriteBack), (entry >> 10) << 12))
     }
 }
 
@@ -821,27 +810,9 @@ struct TableWalk<'i> {
 
 impl PageWalk for TableWalk<'_> {
     fn leaf(&self, address: u64) -> Option<Leaf> {
-        let va = usize::try_from(address).ok()?;
-        let mut table = self.root;
-        let mut level = self.top;
-        loop {
-            // SAFETY: `table` is a readable 512-entry root or identity-mapped child,
-            // and the index is masked to nine bits.
-            let entry = unsafe { *table.add(index(va, level)) };
-            if entry & PTE_V == 0 {
-                return None;
-            }
-            if entry & PTE_RWX != 0 {
-                let span = 1u64 << (12 + 9 * level);
-                let start = address & !(span - 1);
-                return Some(Leaf::new(start, span, protection(entry, self.inventory)));
-            }
-            if level == 0 {
-                return None;
-            }
-            table = ((entry >> 10) << 12) as *const u64;
-            level -= 1;
-        }
+        let (entry, level) = descend(self.root, self.top, address)?;
+        let span = 1u64 << (12 + 9 * level);
+        Some(Leaf::new(address & !(span - 1), span, protection(entry, self.inventory)))
     }
 }
 

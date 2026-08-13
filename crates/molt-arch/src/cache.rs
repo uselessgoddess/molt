@@ -5,27 +5,22 @@
 //! caller asked for them, because the caller's address for those bytes is not
 //! the kernel's. The second copy pays for the disagreement, not for the file.
 //!
-//! Molt has one address space, so there is no disagreement to pay for. A window
-//! is read into frames once and given *an* address, and that address is what it
-//! is called everywhere — handing it to a domain adds a leaf and moves no
-//! bytes. So a domain mapping a hundred gigabytes of logs costs a hundred
-//! gigabyte-class entries and one flush, rather than 26 million page-cache
-//! lookups and a copy per page.
+//! Molt has one address space, so there is no disagreement to pay for: a window
+//! is read into frames once, and handing its address to a domain adds a leaf and
+//! moves no bytes. A hundred gigabytes of logs costs a hundred gigabyte-class
+//! entries and one flush, not 26 million page-cache lookups and a copy per page.
 //!
-//! # What this module is and is not
-//!
-//! It is the bookkeeping: which windows are cached, at which addresses, over
-//! which frames, and how many views hold each. Reading the bytes in is the
-//! filesystem's, mapping them is [`Platform::grant`], and counting the leaves a
-//! grant shares is [`refcount`]. Nothing here allocates: a caller supplies the
-//! slice the windows live in, the way [`Space`](crate::va::Space) is handed its
-//! holes.
+//! This module is the bookkeeping — which windows are cached, at which
+//! addresses, over which frames, and how many views hold each. Reading the bytes
+//! in is the filesystem's, mapping them is [`Platform::grant`], counting the
+//! leaves a grant shares is [`refcount`], and nothing here allocates: a caller
+//! supplies the slice the windows live in, the way
+//! [`Space`](crate::va::Space) is handed its holes.
 //!
 //! [`evict`](Windows::evict) hands the [`Extent`] out rather than dropping it,
 //! because the caller still owes the unmap, the shootdown and the retire, in
-//! that order — see [`view`](crate::view) for why the order is not negotiable.
-//! It refuses while anybody still has the window mapped, which is the one thing
-//! this module can enforce on its own.
+//! that order — see [`view`](crate::view). It refuses while anybody still has
+//! the window mapped, which is the one thing this module can enforce alone.
 //!
 //! [`Platform::grant`]: crate::Platform::grant
 //! [`refcount`]: crate::refcount

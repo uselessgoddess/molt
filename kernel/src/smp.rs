@@ -14,6 +14,8 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
 
+use molt_arch::shootdown::Shootdown;
+use molt_arch::va::Epoch;
 use molt_arch::{CpuId, Local, Platform, Smp, Stack, Tlb};
 use molt_core::peers::Peers;
 use molt_exec::{Executor, Handle, Machine};
@@ -248,6 +250,24 @@ pub(crate) fn flush(exec: &Executor) -> (Vec<CpuId>, u16) {
     let mut flushed = vec![CORES.cpu()];
     flushed.extend(peers);
     (flushed, asked)
+}
+
+/// Flushes every attending core and closes `round`, yielding the epoch whose
+/// addresses are now safe to retire.
+///
+/// A core that took the flush and never answered, and a round that closes while
+/// cores still owe one, are both the use-after-free the protocol exists to
+/// prevent — so they are refused here rather than at each caller.
+pub(crate) fn close(exec: &Executor, round: &mut Shootdown) -> Epoch {
+    let (flushed, asked) = flush(exec);
+    assert_eq!(flushed.len() as u16, asked + 1, "a core took the flush and never answered");
+
+    let mut retirable = None;
+    for cpu in flushed {
+        assert!(retirable.is_none(), "the round closed with cores still owing a flush");
+        retirable = round.acknowledge(cpu).expect("a core this round asked");
+    }
+    retirable.expect("the epoch every core has now flushed")
 }
 
 /// Every core a shootdown has to reach: this one, and each that reported an

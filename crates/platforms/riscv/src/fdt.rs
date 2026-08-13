@@ -90,118 +90,17 @@ impl<'dtb> DeviceTree<'dtb> {
 
     /// The ECAM window of the first `pci-host-ecam-generic` node.
     pub fn config_space(&self) -> Result<ConfigSpace, FdtError> {
-        let structs = self.block(8, 36)?;
-        let strings = self.block(12, 32)?;
-
-        let mut cursor = 0;
-        // Cells declared *by* the node open at each depth, for its children.
-        let mut cells = [Cells::DEFAULT; MAX_DEPTH];
-        let mut depth = 0;
         let mut node = Node::new(Cells::DEFAULT);
-
-        for _ in 0..MAX_TOKENS {
-            let token = be32(structs, cursor)?;
-            cursor += 4;
-            match token {
-                BEGIN_NODE => {
-                    // Properties precede subnodes, so an open node is complete
-                    // the moment a child opens.
-                    if node.matched {
-                        return node.config_space();
-                    }
-                    cursor = skip_name(structs, cursor)?;
-                    if depth >= MAX_DEPTH {
-                        return Err(FdtError::Malformed);
-                    }
-                    let parent = if depth == 0 { Cells::DEFAULT } else { cells[depth - 1] };
-                    cells[depth] = Cells::DEFAULT;
-                    node = Node::new(parent);
-                    depth += 1;
-                }
-                PROP => {
-                    let len = be32(structs, cursor)? as usize;
-                    let nameoff = be32(structs, cursor + 4)? as usize;
-                    let start = cursor + 8;
-                    let end = start.checked_add(len).ok_or(FdtError::Truncated)?;
-                    let value = structs.get(start..end).ok_or(FdtError::Truncated)?;
-                    cursor = align(end)?;
-                    if depth == 0 {
-                        return Err(FdtError::Malformed);
-                    }
-                    node.property(name(strings, nameoff)?, value, &mut cells[depth - 1]);
-                }
-                END_NODE => {
-                    if node.matched {
-                        return node.config_space();
-                    }
-                    depth = depth.checked_sub(1).ok_or(FdtError::Malformed)?;
-                    // The parent reopens with its properties already read, so
-                    // nothing it declares can still arrive.
-                    node = Node::new(Cells::DEFAULT);
-                }
-                NOP => {}
-                END => return Err(FdtError::Missing),
-                _ => return Err(FdtError::Malformed),
-            }
-        }
-
-        Err(FdtError::Malformed)
+        self.walk(&mut node)?.unwrap_or(Err(FdtError::Missing))
     }
 
     /// The hart identifiers of the `cpu` nodes firmware says can run.
     ///
     /// Returns how many were written, which stops at the room `into` has.
     pub fn harts(&self, into: &mut [u64]) -> Result<usize, FdtError> {
-        let structs = self.block(8, 36)?;
-        let strings = self.block(12, 32)?;
-
-        let mut cursor = 0;
-        let mut cells = [Cells::DEFAULT; MAX_DEPTH];
-        let mut depth = 0;
-        let mut node = Cpu::new(Cells::DEFAULT);
-        let mut count = 0;
-
-        for _ in 0..MAX_TOKENS {
-            let token = be32(structs, cursor)?;
-            cursor += 4;
-            match token {
-                BEGIN_NODE => {
-                    // A `cpu` node carries an interrupt controller of its own,
-                    // so it is taken when a child opens as well as when it ends.
-                    node.take(into, &mut count);
-                    cursor = skip_name(structs, cursor)?;
-                    if depth >= MAX_DEPTH {
-                        return Err(FdtError::Malformed);
-                    }
-                    let parent = if depth == 0 { Cells::DEFAULT } else { cells[depth - 1] };
-                    cells[depth] = Cells::DEFAULT;
-                    node = Cpu::new(parent);
-                    depth += 1;
-                }
-                PROP => {
-                    let len = be32(structs, cursor)? as usize;
-                    let nameoff = be32(structs, cursor + 4)? as usize;
-                    let start = cursor + 8;
-                    let end = start.checked_add(len).ok_or(FdtError::Truncated)?;
-                    let value = structs.get(start..end).ok_or(FdtError::Truncated)?;
-                    cursor = align(end)?;
-                    if depth == 0 {
-                        return Err(FdtError::Malformed);
-                    }
-                    node.property(name(strings, nameoff)?, value, &mut cells[depth - 1]);
-                }
-                END_NODE => {
-                    node.take(into, &mut count);
-                    depth = depth.checked_sub(1).ok_or(FdtError::Malformed)?;
-                    node = Cpu::new(Cells::DEFAULT);
-                }
-                NOP => {}
-                END => return Ok(count),
-                _ => return Err(FdtError::Malformed),
-            }
-        }
-
-        Err(FdtError::Malformed)
+        let mut harts = Harts { node: Cpu::new(Cells::DEFAULT), into, count: 0 };
+        self.walk(&mut harts)?;
+        Ok(harts.count)
     }
 
     /// The RAM bank that contains `address`, as firmware described it.
@@ -217,21 +116,31 @@ impl<'dtb> DeviceTree<'dtb> {
     /// allocates from. Fixing it is a `MemoryMap` that reports more than one
     /// region, not a different walk.
     pub fn ram(&self, address: u64) -> Result<MemoryRegion, FdtError> {
+        let mut banks = Banks { node: Ram::new(Cells::DEFAULT), address };
+        self.walk(&mut banks)?.ok_or(FdtError::Missing)
+    }
+
+    /// Drives the structure block once, handing every node to `visitor`.
+    ///
+    /// `Ok(None)` is a tree that ended without an answer. A node is finished the
+    /// moment a child opens as well as at `END_NODE`, because properties precede
+    /// subnodes and a `cpu` node carries an interrupt controller of its own.
+    fn walk<V: Visit<'dtb>>(&self, visitor: &mut V) -> Result<Option<V::Found>, FdtError> {
         let structs = self.block(8, 36)?;
         let strings = self.block(12, 32)?;
 
         let mut cursor = 0;
+        // Cells declared *by* the node open at each depth, for its children.
         let mut cells = [Cells::DEFAULT; MAX_DEPTH];
         let mut depth = 0;
-        let mut node = Ram::new(Cells::DEFAULT);
 
         for _ in 0..MAX_TOKENS {
             let token = be32(structs, cursor)?;
             cursor += 4;
             match token {
                 BEGIN_NODE => {
-                    if let Some(bank) = node.bank(address) {
-                        return Ok(bank);
+                    if let Some(found) = visitor.close() {
+                        return Ok(Some(found));
                     }
                     cursor = skip_name(structs, cursor)?;
                     if depth >= MAX_DEPTH {
@@ -239,7 +148,7 @@ impl<'dtb> DeviceTree<'dtb> {
                     }
                     let parent = if depth == 0 { Cells::DEFAULT } else { cells[depth - 1] };
                     cells[depth] = Cells::DEFAULT;
-                    node = Ram::new(parent);
+                    visitor.open(parent);
                     depth += 1;
                 }
                 PROP => {
@@ -252,17 +161,19 @@ impl<'dtb> DeviceTree<'dtb> {
                     if depth == 0 {
                         return Err(FdtError::Malformed);
                     }
-                    node.property(name(strings, nameoff)?, value, &mut cells[depth - 1]);
+                    visitor.property(name(strings, nameoff)?, value, &mut cells[depth - 1]);
                 }
                 END_NODE => {
-                    if let Some(bank) = node.bank(address) {
-                        return Ok(bank);
+                    if let Some(found) = visitor.close() {
+                        return Ok(Some(found));
                     }
                     depth = depth.checked_sub(1).ok_or(FdtError::Malformed)?;
-                    node = Ram::new(Cells::DEFAULT);
+                    // The parent reopens with its properties already read, so
+                    // nothing it declares can still arrive.
+                    visitor.open(Cells::DEFAULT);
                 }
                 NOP => {}
-                END => return Err(FdtError::Missing),
+                END => return Ok(None),
                 _ => return Err(FdtError::Malformed),
             }
         }
@@ -379,6 +290,31 @@ impl Cells {
     const DEFAULT: Self = Self { address: 2, size: 2 };
 }
 
+/// What one walk of the structure block is looking for.
+///
+/// The three lookups differ only in what they keep from a node and when a node
+/// is the answer. Token order, bounds, and the cell widths a parent declares for
+/// its children are the same question every time, so they are asked once, in
+/// [`DeviceTree::walk`].
+trait Visit<'dtb> {
+    /// What a finished node can turn out to be.
+    type Found;
+
+    /// Starts a node whose parent declared `cells`, discarding the last one.
+    fn open(&mut self, cells: Cells);
+
+    /// Offers one property of the open node, which may declare `children`.
+    fn property(&mut self, name: &[u8], value: &'dtb [u8], children: &mut Cells);
+
+    /// Closes the open node, and says whether it was the one.
+    fn close(&mut self) -> Option<Self::Found>;
+}
+
+/// Whether a NUL-separated list of strings contains `wanted`.
+fn lists(value: &[u8], wanted: &[u8]) -> bool {
+    value.split(|&byte| byte == 0).any(|it| it == wanted)
+}
+
 /// The properties of the node currently open, kept only until it closes.
 struct Node<'dtb> {
     matched: bool,
@@ -391,21 +327,6 @@ struct Node<'dtb> {
 impl<'dtb> Node<'dtb> {
     fn new(cells: Cells) -> Self {
         Self { matched: false, cells, reg: None, bus_range: None, domain: None }
-    }
-
-    /// Records one property, and any cell width it declares for its children.
-    fn property(&mut self, name: &[u8], value: &'dtb [u8], children: &mut Cells) {
-        match name {
-            // `compatible` is a list of NUL-separated strings, most specific
-            // first, and the generic ECAM binding is rarely the first of them.
-            b"compatible" => self.matched |= value.split(|&byte| byte == 0).any(|it| it == ECAM),
-            b"reg" => self.reg = Some(value),
-            b"bus-range" => self.bus_range = Some(value),
-            b"linux,pci-domain" => self.domain = Some(value),
-            b"#address-cells" => children.address = cell(value).unwrap_or(children.address),
-            b"#size-cells" => children.size = cell(value).unwrap_or(children.size),
-            _ => {}
-        }
     }
 
     fn config_space(&self) -> Result<ConfigSpace, FdtError> {
@@ -451,6 +372,34 @@ impl<'dtb> Node<'dtb> {
     }
 }
 
+impl<'dtb> Visit<'dtb> for Node<'dtb> {
+    /// A matching node either describes a window or is malformed; both end the
+    /// walk, because a second host bridge would not make the first one right.
+    type Found = Result<ConfigSpace, FdtError>;
+
+    fn open(&mut self, cells: Cells) {
+        *self = Self::new(cells);
+    }
+
+    fn property(&mut self, name: &[u8], value: &'dtb [u8], children: &mut Cells) {
+        match name {
+            // `compatible` is a list of NUL-separated strings, most specific
+            // first, and the generic ECAM binding is rarely the first of them.
+            b"compatible" => self.matched |= lists(value, ECAM),
+            b"reg" => self.reg = Some(value),
+            b"bus-range" => self.bus_range = Some(value),
+            b"linux,pci-domain" => self.domain = Some(value),
+            b"#address-cells" => children.address = cell(value).unwrap_or(children.address),
+            b"#size-cells" => children.size = cell(value).unwrap_or(children.size),
+            _ => {}
+        }
+    }
+
+    fn close(&mut self) -> Option<Self::Found> {
+        self.matched.then(|| self.config_space())
+    }
+}
+
 /// A `cpu` node, kept only until it closes.
 struct Cpu<'dtb> {
     matched: bool,
@@ -462,21 +411,6 @@ struct Cpu<'dtb> {
 impl<'dtb> Cpu<'dtb> {
     fn new(cells: Cells) -> Self {
         Self { matched: false, disabled: false, cells, reg: None }
-    }
-
-    fn property(&mut self, name: &[u8], value: &'dtb [u8], children: &mut Cells) {
-        match name {
-            b"device_type" => self.matched |= value.split(|&byte| byte == 0).any(|it| it == CPU),
-            // Firmware marks a hart it will not run `disabled`, and asking for
-            // one anyway is a start that refuses halfway through boot.
-            b"status" => {
-                self.disabled |= value.split(|&byte| byte == 0).any(|it| it == DISABLED);
-            }
-            b"reg" => self.reg = Some(value),
-            b"#address-cells" => children.address = cell(value).unwrap_or(children.address),
-            b"#size-cells" => children.size = cell(value).unwrap_or(children.size),
-            _ => {}
-        }
     }
 
     /// Writes this node's hart identifier, if it named one molt can start.
@@ -497,6 +431,40 @@ impl<'dtb> Cpu<'dtb> {
     }
 }
 
+/// Every startable hart in the tree, collected into the caller's slice.
+struct Harts<'dtb, 'into> {
+    node: Cpu<'dtb>,
+    into: &'into mut [u64],
+    count: usize,
+}
+
+impl<'dtb> Visit<'dtb> for Harts<'dtb, '_> {
+    /// Every `cpu` node is wanted, so no node ends the walk early.
+    type Found = core::convert::Infallible;
+
+    fn open(&mut self, cells: Cells) {
+        self.node = Cpu::new(cells);
+    }
+
+    fn property(&mut self, name: &[u8], value: &'dtb [u8], children: &mut Cells) {
+        match name {
+            b"device_type" => self.node.matched |= lists(value, CPU),
+            // Firmware marks a hart it will not run `disabled`, and asking for
+            // one anyway is a start that refuses halfway through boot.
+            b"status" => self.node.disabled |= lists(value, DISABLED),
+            b"reg" => self.node.reg = Some(value),
+            b"#address-cells" => children.address = cell(value).unwrap_or(children.address),
+            b"#size-cells" => children.size = cell(value).unwrap_or(children.size),
+            _ => {}
+        }
+    }
+
+    fn close(&mut self) -> Option<Self::Found> {
+        self.node.take(self.into, &mut self.count);
+        None
+    }
+}
+
 /// A `memory` node, kept only until it closes.
 struct Ram<'dtb> {
     matched: bool,
@@ -507,16 +475,6 @@ struct Ram<'dtb> {
 impl<'dtb> Ram<'dtb> {
     fn new(cells: Cells) -> Self {
         Self { matched: false, cells, reg: None }
-    }
-
-    fn property(&mut self, name: &[u8], value: &'dtb [u8], children: &mut Cells) {
-        match name {
-            b"device_type" => self.matched |= value.split(|&byte| byte == 0).any(|it| it == MEMORY),
-            b"reg" => self.reg = Some(value),
-            b"#address-cells" => children.address = cell(value).unwrap_or(children.address),
-            b"#size-cells" => children.size = cell(value).unwrap_or(children.size),
-            _ => {}
-        }
     }
 
     /// The bank this node described that holds `address`, if it described one.
@@ -540,6 +498,34 @@ impl<'dtb> Ram<'dtb> {
                 MemoryRegion::new(base, base.saturating_add(len), MemoryRegionKind::Usable)
             })
             .find(|bank| (bank.start()..bank.end()).contains(&address))
+    }
+}
+
+/// The RAM bank holding one address, whichever node turns out to describe it.
+struct Banks<'dtb> {
+    node: Ram<'dtb>,
+    address: u64,
+}
+
+impl<'dtb> Visit<'dtb> for Banks<'dtb> {
+    type Found = MemoryRegion;
+
+    fn open(&mut self, cells: Cells) {
+        self.node = Ram::new(cells);
+    }
+
+    fn property(&mut self, name: &[u8], value: &'dtb [u8], children: &mut Cells) {
+        match name {
+            b"device_type" => self.node.matched |= lists(value, MEMORY),
+            b"reg" => self.node.reg = Some(value),
+            b"#address-cells" => children.address = cell(value).unwrap_or(children.address),
+            b"#size-cells" => children.size = cell(value).unwrap_or(children.size),
+            _ => {}
+        }
+    }
+
+    fn close(&mut self) -> Option<MemoryRegion> {
+        self.node.bank(self.address)
     }
 }
 

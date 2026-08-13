@@ -728,10 +728,12 @@ pub trait Platform: DeviceMapper + InterruptFabric + Local + Smp {
 
     /// Takes `extent` back out of `view`, and says how many leaves went.
     ///
-    /// This clears the leaves and stops. The flush every core owes and the
-    /// return of the addresses to the allocator are the caller's, in that
-    /// order, for the reason [`view`] spells out: a core that cached the leaf
-    /// before this call still translates through it afterwards.
+    /// This clears the leaves and stops. The tables above them stay, because a
+    /// table that held one leaf will hold the next and freeing it would cost a
+    /// second shootdown to make safe. The flush every core owes and the return
+    /// of the addresses to the allocator are the caller's, in that order, for
+    /// the reason [`view`] spells out: a core that cached the leaf before this
+    /// call still translates through it afterwards.
     fn revoke(&mut self, _view: View, _extent: &va::Extent) -> Result<u64, PlatformError> {
         Err(PlatformError::Unsupported)
     }

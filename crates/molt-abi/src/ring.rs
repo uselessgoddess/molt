@@ -25,7 +25,6 @@
 //! could have written itself — is a placement decision the caller makes, not
 //! something a type can hold.
 //!
-//!
 //! [`nospec`]: crate::nospec
 //! [`Region::fits`]: crate::wire::Region::fits
 //! [`Region::within`]: crate::wire::Region::within

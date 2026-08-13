@@ -546,9 +546,9 @@ fn map_4k(
 
 /// Opens an empty tier-2 view, tagged `asid`.
 ///
-/// Empty is the whole point: the root is a zeroed frame, so nothing the kernel
-/// maps is reachable through it, and the only addresses that ever become
-/// reachable are the ones [`grant`] puts there.
+/// The root is a zeroed frame, so nothing the kernel maps is reachable through
+/// it and the only addresses that ever become reachable are the ones [`grant`]
+/// puts there.
 pub fn open_view(asid: Asid) -> Result<View, PlatformError> {
     let state = active()?;
     let (offset, pool) = (state.offset, &mut state.pool);
@@ -562,11 +562,6 @@ pub fn open_view(asid: Asid) -> Result<View, PlatformError> {
 }
 
 /// Maps `extent` into `view` at the extent's own leaf size.
-///
-/// Nothing about the kernel's tables moves: the frames stay mapped where they
-/// already were, and the domain reaches them at the same global address the
-/// kernel calls them by. That is the whole trick of one address space — the
-/// grant is a page-table entry, not a copy and not a relocation.
 pub fn grant(view: View, extent: &Extent, span: Span, rights: Rights) -> Result<(), PlatformError> {
     let level = extent.class().level() as usize;
     let backing = view::backing(extent, span)?;
@@ -583,11 +578,6 @@ pub fn grant(view: View, extent: &Extent, span: Span, rights: Rights) -> Result<
 }
 
 /// Clears `extent` out of `view`, and says how many leaves went.
-///
-/// Only the leaves: the tables above them stay, because a table that held one
-/// leaf will hold the next, and freeing it would cost a second shootdown to
-/// make safe. Nothing here flushes, and nothing here touches the allocator —
-/// see [`molt_arch::view`] for why the caller owes both, in that order.
 pub fn revoke(view: View, extent: &Extent) -> Result<u64, PlatformError> {
     let level = extent.class().level() as usize;
 
@@ -601,12 +591,9 @@ pub fn revoke(view: View, extent: &Extent) -> Result<u64, PlatformError> {
 
 /// Cuts the leaf covering `address` in `view` into 512 smaller ones.
 ///
-/// The address never stops translating to the frame it already did: the child
-/// table is filled with entries describing the same memory before the entry
-/// above it is replaced, and the replacement is one aligned quadword store, so a
-/// core walking concurrently reads either the old leaf or a table that says the
-/// same thing. What it may still hold is the coarse TLB entry, which is why the
-/// caller shoots down before treating any child separately.
+/// The entry above the new table is replaced by one aligned quadword store, so
+/// a core walking concurrently reads either the old leaf or a table that says
+/// the same thing.
 pub fn split_leaf(view: View, address: u64) -> Result<Class, PlatformError> {
     let state = active()?;
     let root = state.views.root(view)?;

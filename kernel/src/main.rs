@@ -387,16 +387,7 @@ fn verify_shootdown<P: Platform>(platform: &mut P, exec: &Executor) {
     let elsewhere = space.allocate(Class::Giga, wanted).expect("room beside the quarantined range");
     assert_ne!(elsewhere.start(), start, "an unflushed range was handed out again");
 
-    let (flushed, asked) = smp::flush(exec);
-    assert_eq!(flushed.len() as u16, asked + 1, "a core took the flush and never answered");
-
-    let mut retirable = None;
-    for cpu in flushed {
-        assert!(retirable.is_none(), "the round closed with cores still owing a flush");
-        retirable = shootdown.acknowledge(cpu).expect("a core this round asked");
-    }
-    let retired = retirable.expect("the epoch every core has now flushed");
-
+    let retired = smp::close(exec, &mut shootdown);
     assert_eq!(retired, epoch, "a round retired an epoch it was not opened for");
     assert_eq!(shootdown.outstanding(), 0, "a core still owes a flush for a retired epoch");
     assert_eq!(space.quarantined(Class::Giga), wanted, "the freed range left quarantine early");
@@ -540,14 +531,7 @@ fn verify_domain<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P, exec: 
     space.release(held).expect("an extent this space issued");
 
     // Step two: every core drops what it cached, and says so itself.
-    let (flushed, asked) = smp::flush(exec);
-    assert_eq!(flushed.len() as u16, asked + 1, "a core took the flush and never answered");
-    let mut retirable = None;
-    for cpu in flushed {
-        assert!(retirable.is_none(), "the round closed with cores still owing a flush");
-        retirable = shootdown.acknowledge(cpu).expect("a core this round asked");
-    }
-    let retired = retirable.expect("the epoch every core has now flushed");
+    let retired = smp::close(exec, &mut shootdown);
 
     // Step three, and not one instruction sooner.
     space.retire(retired);

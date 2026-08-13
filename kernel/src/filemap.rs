@@ -259,14 +259,7 @@ fn unmap<P: Platform>(
     assert_ne!(held.start(), start, "an unflushed window was handed out again");
     space.release(held).expect("an extent this space issued");
 
-    let (flushed, asked) = smp::flush(smp::current());
-    assert_eq!(flushed.len() as u16, asked + 1, "a core took the flush and never answered");
-    let mut retirable = None;
-    for cpu in flushed {
-        assert!(retirable.is_none(), "the round closed with cores still owing a flush");
-        retirable = shootdown.acknowledge(cpu).expect("a core this round asked");
-    }
-    let retired = retirable.expect("the epoch every core has now flushed");
+    let retired = smp::close(smp::current(), &mut shootdown);
 
     // The addresses come back to the space they came from, and not one flush
     // sooner. Bytes rather than the address itself because the space is the
