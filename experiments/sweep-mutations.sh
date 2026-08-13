@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 #
-# Shows that the property sweeps would notice.
+# Shows that the tests which generate their own inputs would notice.
 #
-# A sweep that passes says something about the code only once it has been seen
-# to fail. Two of the five found a bug when they were written and are their own
-# evidence; the rest have never failed, and a sweep that generates nothing reads
-# exactly the same from the outside as one that generates everything.
+# A property sweep or a stress run says something about the code only once it
+# has been seen to fail. Two of these found a bug when they were written and
+# are their own evidence; the rest have never failed, and a sweep that generates
+# nothing reads exactly the same from the outside as one that generates
+# everything.
 #
 # So this puts a bug back. Each mutation below is one edit to the code under a
-# sweep — the kind of edit a refactor makes by accident, not a `panic!` dropped
-# in to be found — and each is followed by the sweep that owns it, which is
-# expected to fail. A mutation the sweep survives is a hole in the sweep, and
-# the script says so and exits non-zero.
+# test — the kind of edit a refactor makes by accident, not a `panic!` dropped
+# in to be found — and each is followed by the test that owns it, which is
+# expected to fail. A mutation the test survives is a hole in the test, and the
+# script says so and exits non-zero.
 #
 # The edit is applied to the working tree and undone afterwards, including on
 # ^C. If something kills it harder than that, `git checkout -- crates` puts the
@@ -45,10 +46,10 @@ restore() {
 trap 'restore; exit 130' INT TERM
 trap restore EXIT
 
-# mutation <name> <file> <package> <test binary> <sweep> <what it must catch>
+# mutation <name> <file> <package> <test binary> <test> <what it must catch>
 #          <the line as written> <the line with the bug in>
 mutation() {
-    local name=$1 file=$2 package=$3 binary=$4 sweep=$5 catches=$6 from=$7 to=$8
+    local name=$1 file=$2 package=$3 binary=$4 test=$5 catches=$6 from=$7 to=$8
 
     if ((${#wanted[@]})) && ! [[ " ${wanted[*]} " == *" $name "* ]]; then
         return 0
@@ -58,7 +59,7 @@ mutation() {
     cp "$file" "$logs/$(basename "$file").orig"
     touched=("$file")
 
-    # Exactly once, or the sweep would be run against code nobody edited: a
+    # Exactly once, or the test would be run against code nobody edited: a
     # mutation that no longer applies is the failure this check is here for.
     if ! FROM="$from" TO="$to" perl -0pi -e '
         my $hits = s/\Q$ENV{FROM}\E/$ENV{TO}/g;
@@ -74,21 +75,21 @@ mutation() {
     echo "   $file: $from"
     echo "               -> $to"
 
-    cargo test --package "$package" --test "$binary" -- --exact "$sweep" \
+    cargo test --package "$package" --test "$binary" -- --exact "$test" \
         >"$logs/$name.log" 2>&1
     local outcome=$?
     restore
 
     if ((outcome != 0)); then
-        # What the sweep had to say, which is the first panic and no more: the
+        # What the test had to say, which is the first panic and no more: the
         # shrunk move list under it is what the log is for.
-        echo "   ok: $sweep failed with"
+        echo "   ok: $test failed with"
         awk '/panicked at/ { inside = 1 }
              /minimal failing input/ { exit }
              inside { print; if (++lines == 5) exit }' \
             "$logs/$name.log" | cut -c1-120 | sed 's/^/       /'
     else
-        echo "   FAILED: $sweep passed with the bug in — see $logs/$name.log"
+        echo "   FAILED: $test passed with the bug in — see $logs/$name.log"
         failures=$((failures + 1))
     fi
     echo
@@ -126,8 +127,15 @@ mutation ipv4-total \
     'if total < header || bytes.len() < total {' \
     'if total < header {'
 
+mutation holder-count \
+    crates/molt-arch/src/cache.rs molt-arch contention \
+    eight_cores_share_one_space_without_losing_an_address \
+    "a window handed to a core without counting the holder" \
+    'window.holders = window.holders.checked_add(1).ok_or(Error::Saturated)?;' \
+    'window.holders = window.holders.checked_add(0).ok_or(Error::Saturated)?;'
+
 if ((failures)); then
     echo "$failures of $ran mutations went unnoticed"
     exit 1
 fi
-echo "all $ran mutations were caught by the sweep that owns them"
+echo "all $ran mutations were caught by the test that owns them"

@@ -401,14 +401,55 @@ are made the only honest way — from every state the churn reaches, drive the
 protocol forward and see that it goes. `Shootdown` is `Copy`, so the escape runs
 on a copy and the churn carries on from where it was.
 
-Two of them found bugs, which is their own evidence. The rest found nothing, and
-that reads the same as a sweep generating nothing — so
+## Eight cores on one address space
+
+Every structure in `molt-arch` takes `&mut self`, which says what a call needs
+and not where it comes from. In the kernel it comes from behind a ticket lock,
+and the sweeps above run one core at a time, so neither says anything about the
+order eight of them produce. `molt-arch/tests/contention.rs` closes that: eight
+host threads share one `Spinlock<Machine>` holding the real `Space`, `Leaves`,
+`Windows` and `Shootdown`, and each runs the sequence a core runs — take a
+window of a file or fill it, count the grant, give it back, hand the addresses
+it freed to a shootdown — dropping the lock in between, where a core would be
+using the mapping.
+
+Three failures live only there. An address handed to two cores at once, which
+the counts refuse rather than the test detecting after the fact: a second `map`
+over a live range is `Overlap`. A window that moves under a core holding it,
+which the way out checks against the region it was given. And a quarantine
+nobody can close, which is the liveness claim the whole scheme rests on: a round
+closes only once all eight cores have answered it, so an address freed in one
+waits for every core that might still translate it, and a round that ever needs
+a core which is not coming shows up as a run that does not finish. What the end
+state asserts is that the churn conserved everything — no window outlives its
+holders, no address is still counted, and the arena is back to one free hole per
+class, the size it was cut at.
+
+**What takes a lock, and what does not.** The two answers in this kernel are not
+a preference, they are which side of the I/O path something is on. The
+primitives in `molt-core` — the ring, the completion slab, the waker — are
+touched from interrupt context on the hot path, so they are lock-free and loom
+checks the orderings. The machine-wide tables are the opposite case: they are
+touched when a mapping is created or destroyed, which is rare against the life
+of the mapping, and a wrong answer there is an address two domains both believe
+they own. So they take one ticket lock rather than each growing its own
+synchronisation, and the lock is a ticket lock because fairness is what matters
+when the critical section is an `O(holes)` walk — a core that keeps losing a
+test-and-set race would be starved of addresses by cores that already have
+theirs. This test is where that decision is exercised rather than asserted.
+
+## Putting the bug back
+
+Two of the sweeps above found bugs, which is their own evidence. The others
+found nothing, and so did the stress run — which reads exactly the same from
+outside as a test that generates nothing. So
 [`experiments/sweep-mutations.sh`](../experiments/sweep-mutations.sh) puts one
-bug back into the code under each sweep in turn, an edit a refactor could make
-by accident rather than a `panic!` planted to be found, and expects that sweep
-to fail. All five are caught, each by the assertion it was written for. It is
-the rule the whole section rests on: a passing sweep is a claim about the sweep,
-not about the code, until something has been seen to fail it.
+bug back into the code under each of them in turn, an edit a refactor could make
+by accident rather than a `panic!` planted to be found, and expects that test to
+fail. All six are caught, each by the assertion it was written for — the stress
+run by the holder count eight cores hold at once. It is the rule both sections
+rest on: a passing test that makes its own inputs is a claim about the test, not
+about the code, until something has been seen to fail it.
 
 ## Conventions
 
