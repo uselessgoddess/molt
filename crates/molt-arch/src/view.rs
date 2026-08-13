@@ -26,6 +26,8 @@
 //! pretend the flush is part of the unmap.
 
 use crate::asid::Asid;
+use crate::memory::Span;
+use crate::va::Extent;
 
 /// How many views one platform keeps roots for.
 ///
@@ -78,4 +80,60 @@ impl View {
     pub const fn asid(self) -> Asid {
         self.asid
     }
+}
+
+/// The roots a port holds, and the indices a [`View`] is a name for.
+///
+/// What a root *is* differs per port — a pointer into identity-mapped RAM on
+/// riscv64, a frame number reached through the direct map on x86_64 — but which
+/// slot it lives in, when there is no slot left, and what a view whose slot was
+/// never filled means do not, so they are here rather than twice.
+pub struct Views<Root> {
+    roots: [Option<Root>; VIEWS],
+}
+
+impl<Root: Copy> Views<Root> {
+    /// A port with no views open, which is how every port starts.
+    pub const EMPTY: Self = Self { roots: [None; VIEWS] };
+
+    /// Opens a view tagged `asid`, building its root only once there is a slot
+    /// to record it in: a root allocated into a full table is a frame nobody is
+    /// left holding a name for.
+    pub fn open<E: From<Error>>(
+        &mut self,
+        asid: Asid,
+        root: impl FnOnce() -> Result<Root, E>,
+    ) -> Result<View, E> {
+        let index = self.roots.iter().position(Option::is_none).ok_or(Error::Capacity)?;
+        self.roots[index] = Some(root()?);
+        Ok(View::new(index as u16, asid))
+    }
+
+    /// The root of a view this table opened.
+    pub fn root(&self, view: View) -> Result<Root, Error> {
+        self.roots.get(view.index() as usize).copied().flatten().ok_or(Error::Unknown)
+    }
+}
+
+/// The leaves of `extent`, as the addresses a port maps or clears one by one.
+pub fn leaves(extent: &Extent) -> impl Iterator<Item = u64> {
+    let (start, granule) = (extent.start(), extent.class().granule());
+    (0..extent.leaves()).map(move |leaf| start + leaf * granule)
+}
+
+/// The same addresses, paired with the frames `span` backs them with.
+///
+/// Refuses a span too small for the extent or cut at the wrong size: a grant
+/// starting half a leaf into the frames would map, at the leaf size the extent
+/// was cut for, memory the caller never named.
+pub fn backing(extent: &Extent, span: Span) -> Result<impl Iterator<Item = (u64, u64)>, Error> {
+    let granule = extent.class().granule();
+    if span.bytes() < extent.bytes() || span.start() % granule != 0 || extent.start() % granule != 0
+    {
+        return Err(Error::Backing);
+    }
+    let frames = span.start();
+    Ok(leaves(extent)
+        .enumerate()
+        .map(move |(leaf, address)| (address, frames + leaf as u64 * granule)))
 }

@@ -18,7 +18,7 @@ use molt_arch::asid::Asid;
 use molt_arch::audit::{Audit, Declared, Leaf, MappedRange, PageWalk};
 use molt_arch::memory::{Cache, Device, Inventory, Kind, Rights, Span};
 use molt_arch::va::{Class, Extent};
-use molt_arch::view::{self, VIEWS};
+use molt_arch::view::{self, Views};
 use molt_arch::{
     BootInfo, FrameAllocator, FrameCursor, FramePool, ImageSection, MapPermissions, MappingError,
     Mmio, PageProtection, PhysicalFrame, PlatformError, UsableRegions, View,
@@ -101,7 +101,7 @@ struct BootPaging {
     devices: usize,
     /// The root of each open tier-2 view, beside the kernel's own. Empty when
     /// opened, and only ever holding what was granted into it.
-    views: [Option<*mut u64>; VIEWS],
+    views: Views<*mut u64>,
 }
 
 struct Active(UnsafeCell<Option<BootPaging>>);
@@ -183,7 +183,7 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
             pool,
             log,
             devices: DEVICE_REGION,
-            views: [None; VIEWS],
+            views: Views::EMPTY,
         });
     }
     Ok(())
@@ -358,15 +358,8 @@ pub fn claim_ram(boot_info: &BootInfo<'_>, count: u64) -> Result<Span, PlatformE
 /// never put in it — not because something removed them afterwards.
 pub fn open_view(asid: Asid) -> Result<View, PlatformError> {
     let state = active()?;
-    let index = state
-        .views
-        .iter()
-        .position(Option::is_none)
-        .ok_or(PlatformError::View(view::Error::Capacity))?;
-
-    let root = alloc_table(&mut state.pool)?;
-    state.views[index] = Some(root);
-    Ok(View::new(index as u16, asid))
+    let pool = &mut state.pool;
+    state.views.open(asid, || alloc_table(pool))
 }
 
 /// Maps `extent` into `view` at the extent's own leaf size.
@@ -376,20 +369,15 @@ pub fn open_view(asid: Asid) -> Result<View, PlatformError> {
 /// kernel calls them by. That is the whole trick of one address space — the
 /// grant is a page-table entry, not a copy and not a relocation.
 pub fn grant(view: View, extent: &Extent, span: Span, rights: Rights) -> Result<(), PlatformError> {
-    let granule = extent.class().granule();
     let level = extent.class().level() as usize;
-    if span.bytes() < extent.bytes() || span.start() % granule != 0 || extent.start() % granule != 0
-    {
-        return Err(PlatformError::View(view::Error::Backing));
-    }
+    let backing = view::backing(extent, span)?;
 
     let state = active()?;
-    let root = root_of(state, view)?;
+    let root = state.views.root(view)?;
     let flags = leaf_flags(rights);
-    for leaf in 0..extent.leaves() {
-        let offset = leaf * granule;
-        let va = usize::try_from(extent.start() + offset).map_err(|_| address_error())?;
-        map_leaf(root, state.top, &mut state.pool, va, span.start() + offset, flags, level)?;
+    for (address, frame) in backing {
+        let va = usize::try_from(address).map_err(|_| address_error())?;
+        map_leaf(root, state.top, &mut state.pool, va, frame, flags, level)?;
     }
     Ok(())
 }
@@ -401,13 +389,12 @@ pub fn grant(view: View, extent: &Extent, span: Span, rights: Rights) -> Result<
 /// make safe. Nothing here flushes, and nothing here touches the allocator —
 /// see [`molt_arch::view`] for why the caller owes both, in that order.
 pub fn revoke(view: View, extent: &Extent) -> Result<u64, PlatformError> {
-    let granule = extent.class().granule();
     let level = extent.class().level() as usize;
 
     let state = active()?;
-    let root = root_of(state, view)?;
-    for leaf in 0..extent.leaves() {
-        let va = usize::try_from(extent.start() + leaf * granule).map_err(|_| address_error())?;
+    let root = state.views.root(view)?;
+    for address in view::leaves(extent) {
+        let va = usize::try_from(address).map_err(|_| address_error())?;
         unmap_leaf(root, state.top, va, level)?;
     }
     Ok(extent.leaves())
@@ -423,7 +410,7 @@ pub fn revoke(view: View, extent: &Extent) -> Result<u64, PlatformError> {
 /// this fences and the caller shoots down before treating any child separately.
 pub fn split_leaf(view: View, address: u64) -> Result<Class, PlatformError> {
     let state = active()?;
-    let root = root_of(state, view)?;
+    let root = state.views.root(view)?;
     let va = usize::try_from(address).map_err(|_| address_error())?;
 
     let mut table = root;
@@ -463,18 +450,8 @@ pub fn split_leaf(view: View, address: u64) -> Result<Class, PlatformError> {
 /// What `view` translates `address` through, read back out of its own tables.
 pub fn resident(view: View, address: u64) -> Option<Leaf> {
     let state = active().ok()?;
-    let root = root_of(state, view).ok()?;
+    let root = state.views.root(view).ok()?;
     ViewWalk { root, top: state.top }.leaf(address)
-}
-
-/// The root of a view this platform opened.
-fn root_of(state: &BootPaging, view: View) -> Result<*mut u64, PlatformError> {
-    state
-        .views
-        .get(view.index() as usize)
-        .copied()
-        .flatten()
-        .ok_or(PlatformError::View(view::Error::Unknown))
 }
 
 /// Invalidates the leaf covering `va`, refusing anything but a leaf at `level`.
@@ -527,15 +504,15 @@ impl PageWalk for ViewWalk {
                 return None;
             }
             if entry & PTE_RWX != 0 {
-                let span = 1u64 << (12 + 9 * level);
                 let rights =
                     PageProtection::new(entry & PTE_R != 0, entry & PTE_W != 0, entry & PTE_X != 0);
-                return Some(Leaf::backed(
-                    address & !(span - 1),
-                    span,
+                let leaf = Leaf::at(
+                    level as u32,
+                    address,
                     rights.cached(Cache::WriteBack),
-                    ((entry >> 10) << 12) & !(span - 1),
-                ));
+                    (entry >> 10) << 12,
+                );
+                return Some(leaf);
             }
             if level == 0 {
                 return None;

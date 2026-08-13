@@ -10,7 +10,7 @@ use molt_arch::asid::Asid;
 use molt_arch::audit::{Audit, Contents, Declared, Leaf, MappedRange, PageWalk};
 use molt_arch::memory::{Cache, Device, Inventory, Rights, Span};
 use molt_arch::va::{Class, Extent};
-use molt_arch::view::{self, VIEWS};
+use molt_arch::view::{self, Views};
 use molt_arch::{
     BootInfo, FrameAllocator as BootFrameAllocator, FrameCursor, MapPermissions, MappingError,
     MemoryMap, Mmio, PageProtection, PlatformError, UsableRegions, View,
@@ -90,7 +90,7 @@ struct Space {
     trampoline: Option<u64>,
     /// The root of each open tier-2 view, beside the kernel's own. Empty when
     /// opened, and only ever holding what was granted into it.
-    views: [Option<PhysFrame<Size4KiB>>; VIEWS],
+    views: Views<PhysFrame<Size4KiB>>,
 }
 
 /// The frame an application processor's first instruction runs from.
@@ -344,7 +344,7 @@ pub fn init(boot_info: &BootInfo<'_>) -> Result<u64, PlatformError> {
             pool,
             devices: DEVICE_REGION,
             trampoline,
-            views: [None; VIEWS],
+            views: Views::EMPTY,
         })
     };
     Ok(APIC_WINDOW)
@@ -551,18 +551,14 @@ fn map_4k(
 /// reachable are the ones [`grant`] puts there.
 pub fn open_view(asid: Asid) -> Result<View, PlatformError> {
     let state = active()?;
-    let index = state
-        .views
-        .iter()
-        .position(Option::is_none)
-        .ok_or(PlatformError::View(view::Error::Capacity))?;
-
-    let root = PoolFrames(&mut state.pool).allocate_frame().ok_or(out_of_frames())?;
-    // SAFETY: the frame came out of the pool `init` drained, so nothing else
-    // owns it, and `offset` direct-maps every frame of usable RAM.
-    unsafe { &mut *table_pointer(state.offset, root) }.zero();
-    state.views[index] = Some(root);
-    Ok(View::new(index as u16, asid))
+    let (offset, pool) = (state.offset, &mut state.pool);
+    state.views.open(asid, || {
+        let root = PoolFrames(pool).allocate_frame().ok_or(out_of_frames())?;
+        // SAFETY: the frame came out of the pool `init` drained, so nothing else
+        // owns it, and `offset` direct-maps every frame of usable RAM.
+        unsafe { &mut *table_pointer(offset, root) }.zero();
+        Ok(root)
+    })
 }
 
 /// Maps `extent` into `view` at the extent's own leaf size.
@@ -572,29 +568,16 @@ pub fn open_view(asid: Asid) -> Result<View, PlatformError> {
 /// kernel calls them by. That is the whole trick of one address space — the
 /// grant is a page-table entry, not a copy and not a relocation.
 pub fn grant(view: View, extent: &Extent, span: Span, rights: Rights) -> Result<(), PlatformError> {
-    let granule = extent.class().granule();
     let level = extent.class().level() as usize;
-    if span.bytes() < extent.bytes() || span.start() % granule != 0 || extent.start() % granule != 0
-    {
-        return Err(PlatformError::View(view::Error::Backing));
-    }
+    let backing = view::backing(extent, span)?;
 
     let state = active()?;
-    let root = root_of(state, view)?;
+    let root = state.views.root(view)?;
     let flags = leaf_flags(rights, Cache::WriteBack);
     let offset = state.offset;
     let mut frames = PoolFrames(&mut state.pool);
-    for leaf in 0..extent.leaves() {
-        let stride = leaf * granule;
-        map_leaf(
-            offset,
-            root,
-            &mut frames,
-            extent.start() + stride,
-            span.start() + stride,
-            flags,
-            level,
-        )?;
+    for (address, frame) in backing {
+        map_leaf(offset, root, &mut frames, address, frame, flags, level)?;
     }
     Ok(())
 }
@@ -606,13 +589,12 @@ pub fn grant(view: View, extent: &Extent, span: Span, rights: Rights) -> Result<
 /// make safe. Nothing here flushes, and nothing here touches the allocator —
 /// see [`molt_arch::view`] for why the caller owes both, in that order.
 pub fn revoke(view: View, extent: &Extent) -> Result<u64, PlatformError> {
-    let granule = extent.class().granule();
     let level = extent.class().level() as usize;
 
     let state = active()?;
-    let root = root_of(state, view)?;
-    for leaf in 0..extent.leaves() {
-        unmap_leaf(state.offset, root, extent.start() + leaf * granule, level)?;
+    let root = state.views.root(view)?;
+    for address in view::leaves(extent) {
+        unmap_leaf(state.offset, root, address, level)?;
     }
     Ok(extent.leaves())
 }
@@ -627,7 +609,7 @@ pub fn revoke(view: View, extent: &Extent) -> Result<u64, PlatformError> {
 /// caller shoots down before treating any child separately.
 pub fn split_leaf(view: View, address: u64) -> Result<Class, PlatformError> {
     let state = active()?;
-    let root = root_of(state, view)?;
+    let root = state.views.root(view)?;
     let (offset, mut frame) = (state.offset, root);
     let mut frames = PoolFrames(&mut state.pool);
 
@@ -676,18 +658,8 @@ pub fn split_leaf(view: View, address: u64) -> Result<Class, PlatformError> {
 /// What `view` translates `address` through, read back out of its own tables.
 pub fn resident(view: View, address: u64) -> Option<Leaf> {
     let state = active().ok()?;
-    let root = root_of(state, view).ok()?;
+    let root = state.views.root(view).ok()?;
     ViewWalk { offset: state.offset, root }.leaf(address)
-}
-
-/// The root of a view this platform opened.
-fn root_of(state: &Space, view: View) -> Result<PhysFrame<Size4KiB>, PlatformError> {
-    state
-        .views
-        .get(view.index() as usize)
-        .copied()
-        .flatten()
-        .ok_or(PlatformError::View(view::Error::Unknown))
 }
 
 /// Which entry of the level-`level` table covers `address`.
@@ -789,13 +761,8 @@ impl PageWalk for ViewWalk {
             }
             if level == 0 || flags.contains(PageTableFlags::HUGE_PAGE) {
                 let size = 1u64 << (12 + 9 * level);
-                let base = entry.addr().as_u64() & !(size - 1);
-                return Some(Leaf::backed(
-                    address & !(size - 1),
-                    size,
-                    protection(flags, size),
-                    base,
-                ));
+                let rights = protection(flags, size);
+                return Some(Leaf::at(level as u32, address, rights, entry.addr().as_u64()));
             }
             frame = PhysFrame::containing_address(entry.addr());
             level -= 1;
