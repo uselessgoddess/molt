@@ -2,9 +2,6 @@
 
 use crate::{Ipv6Addr, NetError};
 
-/// The next-header value that ends the chain with no payload protocol.
-pub const NO_NEXT_HEADER: u8 = 59;
-
 /// An IPv6 header and borrowed protocol payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Packet<'a> {

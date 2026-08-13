@@ -19,12 +19,24 @@ const DISK_TREE: &str = "disk";
 
 const BOOT_MARKERS: &[&str] = &[
     "MOLT_EXCEPTION_OK",
+    "MOLT_RAM_OK",
     "MOLT_HEAP_OK",
     "MOLT_MAPPING_OK",
+    "MOLT_VA_OK",
+    "MOLT_ASID_OK",
+    "MOLT_REFCOUNT_OK",
     "MOLT_WX_OK",
+    "MOLT_HUGE_MAP_OK",
     "MOLT_DEVICE_WINDOW_OK",
     "MOLT_EXEC_OK",
     "MOLT_SMP_OK",
+    "MOLT_SHOOTDOWN_OK",
+    "MOLT_DOMAIN_OK",
+    "MOLT_DOMAIN_ABSENT_OK",
+    "MOLT_GRANT_OK",
+    "MOLT_SPLIT_OK",
+    "MOLT_REVOKE_OK",
+    "MOLT_RING_FAULT_OK",
     "MOLT_TIMER_OK",
     "MOLT_CANCELLATION_OK",
     "MOLT_STALE_COMPLETION_OK",
@@ -162,14 +174,37 @@ impl Case {
 
 fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
     match (arch, case) {
-        (Arch::Riscv64, Case::Boot) => &["MOLT_SBI_CONSOLE:", "MOLT_UART_WINDOW:"],
+        // `sv57` is an assertion, not a report: the QEMU `virt` board's default
+        // rv64 CPU implements every mode, so anything narrower means the probe
+        // in `paging::enable` stopped early and the address space Molt plans to
+        // spend is not there.
+        // The RAM top is likewise an assertion: QEMU was given 2 GiB above
+        // `0x8000_0000`, so a kernel that read the device tree prints exactly
+        // this, and one that fell back to its own constant prints `0x88000000`.
+        // The leaf size is per-arch because the mappers differ: the RISC-V port
+        // reaches for a gigapage and the 2 GiB QEMU is given leaves room for
+        // exactly one, while the x86_64 direct map stops at 2 MiB. Both are
+        // pinned so a port that silently fell back to 4 KiB pages fails here
+        // instead of only showing up as TLB misses years later.
+        (Arch::Riscv64, Case::Boot) => &[
+            "MOLT_SBI_CONSOLE:",
+            "MOLT_SATP_MODE: sv57",
+            "MOLT_RAM_OK: top 0x100000000",
+            "MOLT_HUGE_MAP_OK: 1 GiB leaf",
+            "MOLT_UART_WINDOW:",
+        ],
         (Arch::X86_64, Case::Boot) => &[
+            "MOLT_HUGE_MAP_OK: 2 MiB leaf",
             "MOLT_BAR_OK:",
             "MOLT_MSI_OK:",
             "MOLT_INTERRUPT_OK:",
             "MOLT_AFFINITY_OK:",
             "MOLT_VIRTIO_OK:",
             "MOLT_IOMMU_OK:",
+            // Two endpoints, and the one the kernel attached first holding the
+            // lower domain although its requester ID is the higher: the
+            // assignment follows kernel order, not device identity.
+            "MOLT_IOMMU_DOMAIN_OK:",
             "MOLT_IOMMU_MAP_OK:",
             "MOLT_BLOCK_OK:",
             "MOLT_BLOCK_DEPTH_OK:",
@@ -182,6 +217,7 @@ fn arch_markers(arch: Arch, case: Case) -> &'static [&'static str] {
             "hello, molt",
             "MOLT_SHELL_OK:",
             "MOLT_FS_RESTART_OK:",
+            "MOLT_FILE_MAP_OK:",
             "MOLT_VIRTIO_RESET_OK:",
             "MOLT_IOMMU_FAULT_OK:",
             "MOLT_NVME_IOMMU_OK:",
@@ -255,6 +291,14 @@ fn smoke_case(arch: Arch, case: Case) -> Result<(), String> {
         if !run.serial.contains(marker) {
             return Err(format!("{name} {label} QEMU exited without the {marker} serial marker"));
         }
+    }
+    // Checked apart from the list because it is a value and not a name: what the
+    // kernel prints depends on the machine QEMU built, and both answers are a
+    // pass — the failure this catches is a machine with tags that reports none.
+    if let Some(marker) = tag_marker(arch, case)
+        && !run.serial.contains(&marker)
+    {
+        return Err(format!("{name} {label} QEMU exited without the {marker} serial marker"));
     }
     Ok(())
 }
@@ -360,6 +404,49 @@ fn run_qemu_interactive(image: &Path) -> Result<(), String> {
     check_exit_status(Arch::X86_64, Case::Boot, status)
 }
 
+/// The accelerator QEMU runs the x86_64 image under.
+///
+/// TCG by default, because that is what a machine without `/dev/kvm` has and
+/// what makes the smoke reproducible everywhere. `MOLT_QEMU_ACCEL=kvm` is the
+/// run that exercises tagged translation: TCG implements no PCIDs at all —
+/// QEMU lists `CPUID_EXT_PCID` among the features it does not emulate and
+/// filters it out of whatever `-cpu` asks for, warning as it goes — so under it
+/// the kernel has no tags to turn on, and under KVM it has the host's.
+fn accelerator() -> String {
+    env::var("MOLT_QEMU_ACCEL").unwrap_or_else(|_| "tcg".into())
+}
+
+/// The CPU model that goes with the accelerator: the machine's own under KVM,
+/// where passing its features through is the point, and otherwise the default
+/// model with PCIDs asked for, so the ask and its refusal are both in the log.
+fn cpu_model(accelerator: &str) -> &'static str {
+    match accelerator {
+        "kvm" => "host",
+        _ => "qemu64,+pcid",
+    }
+}
+
+/// What `MOLT_ASID_OK` has to print, for the runs where the machine's answer is
+/// known before it boots.
+///
+/// The kernel reports `CR4.PCIDE` rather than CPUID, so this pins the state and
+/// not the capability: a run on a CPU that has PCIDs and prints zero bits is a
+/// run where the bit never got set, and one that prints twelve is proof it did.
+fn tag_marker(arch: Arch, case: Case) -> Option<String> {
+    let (Arch::X86_64, Case::Boot) = (arch, case) else {
+        return None;
+    };
+    let tagged = match accelerator().as_str() {
+        // KVM hands the host CPU's features through, so the host's own flags
+        // are this machine's, and every x86_64 CPU since Westmere has PCIDs.
+        "kvm" => fs::read_to_string("/proc/cpuinfo").is_ok_and(|info| {
+            info.split(|byte: char| !byte.is_ascii_alphanumeric()).any(|flag| flag == "pcid")
+        }),
+        _ => false,
+    };
+    Some(format!("MOLT_ASID_OK: bits={}", if tagged { 12 } else { 0 }))
+}
+
 fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
     let disk = smoke_disk("molt-disk.img")?;
     let nvme = smoke_disk("molt-nvme.img")?;
@@ -368,6 +455,8 @@ fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
     if let Some(firmware) = env::var_os("MOLT_QEMU_FIRMWARE") {
         command.arg("-L").arg(firmware);
     }
+    let accelerator = accelerator();
+    command.args(["-accel", &accelerator, "-cpu", cpu_model(&accelerator)]);
     command.args([
         "-machine",
         "q35",
@@ -375,6 +464,13 @@ fn qemu_x86_64_command(image: &Path) -> Result<Command, String> {
         // ever runs on two is a crossing that never had to pick a target.
         "-smp",
         CORES,
+        // The same two gigabytes the RISC-V machine gets. QEMU's default is a
+        // hundred and twenty-eight megabytes, which the loader has mostly spent
+        // by the time the kernel runs: a machine with no contiguous megabyte
+        // left cannot back a megabyte leaf, and a grant of addresses nothing
+        // backs would prove nothing about a grant.
+        "-m",
+        "2G",
         "-device",
         "edu",
         "-display",
@@ -427,7 +523,10 @@ fn qemu_riscv64_command(kernel: &Path) -> Command {
         env::var_os("MOLT_QEMU_RISCV64").unwrap_or_else(|| OsString::from("qemu-system-riscv64"));
     let mut command = Command::new(qemu);
     // OpenSBI loads the ELF at its S-mode payload address.
-    command.args(["-machine", "virt", "-smp", CORES, "-display", "none"]);
+    // More than the 128 MiB default, and not a round power of the fallback the
+    // kernel used to carry: `MOLT_RAM_OK` can only print this if the device
+    // tree was read. It is also the least that lets a 1 GiB leaf exist.
+    command.args(["-machine", "virt", "-smp", CORES, "-m", "2G", "-display", "none"]);
     command.args(["-no-reboot", "-bios", "default"]);
     command.arg("-kernel").arg(kernel);
     command

@@ -98,6 +98,29 @@ A test whose only answer to an error is to fail returns `Result` and uses `?`.
 type. `expect` is for the message that says something the line does not;
 `.expect("cell")` says nothing, and the `?` or the `unwrap` reads better.
 
+## Lints
+
+`molt-abi` and `molt-core` deny `clippy::unwrap_used`, `expect_used` and
+`panic` outside their tests. Both were already free of all three, so the deny
+is a wall against a future line rather than a cleanup of an old one: these are
+the crates that parse what a domain wrote and the primitives the kernel runs
+on, and a panic in either is the machine stopping with nobody left to handle
+it.
+
+The same lints are *not* on elsewhere, and three others were measured and
+turned down:
+
+| lint | sites | why not |
+| --- | --- | --- |
+| `arithmetic_side_effects` | 623 | fires on ordinary `+` on integers; the fix is `checked_*` at every one, which is more code saying less |
+| `cast_possible_truncation` | 112 | every site sampled checks its bound and then narrows — `try_from` there adds an error arm that cannot be taken |
+| `unwrap_used` elsewhere | 51 | all `try_into().unwrap()` on a fixed-size slice behind a length check, which is what the rule above already allows |
+| `panic` in the kernel binary | 9 | boot self-checks, where halting with a marker is the correct answer and there is no caller to return to |
+
+A count is not an argument on its own; what settles each row is that the sites
+are already guarded, so the lint would buy `#[allow]`s rather than checks.
+Reopen the question with a defect the lint would have caught.
+
 ## Structure
 
 - One concept per module, one module per file. No `mod.rs`.

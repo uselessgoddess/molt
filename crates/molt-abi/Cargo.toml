@@ -1,0 +1,16 @@
+[package]
+name = "molt-abi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dev-dependencies]
+molt-churn.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+bench = false

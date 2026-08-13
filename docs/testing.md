@@ -121,12 +121,19 @@ that cannot tell "the board did not come up" from "the code is wrong" trains
 everyone to ignore it. Molt has no boards and no serial capture equipment yet.
 Until it does, QEMU is the honest limit, and the roadmap records the hardware
 result as pending rather than claiming it.
+[`docs/hardware.md`](hardware.md) prices the boards, designs the rig that would
+capture their serial output with the markers this suite already defines, and
+argues that the first such run should be a `just board` a person invokes — never
+a merge gate — because a lab of one board has no queue to retry into.
 
 ## Boot tests
 
 The smoke runner boots a real image under QEMU and asserts serial markers
 through `MOLT_BOOT_OK`, with a hard 20-second timeout (`MOLT_SMOKE_TIMEOUT`
-raises it for a slow host) so a hang fails instead of occupying a runner.
+raises it for a slow host) so a hang fails instead of occupying a runner. It
+emulates by default and accelerates on request: `MOLT_QEMU_ACCEL=kvm` swaps TCG
+for the host's own CPU, which is the only way to boot x86_64 on a machine that
+has PCIDs at all.
 A timed-out run prints the serial log it captured, because the log is the only
 evidence of where the boot stopped; the pipe is drained by its own thread so a
 talkative guest cannot block on its own console and look like a hang. The smoke
@@ -170,6 +177,55 @@ hardware-boot item follows: a marker asserts a property the machine actually
 has, and a machine that lacks it says so on the serial line rather than being
 excused quietly.
 
+**`MOLT_SATP_MODE: sv57` is an assertion about a value, not about a line.** The
+riscv64 boot prints whichever paging mode the hart accepted, and the marker list
+demands the widest one, so a probe that stopped early fails the smoke rather than
+reporting a narrower address space in passing. It has a partner that is harder to
+fake: `verify_owned_mapping` writes and reads its probe value at `1 << 54`, which
+is 16 PiB and untranslatable under Sv39, so `MOLT_MAPPING_OK` on riscv64 is a
+translation the hardware performed at an address only the wide mode reaches. See
+[`address-space.md`](address-space.md).
+
+**`MOLT_VA_OK` and `MOLT_ASID_OK` print numbers the hardware supplied.** Neither
+is a fixed string: the first cuts the global VA allocator from the address width
+the platform probed and carves the 100 GiB of
+[`va-allocator.md`](va-allocator.md)'s worked example out of it, and the second
+reports how many domain tags the core came up running with. Both markers appear
+on both platforms with different numbers — 57 bits and 65 535 tags on riscv64,
+48 bits and no tags at all under QEMU's TCG, which emulates no PCIDs — which is
+the point: the tagless path is not skipped, it is exercised, and the kernel that
+flushes on every switch is proven to still work rather than assumed to.
+
+The tagged x86_64 path is the same smoke under `MOLT_QEMU_ACCEL=kvm`, which
+hands the host CPU's own features to the guest; on a host with PCIDs the kernel
+turns them on and prints 4 095 tags. The number is asserted either way, and from
+the accelerator rather than from the kernel's own output — a run that could have
+tagged and reported none is the failure this catches, and it is precisely the
+bug the enable was added to fix.
+
+**`MOLT_RAM_OK` catches a constant pretending to be a measurement.** The riscv64
+kernel used to carry the QEMU `virt` default — RAM ends at `0x8800_0000` — which
+boots identically on that one machine and is wrong on every other, in both
+directions: more memory goes unused, less has the frame allocator hand out
+addresses that decode to nothing. The smoke now starts QEMU with `-m 2G` and the
+marker list demands `MOLT_RAM_OK: top 0x100000000`, a number the kernel can only
+print by reading the `/memory` node of the device tree firmware passed. The
+usable byte count follows the top rather than leading it, because that part moves
+whenever the image in front of it changes size and is not something to pin.
+
+**`MOLT_HUGE_MAP_OK` is read back, not remembered.** The size it prints does not
+come from a variable the mapper set while building the tables — that would only
+prove the mapper's intent — but from walking the live tables afterwards and
+asking each address of every usable range which leaf translates it, which is the
+same `PageWalk` the W^X audit uses. The walk stops on an unmapped page inside a
+range the kernel declared rather than stepping over it, so a hole cannot hide
+behind the bigger leaf next door. The asserted size differs per port because the
+mappers do: riscv64 must show `1 GiB leaf`, which the smoke's `-m 2G` leaves
+exactly one room for, and x86_64 must show `2 MiB leaf`, the largest its direct
+map builds. Without this, a port that quietly fell back to 4 KiB pages would
+still pass every other marker and cost only TLB misses, in a program nobody has
+written yet.
+
 **The x86_64 smoke boots `q35` with `-device edu`.** Both halves are load-bearing.
 The default `pc` machine publishes no ACPI `MCFG` table, so there is no
 configuration space to enumerate and the PCI smoke would pass by skipping
@@ -185,6 +241,16 @@ is attached and its five DMA regions are mapped, and must negotiate
 `MOLT_BLOCK_DEPTH_OK` requires two reads to be submitted before either is
 reaped; and `MOLT_IOMMU_FAULT_OK` requires the replenished event queue to remain
 clean through filesystem I/O and block reset. See [`block.md`](block.md).
+
+**`MOLT_IOMMU_DOMAIN_OK` is where the domain numbers come from.** The smoke
+borrows the NIC — quiesced, and detached again a few lines later — as a second
+endpoint, attaches it ahead of the block function, and requires the device with
+the higher requester ID to hold the lower domain. Both orders are legal
+outputs of an allocator that reads the identifier; only one is possible from an
+allocator that reads its own table, and that is the one the marker pins. The
+same property is checked without hardware in `molt-virtio`'s
+`domains_follow_arrival_not_identity`, and the identifiers themselves in
+`molt-pci`'s `requester_ids_are_distinct_per_address`.
 
 **`MOLT_BLK_IRQ_OK` is a marker about an absence.** The block driver's used-ring
 poll is gone, so a sector read that returns at all returns because queue zero's
@@ -259,39 +325,131 @@ asked for the refusal, so the tests still run in parallel. It shows a mount
 answering the error and a create rolling back to its snapshot with the journal
 still usable afterwards, which is the part a type signature cannot claim.
 
-## Fuzzing, and the half worth having now
+## Fuzzing, and the two halves of it
 
 Stage 3 raised the question and answered half of it. `molt-net`'s parsers were
 covered only by frames its own emitter wrote, so every length field they read
 was one they had produced — the case that matters, a length field a peer chose,
-was the one case never tested.
+was the one case never tested. The answer then was a xorshift generator seeded
+by one constant: cheap, replayable from the source, and blind — it never learned
+that a mutation had reached a branch nothing before it had.
 
-`crates/molt-net/tests/noise.rs` is that case, as an ordinary test rather than
-as infrastructure. A xorshift generator seeded by one constant sweeps 16384
-inputs per parser and asserts the invariant the parsers actually owe: nothing is
-read past the input the caller handed over. The seed is the reproduction, so a
-failure replays from a constant in the source with no checked-in corpus, no
-crash triage, and no time budget in CI.
+Stage 5 replaced the generator with the two tools that each do one half of what
+it was doing badly, because the halves want opposite things.
 
-**The noise is shaped, because unshaped noise proves nothing.** Random bytes
-almost never satisfy an IPv4 header checksum, and a random 16-bit length field
-lands inside a 128-byte buffer about two times in a thousand — the first draft
-passed with the truncation check deleted. So the sweep forces the version
-nibble, zeroes the fragment field, repairs the checksum, and draws lengths from
-a range that straddles the buffer's end, and every test asserts a floor on how
-many inputs actually parsed. A sweep that proves nothing now says so.
+**A structure, walked until it breaks: [proptest].** The inputs the kernel takes
+from a domain are not bytes, they are protocols — allocate, release, sweep,
+retire; grant, revoke, split, merge — and what breaks them is an order nobody
+thought of rather than a byte nobody expected. So each sweep generates a *list
+of moves* and replays it against a model. A move is a value and not a call
+because control flow cannot be shrunk: when a list fails, proptest cuts it down
+until nothing more can be dropped, and what a failure prints is the shortest
+churn that still reaches the bug. `crates/molt-churn` holds what they share — the
+runner, and the coverage floors below.
 
-Validated the same way the loom tests were: each of the three truncation checks
-was reintroduced as a no-op in turn, and each time the sweep failed with an
-index past the slice. Two further tests flip one bit of a valid packet and
-require anything that still parses to re-emit to itself, which is the property a
-parse/emit pair owes and neither half can be asked about alone.
+**Bytes nobody shaped, mutated toward coverage: [cargo fuzz].** The wire is the
+other kind of input, and there the interesting states are branches rather than
+orders. libFuzzer keeps what reached a new edge and mutates from there, which is
+the part a seeded generator cannot do at any number of iterations:
 
-**What is deliberately deferred.** A corpus, coverage-guided mutation, a CI time
-budget, and crash triage are the other half, and they are infrastructure with
-running costs. They earn those costs against a parser that takes input from
-somewhere less bounded than a 1514-byte frame, which is Stage 4's NVMe and real
-NIC work at the earliest. The cheap half runs on every push today.
+| Target | What it feeds | What it must not find |
+| --- | --- | --- |
+| `fuzz/fuzz_targets/call_parse.rs` | a submission slot, either eight raw words or a shaped call | an accepted call whose id or buffer is not what the words said, a buffer outside the aperture, or a call that does not survive its own encoding |
+| `fuzz/fuzz_targets/frame_parse.rs` | one frame per parser, with the ICMPv6 checksum repaired on request | a read past the frame, or a parse that does not re-emit to itself |
+
+`just fuzz [seconds]` runs every target in `cargo fuzz list` for that long — a
+minute each by default — and CI does the same on every push, uploading
+`fuzz/artifacts` if anything crashes. It is deliberately not part of `just pre`:
+a time budget is a search, and a search that found nothing today is not a pass.
+Neither target has found a crash yet, at about seven million executions of
+`call_parse` per half minute on one core.
+
+**Shape is still what makes either of them work.** Random bytes almost never
+satisfy an IPv4 header checksum, and a random 16-bit length field lands inside a
+128-byte buffer about two times in a thousand — the first draft of the old sweep
+passed with the truncation check deleted. So the harnesses force the version
+nibble, repair the checksum on demand, and draw lengths from a range that
+straddles the buffer's end; and every sweep declares the states it exists to
+reach, counted across all its cases, so one that generated nothing interesting
+says so instead of passing quietly.
+
+[proptest]: https://docs.rs/proptest
+[cargo fuzz]: https://rust-fuzz.github.io/book/cargo-fuzz.html
+
+## Red teaming the address space
+
+Stage 5 pointed the same shape at what a hostile domain can reach. Each sweep is
+an ordinary `#[test]` replaying generated moves against a model, each names the
+states it had to reach, and each is named for the thing it is trying to break:
+
+| Sweep | What it must not find |
+| --- | --- |
+| `molt-arch/tests/va_churn.rs` | an address handed out twice, or an arena that does not come back whole |
+| `molt-arch/tests/refcount_churn.rs` | a count the model disagrees with, after any order of grant, revoke, split and merge |
+| `molt-abi/tests/ring_churn.rs` | a lying producer read past its fault, or a corrupt head starving the kernel end |
+| `molt-arch/tests/shootdown_churn.rs` | a round nobody can close, or an address stuck in quarantine |
+| `molt-net/tests/frame_churn.rs` | a parser reading past the frame, or one that will not re-emit what it just parsed |
+
+The refcount sweep carries a model that knows only which bytes are held how many
+times — no classes, no records — so anything the table does with either, a split
+that loses a count or a refusal that spends a slot, shows up as the two
+disagreeing.
+
+The shootdown sweeps are liveness claims, and a tracker that wedges does not
+crash: it stops, and the addresses it holds are never handed out again. So they
+are made the only honest way — from every state the churn reaches, drive the
+protocol forward and see that it goes. `Shootdown` is `Copy`, so the escape runs
+on a copy and the churn carries on from where it was.
+
+## Eight cores on one address space
+
+Every structure in `molt-arch` takes `&mut self`, which says what a call needs
+and not where it comes from. In the kernel it comes from behind a ticket lock,
+and the sweeps above run one core at a time, so neither says anything about the
+order eight of them produce. `molt-arch/tests/contention.rs` closes that: eight
+host threads share one `Spinlock<Machine>` holding the real `Space`, `Leaves`,
+`Windows` and `Shootdown`, and each runs the sequence a core runs — take a
+window of a file or fill it, count the grant, give it back, hand the addresses
+it freed to a shootdown — dropping the lock in between, where a core would be
+using the mapping.
+
+Three failures live only there. An address handed to two cores at once, which
+the counts refuse rather than the test detecting after the fact: a second `map`
+over a live range is `Overlap`. A window that moves under a core holding it,
+which the way out checks against the region it was given. And a quarantine
+nobody can close, which is the liveness claim the whole scheme rests on: a round
+closes only once all eight cores have answered it, so an address freed in one
+waits for every core that might still translate it, and a round that ever needs
+a core which is not coming shows up as a run that does not finish. What the end
+state asserts is that the churn conserved everything — no window outlives its
+holders, no address is still counted, and the arena is back to one free hole per
+class, the size it was cut at.
+
+**What takes a lock, and what does not.** The two answers in this kernel are not
+a preference, they are which side of the I/O path something is on. The
+primitives in `molt-core` — the ring, the completion slab, the waker — are
+touched from interrupt context on the hot path, so they are lock-free and loom
+checks the orderings. The machine-wide tables are the opposite case: they are
+touched when a mapping is created or destroyed, which is rare against the life
+of the mapping, and a wrong answer there is an address two domains both believe
+they own. So they take one ticket lock rather than each growing its own
+synchronisation, and the lock is a ticket lock because fairness is what matters
+when the critical section is an `O(holes)` walk — a core that keeps losing a
+test-and-set race would be starved of addresses by cores that already have
+theirs. This test is where that decision is exercised rather than asserted.
+
+## Putting the bug back
+
+Two of the sweeps above found bugs, which is their own evidence. The others
+found nothing, and so did the stress run — which reads exactly the same from
+outside as a test that generates nothing. So
+[`experiments/sweep-mutations.sh`](../experiments/sweep-mutations.sh) puts one
+bug back into the code under each of them in turn, an edit a refactor could make
+by accident rather than a `panic!` planted to be found, and expects that test to
+fail. All six are caught, each by the assertion it was written for — the stress
+run by the holder count eight cores hold at once. It is the rule both sections
+rest on: a passing test that makes its own inputs is a claim about the test, not
+about the code, until something has been seen to fail it.
 
 ## Conventions
 

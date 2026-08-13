@@ -1,0 +1,33 @@
+[package]
+name = "molt-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1.4.2", features = ["derive"] }
+libfuzzer-sys = "0.4.11"
+molt-abi = { path = "../crates/molt-abi" }
+molt-net = { path = "../crates/molt-net" }
+
+[[bin]]
+name = "call_parse"
+path = "fuzz_targets/call_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_parse"
+path = "fuzz_targets/frame_parse.rs"
+test = false
+doc = false
+bench = false
+
+# The fuzz targets are their own workspace: they need a sanitizer and a
+# libFuzzer runtime the kernel build has no business linking, and `cargo test`
+# at the root would otherwise try to build them for a bare-metal target.
+[workspace]

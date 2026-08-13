@@ -22,6 +22,7 @@ mod msi;
 
 use core::fmt;
 
+use molt_arch::iommu::DeviceId;
 use molt_arch::memory::Span;
 use molt_arch::pci::BUS_STRIDE;
 use molt_arch::{ConfigSpace, Mmio, MmioError};
@@ -96,6 +97,18 @@ impl Address {
     /// The offset of this function's 4 KiB window within its bus's window.
     pub const fn offset(self) -> u64 {
         (self.device as u64) << 15 | (self.function as u64) << 12
+    }
+
+    /// The requester ID an IOMMU sees on this function's transactions.
+    ///
+    /// It lives here, on the address the kernel read off the bus, because that
+    /// is the only thing it may be derived from: the identifier an endpoint is
+    /// isolated by has to come from where the function answers, not from
+    /// anything the function says about itself. Bus, device, and function pack
+    /// into disjoint fields, so distinct addresses are distinct endpoints —
+    /// two functions cannot land in one domain by sharing a name.
+    pub const fn requester(self) -> DeviceId {
+        DeviceId::new((self.bus as u32) << 8 | (self.device as u32) << 3 | self.function as u32)
     }
 }
 
@@ -192,6 +205,28 @@ mod tests {
         assert_eq!(address.offset(), 31 << 15 | 7 << 12);
         assert_eq!(Address::new(0, 32, 0), Err(PciError::Address));
         assert_eq!(Address::new(0, 0, 8), Err(PciError::Address));
+        Ok(())
+    }
+
+    /// Every address on a bus has a requester ID of its own. Two functions
+    /// that shared one would be one endpoint to the IOMMU, and whatever
+    /// domain the kernel put the first in would be the second's as well.
+    #[test]
+    fn requester_ids_are_distinct_per_address() -> Result<(), PciError> {
+        let mut seen = std::collections::BTreeSet::new();
+        for bus in [0, 1, 0xff] {
+            for device in 0..32 {
+                for function in 0..8 {
+                    let address = Address::new(bus, device, function)?;
+                    assert!(
+                        seen.insert(address.requester().get()),
+                        "{address} reuses a requester ID",
+                    );
+                }
+            }
+        }
+
+        assert_eq!(Address::new(0, 3, 1)?.requester().get(), 0x19);
         Ok(())
     }
 
