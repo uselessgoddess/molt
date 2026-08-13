@@ -120,20 +120,14 @@ trace. Two things stop it, and both are needed — the generation check (a stale
 `Asid` cannot be presented as live) and the full flush on rollover (the hardware
 has no per-tag invalidate that is cheaper than the flush at that point).
 
-The budget is measured, not assumed: `MOLT_ASID_OK` prints what the core is
-running with, which is 16 bits / 65 535 concurrent domains on QEMU's `virt`, and
-12 bits / 4 095 domains on an x86_64 machine whose PCIDs the kernel turned on.
-On one that has none — QEMU's TCG emulates none — the same kernel prints 0 and
-flushes on every switch. That "0 domains" path is not a degraded security
-posture; it is the same posture, paid for in TLB misses.
-
-What is measured there is the state and not the capability. `CR4.PCIDE` comes
-out of reset clear and per core, so every core sets it for itself
-(`memory::enable_tags`, called from `init` on the boot core and from `ap::enter`
-on every other), the boot core refuses a machine whose CPUID answer and whose
-`CR4` disagree, and the width reported is the bit read back afterwards. A kernel
-that reported the capability instead would claim 12 bits while every switch was
-still a full flush — true about the machine, false about the isolation.
+The budget itself is arithmetic, and it is counted in
+[`docs/address-space.md`](address-space.md#the-tag-budget-counted-not-assumed).
+Two things about it are security claims rather than numbers. A core with no tags
+flushes on every switch, which is not a degraded posture but the same one paid
+for in TLB misses. And what `MOLT_ASID_OK` reports is the state the core is
+running with, never the capability it advertises — a kernel that printed
+`CPUID.01H:ECX[17]` would claim 12 bits while every switch was still a full
+flush, true about the machine and false about the isolation.
 
 One consequence is in `flush`. Once tagging is on, reloading `CR3` invalidates
 only the tag it names, so the whole-TLB flush is `CR4.PGE` toggled and put back,
@@ -442,21 +436,3 @@ questions for every commit in Stage 5.0 and after:
   `CR4.PCIDE` is set on every core now, but QEMU's TCG emulates no PCIDs at all,
   so the default smoke boots the untagged floor; the 12-bit answer comes from
   the KVM run CI adds beside it, and a host without `/dev/kvm` cannot see it.
-
-## The decision, restated
-
-- **Isolation is absence, not permission** — the kernel and every other domain
-  have no PTE in a domain's view, which is what makes the Meltdown family
-  structurally inapplicable.
-- **Addresses are not secrets.** Nothing may protect an extent by being hard to
-  find, because a single address space has no re-roll.
-- **Tags identify, they never authorise**, and a stale one is caught by
-  generation before it is caught by hardware.
-- **The cross-domain ring is a different type** from `SpscRing`, with a private
-  consumer index, a validated producer index, a parsed POD payload, read-once
-  fields, one masked range check, and rings inside the domain's own extent.
-- **Spectre-v1 is answered by masking in the validator**, because it needs no
-  barrier and both ports can have it; v2 and MDS are named as unaddressed rather
-  than mitigated on paper.
-- **Availability is not promised**, and the four ways it can be spent are
-  enumerated instead of hedged.

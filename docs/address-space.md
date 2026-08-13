@@ -451,18 +451,4 @@ exists, the table above is a plan; after it, it is a property.
 | an aperture inside a domain | `MOLT_SANDBOX_OK` | tier 1 nests in tier 2 |
 | the same cell built for all three tiers | `MOLT_TIER_PARITY_OK` | the claim, made testable |
 
-## The decision, restated
-
-- **The 4 GiB stays** for tier 1, where it is free, and stops being the ceiling
-  for anything else.
-- **The address space is single and global**; domains differ in what is present,
-  never in what an address means.
-- **A domain is a view, not a process.** No `fork`, no `exec`, no pid, no
-  per-program layout — the parts of the thesis that were load-bearing survive;
-  the "exactly one page table" part does not.
-- **Reach comes from hardware**, not from a wider software window: Sv57 today,
-  CHERI if it ever ships, MPK as an x86_64 accelerator.
-- **The tier is a build-time decision**, because all three speak the same
-  `molt-abi` rings — and `MOLT_TIER_PARITY_OK` is how that stops being a claim.
-
 [spec]: https://github.com/lfi-project/lfi-spec

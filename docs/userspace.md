@@ -189,12 +189,3 @@ one whose failures are about the sandbox.
 | `cat`, `ls`, `cp` as Molt programs over `molt-abi` | `MOLT_USER_TOOLS_OK` | Enough of a userspace to notice what the protocol is missing |
 | tier-3 target proposal | — | Only once the ABI version stops changing |
 | `molt-posix` and uutils | — | Only if the compatibility exercise is judged worth it, and only in the sandbox |
-
-## The decision, restated
-
-- **Custom target**: yes, two JSON specs and `-Z build-std`, on the pinned
-  nightly the repository already uses.
-- **rustc fork**: no. riscv64 does not need one; x86_64 would, so x86_64 waits.
-- **coreutils**: not uutils. Molt's own small tools first, over `molt-abi`; a
-  POSIX layer, if ever, strictly inside the sandbox.
-- **Shell**: the one already in the tree, moved rather than rewritten.

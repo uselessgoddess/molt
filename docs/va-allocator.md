@@ -371,17 +371,3 @@ flushed through, which is the same shape as the shootdown protocol in
 - **Nothing reclaims a leaked extent.** There is no scan, no GC, and no process
   exit to fall back on; domain teardown must release what it allocated, which is
   a capability-lifetime problem rather than an allocator one.
-
-## The decision, restated
-
-- **Three arenas, one per page-table leaf level.** Alignment is an invariant,
-  not a search.
-- **Address-ordered first fit with immediate coalescing**, the same policy the
-  heap already uses.
-- **A freed address waits for a shootdown**, batched by epoch, and coalesces
-  only with neighbours waiting on the same one.
-- **No compaction, ever** — a global address is the product, so fragmentation is
-  prevented rather than repaired, and exhaustion is a reported error.
-- **Caller-supplied storage**, 24 bytes a hole, no allocator underneath.
-- **Grant and revoke never allocate**, which is why a churning system does not
-  fragment and why the single lock is not a bottleneck.
