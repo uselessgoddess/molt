@@ -1,5 +1,10 @@
 // loom requires `std`; production builds remain `no_std`.
 #![cfg_attr(not(loom), no_std)]
+// Same wall as `molt-abi`, for the same reason one level in: these are the
+// primitives the kernel runs on, and a panic in one of them is the machine
+// stopping with no caller left to handle it.
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 //! Architecture-independent primitives for the Molt kernel.
 //!

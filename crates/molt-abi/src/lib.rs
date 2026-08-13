@@ -1,4 +1,11 @@
 #![no_std]
+// Nothing here may halt the machine on what a domain wrote: every path this
+// crate owns parses hostile words, and a panic is a denial of service the
+// domain gets to choose. The crate is already free of them, so the lint is a
+// wall rather than a cleanup, and it costs nothing to keep standing. Tests are
+// exempt — `unwrap` there is how a test states what must have worked.
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 //! The layouts and rules that cross the boundary to something untrusted.
 //!

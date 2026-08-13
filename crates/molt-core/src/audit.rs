@@ -103,7 +103,7 @@ impl<const N: usize> Log<N> {
     /// The retained events, oldest first.
     pub fn iter(&self) -> impl Iterator<Item = Event> + '_ {
         let start = if self.len == N { self.next } else { 0 };
-        (0..self.len).map(move |offset| self.events[(start + offset) % N].unwrap())
+        (0..self.len).filter_map(move |offset| self.events[(start + offset) % N])
     }
 }
 
