@@ -26,7 +26,7 @@
 //! [`refcount`]: crate::refcount
 
 use crate::memory::Span;
-use crate::va::{Class, Extent, Region};
+use crate::va::{Extent, Region};
 
 /// Why a cache request was refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,23 +115,6 @@ impl Window {
     pub const fn extent(&self) -> Option<&Extent> {
         match self.backing {
             Some((ref extent, _)) => Some(extent),
-            None => None,
-        }
-    }
-
-    /// The frames the bytes were read into.
-    pub const fn frames(&self) -> Option<Span> {
-        match self.backing {
-            Some((_, frames)) => Some(frames),
-            None => None,
-        }
-    }
-
-    /// The leaf size the window is mapped with, which is also what its offset
-    /// has to be a multiple of.
-    pub const fn class(&self) -> Option<Class> {
-        match self.extent() {
-            Some(extent) => Some(extent.class()),
             None => None,
         }
     }
@@ -287,11 +270,6 @@ impl<'windows> Windows<'windows> {
     /// How much of the address space they cover between them.
     pub fn bytes(&self) -> u64 {
         self.windows[..self.len].iter().map(Window::bytes).sum()
-    }
-
-    /// Every cached window, in no order a caller should rely on.
-    pub fn iter(&self) -> impl Iterator<Item = &Window> {
-        self.windows[..self.len].iter()
     }
 
     fn find(&self, file: File, offset: u64) -> Option<usize> {

@@ -23,7 +23,6 @@ pub struct Asids {
     width: u32,
     next: u32,
     generation: u64,
-    assigned: u64,
     rollovers: u64,
 }
 
@@ -85,13 +84,7 @@ impl Asids {
     /// A width of zero is a real answer, not a broken one: RISC-V allows
     /// `ASIDLEN` to be zero, and such a hart shares one tag between everybody.
     pub const fn new(width: u32) -> Self {
-        Self {
-            width: if width > 16 { 16 } else { width },
-            next: 1,
-            generation: 1,
-            assigned: 0,
-            rollovers: 0,
-        }
+        Self { width: if width > 16 { 16 } else { width }, next: 1, generation: 1, rollovers: 0 }
     }
 
     /// How many domains can hold a tag between two wraps.
@@ -104,7 +97,6 @@ impl Asids {
 
     /// Hands out the next tag, and says what using it costs.
     pub fn assign(&mut self) -> Grant {
-        self.assigned += 1;
         if self.next > self.capacity() {
             // Nothing is searched for and nothing is reclaimed: the generation
             // moves, which retires every outstanding tag at once.
@@ -133,11 +125,6 @@ impl Asids {
     /// The width the hart reported, as far as this kernel will use it.
     pub const fn width(&self) -> u32 {
         self.width
-    }
-
-    /// How many tags have been handed out, wraps included.
-    pub const fn assigned(&self) -> u64 {
-        self.assigned
     }
 
     /// How many times the numbers have wrapped, which is how many global
