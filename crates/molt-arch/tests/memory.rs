@@ -195,7 +195,7 @@ fn run_across_gap_refused() {
 }
 
 #[test]
-fn contiguous_looks_past_a_gap() {
+fn contiguous_looks_past_gap() {
     let map = TestMap([
         MemoryRegion::new(0, 0x1000, MemoryRegionKind::Reserved),
         MemoryRegion::new(0x4000, 0x5000, MemoryRegionKind::Usable),

@@ -157,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn levels_match_the_specified_widths() {
+    fn levels_match_specified_widths() {
         assert_eq!(Mode::Sv39.level(), 2);
         assert_eq!(Mode::Sv48.level(), 3);
         assert_eq!(Mode::Sv57.level(), 4);
@@ -171,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tag_round_trips_beside_the_mode() {
+    fn tag_round_trips_beside_mode() {
         let satp = Mode::Sv57.field() | Asid::field(0xbeef) | 0x8_0000;
 
         assert_eq!(Asid::from_satp(satp), 0xbeef);
@@ -184,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn the_probe_counts_the_bits_that_stuck() {
+    fn probe_counts_stuck_bits() {
         // What QEMU's `virt` hart answers with, and what a narrower one would.
         assert_eq!(Asid::width(Asid::MASK), 16);
         assert_eq!(Asid::width(Asid::field(0x1ff)), 9);
@@ -192,14 +192,14 @@ mod tests {
     }
 
     #[test]
-    fn a_hole_in_the_field_ends_the_count() {
+    fn hole_in_field_ends_count() {
         // WARL lets a hart keep a bit it does not decode; anything above a gap
         // would hand two domains tags that alias in the bits that do decode.
         assert_eq!(Asid::width(Asid::field(0b1000_1111)), 4);
     }
 
     #[test]
-    fn probe_addresses_need_the_mode_that_names_them() {
+    fn probe_address_needs_naming_mode() {
         for mode in Mode::WIDEST {
             let va = mode.probe_va();
             assert!(va < (1 << (mode.bits() - 1)), "{} cannot translate {va:#x}", mode.name());

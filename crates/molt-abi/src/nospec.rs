@@ -110,7 +110,7 @@ mod tests {
     ];
 
     #[test]
-    fn masks_agree_with_the_comparison() {
+    fn masks_agree_with_comparison() {
         for value in EDGES {
             for limit in EDGES {
                 assert_eq!(below(value, limit).passed(), value < limit, "{value:#x} < {limit:#x}");

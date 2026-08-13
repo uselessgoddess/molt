@@ -150,7 +150,7 @@ address, because there is no misaligned address in that arena to return.
 spill into the megabyte arena would immediately reintroduce the search — the
 spilled region would have to be gigabyte-aligned inside a range that is not — and
 would let one runaway consumer starve a class it does not use.
-`an_exhausted_class_does_not_borrow_from_another` pins this: filling the
+`exhausted_class_does_not_borrow` pins this: filling the
 gigabyte arena leaves the megabyte arena whole, and the failure is
 `Error::Exhausted` rather than a quiet fallback.
 
@@ -189,7 +189,7 @@ Three consequences worth stating plainly:
 **Batching is the point.** A shootdown is an IPI round to every hart; paying one
 per unmapped extent would make revocation the dominant cost of a domain
 teardown. `sweep` closes a batch, so a domain that releases four hundred extents
-pays one flush for all of them. `an_epoch_that_was_never_swept_frees_nothing`
+pays one flush for all of them. `unswept_epoch_frees_nothing`
 pins the ordering: `retire` on an epoch that is still open is a no-op, so a
 mistaken call cannot shortcut the flush.
 
@@ -200,7 +200,7 @@ next to a free arena tail moved the *entire tail* behind the next flush, so a
 single release could drop the allocatable space of a class to zero. The rule is
 now that only neighbours waiting on the same epoch merge on release, and
 `settle` — run from `retire` — merges the islands once they have become
-indistinguishable. `released_addresses_wait_for_the_shootdown` and
+indistinguishable. `released_addresses_wait_shootdown` and
 `churn_leaves_no_permanent_fragmentation` are the two halves of that fix.
 
 **Quarantine is bounded by the release rate, not by the arena size.** At most
@@ -268,7 +268,7 @@ caller can report — a mapping refused, not a mapping silently made slow.
 
 `Space::bounds(bits)` takes the top quarter of the lower canonical half, which is
 one eighth of the space: everything below stays with the kernel's identity map
-and, on RISC-V, the device window at 128 GiB (`the_narrowest_mode_clears_the_device_window`).
+and, on RISC-V, the device window at 128 GiB (`narrowest_mode_clears_device_window`).
 
 | Mode | Handed out | Page arena | Mega arena | Giga arena | 100 GiB mappings |
 | --- | --- | --- | --- | --- | --- |
@@ -311,7 +311,7 @@ and pays 24 bytes per slot.
 Running out of slots is the one case where a *release* can fail, and the
 behaviour is the conservative one: `Error::Full`, and the extent is not
 recorded, which leaks the range rather than corrupting the free list.
-`a_full_free_list_refuses_rather_than_loses_the_range` asserts both halves —
+`full_free_list_refuses_range` asserts both halves —
 the error, and that the free list is unchanged afterward. The alternative
 (silently merging non-adjacent ranges to make room) would hand out addresses
 that were never freed, which is a correctness bug traded for a resource bug.
@@ -322,19 +322,19 @@ the arena.
 
 | Test | Claim |
 | --- | --- |
-| `every_class_hands_out_its_own_alignment` | a class's extents start on its granule, always |
+| `classes_hand_out_own_alignment` | a class's extents start on its granule, always |
 | `class_arenas_do_not_overlap` | the cut leaves no unowned gap and no shared range |
-| `a_hundred_gigabyte_mapping_fits_in_one_extent` | 100 leaves, not 26 214 400 pages |
-| `a_size_that_is_not_whole_leaves_rounds_up` | a byte past a leaf takes the next leaf |
-| `released_addresses_wait_for_the_shootdown` | no reuse before a flush, ever |
-| `retiring_the_swept_epoch_returns_the_addresses` | and full reuse after one |
-| `an_epoch_that_was_never_swept_frees_nothing` | the flush cannot be shortcut |
+| `hundred_gigabyte_mapping_one_extent` | 100 leaves, not 26 214 400 pages |
+| `partial_leaf_size_rounds_up` | a byte past a leaf takes the next leaf |
+| `released_addresses_wait_shootdown` | no reuse before a flush, ever |
+| `retiring_swept_epoch_returns_addresses` | and full reuse after one |
+| `unswept_epoch_frees_nothing` | the flush cannot be shortcut |
 | `churn_leaves_no_permanent_fragmentation` | out-of-order churn returns the arena whole |
-| `an_exhausted_class_does_not_borrow_from_another` | exhaustion is local and loud |
-| `a_full_free_list_refuses_rather_than_loses_the_range` | slots run out safely |
-| `a_range_that_is_already_free_is_refused` | double release is caught, not doubled |
-| `a_space_too_narrow_to_cut_is_refused` | Sv39 works, narrower is refused |
-| `the_narrowest_mode_clears_the_device_window` | the handed-out range never collides with devices |
+| `exhausted_class_does_not_borrow` | exhaustion is local and loud |
+| `full_free_list_refuses_range` | slots run out safely |
+| `already_free_range_refused` | double release is caught, not doubled |
+| `too_narrow_space_refused` | Sv39 works, narrower is refused |
+| `narrowest_mode_clears_device_window` | the handed-out range never collides with devices |
 | `zero_bytes_name_no_page` | the degenerate request is an error |
 
 Two of these exist because they caught real bugs during development, not because

@@ -216,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn an_address_is_not_free_until_the_last_core_has_flushed() -> Result<(), Error> {
+    fn address_free_only_after_last_flush() -> Result<(), Error> {
         let mut shootdown = Shootdown::new();
         let first = epoch(1);
 
@@ -257,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn the_core_that_unmapped_owes_a_flush_like_any_other() -> Result<(), Error> {
+    fn unmapping_core_owes_flush() -> Result<(), Error> {
         let mut shootdown = Shootdown::new();
 
         shootdown.begin(epoch(1), CORES.into_iter())?;
@@ -267,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn a_core_the_round_never_asked_cannot_close_it() -> Result<(), Error> {
+    fn unasked_core_cannot_close_round() -> Result<(), Error> {
         let mut shootdown = Shootdown::new();
         shootdown.begin(epoch(1), CORES[..2].iter().copied())?;
 
@@ -279,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn a_second_round_waits_for_the_first_to_finish() -> Result<(), Error> {
+    fn second_round_waits_for_first() -> Result<(), Error> {
         let mut shootdown = Shootdown::new();
         let first = epoch(1);
         shootdown.begin(first, CORES.into_iter())?;
@@ -295,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn an_epoch_already_retired_is_not_flushed_again() -> Result<(), Error> {
+    fn retired_epoch_not_flushed_again() -> Result<(), Error> {
         let mut shootdown = Shootdown::new();
         let first = epoch(1);
         shootdown.begin(first, CORES.into_iter())?;
@@ -309,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn a_flush_nobody_asked_for_is_refused() {
+    fn unasked_flush_refused() {
         let mut shootdown = Shootdown::new();
 
         assert_eq!(shootdown.acknowledge(CpuId::BOOT), Err(Error::Closed));
@@ -318,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn a_round_over_no_cores_is_refused() {
+    fn round_over_no_cores_refused() {
         let mut shootdown = Shootdown::new();
 
         assert_eq!(shootdown.begin(epoch(1), [].into_iter()), Err(Error::Empty));

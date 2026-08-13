@@ -18,7 +18,7 @@ fn extent(space: &mut Space<'_>, class: Class, bytes: u64) -> Extent {
 }
 
 #[test]
-fn root_built_only_with_a_slot() {
+fn root_built_only_with_slot() {
     let mut asids = Asids::new(16);
     let mut views = Views::<u64>::EMPTY;
     let mut built = 0;

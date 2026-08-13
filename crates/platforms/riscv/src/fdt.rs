@@ -838,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn ram_is_the_bank_holding_the_kernel() -> Result<(), FdtError> {
+    fn ram_is_bank_holding_kernel() -> Result<(), FdtError> {
         let bytes = memory(&[&[(0x8000_0000, 0x8000_0000)]]);
 
         let bank = DeviceTree::new(&bytes)?.ram(0x8020_0000)?;
@@ -872,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn ram_without_a_tree_pointer_is_missing() {
+    fn ram_without_tree_pointer_missing() {
         // SAFETY: zero is the one address `ram_at` answers without a load.
         let bank = unsafe { super::ram_at(0, 0x8000_0000) };
 

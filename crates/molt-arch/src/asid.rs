@@ -155,7 +155,7 @@ mod tests {
     const RISCV: u32 = 16;
 
     #[test]
-    fn every_domain_gets_a_tag_of_its_own() {
+    fn every_domain_gets_own_tag() {
         let mut asids = Asids::new(RISCV);
 
         let first = asids.assign();
@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn the_kernel_keeps_tag_zero() {
+    fn kernel_keeps_tag_zero() {
         let mut asids = Asids::new(RISCV);
 
         for _ in 0..64 {
@@ -177,7 +177,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sixteen_bit_field_holds_sixty_five_thousand_domains() {
+    fn sixteen_bit_field_holds_65536_domains() {
         assert_eq!(Asids::new(16).capacity(), 65_535);
         assert_eq!(Asids::new(9).capacity(), 511);
         assert_eq!(Asids::new(0).capacity(), 0, "a hart with no tag bits has no tags to give");
@@ -197,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tag_from_before_the_wrap_is_not_live() {
+    fn tag_from_before_wrap_not_live() {
         let mut asids = Asids::new(4);
         let old = asids.assign().asid();
 
@@ -212,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hart_without_tag_bits_flushes_on_every_switch() {
+    fn untagged_hart_flushes_every_switch() {
         let mut asids = Asids::new(0);
 
         let grants = [asids.assign(), asids.assign(), asids.assign()];
@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn a_width_wider_than_the_field_is_taken_as_the_field() {
+    fn overwide_width_clamped_to_field() {
         assert_eq!(Asids::new(64).width(), 16, "a bad probe must not widen the tag field");
     }
 }

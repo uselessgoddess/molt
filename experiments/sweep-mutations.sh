@@ -103,14 +103,14 @@ mutation quarantine \
 
 mutation split-counts \
     crates/molt-arch/src/refcount.rs molt-arch refcount_churn \
-    every_request_leaves_the_counts_the_model_expects \
+    requests_leave_counts_model_expects \
     "a split that hands the children a count nobody held" \
     'Self::run(leaf, child, Class::FANOUT, run.count)?' \
     'Self::run(leaf, child, Class::FANOUT, 1)?'
 
 mutation flush-set \
     crates/molt-arch/src/shootdown.rs molt-arch shootdown_churn \
-    no_run_of_answers_leaves_a_round_nobody_can_close \
+    no_answers_leave_round_unclosable \
     "a round that forgets the cores which already answered" \
     'self.flushed |= 1 << cpu.index();' \
     'self.flushed = 1 << cpu.index();'
@@ -129,7 +129,7 @@ mutation ipv4-total \
 
 mutation holder-count \
     crates/molt-arch/src/cache.rs molt-arch contention \
-    eight_cores_share_one_space_without_losing_an_address \
+    eight_cores_share_space_losing_none \
     "a window handed to a core without counting the holder" \
     'window.holders = window.holders.checked_add(1).ok_or(Error::Saturated)?;' \
     'window.holders = window.holders.checked_add(0).ok_or(Error::Saturated)?;'

@@ -190,7 +190,7 @@ fn canonical(leaves: &Leaves<'_>) -> TestCaseResult {
 }
 
 #[test]
-fn every_request_leaves_the_counts_the_model_expects() {
+fn requests_leave_counts_model_expects() {
     let seen = Seen::default();
 
     sweep(moves(), |moves| {

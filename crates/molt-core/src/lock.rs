@@ -105,7 +105,7 @@ mod tests {
     use super::Spinlock;
 
     #[test]
-    fn held_lock_turns_away_a_try() {
+    fn held_lock_turns_away_try() {
         let lock = Spinlock::new(0u64);
         let held = lock.lock();
         assert!(lock.try_lock().is_none(), "a held lock was handed out twice");

@@ -14,7 +14,7 @@ fn region(start: u64, bytes: u64) -> Region {
 }
 
 #[test]
-fn a_hundred_gigabytes_cost_one_record() -> Result<(), Error> {
+fn hundred_gigabytes_single_record() -> Result<(), Error> {
     let mut runs = [Run::EMPTY; 8];
     let mut leaves = Leaves::over(&mut runs);
 
@@ -28,7 +28,7 @@ fn a_hundred_gigabytes_cost_one_record() -> Result<(), Error> {
 }
 
 #[test]
-fn sharing_the_whole_extent_stays_one_record() -> Result<(), Error> {
+fn sharing_whole_extent_one_record() -> Result<(), Error> {
     let mut runs = [Run::EMPTY; 8];
     let mut leaves = Leaves::over(&mut runs);
     leaves.map(BASE, Class::Giga, 100)?;
@@ -42,7 +42,7 @@ fn sharing_the_whole_extent_stays_one_record() -> Result<(), Error> {
 }
 
 #[test]
-fn a_grant_of_part_records_only_that_part() -> Result<(), Error> {
+fn partial_grant_records_only_part() -> Result<(), Error> {
     let mut runs = [Run::EMPTY; 8];
     let mut leaves = Leaves::over(&mut runs);
     leaves.map(BASE, Class::Giga, 100)?;
@@ -59,7 +59,7 @@ fn a_grant_of_part_records_only_that_part() -> Result<(), Error> {
 }
 
 #[test]
-fn two_megabytes_out_of_a_gigabyte_leaf_is_refused() -> Result<(), Error> {
+fn two_megabytes_from_giga_leaf_refused() -> Result<(), Error> {
     let mut runs = [Run::EMPTY; 8];
     let mut leaves = Leaves::over(&mut runs);
     leaves.map(BASE, Class::Giga, 1)?;
@@ -72,7 +72,7 @@ fn two_megabytes_out_of_a_gigabyte_leaf_is_refused() -> Result<(), Error> {
 }
 
 #[test]
-fn splitting_a_leaf_keeps_everyone_who_held_it() -> Result<(), Error> {
+fn split_leaf_keeps_holders() -> Result<(), Error> {
     let mut runs = [Run::EMPTY; 8];
     let mut leaves = Leaves::over(&mut runs);
     leaves.map(BASE, Class::Giga, 100)?;
@@ -90,7 +90,7 @@ fn splitting_a_leaf_keeps_everyone_who_held_it() -> Result<(), Error> {
 }
 
 #[test]
-fn a_subrange_can_be_revoked_once_its_leaf_is_split() -> Result<(), Error> {
+fn split_leaf_lets_subrange_revoke() -> Result<(), Error> {
     let mut runs = [Run::EMPTY; 8];
     let mut leaves = Leaves::over(&mut runs);
     leaves.map(BASE, Class::Giga, 100)?;
@@ -107,7 +107,7 @@ fn a_subrange_can_be_revoked_once_its_leaf_is_split() -> Result<(), Error> {
 }
 
 #[test]
-fn the_last_holder_reports_what_it_freed() -> Result<(), Error> {
+fn last_holder_reports_what_freed() -> Result<(), Error> {
     let mut runs = [Run::EMPTY; 8];
     let mut leaves = Leaves::over(&mut runs);
     leaves.map(BASE, Class::Giga, 4)?;
@@ -125,7 +125,7 @@ fn the_last_holder_reports_what_it_freed() -> Result<(), Error> {
 }
 
 #[test]
-fn merging_needs_a_whole_group_that_agrees() -> Result<(), Error> {
+fn merging_needs_whole_group_agreeing() -> Result<(), Error> {
     let mut runs = [Run::EMPTY; 8];
     let mut leaves = Leaves::over(&mut runs);
     leaves.map(BASE, Class::Giga, 2)?;
@@ -146,7 +146,7 @@ fn merging_needs_a_whole_group_that_agrees() -> Result<(), Error> {
 }
 
 #[test]
-fn merging_climbs_back_one_class_at_a_time() -> Result<(), Error> {
+fn merging_climbs_one_class_at_a_time() -> Result<(), Error> {
     let mut runs = [Run::EMPTY; 8];
     let mut leaves = Leaves::over(&mut runs);
     leaves.map(BASE, Class::Giga, 1)?;
@@ -171,7 +171,7 @@ fn merging_climbs_back_one_class_at_a_time() -> Result<(), Error> {
 }
 
 #[test]
-fn a_leaf_cannot_be_counted_twice() -> Result<(), Error> {
+fn leaf_not_counted_twice() -> Result<(), Error> {
     let mut runs = [Run::EMPTY; 8];
     let mut leaves = Leaves::over(&mut runs);
     leaves.map(BASE, Class::Giga, 2)?;
@@ -182,7 +182,7 @@ fn a_leaf_cannot_be_counted_twice() -> Result<(), Error> {
 }
 
 #[test]
-fn counting_an_address_nobody_mapped_is_refused() {
+fn counting_unmapped_address_refused() {
     let mut runs = [Run::EMPTY; 8];
     let mut leaves = Leaves::over(&mut runs);
 
@@ -192,7 +192,7 @@ fn counting_an_address_nobody_mapped_is_refused() {
 }
 
 #[test]
-fn a_page_leaf_has_nothing_left_to_split_into() -> Result<(), Error> {
+fn page_leaf_cannot_split() -> Result<(), Error> {
     let mut runs = [Run::EMPTY; 8];
     let mut leaves = Leaves::over(&mut runs);
     leaves.map(BASE, Class::Page, 1)?;
@@ -203,7 +203,7 @@ fn a_page_leaf_has_nothing_left_to_split_into() -> Result<(), Error> {
 }
 
 #[test]
-fn a_hole_in_the_range_is_not_silently_skipped() -> Result<(), Error> {
+fn hole_in_range_not_skipped() -> Result<(), Error> {
     let mut runs = [Run::EMPTY; 8];
     let mut leaves = Leaves::over(&mut runs);
     leaves.map(BASE, Class::Giga, 1)?;
@@ -215,7 +215,7 @@ fn a_hole_in_the_range_is_not_silently_skipped() -> Result<(), Error> {
 }
 
 #[test]
-fn a_refused_grant_spends_no_record() -> Result<(), Error> {
+fn refused_grant_spends_no_record() -> Result<(), Error> {
     let mut runs = [Run::EMPTY; 8];
     let mut leaves = Leaves::over(&mut runs);
     leaves.map(BASE, Class::Giga, 2)?;
@@ -230,7 +230,7 @@ fn a_refused_grant_spends_no_record() -> Result<(), Error> {
 }
 
 #[test]
-fn the_table_refuses_to_run_out_of_records_silently() -> Result<(), Error> {
+fn full_table_refuses_loudly() -> Result<(), Error> {
     let mut runs = [Run::EMPTY; 2];
     let mut leaves = Leaves::over(&mut runs);
     leaves.map(BASE, Class::Giga, 8)?;

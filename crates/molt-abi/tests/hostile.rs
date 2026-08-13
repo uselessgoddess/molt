@@ -162,7 +162,7 @@ fn region_outside_extent_is_masked_to_nothing() {
 /// and the in-kernel rings of `molt_core::ring` implement neither, so they
 /// cannot be passed to either.
 #[test]
-fn each_end_names_who_writes_the_other() {
+fn each_end_names_its_writer() {
     fn drain<R: Reader<Peer = Hostile>>(reader: &mut R) -> Result<R::Item, Fault> {
         reader.take()
     }

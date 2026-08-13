@@ -98,7 +98,7 @@ fn refusal(error: Error) -> &'static str {
 }
 
 #[test]
-fn no_run_of_answers_leaves_a_round_nobody_can_close() {
+fn no_answers_leave_round_unclosable() {
     let seen = Seen::default();
 
     sweep(moves(), |moves| {
@@ -257,7 +257,7 @@ fn quarantine() -> impl Strategy<Value = Vec<Held>> {
 }
 
 #[test]
-fn no_run_of_flushes_leaves_an_address_stuck_in_quarantine() {
+fn no_flushes_leave_address_quarantined() {
     sweep((quarantine(), order()), |(moves, order)| {
         let mut holes = [Hole::EMPTY; HOLES];
         let mut space = Space::over(BITS, &mut holes).expect("a space this wide cuts into arenas");

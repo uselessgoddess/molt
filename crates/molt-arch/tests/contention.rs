@@ -141,7 +141,7 @@ fn leave(machine: &Spinlock<Machine>, cpu: CpuId, offset: u64, region: Region) {
 }
 
 #[test]
-fn eight_cores_share_one_space_without_losing_an_address() {
+fn eight_cores_share_space_losing_none() {
     let machine = Arc::new(Spinlock::new(Machine::new()));
     let taken = Arc::new(AtomicU64::new(0));
     let gate = Arc::new(Barrier::new(CORES as usize));

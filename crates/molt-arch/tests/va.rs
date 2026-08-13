@@ -8,7 +8,7 @@ fn space(holes: &mut [Hole]) -> Space<'_> {
 }
 
 #[test]
-fn every_class_hands_out_its_own_alignment() -> Result<(), Error> {
+fn classes_hand_out_own_alignment() -> Result<(), Error> {
     let mut holes = [Hole::EMPTY; 12];
     let mut space = space(&mut holes);
 
@@ -37,7 +37,7 @@ fn class_arenas_do_not_overlap() {
 }
 
 #[test]
-fn a_hundred_gigabyte_mapping_fits_in_one_extent() -> Result<(), Error> {
+fn hundred_gigabyte_mapping_one_extent() -> Result<(), Error> {
     let mut holes = [Hole::EMPTY; 12];
     let mut space = space(&mut holes);
     let log = 100 * (1 << 30);
@@ -51,7 +51,7 @@ fn a_hundred_gigabyte_mapping_fits_in_one_extent() -> Result<(), Error> {
 }
 
 #[test]
-fn a_size_that_is_not_whole_leaves_rounds_up() -> Result<(), Error> {
+fn partial_leaf_size_rounds_up() -> Result<(), Error> {
     let mut holes = [Hole::EMPTY; 12];
     let mut space = space(&mut holes);
 
@@ -63,7 +63,7 @@ fn a_size_that_is_not_whole_leaves_rounds_up() -> Result<(), Error> {
 }
 
 #[test]
-fn released_addresses_wait_for_the_shootdown() -> Result<(), Error> {
+fn released_addresses_wait_shootdown() -> Result<(), Error> {
     let mut holes = [Hole::EMPTY; 12];
     let mut space = space(&mut holes);
     let first = space.allocate(Class::Giga, 1)?;
@@ -81,7 +81,7 @@ fn released_addresses_wait_for_the_shootdown() -> Result<(), Error> {
 }
 
 #[test]
-fn retiring_the_swept_epoch_returns_the_addresses() -> Result<(), Error> {
+fn retiring_swept_epoch_returns_addresses() -> Result<(), Error> {
     let mut holes = [Hole::EMPTY; 12];
     let mut space = space(&mut holes);
     let first = space.allocate(Class::Giga, 1)?;
@@ -99,7 +99,7 @@ fn retiring_the_swept_epoch_returns_the_addresses() -> Result<(), Error> {
 }
 
 #[test]
-fn an_epoch_that_was_never_swept_frees_nothing() -> Result<(), Error> {
+fn unswept_epoch_frees_nothing() -> Result<(), Error> {
     let mut holes = [Hole::EMPTY; 12];
     let mut space = space(&mut holes);
     let extent = space.allocate(Class::Mega, 1)?;
@@ -139,7 +139,7 @@ fn churn_leaves_no_permanent_fragmentation() -> Result<(), Error> {
 }
 
 #[test]
-fn an_exhausted_class_does_not_borrow_from_another() -> Result<(), Error> {
+fn exhausted_class_does_not_borrow() -> Result<(), Error> {
     let mut holes = [Hole::EMPTY; 12];
     let mut space = space(&mut holes);
     let whole = space.free(Class::Giga);
@@ -156,7 +156,7 @@ fn an_exhausted_class_does_not_borrow_from_another() -> Result<(), Error> {
 }
 
 #[test]
-fn a_full_free_list_refuses_rather_than_loses_the_range() -> Result<(), Error> {
+fn full_free_list_refuses_range() -> Result<(), Error> {
     // Three slots per class: the range above what is taken, and two islands.
     let mut holes = [Hole::EMPTY; 9];
     let mut space = space(&mut holes);
@@ -186,7 +186,7 @@ fn a_full_free_list_refuses_rather_than_loses_the_range() -> Result<(), Error> {
 }
 
 #[test]
-fn a_full_free_list_merges_across_epochs() -> Result<(), Error> {
+fn full_free_list_merges_across_epochs() -> Result<(), Error> {
     // Three slots per class again, which the two islands below fill.
     let mut holes = [Hole::EMPTY; 9];
     let mut space = space(&mut holes);
@@ -226,7 +226,7 @@ fn a_full_free_list_merges_across_epochs() -> Result<(), Error> {
 }
 
 #[test]
-fn a_range_that_is_already_free_is_refused() -> Result<(), Error> {
+fn already_free_range_refused() -> Result<(), Error> {
     let mut mine = [Hole::EMPTY; 12];
     let mut theirs = [Hole::EMPTY; 12];
     let mut mine = space(&mut mine);
@@ -246,7 +246,7 @@ fn a_range_that_is_already_free_is_refused() -> Result<(), Error> {
 }
 
 #[test]
-fn a_space_too_narrow_to_cut_is_refused() {
+fn too_narrow_space_refused() {
     let mut holes = [Hole::EMPTY; 12];
 
     assert_eq!(Space::over(34, &mut holes).err(), Some(Error::Width));
@@ -254,14 +254,14 @@ fn a_space_too_narrow_to_cut_is_refused() {
 }
 
 #[test]
-fn a_space_without_a_slot_per_class_is_refused() {
+fn space_without_slot_per_class_refused() {
     let mut holes = [Hole::EMPTY; 2];
 
     assert_eq!(Space::over(SV57, &mut holes).err(), Some(Error::Storage));
 }
 
 #[test]
-fn the_narrowest_mode_clears_the_device_window() {
+fn narrowest_mode_clears_device_window() {
     // `paging::DEVICE_REGION` on RISC-V and the gigabyte it spans, which the
     // kernel's own tables own on every mode.
     const DEVICE_REGION_END: u64 = 0x20_0000_0000 + (1 << 30);

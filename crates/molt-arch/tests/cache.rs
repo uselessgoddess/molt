@@ -20,7 +20,7 @@ fn frames(base: u64, extent: &Extent) -> Span {
 }
 
 #[test]
-fn a_window_is_cached_at_one_address_for_everybody() -> Result<(), Error> {
+fn window_cached_at_one_address() -> Result<(), Error> {
     let mut holes = [Hole::EMPTY; HOLES];
     let mut space = space(&mut holes);
     let mut slots = [const { Window::EMPTY }; 4];
@@ -43,7 +43,7 @@ fn a_window_is_cached_at_one_address_for_everybody() -> Result<(), Error> {
 }
 
 #[test]
-fn a_window_nobody_cached_is_a_miss() {
+fn uncached_window_misses() {
     let mut slots = [const { Window::EMPTY }; 4];
     let mut windows = Windows::over(&mut slots);
 
@@ -73,7 +73,7 @@ fn windows_of_one_file_are_told_apart_by_offset() -> Result<(), Error> {
 }
 
 #[test]
-fn the_same_window_is_not_cached_twice() -> Result<(), Error> {
+fn same_window_not_cached_twice() -> Result<(), Error> {
     let mut holes = [Hole::EMPTY; HOLES];
     let mut space = space(&mut holes);
     let mut slots = [const { Window::EMPTY }; 4];
@@ -91,7 +91,7 @@ fn the_same_window_is_not_cached_twice() -> Result<(), Error> {
 }
 
 #[test]
-fn a_window_has_to_start_on_its_own_leaf_boundary() {
+fn window_starts_on_leaf_boundary() {
     let mut holes = [Hole::EMPTY; HOLES];
     let mut space = space(&mut holes);
     let mut slots = [const { Window::EMPTY }; 4];
@@ -104,7 +104,7 @@ fn a_window_has_to_start_on_its_own_leaf_boundary() {
 }
 
 #[test]
-fn frames_that_could_not_be_a_leaf_are_refused() {
+fn nonleaf_frames_refused() {
     let mut holes = [Hole::EMPTY; HOLES];
     let mut space = space(&mut holes);
     let mut slots = [const { Window::EMPTY }; 4];
@@ -132,7 +132,7 @@ fn unaligned_frames_are_refused() {
 }
 
 #[test]
-fn a_held_window_is_not_evicted() -> Result<(), Error> {
+fn held_window_not_evicted() -> Result<(), Error> {
     let mut holes = [Hole::EMPTY; HOLES];
     let mut space = space(&mut holes);
     let mut slots = [const { Window::EMPTY }; 4];
@@ -160,7 +160,7 @@ fn a_held_window_is_not_evicted() -> Result<(), Error> {
 }
 
 #[test]
-fn a_reference_nobody_took_cannot_be_given_back() -> Result<(), Error> {
+fn untaken_reference_not_returned() -> Result<(), Error> {
     let mut holes = [Hole::EMPTY; HOLES];
     let mut space = space(&mut holes);
     let mut slots = [const { Window::EMPTY }; 4];
@@ -177,7 +177,7 @@ fn a_reference_nobody_took_cannot_be_given_back() -> Result<(), Error> {
 }
 
 #[test]
-fn eviction_keeps_the_windows_around_it() -> Result<(), Error> {
+fn eviction_keeps_neighbour_windows() -> Result<(), Error> {
     let mut holes = [Hole::EMPTY; HOLES];
     let mut space = space(&mut holes);
     let mut slots = [const { Window::EMPTY }; 4];
@@ -210,7 +210,7 @@ fn eviction_keeps_the_windows_around_it() -> Result<(), Error> {
 }
 
 #[test]
-fn a_cache_with_no_room_says_so() -> Result<(), Error> {
+fn full_cache_says_so() -> Result<(), Error> {
     let mut holes = [Hole::EMPTY; HOLES];
     let mut space = space(&mut holes);
     let mut slots = [const { Window::EMPTY }; 1];
