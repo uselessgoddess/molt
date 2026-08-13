@@ -1,16 +1,15 @@
 [package]
-name = "molt-arch"
+name = "molt-churn"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
 
 [dependencies]
-molt-core.workspace = true
-
-[dev-dependencies]
-molt-churn.workspace = true
 proptest.workspace = true
 
 [lints]
 workspace = true
+
+[lib]
+bench = false

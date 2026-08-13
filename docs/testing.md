@@ -325,70 +325,90 @@ asked for the refusal, so the tests still run in parallel. It shows a mount
 answering the error and a create rolling back to its snapshot with the journal
 still usable afterwards, which is the part a type signature cannot claim.
 
-## Fuzzing, and the half worth having now
+## Fuzzing, and the two halves of it
 
 Stage 3 raised the question and answered half of it. `molt-net`'s parsers were
 covered only by frames its own emitter wrote, so every length field they read
 was one they had produced — the case that matters, a length field a peer chose,
-was the one case never tested.
+was the one case never tested. The answer then was a xorshift generator seeded
+by one constant: cheap, replayable from the source, and blind — it never learned
+that a mutation had reached a branch nothing before it had.
 
-`crates/molt-net/tests/noise.rs` is that case, as an ordinary test rather than
-as infrastructure. A xorshift generator seeded by one constant sweeps 16384
-inputs per parser and asserts the invariant the parsers actually owe: nothing is
-read past the input the caller handed over. The seed is the reproduction, so a
-failure replays from a constant in the source with no checked-in corpus, no
-crash triage, and no time budget in CI.
+Stage 5 replaced the generator with the two tools that each do one half of what
+it was doing badly, because the halves want opposite things.
 
-**The noise is shaped, because unshaped noise proves nothing.** Random bytes
-almost never satisfy an IPv4 header checksum, and a random 16-bit length field
-lands inside a 128-byte buffer about two times in a thousand — the first draft
-passed with the truncation check deleted. So the sweep forces the version
-nibble, zeroes the fragment field, repairs the checksum, and draws lengths from
-a range that straddles the buffer's end, and every test asserts a floor on how
-many inputs actually parsed. A sweep that proves nothing now says so.
+**A structure, walked until it breaks: [proptest].** The inputs the kernel takes
+from a domain are not bytes, they are protocols — allocate, release, sweep,
+retire; grant, revoke, split, merge — and what breaks them is an order nobody
+thought of rather than a byte nobody expected. So each sweep generates a *list
+of moves* and replays it against a model. A move is a value and not a call
+because control flow cannot be shrunk: when a list fails, proptest cuts it down
+until nothing more can be dropped, and what a failure prints is the shortest
+churn that still reaches the bug. `crates/molt-churn` holds what they share — the
+runner, and the coverage floors below.
 
-Validated the same way the loom tests were: each of the three truncation checks
-was reintroduced as a no-op in turn, and each time the sweep failed with an
-index past the slice. Two further tests flip one bit of a valid packet and
-require anything that still parses to re-emit to itself, which is the property a
-parse/emit pair owes and neither half can be asked about alone.
+**Bytes nobody shaped, mutated toward coverage: [cargo fuzz].** The wire is the
+other kind of input, and there the interesting states are branches rather than
+orders. libFuzzer keeps what reached a new edge and mutates from there, which is
+the part a seeded generator cannot do at any number of iterations:
 
-**What is deliberately deferred.** A corpus, coverage-guided mutation, a CI time
-budget, and crash triage are the other half, and they are infrastructure with
-running costs. They earn those costs against a parser that takes input from
-somewhere less bounded than a 1514-byte frame, which is Stage 4's NVMe and real
-NIC work at the earliest. The cheap half runs on every push today.
+| Target | What it feeds | What it must not find |
+| --- | --- | --- |
+| `fuzz/fuzz_targets/call_parse.rs` | a submission slot, either eight raw words or a shaped call | an accepted call whose id or buffer is not what the words said, a buffer outside the aperture, or a call that does not survive its own encoding |
+| `fuzz/fuzz_targets/frame_parse.rs` | one frame per parser, with the ICMPv6 checksum repaired on request | a read past the frame, or a parse that does not re-emit to itself |
+
+`just fuzz [seconds]` runs every target in `cargo fuzz list` for that long — a
+minute each by default — and CI does the same on every push, uploading
+`fuzz/artifacts` if anything crashes. It is deliberately not part of `just pre`:
+a time budget is a search, and a search that found nothing today is not a pass.
+Neither target has found a crash yet, at about seven million executions of
+`call_parse` per half minute on one core.
+
+**Shape is still what makes either of them work.** Random bytes almost never
+satisfy an IPv4 header checksum, and a random 16-bit length field lands inside a
+128-byte buffer about two times in a thousand — the first draft of the old sweep
+passed with the truncation check deleted. So the harnesses force the version
+nibble, repair the checksum on demand, and draw lengths from a range that
+straddles the buffer's end; and every sweep declares the states it exists to
+reach, counted across all its cases, so one that generated nothing interesting
+says so instead of passing quietly.
+
+[proptest]: https://docs.rs/proptest
+[cargo fuzz]: https://rust-fuzz.github.io/book/cargo-fuzz.html
 
 ## Red teaming the address space
 
 Stage 5 pointed the same shape at what a hostile domain can reach. Each sweep is
-an ordinary `#[test]` over a seeded xorshift, each asserts a floor on what it
-covered, and each is named for the thing it is trying to break:
+an ordinary `#[test]` replaying generated moves against a model, each names the
+states it had to reach, and each is named for the thing it is trying to break:
 
 | Sweep | What it must not find |
 | --- | --- |
-| `molt-arch/tests/va_noise.rs` | an address handed out twice, or an arena that does not come back whole |
-| `molt-arch/tests/refcount_noise.rs` | a count the model disagrees with, after any order of grant, revoke, split and merge |
-| `molt-abi/tests/noise.rs` | a lying producer read past its fault, or a corrupt head starving the kernel end |
-| `molt-arch/tests/shootdown_noise.rs` | a round nobody can close, or an address stuck in quarantine |
+| `molt-arch/tests/va_churn.rs` | an address handed out twice, or an arena that does not come back whole |
+| `molt-arch/tests/refcount_churn.rs` | a count the model disagrees with, after any order of grant, revoke, split and merge |
+| `molt-abi/tests/ring_churn.rs` | a lying producer read past its fault, or a corrupt head starving the kernel end |
+| `molt-arch/tests/shootdown_churn.rs` | a round nobody can close, or an address stuck in quarantine |
+| `molt-net/tests/frame_churn.rs` | a parser reading past the frame, or one that will not re-emit what it just parsed |
 
 The refcount sweep carries a model that knows only which bytes are held how many
 times — no classes, no records — so anything the table does with either, a split
 that loses a count or a refusal that spends a slot, shows up as the two
 disagreeing.
 
-The last two are liveness claims, and a tracker that wedges does not crash: it
-stops, and the addresses it holds are never handed out again. So they are made
-the only honest way — from every state the churn reaches, drive the protocol
-forward and see that it goes. `Shootdown` is `Copy`, so the escape runs on a
-copy and the churn carries on from where it was.
+The shootdown sweeps are liveness claims, and a tracker that wedges does not
+crash: it stops, and the addresses it holds are never handed out again. So they
+are made the only honest way — from every state the churn reaches, drive the
+protocol forward and see that it goes. `Shootdown` is `Copy`, so the escape runs
+on a copy and the churn carries on from where it was.
 
-Two of the four found bugs, which is their own evidence. The other two found
-nothing, and that reads the same as a sweep generating nothing — so
-[`experiments/sweep-mutations`](../experiments/sweep-mutations) puts a bug back
-into each and expects the sweep to fail. It is the rule the whole section rests
-on: a passing sweep is a claim about the sweep, not about the code, until
-something has been seen to fail it.
+Two of them found bugs, which is their own evidence. The rest found nothing, and
+that reads the same as a sweep generating nothing — so
+[`experiments/sweep-mutations.sh`](../experiments/sweep-mutations.sh) puts one
+bug back into the code under each sweep in turn, an edit a refactor could make
+by accident rather than a `panic!` planted to be found, and expects that sweep
+to fail. All five are caught, each by the assertion it was written for. It is
+the rule the whole section rests on: a passing sweep is a claim about the sweep,
+not about the code, until something has been seen to fail it.
 
 ## Conventions
 

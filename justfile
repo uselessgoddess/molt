@@ -33,6 +33,13 @@ x86_64-check:
 riscv64gc-check:
     cargo clippy --package molt-kernel --target riscv64gc-unknown-none-elf -- -D warnings
 
+# Runs every libFuzzer target for `seconds` each. Not part of `pre`: a time
+# budget is a search, and a search that found nothing today is not a pass.
+fuzz seconds="60":
+    for target in $(cargo fuzz list); do \
+        cargo fuzz run "$target" -- -max_total_time={{ seconds }} -print_final_stats=1; \
+    done
+
 bench-check:
     cargo bench --package molt-core --package molt-exec --package molt-block --package molt-fs --no-run
 

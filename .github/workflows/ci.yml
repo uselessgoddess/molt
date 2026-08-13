@@ -79,6 +79,29 @@ jobs:
           tool: just
       - run: just loom
 
+  fuzz:
+    name: Fuzz the wire parsers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-fuzz
+      # A minute per target finds nothing most days, which is the point: the run
+      # is here so that a mutation reaching a new branch is noticed on the commit
+      # that added it, not months later.
+      - run: just fuzz 60
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
   boot:
     name: Build images and boot in QEMU
     runs-on: ubuntu-24.04

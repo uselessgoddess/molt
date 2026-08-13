@@ -306,12 +306,13 @@ which is a scheduler. So it moves to Stage 4.4, behind the executors — see
 
 Fuzzing arrived as tests rather than as infrastructure. `molt-net`'s parsers
 were covered only by frames its own emitter wrote, so every length field they
-read was one they had produced; `crates/molt-net/tests/noise.rs` now shapes
-noise past the version and checksum checks and asserts nothing is read past the
-input, with the seed as the reproduction. That is the half that pays for itself
-today. A corpus, a CI time budget, and crash triage are the other half, and
-they are background infrastructure for whenever there is a parser worth that —
-see [`docs/testing.md`](testing.md).
+read was one they had produced; a shaped xorshift sweep got noise past the
+version and checksum checks and asserted nothing is read past the input, with
+the seed as the reproduction. That was the half that paid for itself
+immediately. The other half — coverage-guided mutation, a corpus, and a CI time
+budget — arrived in Stage 5 with `cargo fuzz`, once the wire gave it a parser
+taking input from a domain rather than from a 1514-byte frame; the sweeps
+themselves are proptest now. See [`docs/testing.md`](testing.md).
 
 ## Stage 4 — SMP, hardware breadth, and performance
 
