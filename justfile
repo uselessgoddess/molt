@@ -35,9 +35,15 @@ riscv64gc-check:
 
 # Runs every libFuzzer target for `seconds` each. Not part of `pre`: a time
 # budget is a search, and a search that found nothing today is not a pass.
+#
+# The target is named rather than defaulted because cargo-fuzz defaults to the
+# triple *it* was built for, not the one rustc builds for: a prebuilt musl
+# cargo-fuzz then asks for a statically linked libc, which no sanitizer works
+# with. The host triple is the one that has a standard library installed.
 fuzz seconds="60":
     for target in $(cargo fuzz list); do \
-        cargo fuzz run "$target" -- -max_total_time={{ seconds }} -print_final_stats=1; \
+        cargo fuzz run --target "$(rustc -vV | sed -n 's/^host: //p')" "$target" \
+            -- -max_total_time={{ seconds }} -print_final_stats=1; \
     done
 
 bench-check:
