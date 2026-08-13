@@ -1,5 +1,8 @@
 use molt_abi::wire::APERTURE;
-use molt_abi::{Call, Channel, Fault, Handle, Next, Op, Region, Reject, Reply};
+use molt_abi::{
+    Call, Channel, Domain, Fault, Handle, Hostile, Next, Op, Peer, Reader, Region, Reject, Reply,
+    Submissions,
+};
 
 const TIMER: Op = Op::Timer { ticks: 7 };
 
@@ -148,4 +151,40 @@ fn region_outside_extent_is_masked_to_nothing() {
     let last = Region::new(u32::MAX, 1);
     assert!(last.fits(APERTURE), "a region ending exactly at the aperture");
     assert!(!Region::new(u32::MAX, 2).fits(APERTURE), "a region ending one byte past it");
+}
+
+/// Which end of a channel is which, as the compiler sees it.
+///
+/// Both ends read a ring, and only one of them is reading memory somebody else
+/// may have written. `Reader::Peer` is where that difference is written down,
+/// and the generic below is how a kernel path says which one it will take: the
+/// hostile read has a `Fault` to handle, the trusted read has none to produce,
+/// and the in-kernel rings of `molt_core::ring` implement neither, so they
+/// cannot be passed to either.
+#[test]
+fn each_end_names_who_writes_the_other() {
+    fn drain<R: Reader<Peer = Hostile>>(reader: &mut R) -> Result<R::Item, Fault> {
+        reader.take()
+    }
+
+    // Const, so the mismatch that matters is caught before this test runs.
+    const {
+        assert!(<Submissions<'_, 4> as Reader>::Peer::HOSTILE, "the kernel trusts a domain's tail");
+        assert!(!<Domain<'_, 4> as Reader>::Peer::HOSTILE, "a domain checks the kernel's tail");
+    }
+
+    let channel = Channel::<4>::new();
+    let (mut submissions, mut completions) = channel.kernel();
+    let mut domain = channel.domain();
+
+    domain.submit(Call::new(1, TIMER));
+    assert_eq!(drain(&mut submissions), Ok(Next::Ready(Call::new(1, TIMER))));
+    completions.publish(Reply::new(1, 0)).unwrap();
+
+    // The same call, on the end that has nothing to check.
+    assert_eq!(Reader::take(&mut domain), Ok(Some(Reply::new(1, 0))));
+
+    domain.claim(5);
+    assert_eq!(drain(&mut submissions), Err(Fault::Tail), "a lie went unnoticed");
+    assert_eq!(Reader::take(&mut domain), Ok(None), "the domain's own end faulted");
 }

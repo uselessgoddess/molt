@@ -17,5 +17,7 @@ pub mod nospec;
 pub mod ring;
 pub mod wire;
 
-pub use crate::ring::{Channel, Completions, Domain, Fault, Next, Submissions};
+pub use crate::ring::{
+    Channel, Completions, Domain, Fault, Hostile, Next, Peer, Reader, Submissions, Trusted,
+};
 pub use crate::wire::{Call, Handle, Op, Region, Reject, Reply, SLOT_BYTES, SLOT_WORDS};

@@ -137,6 +137,57 @@ pub enum Next {
     Rejected { id: u64, reject: Reject },
 }
 
+/// Who is on the other end of a ring, which is what decides whether the words
+/// it publishes are facts or inputs.
+///
+/// Sealed: there are two answers and a caller cannot invent a third, because
+/// the third would be a ring the kernel validates halfway.
+pub trait Peer: sealed::Sealed {
+    /// Whether the far end may lie about what it wrote.
+    const HOSTILE: bool;
+}
+
+/// The far end is code compiled with this one — the kernel's own rings, or the
+/// kernel as a domain sees it.
+pub enum Trusted {}
+
+/// The far end is a domain's memory: every word is an input, and the indices
+/// are claims to check rather than counts to use.
+pub enum Hostile {}
+
+impl Peer for Trusted {
+    const HOSTILE: bool = false;
+}
+
+impl Peer for Hostile {
+    const HOSTILE: bool = true;
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::Trusted {}
+    impl Sealed for super::Hostile {}
+}
+
+/// A ring end that reads what the other end published, and names who that is.
+///
+/// The associated peer is the point of the trait. A function that drives a
+/// domain writes `R: Reader<Peer = Hostile>`, and the in-kernel rings of
+/// `molt_core::ring` cannot reach it: they implement nothing here, because
+/// their far end is kernel code and their indices are read without checking.
+/// The mistake that costs the most — a trusted ring wired to a sandbox — stops
+/// being a thing to remember and becomes a type that does not fit.
+pub trait Reader {
+    /// What one read yields.
+    type Item;
+
+    /// Who wrote it.
+    type Peer: Peer;
+
+    /// Reads the next item, or faults when the far end lied about its index.
+    fn take(&mut self) -> Result<Self::Item, Fault>;
+}
+
 /// Kernel's submission reader. Holds the private `head`.
 #[derive(Debug)]
 pub struct Submissions<'ring, const N: usize> {
@@ -180,6 +231,15 @@ impl<const N: usize> Submissions<'_, N> {
     /// Kernel `head` counter.
     pub const fn taken(&self) -> u32 {
         self.head
+    }
+}
+
+impl<const N: usize> Reader for Submissions<'_, N> {
+    type Item = Next;
+    type Peer = Hostile;
+
+    fn take(&mut self) -> Result<Next, Fault> {
+        Submissions::take(self)
     }
 }
 
@@ -246,6 +306,17 @@ impl<const N: usize> Domain<'_, N> {
         self.head = self.head.wrapping_add(1);
         self.channel.completions.head.store(self.head, Ordering::Release);
         Some(Reply::decode(words))
+    }
+}
+
+impl<const N: usize> Reader for Domain<'_, N> {
+    type Item = Option<Reply>;
+    type Peer = Trusted;
+
+    /// Never `Err`: the kernel does not publish a tail it did not write, which
+    /// is the whole difference between the two ends of this channel.
+    fn take(&mut self) -> Result<Option<Reply>, Fault> {
+        Ok(self.reply())
     }
 }
 

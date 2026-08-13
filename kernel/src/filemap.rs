@@ -34,6 +34,7 @@ use molt_core::buffer::{BufferOperation, BufferRegistry};
 use molt_fs::{Fs, FsDone, FsOp, Handle, Name};
 use molt_kernel::report;
 
+use crate::config::CONFIG;
 use crate::{smp, space};
 
 /// Whose buffer the window is read into: the kernel's page cache, which is not
@@ -50,10 +51,6 @@ const HANDLES: usize = 4;
 /// design is for is the class, not the smoke — a gigabyte-class window is the
 /// same one entry per view, and `molt-arch` tests it on the host.
 const MAPPED: Class = Class::Mega;
-
-const RUNS: usize = 4;
-/// One window, and a slot to prove the second domain does not take another.
-const SLOTS: usize = 2;
 
 /// The file the smoke maps, and what the image builder put in it.
 const MAPPING: &str = "hello.txt";
@@ -97,9 +94,9 @@ pub fn smoke<P: Platform, Q: Queue>(boot_info: &BootInfo<'_>, platform: &mut P, 
     let read = fill(&mut fs, offset, span);
 
     let mut space = space::global();
-    let mut slots = [const { Window::EMPTY }; SLOTS];
+    let mut slots = [const { Window::EMPTY }; CONFIG.windows];
     let mut windows = Windows::over(&mut slots);
-    let mut runs = [Run::EMPTY; RUNS];
+    let mut runs = [Run::EMPTY; CONFIG.runs];
     let mut leaves = Leaves::over(&mut runs);
 
     // Nothing is cached, which is the only thing that makes the kernel go to

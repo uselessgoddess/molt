@@ -10,6 +10,12 @@
 //! endpoint each, inside the kernel — and it is why a ring shared with a
 //! sandbox or a domain must not be this type: see `docs/threat-model.md`, which
 //! states the rules such a ring obeys instead.
+//!
+//! That last sentence is not left to the reader. Neither endpoint here
+//! implements `molt_abi::Reader`, so neither fits a parameter that asks for a
+//! `Reader<Peer = Hostile>` — the paths that drive a domain are typed to
+//! exclude these rings, and a mistake is a compile error rather than a review
+//! comment.
 
 use core::mem::MaybeUninit;
 use core::ops::Deref;

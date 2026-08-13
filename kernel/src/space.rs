@@ -19,9 +19,7 @@ use core::cell::UnsafeCell;
 use molt_arch::va::{Hole, Space, Widths};
 use molt_core::lock::{Guard, Spinlock};
 
-/// Free ranges per class, which is the budget `docs/va-allocator.md` sizes:
-/// 24 bytes apiece, 64 per class, 4 608 bytes in total.
-const HOLES: usize = 3 * 64;
+use crate::config::HOLES;
 
 /// The free lists themselves, which the space borrows for the life of the
 /// machine. They sit outside the lock because nothing may name them except

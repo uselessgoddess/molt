@@ -7,7 +7,7 @@ use core::pin::pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use molt_abi::{Call, Channel, Fault, Handle, Next, Op, Reject, Reply};
+use molt_abi::{Call, Channel, Fault, Handle, Hostile, Next, Op, Reader, Reject, Reply};
 use molt_arch::asid::{Asids, Flush};
 use molt_arch::memory::{Error, FrameTable, Inventory, Kind, Owner, Rights, Span};
 use molt_arch::refcount::{self, Leaves, Run};
@@ -25,6 +25,7 @@ use molt_exec::Executor;
 
 extern crate alloc;
 
+mod config;
 mod device;
 mod filemap;
 mod heap;
@@ -38,6 +39,8 @@ mod space;
 mod virtio;
 
 use molt_kernel::report;
+
+use crate::config::CONFIG;
 
 #[cfg(target_arch = "x86_64")]
 molt_x86_64::entry_point!(kernel_main);
@@ -296,10 +299,6 @@ fn verify_address_space<P: Platform>(platform: &mut P) -> Extent {
     again
 }
 
-/// How many records the leaf counts get: three per class is enough for the
-/// splits a revoke of part of one leaf goes through, with room to spare.
-const RUNS: usize = 16;
-
 /// Counts the leaves of that same extent the way a grant and a revoke would.
 ///
 /// The claim under test is the keying, not the arithmetic — `molt-arch` tests
@@ -308,7 +307,7 @@ const RUNS: usize = 16;
 /// record holding the number two, and the 26 million frames underneath it never
 /// get a record at all. See `docs/address-space.md`.
 fn verify_refcounts<P: Platform>(platform: &mut P, analyzer: Extent) {
-    let mut runs = [Run::EMPTY; RUNS];
+    let mut runs = [Run::EMPTY; CONFIG.runs];
     let mut leaves = Leaves::over(&mut runs);
     let start = analyzer.start();
 
@@ -564,13 +563,6 @@ fn verify_domain<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P, exec: 
     );
 }
 
-/// Slots in the channel the smoke drives.
-///
-/// Four, because the interesting numbers are the small ones: a tail five ahead
-/// of a four-slot ring is a lie the ring's own length makes checkable, and a
-/// longer ring would only make the arithmetic longer.
-const SLOTS: usize = 4;
-
 /// Drives a ring whose other end is hostile.
 ///
 /// The six rules in `docs/threat-model.md` are claims about what a domain
@@ -585,14 +577,26 @@ const SLOTS: usize = 4;
 /// slot with nothing in it; what it gets is a fault, which is fatal to the
 /// domain and costs the kernel one ring.
 fn verify_ring<P: Platform>(platform: &mut P) {
-    let channel = Channel::<SLOTS>::new();
+    /// One read from a ring the kernel does not own both ends of.
+    ///
+    /// Bounded on who wrote the index rather than on which ring it is: the
+    /// in-kernel endpoints of `molt_core::ring` implement no [`Reader`] at all,
+    /// so a ring both of whose ends the kernel compiled cannot reach a
+    /// domain-facing path by mistake — it does not fit the hole. Every read
+    /// below goes through here, which is what makes that a property of the
+    /// code rather than of this comment.
+    fn from_domain<R: Reader<Peer = Hostile>>(reader: &mut R) -> Result<R::Item, Fault> {
+        reader.take()
+    }
+
+    let channel = Channel::<{ CONFIG.slots }>::new();
     let (mut submissions, mut completions) = channel.kernel();
     let mut domain = channel.domain();
 
     // Honest work first, so that what follows is a ring known to have been
     // running rather than one that never worked.
     domain.submit(Call::new(1, Op::Timer { ticks: 7 }));
-    let Ok(Next::Ready(call)) = submissions.take() else {
+    let Ok(Next::Ready(call)) = from_domain(&mut submissions) else {
         panic!("an honest submission did not arrive");
     };
     assert_eq!(call.op(), Op::Timer { ticks: 7 }, "a submission changed on the way in");
@@ -606,7 +610,7 @@ fn verify_ring<P: Platform>(platform: &mut P) {
     // offset into the domain's aperture, which is what a submission can name.
     let buf = molt_abi::Region::new(0, 4096);
     domain.submit(Call::new(2, Op::Read { cap: Handle::new(0), offset: 0, buf }));
-    let Ok(Next::Ready(read)) = submissions.take() else {
+    let Ok(Next::Ready(read)) = from_domain(&mut submissions) else {
         panic!("a well-formed read did not arrive");
     };
     let named = read.op().region().expect("a read names a buffer");
@@ -623,7 +627,7 @@ fn verify_ring<P: Platform>(platform: &mut P) {
     // and the ring keeps going: a domain that guesses wrong is wrong about one
     // submission and not about the connection.
     domain.write([3, 4096, 0, 0, 0, 0, 0, 0]);
-    let Ok(Next::Rejected { id, reject }) = submissions.take() else {
+    let Ok(Next::Rejected { id, reject }) = from_domain(&mut submissions) else {
         panic!("a slot that parses to nothing was accepted");
     };
     completions.publish(Reply::rejected(id, reject)).expect("room in the completion ring");
@@ -635,15 +639,24 @@ fn verify_ring<P: Platform>(platform: &mut P) {
 
     // And the lie: five submissions published into four slots, at least one of
     // which was never written by anybody.
-    let claimed = SLOTS as u32 + 1;
+    let claimed = CONFIG.slots as u32 + 1;
     domain.claim(claimed);
-    assert_eq!(submissions.take(), Err(Fault::Tail), "the kernel read a slot nobody wrote");
-    assert_eq!(submissions.take(), Err(Fault::Tail), "a ring that faulted was read again");
+    assert_eq!(
+        from_domain(&mut submissions),
+        Err(Fault::Tail),
+        "the kernel read a slot nobody wrote"
+    );
+    assert_eq!(
+        from_domain(&mut submissions),
+        Err(Fault::Tail),
+        "a ring that faulted was read again"
+    );
 
     report!(
         platform,
-        "MOLT_RING_FAULT_OK: {} calls taken, then a tail {claimed} ahead over {SLOTS} slots faulted",
+        "MOLT_RING_FAULT_OK: {} calls taken, then a tail {claimed} ahead over {} slots faulted",
         submissions.taken(),
+        CONFIG.slots,
     );
 }
 
