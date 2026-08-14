@@ -3,9 +3,9 @@ resolver = "3"
 # A group under `crates/` is a level in the dependency graph: a package there
 # may only reach into groups below its own. Adding one is creating a directory,
 # not editing this list.
-members = ["crates/*/*", "kernel", "xtask"]
+members = ["crates/*/*", "userspace/*", "kernel", "xtask"]
 # The kernel is the one member a host cannot build, so it is the one exclusion.
-default-members = ["crates/*/*", "xtask"]
+default-members = ["crates/*/*", "userspace/*", "xtask"]
 
 [workspace.package]
 version = "0.1.0"

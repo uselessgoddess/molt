@@ -34,10 +34,10 @@ riscv64gc-check:
     cargo clippy --package molt-kernel --target riscv64gc-unknown-none-elf -- -D warnings
 
 user-check:
-    cargo build --package molt-hello --package molt-shell-domain \
+    cargo build --package molt-hello --package molt-shell-image \
         --target targets/x86_64-unknown-molt-domain.json \
         -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
-    cargo build --package molt-hello --package molt-shell-domain \
+    cargo build --package molt-hello --package molt-shell-image \
         --target targets/riscv64gc-unknown-molt-domain.json \
         -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
 

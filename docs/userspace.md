@@ -19,6 +19,13 @@ that a loader may reinterpret after compilation. `just user-check` rebuilds
 `core` and `alloc` and checks both `molt-hello` and the domain adapter for the
 existing shell on both architectures.
 
+Applications themselves live under `userspace/`, outside the reusable crate
+graph, and their names do not encode an isolation tier. The same `hello` or
+shell source can later be built for an aperture without becoming a different
+application. The suffix belongs to the target because `domain` selects the
+page-table-isolated ABI; dropping it to `unknown-molt` would hide the tier and
+leave no unambiguous peer name for the future `aperture` target.
+
 ## The shell already exists
 
 It is worth starting here, because it changes the shape of the question.
@@ -160,7 +167,7 @@ kept true. [`docs/address-space.md`](address-space.md) adds a third destination
 possible.
 
 Tier 2 now exercises that destination without changing `molt-shell`. The
-`molt-shell-domain` binary supplies the allocator and transport boundary, then
+`userspace/shell` image supplies the allocator and transport boundary, then
 constructs the existing `molt_shell::Shell`, `Session`, and `FsOp` ring. Its
 adapter forwards those operations through `molt-user`; the kernel validates the
 hostile ring and applies them to the build-produced MoltFS image. The shell

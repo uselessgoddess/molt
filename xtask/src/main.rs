@@ -417,7 +417,7 @@ fn build_user_image(root: &Path, kernel_target: &str) -> Result<UserImages, Stri
         .file_stem()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("invalid user target {target}"))?;
-    let build = |package: &str| -> Result<PathBuf, String> {
+    let build = |package: &str, binary: &str| -> Result<PathBuf, String> {
         let status = Command::new(cargo())
             .current_dir(root)
             .args([
@@ -434,7 +434,7 @@ fn build_user_image(root: &Path, kernel_target: &str) -> Result<UserImages, Stri
             .status()
             .map_err(|error| format!("failed to start cargo: {error}"))?;
         require_success(status, &format!("{package} image build"))?;
-        let image = target_dir(root).join(target_name).join("release").join(package);
+        let image = target_dir(root).join(target_name).join("release").join(binary);
         if !image.is_file() {
             return Err(format!("user image was not created at {}", image.display()));
         }
@@ -446,7 +446,11 @@ fn build_user_image(root: &Path, kernel_target: &str) -> Result<UserImages, Stri
     let disk = disk_dir.join("molt-domain-disk.img");
     fs::write(&disk, lay_out(&root.join(DISK_TREE))?)
         .map_err(|error| format!("failed to write {}: {error}", disk.display()))?;
-    Ok(UserImages { hello: build("molt-hello")?, shell: build("molt-shell-domain")?, disk })
+    Ok(UserImages {
+        hello: build("molt-hello", "molt-hello")?,
+        shell: build("molt-shell-image", "molt-shell")?,
+        disk,
+    })
 }
 
 fn run_qemu_interactive(image: &Path) -> Result<(), String> {
