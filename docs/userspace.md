@@ -11,6 +11,14 @@ The answer is: **a custom target, no fork, and not `uutils` for a long while.**
 The reasoning is below, and the part that decides it is a measurement rather
 than an opinion.
 
+The first targets that now ship are the tier-2 forms:
+`x86_64-unknown-molt-domain.json` and
+`riscv64gc-unknown-molt-domain.json`. The `domain` environment is part of the
+target name deliberately. Isolation tier is a build-time property, not a flag
+that a loader may reinterpret after compilation. `just user-check` rebuilds
+`core` and `alloc` and checks both `molt-hello` and the domain adapter for the
+existing shell on both architectures.
+
 ## The shell already exists
 
 It is worth starting here, because it changes the shape of the question.
@@ -151,6 +159,13 @@ kept true. [`docs/address-space.md`](address-space.md) adds a third destination
 4 GiB sandbox cannot hold — without changing the vocabulary that makes the move
 possible.
 
+Tier 2 now exercises that destination without changing `molt-shell`. The
+`molt-shell-domain` binary supplies the allocator and transport boundary, then
+constructs the existing `molt_shell::Shell`, `Session`, and `FsOp` ring. Its
+adapter forwards those operations through `molt-user`; the kernel validates the
+hostile ring and applies them to the build-produced MoltFS image. The shell
+source and the filesystem operation vocabulary stay the same.
+
 ## coreutils
 
 [uutils/coreutils](https://github.com/uutils/coreutils) is MIT-licensed, ~24k
@@ -185,8 +200,12 @@ one whose failures are about the sandbox.
 
 | Step | Marker | What it is |
 | --- | --- | --- |
-| `riscv64gc-molt.json` + `-Z build-std` builds a `no_std` binary | `just user-check` | The target exists and `core` is rebuilt with the reservations |
-| `molt-user` wraps the op table | host tests | A program can submit and await without touching `molt-abi` directly |
+| both `*-unknown-molt-domain.json` targets + `-Z build-std` build `no_std` binaries | `just user-check` | Tier 2 is named in the target, and `core`/`alloc` are rebuilt for both ports |
+| `molt-user` wraps the op table | host tests | A program submits and awaits without touching `molt-abi` directly |
+| a static ELF64 image is admitted before any mapping | `MOLT_DOMAIN_WX_OK` | A writable-executable segment is rejected with zero mapper calls |
+| `hello` enters user mode and exits on both ports | `MOLT_USER_HELLO_OK`, `MOLT_DOMAIN_EXIT_OK` | The ELF loader, page-table switch, hostile ring, return gate, and exit path work end to end |
+| a user-mode fault returns to the kernel | `MOLT_DOMAIN_FAULT_OK` | A bad user access kills the domain path rather than the kernel |
+| unchanged `molt-shell` logic reads the real filesystem | `MOLT_SHELL_DOMAIN_OK` | Existing `FsOp` traffic crosses the domain ABI and reaches a mounted MoltFS |
 | `hello` runs in a sandbox and exits | `MOLT_SANDBOX_OK` | The loader from [`docs/abi.md`](abi.md) works end to end |
 | `molt-shell` runs in a sandbox against the real filesystem ring | `MOLT_USER_SHELL_OK` | The claim above: a cell moved out of the kernel unchanged in shape |
 | `cat`, `ls`, `cp` as Molt programs over `molt-abi` | `MOLT_USER_TOOLS_OK` | Enough of a userspace to notice what the protocol is missing |

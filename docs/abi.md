@@ -147,6 +147,25 @@ A program that genuinely needs more than 4 GiB does not get it from either:
 it gets a tier-2 domain with the full 57 bits, which is what
 [`docs/address-space.md`](address-space.md) decides.
 
+## Tier-2 ELF images
+
+Hardware domains use ordinary static ELF64 rather than the tier-1 image header
+below. `molt-domain` admits the complete program-header table before it calls a
+mapper: the machine must match the port, dynamic/interpreter images are refused,
+file ranges must be in bounds, load segments must be aligned and non-overlapping,
+and the entry point must lie in an executable segment. A segment asking for
+write and execute is rejected before the first page becomes executable. The
+boot assertion mutates a real build-produced image and verifies that rejection
+made zero mapper calls (`MOLT_DOMAIN_WX_OK`).
+
+Accepted `PT_LOAD` segments keep their linked global virtual addresses. Only
+those segments plus explicit ring, stack, and heap extents are granted into the
+fresh view; the gateway needed to return to the kernel is supervisor-only. The
+same hostile `molt-abi` channel is used by a tier-2 image. Its `Region` values
+remain 32-bit offsets from the image base, so the existing one-check/nospec
+boundary and the six ring rules do not acquire a tier-specific variant. No new
+operation was added for domain entry, exit, or faults.
+
 ## The image and its descriptors
 
 A new crate, `molt-abi`, `no_std`, no dependencies, compiled into both the
