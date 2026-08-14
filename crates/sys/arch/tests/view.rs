@@ -12,6 +12,8 @@ const MEGA: u64 = Class::Mega.granule();
 
 /// Where the frames under a grant are; nothing here reads them.
 const RAM: u64 = 1 << 30;
+/// Domain audit, hello, shell, and the two-view file-map boot probes.
+const BOOT_SMOKE_VIEWS: usize = 5;
 
 /// A space over storage it outlives, the way the kernel hands it a static.
 fn space() -> Space<'static> {
@@ -40,6 +42,18 @@ fn root_built_only_with_slot() {
 
     assert_eq!(open(), Err(PlatformError::View(Error::Capacity)));
     assert_eq!(built, VIEWS as u64, "a root was allocated into a table with nowhere to put it");
+}
+
+#[test]
+fn boot_smokes_fit_in_view_table() {
+    let mut asids = Asids::new(16);
+    let mut views = Views::<u64>::EMPTY;
+
+    for root in 0..BOOT_SMOKE_VIEWS {
+        views
+            .open::<PlatformError>(asids.assign().asid(), || Ok(root as u64))
+            .expect("room for every boot-smoke root");
+    }
 }
 
 #[test]
