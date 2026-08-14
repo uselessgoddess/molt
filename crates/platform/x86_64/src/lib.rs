@@ -7,6 +7,7 @@ pub mod acpi;
 
 mod ap;
 mod apic;
+mod domain;
 mod interrupts;
 mod memory;
 mod msi;
@@ -26,10 +27,10 @@ use molt_arch::asid::Asid;
 use molt_arch::audit::Leaf;
 use molt_arch::memory::{Device, Rights, Span};
 use molt_arch::{
-    BootInfo, ConfigSpace, CpuId, DeviceMapper, Entry, ExitStatus, FabricError, FrameCursor,
-    ImageRange, InterruptFabric, Local, MappingError, MemoryMap, MemoryRegion, MemoryRegionKind,
-    Mmio, MsiMessage, Platform, PlatformError, SerialPort, Sink, Smp, SmpError, Stack, Tlb, View,
-    va,
+    BootInfo, ConfigSpace, CpuId, DeviceMapper, DomainExit, DomainState, Entry, ExitStatus,
+    FabricError, FrameCursor, ImageRange, InterruptFabric, Local, MappingError, MemoryMap,
+    MemoryRegion, MemoryRegionKind, Mmio, MsiMessage, Platform, PlatformError, SerialPort, Sink,
+    Smp, SmpError, Stack, Tlb, View, va,
 };
 
 /// Fixed boot-stack window cloned into kernel-owned page tables.
@@ -255,6 +256,10 @@ impl Platform for X86_64 {
         memory::claim_ram(boot_info.memory_map(), count)
     }
 
+    fn claimed_pointer(&mut self, span: Span) -> Result<*mut u8, PlatformError> {
+        memory::claimed_pointer(span)
+    }
+
     fn open_view(&mut self, asid: Asid) -> Result<View, PlatformError> {
         memory::open_view(asid)
     }
@@ -279,6 +284,10 @@ impl Platform for X86_64 {
 
     fn resident(&self, view: View, address: u64) -> Option<Leaf> {
         memory::resident(view, address)
+    }
+
+    fn enter_domain(&mut self, state: &mut DomainState) -> Result<DomainExit, PlatformError> {
+        domain::enter(state)
     }
 
     fn terminate(&mut self, status: ExitStatus) -> ! {

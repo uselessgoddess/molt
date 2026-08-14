@@ -27,6 +27,7 @@ const PTE_V: u64 = 1 << 0;
 const PTE_R: u64 = 1 << 1;
 const PTE_W: u64 = 1 << 2;
 const PTE_X: u64 = 1 << 3;
+const PTE_U: u64 = 1 << 4;
 const PTE_A: u64 = 1 << 6;
 const PTE_D: u64 = 1 << 7;
 
@@ -324,6 +325,12 @@ pub fn claim_ram(boot_info: &BootInfo<'_>, count: u64) -> Result<Span, PlatformE
     Ok(span)
 }
 
+/// Identity-map address of a span the caller already claimed.
+pub fn claimed_pointer(span: Span) -> Result<*mut u8, PlatformError> {
+    active()?;
+    Ok(span.start() as *mut u8)
+}
+
 /// Opens an empty view of the one address space, tagged `asid`.
 ///
 /// A zeroed level-`top` table translates nothing, so the kernel's text, its
@@ -342,7 +349,7 @@ pub fn grant(view: View, extent: &Extent, span: Span, rights: Rights) -> Result<
 
     let state = active()?;
     let root = state.views.root(view)?;
-    let flags = leaf_flags(rights);
+    let flags = leaf_flags(rights) | PTE_U;
     for (address, frame) in backing {
         let va = usize::try_from(address).map_err(|_| address_error())?;
         map_leaf(root, state.top, &mut state.pool, va, frame, flags, level)?;
@@ -412,6 +419,29 @@ pub fn resident(view: View, address: u64) -> Option<Leaf> {
     let state = active().ok()?;
     let root = state.views.root(view).ok()?;
     ViewWalk { root, top: state.top }.leaf(address)
+}
+
+/// Maps the supervisor-only trap gateway into a domain view and returns the
+/// tagged root value used for entry.
+pub(crate) fn prepare_domain(
+    view: View,
+    code: (u64, u64),
+    data: (u64, u64),
+) -> Result<u64, PlatformError> {
+    let state = active()?;
+    let root = state.views.root(view)?;
+    for (range, flags) in [(code, PTE_R | PTE_X | PTE_A), (data, PTE_R | PTE_W | PTE_A | PTE_D)] {
+        let (mut address, end) = range;
+        if address % PAGE_4K as u64 != 0 || end % PAGE_4K as u64 != 0 || address >= end {
+            return Err(address_error());
+        }
+        while address < end {
+            let va = usize::try_from(address).map_err(|_| address_error())?;
+            map_leaf(root, state.top, &mut state.pool, va, address, flags, 0)?;
+            address += PAGE_4K as u64;
+        }
+    }
+    Ok(state.mode.field() | Tag::field(view.asid().value()) | (root as u64 >> 12))
 }
 
 /// Invalidates the leaf covering `va`, refusing anything but a leaf at `level`.
