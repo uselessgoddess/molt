@@ -37,6 +37,11 @@ pub fn sepc() -> usize {
     unsafe { read_csr!(sepc) }
 }
 
+pub fn stval() -> usize {
+    // SAFETY: reading a supervisor CSR has no side effects.
+    unsafe { read_csr!(stval) }
+}
+
 pub fn time() -> u64 {
     // SAFETY: reading a supervisor CSR has no side effects.
     unsafe { read_csr!(time) as u64 }
