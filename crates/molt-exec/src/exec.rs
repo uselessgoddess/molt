@@ -13,9 +13,9 @@ use alloc::vec::Vec;
 use core::array;
 use core::cell::RefCell;
 use core::pin::{Pin, pin};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
+use limen::atomic::{AtomicBool, AtomicUsize, Ordering};
 use molt_core::cpu::CpuId;
 
 use crate::machine::Machine;
@@ -169,7 +169,7 @@ impl Executor {
                 machine,
                 capacity,
                 live: AtomicUsize::new(0),
-                inbox: [const { Inbox::new() }; Priority::LEVELS],
+                inbox: array::from_fn(|_| Inbox::new()),
             }),
             local: RefCell::new(Local::new(capacity)),
             tasks: RefCell::new(Vec::with_capacity(capacity)),
@@ -333,5 +333,43 @@ impl Wake for Blocker {
     fn wake_by_ref(self: &Arc<Self>) {
         self.rung.store(true, Ordering::Release);
         self.machine.wake(self.owner);
+    }
+}
+
+#[cfg(test)]
+mod races {
+    use limen::atomic::{AtomicUsize, Ordering};
+    use limen::{Arc, thread};
+
+    use super::Executor;
+    use crate::machine::Solo;
+
+    static SOLO: Solo = Solo;
+
+    #[test]
+    fn every_push_arrives() {
+        limen::model(|| {
+            let executor = Executor::new(&SOLO, 4);
+            let ran = Arc::new(AtomicUsize::new(0));
+
+            let remotes = [(); 2].map(|()| {
+                let (handle, ran) = (executor.handle(), ran.clone());
+                thread::spawn(move || {
+                    handle
+                        .spawn(async move {
+                            ran.fetch_add(1, Ordering::Release);
+                        })
+                        .expect("a free slot")
+                })
+            });
+
+            executor.run_until_idle();
+            for remote in remotes {
+                remote.join().unwrap();
+            }
+            executor.run_until_idle();
+
+            assert_eq!(ran.load(Ordering::Acquire), 2, "a task never reached its core");
+        });
     }
 }

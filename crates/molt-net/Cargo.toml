@@ -8,5 +8,9 @@ publish = false
 [dependencies]
 molt-core.workspace = true
 
+[dev-dependencies]
+molt-churn.workspace = true
+proptest.workspace = true
+
 [lib]
 bench = false

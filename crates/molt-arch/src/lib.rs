@@ -2,7 +2,9 @@
 
 //! Hardware-independent contracts shared by the kernel and architecture crates.
 
+pub mod asid;
 pub mod audit;
+pub mod cache;
 pub mod cpu;
 pub mod dma;
 pub mod iommu;
@@ -10,7 +12,12 @@ pub mod irq;
 pub mod memory;
 pub mod mmio;
 pub mod pci;
+pub mod platform;
+pub mod refcount;
+pub mod shootdown;
 pub mod smp;
+pub mod va;
+pub mod view;
 
 use core::fmt;
 
@@ -21,7 +28,12 @@ pub use crate::irq::{FabricError, InterruptFabric, MsiMessage, Sink};
 pub use crate::memory::Cache;
 pub use crate::mmio::{DeviceMapper, Mmio, MmioError};
 pub use crate::pci::ConfigSpace;
+pub use crate::platform::{
+    ExitStatus, InterruptController, Platform, PlatformError, panic_handler,
+};
+pub use crate::shootdown::{Shootdown, Tlb};
 pub use crate::smp::{Entry, Smp, SmpError, Stack, number};
+pub use crate::view::View;
 
 /// Architecture-neutral information passed from a platform boot adapter.
 #[derive(Clone, Copy)]
@@ -297,6 +309,30 @@ impl<'m> FrameAllocator<'m> {
         memory::Span::frames(first, count).map_err(|_| RunError::OutOfFrames)
     }
 
+    /// Hands out `count` frames as one span, from wherever in the map one fits.
+    ///
+    /// [`run`](Self::run) takes what is next and refuses a gap; this keeps
+    /// looking past it, for a caller that needs contiguity and does not care
+    /// where. What is walked over is spent, the same as a failed `run` spends
+    /// what it took: a claim that moves the cursor forward and never back.
+    pub fn contiguous(&mut self, count: u64) -> Result<memory::Span, RunError> {
+        if count == 0 {
+            return Err(RunError::Empty);
+        }
+        let mut first = self.allocate().ok_or(RunError::OutOfFrames)?.start();
+        let (mut previous, mut held) = (first, 1);
+        while held < count {
+            let frame = self.allocate().ok_or(RunError::OutOfFrames)?.start();
+            // The frame past a gap starts the next candidate rather than
+            // being given back: a region holding exactly `count` is still an
+            // answer, which retrying `run` from here would have already spent.
+            (first, held) =
+                if frame == previous + FRAME_SIZE { (first, held + 1) } else { (frame, 1) };
+            previous = frame;
+        }
+        memory::Span::frames(first, count).map_err(|_| RunError::OutOfFrames)
+    }
+
     pub fn allocate(&mut self) -> Option<PhysicalFrame> {
         while self.region < self.map.len() {
             let range = self.map.region(self.region).and_then(|region| {
@@ -510,137 +546,4 @@ impl<S: SerialPort + ?Sized> fmt::Write for SerialWriter<'_, S> {
         self.serial.write_bytes(text.as_bytes());
         Ok(())
     }
-}
-
-/// Interrupt routing implemented by a concrete architecture crate.
-pub trait InterruptController {
-    fn init(&mut self) {}
-    fn enable_irq(&mut self, irq: u8);
-}
-
-/// Terminal state reported by the kernel to its platform.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExitStatus {
-    Success,
-    Failure,
-}
-
-/// Failure while enabling a platform's hardware services.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PlatformError {
-    Unsupported,
-    MissingPhysicalMemoryMap,
-    InvalidHardware,
-    Mapping(MappingError),
-    Fabric(FabricError),
-    MissingConfigSpace,
-    /// Free RAM could not cover a request for frames.
-    Frames(RunError),
-}
-
-impl From<RunError> for PlatformError {
-    fn from(error: RunError) -> Self {
-        Self::Frames(error)
-    }
-}
-
-impl From<MappingError> for PlatformError {
-    fn from(error: MappingError) -> Self {
-        Self::Mapping(error)
-    }
-}
-
-impl From<FabricError> for PlatformError {
-    fn from(error: FabricError) -> Self {
-        Self::Fabric(error)
-    }
-}
-
-/// Hardware services used directly by architecture-independent kernel code.
-pub trait Platform: DeviceMapper + InterruptFabric + Local + Smp {
-    type Serial: SerialPort;
-
-    fn serial(&mut self) -> &mut Self::Serial;
-
-    fn initialize(&mut self, _boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
-        Ok(())
-    }
-
-    fn verify_exception_path(&mut self) -> bool {
-        false
-    }
-
-    fn verify_owned_mapping(&mut self, _boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported)
-    }
-
-    fn verify_image_protection(&mut self, _boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported)
-    }
-
-    /// Maps, exercises, and audits an MMIO window from [`Inventory::device`].
-    ///
-    /// [`Inventory::device`]: memory::Inventory::device
-    fn verify_device_window(&mut self, _boot_info: &BootInfo<'_>) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported)
-    }
-
-    /// The PCI configuration space firmware described, if there is one.
-    fn config_space(&mut self, _boot_info: &BootInfo<'_>) -> Result<ConfigSpace, PlatformError> {
-        Err(PlatformError::MissingConfigSpace)
-    }
-
-    /// Sends every interrupt line this platform raises to `sink`.
-    fn route_interrupts(&mut self, _sink: &'static dyn Sink) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported)
-    }
-
-    /// A cursor past the RAM the kernel's own tables and image already own.
-    ///
-    /// A driver resumes a [`FrameAllocator`] here to back DMA out of frames no
-    /// live mapping claims. A platform that cannot say returns `None`, and the
-    /// driver goes without.
-    ///
-    /// The cursor is a snapshot, not a reservation: a later
-    /// [`claim_ram`](Self::claim_ram) moves the platform past it, so one taken
-    /// before that call names frames somebody else now owns. Read it again
-    /// rather than keeping one.
-    fn free_frames(&self) -> Option<FrameCursor> {
-        None
-    }
-
-    /// Hands out `count` frames of that same free RAM, for keeps.
-    ///
-    /// [`free_frames`](Self::free_frames) only says where the kernel's own
-    /// mappings end, so two callers resuming there are handed the same RAM.
-    /// This moves the platform's cursor past what it returns, which is what the
-    /// heap needs: it never gives its span back.
-    ///
-    /// So the span is the caller's for the life of the kernel. There is no
-    /// giving it back — no free list stands behind this, and the next consumer
-    /// of RAM starts where the cursor now is, which is only true because every
-    /// claim is recorded here rather than in the caller.
-    fn claim_ram(
-        &mut self,
-        _boot_info: &BootInfo<'_>,
-        _count: u64,
-    ) -> Result<memory::Span, PlatformError> {
-        Err(PlatformError::Unsupported)
-    }
-
-    fn terminate(&mut self, status: ExitStatus) -> !;
-}
-
-/// Reports a bare-metal panic through the selected platform.
-pub fn panic_handler<P>(info: &core::panic::PanicInfo<'_>) -> !
-where
-    P: Platform + Default,
-{
-    use core::fmt::Write as _;
-
-    let mut platform = P::default();
-    let serial = platform.serial();
-    serial.init();
-    let _ = writeln!(SerialWriter::new(serial), "MOLT_PANIC: {info}");
-    platform.terminate(ExitStatus::Failure)
 }

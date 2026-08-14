@@ -31,3 +31,15 @@ Changes to the lock-free primitives in `molt-core` additionally need `just
 miri` and `just loom`. loom is minutes rather than seconds, so CI runs it on
 main and on any pull request carrying the `loom` label — add the label when a
 change touches an atomic ordering.
+
+Changes to a parser that reads what a domain or a peer wrote need `just fuzz`,
+which runs each libFuzzer target for a minute. It is not part of `just pre`
+because a search that found nothing in a minute is not a pass — give it longer
+(`just fuzz 600`) when the change is to the parsing itself rather than around
+it. Property sweeps live next to the code they churn, share their runner
+through `molt-churn`, and are expected to fail when the code is wrong — each was
+checked by putting the bug back under it, which
+[`docs/testing.md`](docs/testing.md) records. The same applies to
+`molt-arch/tests/contention.rs`, which runs the
+machine-wide tables under eight threads: a change to what those tables do while
+the lock is held belongs there rather than in a single-core test.

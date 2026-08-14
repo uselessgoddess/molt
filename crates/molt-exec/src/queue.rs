@@ -8,7 +8,8 @@
 
 use alloc::sync::Arc;
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, Ordering};
+
+use limen::atomic::{AtomicPtr, Ordering};
 
 use crate::task::Task;
 
@@ -17,7 +18,7 @@ pub(crate) struct Inbox {
 }
 
 impl Inbox {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { head: AtomicPtr::new(ptr::null_mut()) }
     }
 

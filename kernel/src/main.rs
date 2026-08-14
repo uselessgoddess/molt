@@ -19,13 +19,19 @@ use molt_exec::Executor;
 
 extern crate alloc;
 
+mod config;
 mod device;
+mod domain;
+mod filemap;
 mod heap;
 mod init;
+mod isolation;
 mod network;
 mod nvme;
 mod pci;
+mod ring;
 mod smp;
+mod space;
 mod virtio;
 
 use molt_kernel::report;
@@ -60,13 +66,23 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     assert!(platform.verify_exception_path(), "breakpoint handler did not return");
     report!(platform, "MOLT_EXCEPTION_OK");
 
+    report_ram(boot_info, platform);
+
     verify_heap(boot_info, platform);
 
     platform.verify_owned_mapping(boot_info).expect("owned W^X mapping probe");
     report!(platform, "MOLT_MAPPING_OK");
 
+    // Everything below allocates out of this one space, there being one.
+    space::cut(platform.address_space().expect("the platform probed its own translation"));
+
+    let analyzer = domain::addresses(platform);
+    domain::counts(platform, analyzer);
+
     platform.verify_image_protection(boot_info).expect("kernel image obeys W^X");
     report!(platform, "MOLT_WX_OK");
+
+    report_huge_map(boot_info, platform);
 
     platform.verify_device_window(boot_info).expect("device window mapped and reachable");
     report!(platform, "MOLT_DEVICE_WINDOW_OK");
@@ -76,6 +92,10 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
 
     let (running, answered) = verify_smp(platform, exec);
     report!(platform, "MOLT_SMP_OK: cores={running} answered={answered}");
+
+    domain::shootdown(platform, exec);
+    domain::smoke(boot_info, platform, exec);
+    ring::smoke(platform);
 
     run_timer_future(exec);
     report!(platform, "MOLT_TIMER_OK");
@@ -149,12 +169,52 @@ fn verify_frame_ownership(span: Span) {
     assert_eq!(frames.claimed(), 0, "released frames stayed claimed");
 }
 
+/// Prints how much RAM firmware said the machine has.
+///
+/// A marker rather than a log line, because it is the only evidence the number
+/// came from firmware: a hardcoded constant boots identically on the machine it
+/// was written for and wastes or invents memory everywhere else, while a number
+/// that tracks `-m` cannot be one.
+fn report_ram<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
+    let map = boot_info.memory_map();
+    let (mut usable, mut top) = (0u64, 0);
+    for range in UsableRegions::above(map, FRAME_SIZE) {
+        usable += range.end() - range.start();
+        top = top.max(range.end());
+    }
+
+    // The top comes first because it is the part a test can pin: how much is
+    // usable moves with the size of the image sitting in front of it.
+    report!(platform, "MOLT_RAM_OK: top {top:#x}, {} MiB usable", usable >> 20);
+}
+
+/// Prints the biggest leaf RAM is mapped through, read back out of the tables.
+///
+/// A mapper that quietly fell back to small pages passes every other marker and
+/// costs only TLB misses, under programs bigger than this smoke ever runs. Read
+/// back from the live tables, so it is what the hardware translates through
+/// rather than what the mapper meant to write.
+fn report_huge_map<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
+    let leaf = platform.largest_ram_leaf(boot_info).expect("RAM leaves readable back");
+    let (size, unit) = scale(leaf.size());
+    report!(platform, "MOLT_HUGE_MAP_OK: {size} {unit} leaf at {:#x}", leaf.start());
+}
+
+/// The largest binary unit `bytes` divides evenly, so a marker reads `1 GiB`
+/// rather than `1048576 KiB`.
+fn scale(bytes: u64) -> (u64, &'static str) {
+    [(1 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")]
+        .into_iter()
+        .find(|(unit, _)| bytes % unit == 0)
+        .map_or((bytes, "B"), |(unit, name)| (bytes / unit, name))
+}
+
 /// Donates the boot heap and proves an allocation round-trips through it.
 fn verify_heap<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let bytes = heap::init(boot_info, platform).expect("RAM for the kernel heap");
 
-    // `black_box` keeps the release build from eliding a box it can prove is
-    // never read: the accounting it drives is the whole point of the probe.
+    // `black_box`, or the release build elides a box it can prove is unread,
+    // along with the accounting the probe is here to check.
     let probe = core::hint::black_box(Box::new([0x4du8; 64]));
     assert!(heap::used() >= probe.len(), "a live box left the heap empty");
     assert!(probe.iter().all(|&byte| byte == 0x4d), "the heap handed back other bytes");
@@ -202,8 +262,8 @@ fn run_timer_future(exec: &Executor) {
 
     let request = timer_driver.try_next().expect("submitted timer request");
     let KernelOp::TimerWait { ticks } = *request.operation();
-    // The wait is the executor's: the core parks, its tick brings it back, and
-    // the wheel is what says the deadline arrived.
+    // The core parks, its tick brings it back, and the wheel says the deadline
+    // arrived.
     let elapsed = exec.block_on(async {
         exec.timers().after(ticks).await;
         exec.timers().now()

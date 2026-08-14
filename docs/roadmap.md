@@ -36,6 +36,9 @@ documented.
 - [x] per-cell arena ownership and deterministic restart sequence
 - [x] QEMU tests for exception, timer, cancellation, stale completion, and restart
 - [ ] documented real-hardware boot on one named x86_64 machine
+      ([`docs/hardware.md`](hardware.md) costs it out and argues this is the
+      cheapest real-hardware result available, and cheaper than any RISC-V
+      board)
 
 Acceptance: the kernel boots without polling for device work, completes timer
 futures through a ring, recovers a test cell without accepting stale results,
@@ -74,8 +77,8 @@ into arbitrary execution. Retrofitting per-section permissions is also strictly
 harder once drivers hold mappings. The boot mapping now walks the linker's
 section bounds, and both platforms read their live tables back through
 `Platform::verify_image_protection`, which prints `MOLT_WX_OK` — a marker the
-smoke runner requires. `experiments/riscv-wx-regression` reintroduces the
-defect to prove the audit can fail.
+smoke runner requires. Putting a writable `.text` back makes that audit fail,
+which is how the marker was shown to mean something.
 
 The console was smaller. The legacy `console_putchar` extension is deprecated in
 SBI 0.2 and later, reports no errors, and costs one `ecall` per byte. It worked,
@@ -84,8 +87,8 @@ leans on the console, and a console that cannot report its own failure is a bad
 thing to be holding while chasing a driver bug. The port now probes the base
 extension for DBCN, writes whole buffers through it, and demotes itself to the
 legacy call if DBCN ever reports an error; `MOLT_SBI_CONSOLE:` names the winner
-in the boot log, and `experiments/riscv-sbi-legacy-console` exercises the
-fallback that QEMU's firmware never selects on its own.
+in the boot log. The fallback was exercised by forcing it, since QEMU's
+firmware never selects it on its own.
 
 Not in this stage: real-hardware boot. It needs serial-capture equipment that
 does not exist yet, so QEMU stays the honest limit and the Stage 1 hardware
@@ -303,12 +306,13 @@ which is a scheduler. So it moves to Stage 4.4, behind the executors — see
 
 Fuzzing arrived as tests rather than as infrastructure. `molt-net`'s parsers
 were covered only by frames its own emitter wrote, so every length field they
-read was one they had produced; `crates/molt-net/tests/noise.rs` now shapes
-noise past the version and checksum checks and asserts nothing is read past the
-input, with the seed as the reproduction. That is the half that pays for itself
-today. A corpus, a CI time budget, and crash triage are the other half, and
-they are background infrastructure for whenever there is a parser worth that —
-see [`docs/testing.md`](testing.md).
+read was one they had produced; a shaped xorshift sweep got noise past the
+version and checksum checks and asserted nothing is read past the input, with
+the seed as the reproduction. That was the half that paid for itself
+immediately. The other half — coverage-guided mutation, a corpus, and a CI time
+budget — arrived in Stage 5 with `cargo fuzz`, once the wire gave it a parser
+taking input from a domain rather than from a 1514-byte frame; the sweeps
+themselves are proptest now. See [`docs/testing.md`](testing.md).
 
 ## Stage 4 — SMP, hardware breadth, and performance
 
@@ -438,9 +442,19 @@ unchanged.
 - [x] NVMe Identify, admin/I/O queue pairs, eight live block operations, and
       read/write/flush behind `molt_block::Queue`
 - [x] VirtIO block, VirtIO network, and NVMe requester IDs isolated in distinct
-      bounded IOMMU domains
+      bounded IOMMU domains, each requester ID derived from the bus address the
+      kernel enumerated and each domain number from the kernel's own table:
+      the smoke attaches a second endpoint ahead of the block function and
+      requires the higher requester ID to hold the lower domain
+      (`MOLT_IOMMU_DOMAIN_OK`)
 - [x] QEMU NVMe smoke with mappings before bus mastering and reset before unmap
-- [ ] selected real NIC/storage targets
+- [x] one module owns IOMMU bring-up and teardown for every endpoint
+      (`kernel/src/isolation.rs`), so the ordering that is the isolation
+      guarantee exists in one place rather than once per driver
+- [ ] selected real NIC/storage targets ([`docs/hardware.md`](hardware.md):
+      no board in the affordable RISC-V class enumerates PCI the way this
+      kernel does, and none has an IOMMU, so the selection waits on a
+      non-ECAM host-bridge path)
 
 NVMe reuses the existing `molt_block::Queue` and `Mapper` boundaries. Namespace
 discovery and PRP/queue-pair setup remain driver work; no filesystem operation
@@ -465,3 +479,102 @@ came first anyway, because the executor could not be made faster without it.
 - [ ] signed object loading with W^X mappings
 - [ ] dependency namespaces and state migration
 - [ ] atomic cutover, rollback, and fault-injection tests
+
+### Stage 5.0 — The SASOS foundation
+
+- [x] [`docs/address-space.md`](address-space.md): every candidate for going
+      past 4 GiB, and the decision — one global address space, three tiers
+      (cell, LFI aperture, hardware-protected domain), with the tier a
+      build-time choice because all three speak the same `molt-abi` rings
+- [x] [`docs/va-allocator.md`](va-allocator.md): the subsystem the tiering
+      rests on, designed on its own — three alignment arenas, address-ordered
+      first fit, epoch quarantine, and no compaction ever
+- [x] [`docs/threat-model.md`](threat-model.md): the adversary's side of the
+      tier-2 safety claims, including the six rules a ring shared with a
+      hostile domain has to obey
+- [x] `satp` MODE probed widest first, Sv57 where the hart has it
+      (`MOLT_SATP_MODE: sv57`), with the boot mapping check performed at
+      `1 << 54` so `MOLT_MAPPING_OK` is evidence rather than a claim
+- [x] a global VA allocator handing out extents, not pages, cut from the
+      probed width inside a booted kernel (`MOLT_VA_OK`)
+- [x] the tag budget read off the hardware rather than assumed, on both ports,
+      with x86_64's PCIDs enabled on every core and the width read back out of
+      `CR4` afterwards (`MOLT_ASID_OK`)
+- [x] the boot mapping of RAM read back out of the live tables, largest leaf
+      first (`MOLT_HUGE_MAP_OK`: a gigapage on riscv64, 2 MiB on x86_64), on a
+      machine given enough memory for a gigapage to exist (`MOLT_RAM_OK`, which
+      comes from the device tree rather than a constant)
+- [x] refcounts keyed on the mapped leaf, not the frame, counted inside a booted
+      kernel on a hundred gigabytes whose frames never get a record
+      (`MOLT_REFCOUNT_OK`)
+- [x] freed addresses held back until every core has acknowledged its own flush,
+      which is the ordering the rest of this list depends on
+      (`MOLT_SHOOTDOWN_OK`)
+- [x] a file mapped as an extent and read at its address, into two domains at
+      once, with the leaf's physical base read back out of both views to show
+      neither got a copy (`MOLT_FILE_MAP_OK`)
+- [x] a second view with no kernel leaf in it (`MOLT_DOMAIN_OK`,
+      `MOLT_DOMAIN_ABSENT_OK`)
+- [ ] a fault inside that view that stays inside it (`MOLT_DOMAIN_FAULT_OK`),
+      which needs the switch into the view that Stage 5.1 brings
+- [x] extent grant and revoke between domains, in the order a revoke has to go
+      in (`MOLT_GRANT_OK`, `MOLT_REVOKE_OK`), and a large leaf cut into the 512
+      below it so part of one can be taken back (`MOLT_SPLIT_OK`)
+- [x] a cross-domain ring that survives a producer publishing a tail it never
+      earned (`MOLT_RING_FAULT_OK`)
+- [x] every claim above put under seeded churn rather than chosen cases — the
+      allocator, the refcounts, a hostile ring producer, and the shootdown
+      protocol, each sweep named for what it must not find
+      ([`docs/testing.md`](testing.md#red-teaming-the-address-space))
+
+First, and before the sandbox, which is the one ordering decision in this stage
+that is not obvious. The reason is that 4 GiB is only a tier-1 property: the ABI
+below assumes a global address, a ring that a hostile end cannot corrupt, and
+extents that are already resident and already IOMMU-mapped. Building the
+sandbox first would mean building it against a 512 GiB Sv39 space and a ring
+type whose safety contract names a trusted producer, then rebuilding both.
+
+The costs are named in `docs/address-space.md` rather than discovered later:
+refcounts, which [`docs/memory.md`](memory.md) had deliberately omitted and
+which are keyed on the mapped leaf rather than the frame; a global VA allocator
+with real fragmentation, which is why it has its own document; and TLB
+shootdown plus ASID recycling, which is Stage 4 cross-hart machinery rather than
+new invention.
+
+### Stage 5.1 — The user binary ABI
+
+- [x] [`docs/abi.md`](abi.md): LFI as the isolation mechanism, a `molt-abi`
+      crate for the versioned `repr(C)` descriptors, rings instead of syscalls,
+      and channels that keep the kernel off the IPC data path
+- [x] [`docs/userspace.md`](userspace.md): a custom target JSON with
+      `-Z build-std`, no compiler fork, and no `uutils` in the kernel
+- [x] measured in [`docs/userspace.md`](userspace.md): stock rustc holds back
+      the registers LFI-RISCV reserves
+- [ ] `molt-abi` with asserted layouts, and `molt-user` over it
+- [ ] a verifier in Rust, agreeing with the reference on its own corpus
+- [ ] a sandbox that loads, runs, and exits (`MOLT_SANDBOX_OK`)
+- [ ] a rejected image that never becomes executable
+      (`MOLT_SANDBOX_REJECT_OK`)
+- [ ] `molt-shell` running in a sandbox against the real filesystem ring
+      (`MOLT_USER_SHELL_OK`)
+
+riscv64 leads this stage, which is the reverse of every stage before it: a
+stock rustc can reserve the registers LFI-RISCV needs and cannot reserve the
+ones LFI-x64 needs. The 4 GiB per sandbox is a real limit and it is not the one
+that binds sandbox count: guard cost is architecture-specific, and on riscv64 it
+is a page per side rather than the spec's x86-64 figure of 40 GiB. What bound
+the count was Sv39, and Stage 5.0 removed it.
+
+### Stage 5.2 — One ABI, three tiers
+
+- [ ] an aperture nested inside a domain (`MOLT_SANDBOX_OK` under a domain)
+- [ ] one cell built for all three tiers unchanged (`MOLT_TIER_PARITY_OK`)
+- [ ] the tier chosen per program at build time: a coreutil as an aperture, a
+      100 GB log analyzer as a domain, a driver as a cell
+
+The claim that makes Stage 5 a tiering rather than three unrelated isolation
+mechanisms, and the last one to become testable: the same source, built three
+ways, behaving identically. Until `MOLT_TIER_PARITY_OK` exists, "the tier is a
+build-time decision" is a design intention; after it, it is a property, and the
+assignment table in [`docs/address-space.md`](address-space.md) stops being a
+plan.

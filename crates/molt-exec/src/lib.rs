@@ -1,4 +1,5 @@
-#![no_std]
+// loom requires `std`; production builds remain `no_std`.
+#![cfg_attr(not(loom), no_std)]
 
 //! One executor per core, and nothing shared between two of them.
 //!

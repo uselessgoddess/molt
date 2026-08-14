@@ -12,10 +12,9 @@ workspace = true
 bench = false
 
 [dev-dependencies]
+limen = { workspace = true, features = ["threads"] }
 criterion = "0.7"
 
-[target.'cfg(loom)'.dependencies]
-loom = "0.7"
 
 [[bench]]
 name = "ring"
@@ -24,3 +23,6 @@ harness = false
 [[bench]]
 name = "scheduler"
 harness = false
+
+[dependencies]
+limen.workspace = true

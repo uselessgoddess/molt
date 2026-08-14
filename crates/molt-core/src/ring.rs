@@ -3,12 +3,21 @@
 //! The queue is split into non-cloneable endpoints. This makes the SPSC
 //! contract a property of the safe API instead of a convention callers must
 //! remember.
+//!
+//! **Both endpoints are trusted.** The indices live beside the slots, so a
+//! producer publishing a `tail` it never wrote makes the consumer read an
+//! uninitialised slot. Fine here, where `split` hands one endpoint each to
+//! kernel code; not fine for a ring shared with a domain, which obeys the rules
+//! in `docs/threat-model.md` instead.
+//!
+//! Enforced, not just stated: neither endpoint implements `molt_abi::Reader`, so
+//! neither fits a `Reader<Peer = Hostile>` parameter.
 
 use core::mem::MaybeUninit;
 use core::ops::Deref;
 
-use crate::sync::UnsafeCell;
-use crate::sync::atomic::{AtomicUsize, Ordering};
+use limen::UnsafeCell;
+use limen::atomic::{AtomicUsize, Ordering};
 
 /// A fixed-capacity single-producer/single-consumer queue.
 pub struct SpscRing<T, const N: usize> {
@@ -106,42 +115,6 @@ impl<T, const N: usize> Drop for SpscRing<T, N> {
             });
             head = head.wrapping_add(1);
         }
-    }
-}
-
-#[cfg(all(test, loom))]
-mod loom_tests {
-    use loom::sync::Arc;
-    use loom::thread;
-
-    use super::SpscRing;
-
-    #[test]
-    fn values_arrive_in_order() {
-        loom::model(|| {
-            let ring = Arc::new(SpscRing::<u32, 1>::new());
-            let producer = {
-                let ring = ring.clone();
-                thread::spawn(move || {
-                    for value in 1..=2 {
-                        while ring.try_push(value).is_err() {
-                            thread::yield_now();
-                        }
-                    }
-                })
-            };
-
-            let mut seen = Vec::new();
-            while seen.len() < 2 {
-                match ring.try_pop() {
-                    Some(value) => seen.push(value),
-                    None => thread::yield_now(),
-                }
-            }
-
-            producer.join().unwrap();
-            assert_eq!(seen, [1, 2]);
-        });
     }
 }
 
@@ -364,5 +337,42 @@ mod tests {
         let completion = client.try_completion().unwrap();
         assert_eq!(completion.id(), RequestId::new(1));
         assert_eq!(completion.into_result(), 14);
+    }
+}
+
+#[cfg(test)]
+mod races {
+    use alloc::vec::Vec;
+
+    use limen::{Arc, thread};
+
+    use super::SpscRing;
+
+    #[test]
+    fn values_arrive_in_order() {
+        limen::model(|| {
+            let ring = Arc::new(SpscRing::<u32, 1>::new());
+            let producer = {
+                let ring = ring.clone();
+                thread::spawn(move || {
+                    for value in 1..=2 {
+                        while ring.try_push(value).is_err() {
+                            thread::yield_now();
+                        }
+                    }
+                })
+            };
+
+            let mut seen = Vec::new();
+            while seen.len() < 2 {
+                match ring.try_pop() {
+                    Some(value) => seen.push(value),
+                    None => thread::yield_now(),
+                }
+            }
+
+            producer.join().unwrap();
+            assert_eq!(seen, [1, 2]);
+        });
     }
 }

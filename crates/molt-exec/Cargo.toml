@@ -12,9 +12,12 @@ workspace = true
 bench = false
 
 [dependencies]
+limen.workspace = true
 molt-core.workspace = true
 
+
 [dev-dependencies]
+limen = { workspace = true, features = ["threads"] }
 criterion = "0.7"
 
 [[bench]]

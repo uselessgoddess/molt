@@ -13,7 +13,8 @@
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use crate::sync::atomic::{AtomicU64, Ordering};
+use limen::atomic::{AtomicU64, Ordering};
+
 use crate::waker::AtomicWaker;
 
 /// Why an interrupt line refused an operation.
@@ -298,22 +299,19 @@ mod tests {
     }
 }
 
-#[cfg(all(test, loom))]
-mod loom_tests {
+#[cfg(test)]
+mod races {
     use core::pin::pin;
     use core::task::{Context, Poll, Waker};
 
-    use loom::sync::Arc;
-    use loom::thread;
+    use limen::{Arc, thread};
 
     use super::InterruptSlab;
-    use crate::waker::Flag;
+    use crate::probe::Flag;
 
-    /// An interrupt racing a poll must never leave the task parked: either the
-    /// poll sees the arrival, or the waker it registered is fired.
     #[test]
     fn race_delivers_arrival() {
-        loom::model(|| {
+        limen::model(|| {
             let slab = Arc::new(InterruptSlab::<1>::new());
             let token = slab.bind(0).unwrap();
             let flag = Flag::new();

@@ -8,10 +8,11 @@ use core::borrow::Borrow;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
+use limen::atomic::{AtomicU8, AtomicU64, Ordering};
+use limen::{UnsafeCell, spin_loop};
+
 use crate::cache::{CacheLayout, Compact, Padded};
 use crate::ring::RequestId;
-use crate::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use crate::sync::{UnsafeCell, spin_loop};
 use crate::waker::AtomicWaker;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -301,60 +302,6 @@ impl<C, const N: usize> Default for CompletionSlab<C, N, Padded> {
     }
 }
 
-#[cfg(all(test, loom))]
-mod loom_tests {
-    use core::task::{Context, Poll, Waker};
-
-    use loom::sync::Arc;
-    use loom::thread;
-
-    use super::CompletionSlab;
-    use crate::waker::Flag;
-
-    #[test]
-    fn race_wakes_waiter() {
-        loom::model(|| {
-            let slab = Arc::new(CompletionSlab::<u32, 1>::new());
-            let token = slab.reserve().expect("free slot");
-            let flag = Flag::new();
-            let waker = Waker::from(flag.clone());
-
-            let producer = {
-                let slab = slab.clone();
-                thread::spawn(move || slab.complete(token.request_id(), 7).expect("live id"))
-            };
-            let polled = slab.poll(token, &mut Context::from_waker(&waker));
-            producer.join().unwrap();
-
-            match polled {
-                Poll::Ready(result) => assert_eq!(result, Ok(7)),
-                Poll::Pending => assert!(flag.fired(), "parked without a wake"),
-            }
-        });
-    }
-
-    #[test]
-    fn race_releases_slot() {
-        loom::model(|| {
-            let slab = Arc::new(CompletionSlab::<u32, 1>::new());
-            let token = slab.reserve().expect("free slot");
-
-            let producer = {
-                let slab = slab.clone();
-                thread::spawn(move || slab.complete(token.request_id(), 7))
-            };
-            let cancelled = slab.cancel(token);
-            let completed = producer.join().unwrap();
-
-            if cancelled.is_ok() {
-                assert!(slab.reserve().is_ok(), "a cancelled slot must be reusable");
-            } else {
-                assert!(completed.is_ok(), "neither party claimed the slot");
-            }
-        });
-    }
-}
-
 pub struct CompletionFuture<'s, C, const N: usize, L: CacheLayout = Compact> {
     slab: &'s CompletionSlab<C, N, L>,
     token: CompletionToken,
@@ -379,5 +326,58 @@ impl<C, const N: usize, L: CacheLayout> Drop for CompletionFuture<'_, C, N, L> {
         if !self.done {
             let _ = self.slab.cancel(self.token);
         }
+    }
+}
+
+#[cfg(test)]
+mod races {
+    use core::task::{Context, Poll, Waker};
+
+    use limen::{Arc, thread};
+
+    use super::CompletionSlab;
+    use crate::probe::Flag;
+
+    #[test]
+    fn race_wakes_waiter() {
+        limen::model(|| {
+            let slab = Arc::new(CompletionSlab::<u32, 1>::new());
+            let token = slab.reserve().expect("free slot");
+            let flag = Flag::new();
+            let waker = Waker::from(flag.clone());
+
+            let producer = {
+                let slab = slab.clone();
+                thread::spawn(move || slab.complete(token.request_id(), 7).expect("live id"))
+            };
+            let polled = slab.poll(token, &mut Context::from_waker(&waker));
+            producer.join().unwrap();
+
+            match polled {
+                Poll::Ready(result) => assert_eq!(result, Ok(7)),
+                Poll::Pending => assert!(flag.fired(), "parked without a wake"),
+            }
+        });
+    }
+
+    #[test]
+    fn race_releases_slot() {
+        limen::model(|| {
+            let slab = Arc::new(CompletionSlab::<u32, 1>::new());
+            let token = slab.reserve().expect("free slot");
+
+            let producer = {
+                let slab = slab.clone();
+                thread::spawn(move || slab.complete(token.request_id(), 7))
+            };
+            let cancelled = slab.cancel(token);
+            let completed = producer.join().unwrap();
+
+            if cancelled.is_ok() {
+                assert!(slab.reserve().is_ok(), "a cancelled slot must be reusable");
+            } else {
+                assert!(completed.is_ok(), "neither party claimed the slot");
+            }
+        });
     }
 }

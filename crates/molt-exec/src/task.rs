@@ -8,12 +8,14 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::cell::{Cell, UnsafeCell};
+use core::cell::Cell;
 use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::ptr;
-use core::sync::atomic::{AtomicU8, Ordering};
 use core::task::{Context, RawWaker, RawWakerVTable, Waker};
+
+use limen::UnsafeCell;
+use limen::atomic::{AtomicU8, Ordering};
 
 use crate::exec::Shared;
 
@@ -126,15 +128,20 @@ impl Task {
 
         let waker = self.waker();
         let mut context = Context::from_waker(&waker);
-        // SAFETY: the owning core polls its tasks one at a time, and a task
-        // being polled is in no queue for a second poll to come from.
-        let future = unsafe { &mut *self.future.get() };
-        let done = match future.as_mut() {
-            Some(future) => future.as_mut().poll(&mut context).is_ready(),
-            None => true,
-        };
+        let done = self.future.with_mut(|slot| {
+            // SAFETY: the owning core polls its tasks one at a time, and a task
+            // being polled is in no queue for a second poll to come from.
+            let future = unsafe { &mut *slot };
+            let done = match future.as_mut() {
+                Some(future) => future.as_mut().poll(&mut context).is_ready(),
+                None => true,
+            };
+            if done {
+                *future = None;
+            }
+            done
+        });
         if done {
-            *future = None;
             self.update(|state| (state & !(RUNNING | WOKEN)) | DONE);
             return true;
         }
@@ -156,7 +163,7 @@ impl Task {
     pub(crate) fn finish(&self) {
         self.update(|state| (state & !(RUNNING | WOKEN | SCHEDULED)) | DONE);
         // SAFETY: the owner is the one calling this, and it is not polling.
-        unsafe { *self.future.get() = None };
+        self.future.with_mut(|slot| unsafe { *slot = None });
     }
 
     pub(crate) fn held(&self) -> bool {
@@ -202,7 +209,7 @@ impl Task {
     /// push that hands it over lands.
     pub(crate) unsafe fn link(&self, next: *const Task) {
         // SAFETY: the caller holds the task and nothing else can reach it.
-        unsafe { *self.next.get() = next };
+        self.next.with_mut(|slot| unsafe { *slot = next });
     }
 
     /// # Safety
@@ -210,7 +217,7 @@ impl Task {
     /// Only the drain that took the task off the inbox may read its link.
     pub(crate) unsafe fn unlink(&self) -> *const Task {
         // SAFETY: the drain owns the whole chain it is walking.
-        unsafe { self.next.get().replace(ptr::null()) }
+        self.next.with_mut(|slot| unsafe { slot.replace(ptr::null()) })
     }
 
     /// A waker for the length of one poll, standing on the reference the

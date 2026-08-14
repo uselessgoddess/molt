@@ -27,7 +27,7 @@ pub trait Machine: Sync {
     /// An implementation must arm before it halts: a wake that raced the park
     /// is one the core has to take, not sleep through.
     fn park(&self) {
-        core::hint::spin_loop();
+        limen::spin_loop();
     }
 
     /// This core's tick, which is what deadlines are counted in.

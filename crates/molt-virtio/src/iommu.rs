@@ -77,11 +77,27 @@ struct Domains<const N: usize> {
     entries: [Option<Attachment>; N],
 }
 
+/// The first domain identifier the kernel will hand out, given the range the
+/// controller reports.
+///
+/// Never zero, whatever the controller says: zero is what an unencoded ATTACH
+/// and an unwritten request buffer both read back as, so a device landing there
+/// would share a domain with every such accident. Spent on nothing, like ASID
+/// zero.
+const fn first_domain(reported: u32) -> u32 {
+    if reported == 0 { 1 } else { reported }
+}
+
 impl<const N: usize> Domains<N> {
     const fn new(start: u32, end: u32) -> Self {
-        Self { start, end, entries: [None; N] }
+        Self { start: first_domain(start), end, entries: [None; N] }
     }
 
+    /// The lowest domain no live attachment holds, given to `device`.
+    ///
+    /// Which number follows from the table's state and the order the kernel
+    /// attached in, never from the identifier the device carries: two endpoints
+    /// in one domain would read each other's mappings.
     fn reserve(&mut self, device: DeviceId) -> Result<u32, VirtioError> {
         if self.domain(device).is_some() {
             return Err(VirtioError::Device);
@@ -200,7 +216,7 @@ impl<'slots, 'window, A: Arrivals> Iommu<'slots, 'window, A> {
         let config = read_config(&common, &device)?;
         let page = page_size(config.page_size_mask)?;
         let (space_start, space_end) = aperture(config.input_start, config.input_end, page)?;
-        let domain_start = config.domain_start.max(1);
+        let domain_start = first_domain(config.domain_start);
         if domain_start > config.domain_end {
             return Err(VirtioError::Device);
         }
@@ -276,6 +292,12 @@ impl<'slots, 'window, A: Arrivals> Iommu<'slots, 'window, A> {
         self.command(STATUS_AT_ATTACH)?;
         self.domains.release(endpoint)?;
         Ok(())
+    }
+
+    /// The domain `endpoint` is attached to, from the kernel's own record of
+    /// what it asked the controller for — the only place it is decided.
+    pub fn domain_of(&self, endpoint: DeviceId) -> Option<u32> {
+        self.domains.domain(endpoint)
     }
 
     /// Most recently observed asynchronous fault, if any.
@@ -588,7 +610,9 @@ mod tests {
     use molt_arch::dma::Region;
     use molt_arch::iommu::{DeviceId, DmaPerm, Identity, Iova, Mapper, Mapping};
 
-    use super::{Domains, EVENT_BYTES, aperture, encode_map, parse_fault, queue_size};
+    use super::{
+        Domains, EVENT_BYTES, aperture, encode_map, first_domain, parse_fault, queue_size,
+    };
 
     fn mapping(bytes: &mut [u8]) -> Mapping {
         // SAFETY: the array stays live and uniquely borrowed through the test.
@@ -662,6 +686,68 @@ mod tests {
         domains.release(first)?;
 
         assert_eq!(domains.reserve(DeviceId::new(2))?, 4);
+        Ok(())
+    }
+
+    /// The same two devices in the other order swap domains, so nothing about
+    /// the identifier a device carries steers where it lands.
+    #[test]
+    fn domains_follow_arrival_not_identity() -> Result<(), crate::VirtioError> {
+        let (low, high) = (DeviceId::new(0x10), DeviceId::new(0x28));
+
+        let mut arrived = Domains::<4>::new(1, 8);
+        assert_eq!(arrived.reserve(low)?, 1);
+        assert_eq!(arrived.reserve(high)?, 2);
+
+        let mut reversed = Domains::<4>::new(1, 8);
+        assert_eq!(reversed.reserve(high)?, 1);
+        assert_eq!(reversed.reserve(low)?, 2);
+        Ok(())
+    }
+
+    /// No two live endpoints ever hold one domain, however the table churns.
+    #[test]
+    fn domains_stay_distinct_across_churn() -> Result<(), crate::VirtioError> {
+        let mut domains = Domains::<4>::new(1, 4);
+        let devices = [0x10, 0x18, 0x20, 0x28].map(DeviceId::new);
+        for device in devices {
+            domains.reserve(device)?;
+        }
+        domains.release(devices[1])?;
+        domains.release(devices[2])?;
+        domains.reserve(DeviceId::new(0x30))?;
+        domains.reserve(devices[1])?;
+
+        let live = domains.entries.map(|entry| entry.map(|it| it.domain));
+        for (index, domain) in live.iter().enumerate() {
+            let Some(domain) = domain else { continue };
+            let mut rest = live[index + 1..].iter().flatten();
+            assert!(!rest.any(|other| other == domain), "two endpoints share domain {domain}");
+        }
+        Ok(())
+    }
+
+    /// An endpoint already attached cannot ask for a second domain, which is
+    /// how a device with two drivers behind it stays one device to the IOMMU.
+    #[test]
+    fn endpoint_holds_one_domain() -> Result<(), crate::VirtioError> {
+        let mut domains = Domains::<4>::new(1, 8);
+        let device = DeviceId::new(0x18);
+        assert_eq!(domains.reserve(device)?, 1);
+
+        assert!(domains.reserve(device).is_err());
+        assert_eq!(domains.domain(device), Some(1));
+        Ok(())
+    }
+
+    /// Domain zero is never handed out, even to a controller that offers it.
+    #[test]
+    fn zero_domain_stays_unspent() -> Result<(), crate::VirtioError> {
+        let mut domains = Domains::<2>::new(0, 2);
+
+        assert_eq!(domains.reserve(DeviceId::new(0x18))?, 1);
+        assert_eq!(first_domain(0), 1);
+        assert_eq!(first_domain(7), 7);
         Ok(())
     }
 }

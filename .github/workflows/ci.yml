@@ -79,6 +79,26 @@ jobs:
           tool: just
       - run: just loom
 
+  fuzz:
+    name: Fuzz the wire parsers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-fuzz
+      - run: just fuzz 60
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
   boot:
     name: Build images and boot in QEMU
     runs-on: ubuntu-24.04
@@ -96,6 +116,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 qemu-system-misc
       - run: just smoke
+      - name: Boot in QEMU with tagged translation
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          if [ ! -r /dev/kvm ]; then
+            echo "::error::no readable /dev/kvm: PCIDs cannot be proven on this runner"
+            exit 1
+          fi
+          MOLT_QEMU_ACCEL=kvm just smoke-x86_64
       - uses: actions/upload-artifact@v7
         with:
           name: molt-x86_64-images

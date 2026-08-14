@@ -15,7 +15,8 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+
+use limen::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use crate::heap::{self, Heap};
 

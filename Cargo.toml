@@ -1,10 +1,13 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/limen",
+    "crates/molt-abi",
     "crates/molt-alloc",
     "crates/molt-arch",
     "xtask",
     "crates/molt-block",
+    "crates/molt-churn",
     "crates/molt-core",
     "crates/molt-exec",
     "crates/molt-fs",
@@ -20,9 +23,12 @@ members = [
 ]
 default-members = [
     "xtask",
+    "crates/limen",
+    "crates/molt-abi",
     "crates/molt-alloc",
     "crates/molt-arch",
     "crates/molt-block",
+    "crates/molt-churn",
     "crates/molt-core",
     "crates/molt-exec",
     "crates/molt-fs",
@@ -42,9 +48,12 @@ edition = "2024"
 rust-version = "1.85"
 
 [workspace.dependencies]
+limen = { path = "crates/limen" }
+molt-abi = { path = "crates/molt-abi" }
 molt-alloc = { path = "crates/molt-alloc" }
 molt-arch = { path = "crates/molt-arch" }
 molt-block = { path = "crates/molt-block" }
+molt-churn = { path = "crates/molt-churn" }
 molt-core = { path = "crates/molt-core" }
 molt-exec = { path = "crates/molt-exec" }
 molt-fs = { path = "crates/molt-fs", default-features = false }
@@ -58,6 +67,9 @@ molt-virtio = { path = "crates/molt-virtio" }
 molt-riscv = { path = "crates/platforms/riscv" }
 molt-x86_64 = { path = "crates/platforms/x86_64" }
 spin = { version = "0.12.2", default-features = false, features = ["once"] }
+# Only ever a dev-dependency: the property sweeps generate their moves with it
+# and shrink a counterexample down to the shortest list that still fails.
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 smoltcp = { version = "0.13.1", default-features = false, features = [
     "medium-ethernet",
     "proto-ipv4",

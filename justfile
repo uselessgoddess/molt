@@ -25,13 +25,19 @@ miri:
 
 loom:
     LOOM_MAX_PREEMPTIONS=2 RUSTFLAGS="--cfg loom" \
-        cargo test --package molt-core --profile loom --lib
+        cargo test --package molt-core --package molt-exec --profile loom --lib
 
 x86_64-check:
     cargo clippy --package molt-kernel --target x86_64-unknown-none -- -D warnings
 
 riscv64gc-check:
     cargo clippy --package molt-kernel --target riscv64gc-unknown-none-elf -- -D warnings
+
+fuzz seconds="60":
+    for target in $(cargo fuzz list); do \
+        cargo fuzz run --target "$(rustc -vV | sed -n 's/^host: //p')" "$target" \
+            -- -max_total_time={{ seconds }} -print_final_stats=1; \
+    done
 
 bench-check:
     cargo bench --package molt-core --package molt-exec --package molt-block --package molt-fs --no-run

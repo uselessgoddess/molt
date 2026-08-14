@@ -12,11 +12,24 @@ pub struct Leaf {
     start: u64,
     size: u64,
     protection: PageProtection,
+    base: Option<u64>,
 }
 
 impl Leaf {
     pub const fn new(start: u64, size: u64, protection: PageProtection) -> Self {
-        Self { start, size, protection }
+        Self { start, size, protection, base: None }
+    }
+
+    /// The leaf a 512-way radix table names at `level`, covering `address`.
+    ///
+    /// Both `address` and `base` are cut back to the level's size, so a walk
+    /// cannot report a boundary the hardware has not got. Unlike
+    /// [`new`](Self::new) this carries the physical address, read back out of
+    /// the entry rather than remembered from the mapping call — which is how a
+    /// grant is checked to name the frames the kernel meant to hand over.
+    pub const fn at(level: u32, address: u64, protection: PageProtection, base: u64) -> Self {
+        let size = FRAME_SIZE << (9 * level);
+        Self { start: address & !(size - 1), size, protection, base: Some(base & !(size - 1)) }
     }
 
     pub const fn start(self) -> u64 {
@@ -29,6 +42,11 @@ impl Leaf {
 
     pub const fn protection(self) -> PageProtection {
         self.protection
+    }
+
+    /// Where the leaf points, for a walk that reported it.
+    pub const fn base(self) -> Option<u64> {
+        self.base
     }
 
     /// One past the last address the leaf translates.

@@ -8,21 +8,23 @@ use molt_core::buffer::{BufferOperation, BufferRegistry};
 use molt_core::ring::{IoRing, RequestId, Submission};
 use molt_kernel::report;
 use molt_net::{Config, Ip, IpAddr, IpDone, IpError, IpOp, Ipv4Addr, Ipv6Addr, Link};
-use molt_pci::{Bus, Command, bus_span};
+use molt_pci::{Command, bus_span};
 use molt_tcp::{SocketStorage, Tcp, TcpDone, TcpError, TcpOp};
 use molt_udp::{Endpoint, Scratch, Udp, UdpDone, UdpError, UdpOp};
-use molt_virtio::{Arrivals, Iommu, Net, NetConfig, Transport};
+use molt_virtio::{Net, NetConfig};
 
 use crate::device::{self, Line};
+use crate::isolation;
 
 const VIRTIO_VENDOR: u16 = 0x1af4;
 const VIRTIO_NET: u16 = 0x1041;
-const VIRTIO_IOMMU: u16 = 0x1057;
 const DMA_FRAMES: usize = 12;
-const IOMMU_FRAMES: usize = 8;
 const NET_TAG: u32 = 0x6e65_7400;
 const IOMMU_TAG: u32 = 0x10ab;
 const OWNER: CellId = CellId::new(3);
+
+/// Bytes a scratch buffer holds: one Ethernet payload, less the IP header.
+const SCRATCH: usize = 1480;
 const LOCAL_V4: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
 const GATEWAY_V4: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
 const DNS_V4: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
@@ -55,15 +57,6 @@ const DNS_QUERY: [u8; 29] = [
     0x00, 0x01, // IN
 ];
 
-struct Poll;
-
-impl Arrivals for Poll {
-    fn wait(&mut self) -> u64 {
-        core::hint::spin_loop();
-        0
-    }
-}
-
 pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let Ok(space) = platform.config_space(boot_info) else {
         return;
@@ -76,94 +69,38 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let bus_zero = bus_span(space, space.first_bus()).expect("bus zero inside the ECAM window");
     let ecam = inventory.device(bus_zero).expect("the ECAM window is not kernel RAM");
     let window = platform.map_device(ecam, Rights::READ_WRITE).expect("a mappable ECAM window");
-    let mut bus = Bus::new(&window, space.first_bus());
-    let mut target = None;
-    let mut controller = None;
-    while let Some(function) = bus.function() {
-        if function.vendor() == VIRTIO_VENDOR {
-            match function.device() {
-                VIRTIO_NET => target = Some(function),
-                VIRTIO_IOMMU => controller = Some(function),
-                _ => {}
-            }
-        }
-    }
-    let (Some(mut function), Some(mut iommu_function)) = (target, controller) else {
+    let found = isolation::pair(&window, space.first_bus(), |function| {
+        function.vendor() == VIRTIO_VENDOR && function.device() == VIRTIO_NET
+    });
+    let Some((mut function, controller)) = found else {
         report!(platform, "MOLT_NET_SKIPPED: no virtio-net/IOMMU pair on bus zero");
         return;
     };
+    let control = isolation::Control::open(platform, &inventory, controller);
 
-    let iommu_transport =
-        Transport::probe(&iommu_function).expect("the network IOMMU describes its structures");
-    let iommu_bar_index = iommu_transport.common().bar();
-    assert!(
-        iommu_transport.notify().bar() == iommu_bar_index
-            && iommu_transport.device().bar() == iommu_bar_index,
-        "IOMMU structures split across BARs",
-    );
-    let (iommu_bar, iommu_registers) =
-        device::map_bar(platform, &inventory, &mut iommu_function, iommu_bar_index);
-    let iommu_command = iommu_function.command().expect("the network IOMMU command register");
-    iommu_function
-        .set_command(
-            iommu_command
-                .with(Command::MEMORY)
-                .with(Command::BUS_MASTER)
-                .with(Command::INTX_DISABLE),
-        )
-        .expect("network IOMMU decode and DMA authority");
-    let iommu_delta = device::delta(iommu_bar);
-    let iommu_common = device::subwindow(&iommu_registers, iommu_delta, iommu_transport.common());
-    let iommu_notify = device::subwindow(&iommu_registers, iommu_delta, iommu_transport.notify());
-    let iommu_config = device::subwindow(&iommu_registers, iommu_delta, iommu_transport.device());
-
-    let transport = Transport::probe(&function).expect("a modern network transport");
-    let transport_bar = transport.common().bar();
-    assert!(
-        transport.notify().bar() == transport_bar && transport.device().bar() == transport_bar,
-        "virtio-net structures split across BARs",
-    );
+    let (transport, bar_index) = device::transport(&function);
     let capability = function.msix().expect("virtio-net exposes MSI-X");
-    let table_bar = capability.table_bar();
-    let (bar, registers) = device::map_bar(platform, &inventory, &mut function, transport_bar);
-    let (table_bar, table_mapping) = if table_bar == transport_bar {
-        (bar, None)
-    } else {
-        let (table_bar, mapping) = device::map_bar(platform, &inventory, &mut function, table_bar);
-        (table_bar, Some(mapping))
-    };
-
-    let command = function.command().expect("the network command register");
-    let quiesced =
-        command.with(Command::MEMORY).with(Command::INTX_DISABLE).without(Command::BUS_MASTER);
-    function.set_command(quiesced).expect("network stays quiesced before mappings exist");
+    let (bar, registers) = device::map_bar(platform, &inventory, &mut function, bar_index);
+    let (table_bar, table_mapping) = device::table_bar(
+        platform,
+        &inventory,
+        &mut function,
+        (bar, bar_index),
+        capability.table_bar(),
+    );
+    let quiesced = device::quiesce(&mut function);
 
     let table = table_mapping.as_ref().unwrap_or(&registers);
     let vectored = device::route(platform, &function, capability, table, device::delta(table_bar));
-    let delta = device::delta(bar);
-    let common = device::subwindow(&registers, delta, transport.common());
-    let notify = device::subwindow(&registers, delta, transport.notify());
-    let config = device::subwindow(&registers, delta, transport.device());
+    let (common, notify, config) = device::structures(&registers, bar, &transport);
     let mut allocator = FrameAllocator::resume(boot_info.memory_map(), cursor);
-    let mut iommu_slots: [Option<Owner>; IOMMU_FRAMES] = [None; IOMMU_FRAMES];
-    let iommu_arena = Arena::claim(&mut allocator, offset, IOMMU_TAG, &mut iommu_slots)
-        .expect("contiguous frames for network IOMMU queues");
+    let mut iommu_slots = isolation::SLOTS;
+    let iommu_arena = isolation::arena(&mut allocator, offset, IOMMU_TAG, &mut iommu_slots);
     let mut slots: [Option<Owner>; DMA_FRAMES] = [None; DMA_FRAMES];
     let arena = Arena::claim(&mut allocator, offset, NET_TAG, &mut slots)
         .expect("a contiguous network DMA span");
-    let endpoint = device::requester(function.address());
-    let mut iommu = Iommu::start(
-        iommu_common,
-        iommu_notify,
-        iommu_config,
-        iommu_transport.notify_multiplier(),
-        u16::MAX,
-        Poll,
-        device::requester(iommu_function.address()),
-        iommu_arena,
-    )
-    .expect("the network IOMMU completes its handshake");
-    iommu.attach(endpoint).expect("network endpoint attaches while quiesced");
+    let endpoint = function.address().requester();
+    let iommu = control.start(iommu_arena, endpoint);
     let net = Net::start(
         NetConfig::new(
             common,
@@ -182,10 +119,10 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
         .expect("network bus mastering follows mappings");
     report!(platform, "MOLT_NET_IOMMU_OK: endpoint mapped before bus mastering");
     let mac = net.mac();
-    report!(platform, "MOLT_NET_OK: {} mac {:02x?}", function.address(), mac.octets(),);
+    report!(platform, "MOLT_NET_OK: {} mac {:02x?}", function.address(), mac.octets());
 
-    let config = Config::new(mac, IpAddr::V4(LOCAL_V4), 24, IpAddr::V4(GATEWAY_V4));
-    let mut ip = Ip::<_, 4>::new(net, config);
+    let v4 = || Config::new(mac, IpAddr::V4(LOCAL_V4), 24, IpAddr::V4(GATEWAY_V4));
+    let mut ip = Ip::<_, 4>::new(net, v4());
     let reply = udp_round_trip(&vectored.line(), &mut ip, IpAddr::V4(DNS_V4)).expect("a DNS reply");
     report!(platform, "MOLT_UDP_OK: DNS replied with {reply} bytes");
 
@@ -196,23 +133,12 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     let _ = udp_round_trip(&vectored.line(), &mut ip, IpAddr::V6(DNS_V6));
     report!(platform, "MOLT_NDP_OK: {DNS_V6} answered a solicitation");
 
-    let config = Config::new(mac, IpAddr::V4(LOCAL_V4), 24, IpAddr::V4(GATEWAY_V4));
-    let (net, echoed) = tcp_echo(&vectored.line(), ip.into_link(), config);
+    let (net, echoed) = tcp_echo(&vectored.line(), ip.into_link(), v4());
     report!(platform, "MOLT_TCP_OK: {ECHO} echoed {echoed} bytes");
 
-    let mut iommu = net.reset().expect("the network device stops before DMA frames return");
+    let iommu = net.reset().expect("the network device stops before DMA frames return");
     function.set_command(quiesced).expect("network bus mastering stays off after reset");
-    assert!(iommu.poll_faults().expect("the network fault queue remains valid").is_none());
-    iommu.detach(endpoint).expect("the empty network domain detaches");
-    iommu.reset().expect("the network IOMMU stops after its endpoint");
-    iommu_function
-        .set_command(
-            iommu_command
-                .with(Command::MEMORY)
-                .with(Command::INTX_DISABLE)
-                .without(Command::BUS_MASTER),
-        )
-        .expect("network IOMMU bus mastering stays off after reset");
+    control.stop(iommu, endpoint);
     vectored.stop(platform);
 }
 
@@ -226,15 +152,15 @@ fn udp_round_trip<M: iommu::Mapper>(
 ) -> Option<usize> {
     let mut source = DNS_QUERY;
     let mut target = [0u8; 512];
-    let mut tx = [0u8; 1480];
-    let mut rx = [0u8; 1480];
+    let mut tx = [0u8; SCRATCH];
+    let mut rx = [0u8; SCRATCH];
     let mut buffers = BufferRegistry::<4>::new();
     let source = buffers.register_read(OWNER, &mut source).expect("one source slot");
     let target = buffers.register_write(OWNER, &mut target).expect("one receive slot");
     let tx = buffers.register_read_write(OWNER, &mut tx).expect("one TX scratch slot");
     let rx = buffers.register_read_write(OWNER, &mut rx).expect("one RX scratch slot");
-    let tx = Scratch::from_registered(tx, 1480, &buffers).expect("bounded TX scratch");
-    let rx = Scratch::from_registered(rx, 1480, &buffers).expect("bounded RX scratch");
+    let tx = Scratch::from_registered(tx, SCRATCH, &buffers).expect("bounded TX scratch");
+    let rx = Scratch::from_registered(rx, SCRATCH, &buffers).expect("bounded RX scratch");
     let mut ip_ring = IoRing::<IpOp, Result<IpDone, IpError>, 8>::new();
     let (mut ip_client, mut ip_driver) = ip_ring.split();
     let mut udp_ring = IoRing::<UdpOp, Result<UdpDone, UdpError>, 8>::new();

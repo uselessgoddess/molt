@@ -78,8 +78,11 @@ queues are identity-mapped, polling control-plane memory; the QEMU PCI function
 does not require MSI-X. For each attached endpoint it:
 
 1. negotiates input range, domain range, and map/unmap support;
-2. allocates a distinct non-bypass domain and attaches the PCI requester while
-   PCI bus mastering is still disabled;
+2. allocates a distinct non-bypass domain — the lowest number no live
+   attachment holds, never zero, and never a second one for an endpoint that
+   already has one — and attaches the PCI requester, which is the bus address
+   the kernel enumerated and not anything the function reported, while PCI bus
+   mastering is still disabled;
 3. allocates page-aligned IOVAs, preferring an aperture above 4 GiB so an
    accidental physical-address descriptor is visible in QEMU;
 4. sends synchronous MAP/UNMAP commands with inclusive ends and exact device
@@ -117,6 +120,10 @@ attaches them; that is compatibility, not isolation for those devices.
 Host tests cover IOVA overlap/reuse, double release, device and domain scoping,
 permissions, request encodings, event parsing, cyclic descriptor rejection,
 two requests published together, reordered reads, and device error status.
+They also cover where a domain number comes from: the same two devices attached
+in the other order swap domains, no two live endpoints ever share one, and
+domain zero stays unspent. The x86_64 smoke checks the same thing on the
+machine — see `MOLT_IOMMU_DOMAIN_OK` in [`testing.md`](testing.md).
 The x86_64 smoke requires each endpoint to attach before bus mastering, two
 simultaneous reads on both storage transports, interrupt completion, clean
 fault queues, ordered teardown, and the existing MoltFS write/restart markers.

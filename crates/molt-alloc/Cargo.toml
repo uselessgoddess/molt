@@ -10,3 +10,6 @@ workspace = true
 
 [lib]
 bench = false
+
+[dependencies]
+limen.workspace = true

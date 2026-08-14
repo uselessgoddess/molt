@@ -5,8 +5,8 @@
 
 use core::task::Waker;
 
-use crate::sync::UnsafeCell;
-use crate::sync::atomic::{AtomicU8, Ordering};
+use limen::UnsafeCell;
+use limen::atomic::{AtomicU8, Ordering};
 
 const WAITING: u8 = 0;
 const REGISTERING: u8 = 0b01;
@@ -103,39 +103,18 @@ impl Default for AtomicWaker {
     }
 }
 
-#[cfg(all(test, loom))]
-pub(crate) struct Flag(pub(crate) loom::sync::atomic::AtomicBool);
-
-#[cfg(all(test, loom))]
-impl std::task::Wake for Flag {
-    fn wake(self: std::sync::Arc<Self>) {
-        self.0.store(true, crate::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-#[cfg(all(test, loom))]
-impl Flag {
-    pub(crate) fn new() -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self(loom::sync::atomic::AtomicBool::new(false)))
-    }
-
-    pub(crate) fn fired(&self) -> bool {
-        self.0.load(crate::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-#[cfg(all(test, loom))]
-mod loom_tests {
+#[cfg(test)]
+mod races {
     use core::task::Waker;
 
-    use loom::sync::Arc;
-    use loom::thread;
+    use limen::{Arc, thread};
 
-    use super::{AtomicWaker, Flag};
+    use super::AtomicWaker;
+    use crate::probe::Flag;
 
     #[test]
     fn race_keeps_wake() {
-        loom::model(|| {
+        limen::model(|| {
             let cell = Arc::new(AtomicWaker::new());
             let flag = Flag::new();
             let waker = Waker::from(flag.clone());

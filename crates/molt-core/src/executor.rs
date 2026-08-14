@@ -8,8 +8,9 @@
 use core::borrow::Borrow;
 use core::task::{RawWaker, RawWakerVTable, Waker};
 
+use limen::atomic::{AtomicU8, Ordering};
+
 use crate::cache::{CacheLayout, CachePadded, Compact, Padded};
-use crate::sync::atomic::{AtomicU8, Ordering};
 
 const OCCUPIED: u8 = 1 << 0;
 const READY: u8 = 1 << 1;
@@ -168,34 +169,6 @@ impl<const N: usize> Default for Executor<N, Padded> {
     }
 }
 
-#[cfg(all(test, loom))]
-mod loom_tests {
-    use loom::sync::Arc;
-    use loom::thread;
-
-    use super::Executor;
-
-    #[test]
-    fn race_keeps_wake() {
-        loom::model(|| {
-            let executor = Arc::new(Executor::<2>::new());
-            let task = executor.register().expect("free slot");
-
-            let notifier = {
-                let executor = executor.clone();
-                thread::spawn(move || executor.wake(task))
-            };
-            let scanned = executor.next_ready();
-            notifier.join().unwrap();
-
-            assert!(
-                scanned == Some(task) || executor.next_ready() == Some(task),
-                "the wake was lost between the scan and the wake"
-            );
-        });
-    }
-}
-
 #[cfg(all(test, not(loom)))]
 mod tests {
     extern crate std;
@@ -273,5 +246,32 @@ mod tests {
     #[test]
     fn layout_is_typed() {
         assert!(size_of::<Executor<4, Padded>>() > size_of::<Executor<4>>());
+    }
+}
+
+#[cfg(test)]
+mod races {
+    use limen::{Arc, thread};
+
+    use super::Executor;
+
+    #[test]
+    fn race_keeps_wake() {
+        limen::model(|| {
+            let executor = Arc::new(Executor::<2>::new());
+            let task = executor.register().expect("free slot");
+
+            let notifier = {
+                let executor = executor.clone();
+                thread::spawn(move || executor.wake(task))
+            };
+            let scanned = executor.next_ready();
+            notifier.join().unwrap();
+
+            assert!(
+                scanned == Some(task) || executor.next_ready() == Some(task),
+                "the wake was lost between the scan and the wake"
+            );
+        });
     }
 }

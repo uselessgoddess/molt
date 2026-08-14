@@ -216,6 +216,10 @@ unsafe extern "C" fn enter(params: *const Params) -> ! {
     let cpu = CpuId::new(params.cpu as u16);
     // SAFETY: this is that core, and this is its only call.
     unsafe { percpu::attach(cpu) };
+    // `CR4` came out of reset with this core, so the boot core's decision about
+    // tags is not this core's until it makes the same one — and the boot core
+    // already checked the machine's answer, so this cannot disagree.
+    memory::enable_tags();
     interrupts::init();
     let _ = apic::init(apic::window());
     (params.hand)(cpu)

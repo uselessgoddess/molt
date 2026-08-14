@@ -2,25 +2,17 @@
 //!
 //! PCI drivers share BAR mapping, MSI-X routing, and line release here.
 
-use molt_arch::iommu::DeviceId;
 use molt_arch::memory::{Inventory, Rights};
 use molt_arch::{Mmio, Platform};
 use molt_core::interrupt::InterruptToken;
-use molt_pci::{Address, Bar, Function, MsiX, MsiXCapability, Vector};
-use molt_virtio::Location;
+use molt_pci::{Bar, Command, Function, MsiX, MsiXCapability, Vector};
+use molt_virtio::{Location, Transport};
 
 /// How long a driver waits on its line before calling the device wedged.
 ///
 /// Ticks of the core's own quantum, so a couple of seconds: generous, because
 /// what it has to outlast is a slow disk rather than a scheduler.
 const WAIT_TICKS: u64 = 256;
-
-/// The PCI requester ID VirtIO-IOMMU uses for one function.
-pub(crate) const fn requester(address: Address) -> DeviceId {
-    DeviceId::new(
-        (address.bus() as u32) << 8 | (address.device() as u32) << 3 | address.function() as u32,
-    )
-}
 
 /// Maps the BAR at `index` and reports where it landed.
 pub(crate) fn map_bar<P: Platform>(
@@ -34,6 +26,65 @@ pub(crate) fn map_bar<P: Platform>(
     let device = inventory.device(span).expect("a BAR outside kernel RAM");
     let mapping = platform.map_device(device, Rights::READ_WRITE).expect("a mappable BAR");
     (bar, mapping)
+}
+
+/// The BAR the MSI-X table lives in, mapped unless it is `mapped` already.
+pub(crate) fn table_bar<P: Platform>(
+    platform: &mut P,
+    inventory: &Inventory<'_>,
+    function: &mut Function<'_>,
+    (mapped, at): (Bar, u8),
+    index: u8,
+) -> (Bar, Option<Mmio<'static>>) {
+    if index == at {
+        return (mapped, None);
+    }
+    let (bar, mapping) = map_bar(platform, inventory, function, index);
+    (bar, Some(mapping))
+}
+
+/// Leaves `function` decoding memory with INTx and bus mastering off, and says
+/// what was written.
+///
+/// The state a device stays in until its domain and its queue mappings exist:
+/// nothing it could DMA into is mapped yet, so nothing it could DMA is allowed.
+pub(crate) fn quiesce(function: &mut Function<'_>) -> Command {
+    let quiesced = quiesced(function.command().expect("a readable command register"));
+    function.set_command(quiesced).expect("a writable command register");
+    quiesced
+}
+
+/// `command` with the function decoding memory and mastering nothing, which is
+/// the one definition of quiesced there is.
+pub(crate) const fn quiesced(command: Command) -> Command {
+    command.with(Command::MEMORY).with(Command::INTX_DISABLE).without(Command::BUS_MASTER)
+}
+
+/// What a modern VirtIO function says about itself, and the one BAR it says it
+/// in — structures spread over several would need several mappings, and no
+/// device molt drives reports them that way.
+pub(crate) fn transport(function: &Function<'_>) -> (Transport, u8) {
+    let transport = Transport::probe(function).expect("a modern function describes its structures");
+    let index = transport.common().bar();
+    assert!(
+        transport.notify().bar() == index && transport.device().bar() == index,
+        "VirtIO structures split across BARs",
+    );
+    (transport, index)
+}
+
+/// The common, notify, and device-specific windows, cut out of the mapped BAR.
+pub(crate) fn structures<'a>(
+    registers: &'a Mmio<'_>,
+    bar: Bar,
+    transport: &Transport,
+) -> (Mmio<'a>, Mmio<'a>, Mmio<'a>) {
+    let delta = delta(bar);
+    (
+        subwindow(registers, delta, transport.common()),
+        subwindow(registers, delta, transport.notify()),
+        subwindow(registers, delta, transport.device()),
+    )
 }
 
 /// Cuts one VirtIO structure out of the BAR window it was reported in.

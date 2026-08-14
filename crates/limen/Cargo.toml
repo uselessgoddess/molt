@@ -1,0 +1,18 @@
+[package]
+name = "limen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+threads = []
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints]
+workspace = true
+
+[lib]
+bench = false
