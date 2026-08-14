@@ -35,10 +35,10 @@ riscv64gc-check:
 
 user-check:
     cargo build --package molt-hello --package molt-shell-image \
-        --target targets/x86_64-unknown-molt-domain.json \
+        --target targets/x86_64-unknown-molt.json \
         -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
     cargo build --package molt-hello --package molt-shell-image \
-        --target targets/riscv64gc-unknown-molt-domain.json \
+        --target targets/riscv64gc-unknown-molt.json \
         -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
 
 fuzz seconds="60":

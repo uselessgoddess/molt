@@ -1,6 +1,6 @@
 #![no_std]
 
-//! Safe user-side handles, ring requests, futures, and domain heap support.
+//! Safe program-side handles, ring requests, futures, and heap support.
 //!
 //! Programs use this crate instead of constructing `molt-abi` wire values.
 //! There is one outstanding request per [`Client`], which makes completion
@@ -231,7 +231,7 @@ fn boundary(reason: u64, value: u64) {
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
 fn boundary(_reason: u64, _value: u64) {
-    unreachable!("molt-user supports x86_64 and riscv64 domains")
+    unreachable!("molt-program supports x86_64 and riscv64")
 }
 
 /// Allocation over the domain heap supplied at entry.

@@ -7,7 +7,7 @@ fn main() {}
 #[cfg(target_os = "molt")]
 mod image {
 
-    use molt_user::{Buffer, Client, Handle, Heap, Output, block_on, exit};
+    use molt_program::{Buffer, Client, Handle, Heap, Output, block_on, exit};
 
     const RING: usize = 4;
     const MESSAGE: &[u8] = b"hello from a Molt domain\n";

@@ -29,7 +29,7 @@ molt-pci = { path = "crates/device/pci" }
 molt-riscv = { path = "crates/platform/riscv" }
 molt-rt = { path = "crates/sys/rt" }
 molt-shell = { path = "crates/user/shell" }
-molt-user = { path = "crates/user/runtime" }
+molt-program = { path = "crates/user/runtime" }
 molt-tcp = { path = "crates/stack/tcp" }
 molt-udp = { path = "crates/stack/udp" }
 molt-virtio = { path = "crates/device/virtio" }

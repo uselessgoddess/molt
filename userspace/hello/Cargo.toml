@@ -7,7 +7,7 @@ publish = false
 build = "build.rs"
 
 [dependencies]
-molt-user.workspace = true
+molt-program.workspace = true
 
 [lints]
 workspace = true

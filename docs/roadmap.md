@@ -550,7 +550,7 @@ new invention.
       `-Z build-std`, no compiler fork, and no `uutils` in the kernel
 - [x] measured in [`docs/userspace.md`](userspace.md): stock rustc holds back
       the registers LFI-RISCV reserves
-- [x] `molt-abi` with asserted layouts, and typed `molt-user` handles, requests,
+- [x] `molt-abi` with asserted layouts, and typed `molt-program` handles, requests,
       allocator, and ring boundary over it
 - [x] tier-2 target names for both ports, static ELF admission with reject-before-
       map W^X enforcement (`MOLT_DOMAIN_WX_OK`), and real user entry/return

@@ -11,20 +11,22 @@ The answer is: **a custom target, no fork, and not `uutils` for a long while.**
 The reasoning is below, and the part that decides it is a measurement rather
 than an opinion.
 
-The first targets that now ship are the tier-2 forms:
-`x86_64-unknown-molt-domain.json` and
-`riscv64gc-unknown-molt-domain.json`. The `domain` environment is part of the
-target name deliberately. Isolation tier is a build-time property, not a flag
-that a loader may reinterpret after compilation. `just user-check` rebuilds
-`core` and `alloc` and checks both `molt-hello` and the domain adapter for the
-existing shell on both architectures.
+The first targets that now ship are `x86_64-unknown-molt.json` and
+`riscv64gc-unknown-molt.json`. An unsuffixed Molt target is the ordinary
+hardware-isolated program ABI; the future verifier-backed aperture adds the
+`lfi` environment as `*-unknown-molt-lfi`. Absence versus `lfi` is the target
+axis, just as absence versus `gnu` is an environment distinction in conventional
+triples. Isolation remains a build-time property, not a flag that a loader may
+reinterpret after compilation. `just user-check` rebuilds `core` and `alloc`
+and checks both `molt-hello` and the adapter for the existing shell on both
+architectures.
 
 Applications themselves live under `userspace/`, outside the reusable crate
 graph, and their names do not encode an isolation tier. The same `hello` or
 shell source can later be built for an aperture without becoming a different
-application. The suffix belongs to the target because `domain` selects the
-page-table-isolated ABI; dropping it to `unknown-molt` would hide the tier and
-leave no unambiguous peer name for the future `aperture` target.
+application. The default target needs no `domain` suffix because page tables
+are Molt's ordinary boundary for independently linked programs; `-lfi` names
+the code-generation and verifier constraints that differ from that default.
 
 ## The shell already exists
 
@@ -143,7 +145,7 @@ path of least resistance.
 
 ## What replaces `std`
 
-Nothing, deliberately. A `molt-user` crate: `no_std`, `alloc`, a global allocator
+Nothing, deliberately. A `molt-program` crate: `no_std`, `alloc`, a global allocator
 over the sandbox's own heap, and typed wrappers over the `molt-abi` operations —
 `Handle`, the ring client, and futures that complete when a `RequestId` comes
 back. `molt-alloc` and `molt-rt` already exist and are already `no_std`, so
@@ -169,7 +171,7 @@ possible.
 Tier 2 now exercises that destination without changing `molt-shell`. The
 `userspace/shell` image supplies the allocator and transport boundary, then
 constructs the existing `molt_shell::Shell`, `Session`, and `FsOp` ring. Its
-adapter forwards those operations through `molt-user`; the kernel validates the
+adapter forwards those operations through `molt-program`; the kernel validates the
 hostile ring and applies them to the build-produced MoltFS image. The shell
 source and the filesystem operation vocabulary stay the same.
 
@@ -207,8 +209,8 @@ one whose failures are about the sandbox.
 
 | Step | Marker | What it is |
 | --- | --- | --- |
-| both `*-unknown-molt-domain.json` targets + `-Z build-std` build `no_std` binaries | `just user-check` | Tier 2 is named in the target, and `core`/`alloc` are rebuilt for both ports |
-| `molt-user` wraps the op table | host tests | A program submits and awaits without touching `molt-abi` directly |
+| both `*-unknown-molt.json` targets + `-Z build-std` build `no_std` binaries | `just user-check` | The default hardware tier is distinct from the future `*-molt-lfi` target, and `core`/`alloc` are rebuilt for both ports |
+| `molt-program` wraps the op table | host tests | A program submits and awaits without touching `molt-abi` directly |
 | a static ELF64 image is admitted before any mapping | `MOLT_DOMAIN_WX_OK` | A writable-executable segment is rejected with zero mapper calls |
 | `hello` enters user mode and exits on both ports | `MOLT_USER_HELLO_OK`, `MOLT_DOMAIN_EXIT_OK` | The ELF loader, page-table switch, hostile ring, return gate, and exit path work end to end |
 | a user-mode fault returns to the kernel | `MOLT_DOMAIN_FAULT_OK` | A bad user access kills the domain path rather than the kernel |

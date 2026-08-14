@@ -1,5 +1,7 @@
 ENTRY(_start)
 
+/* The unsuffixed Molt target is the hardware-isolated program ABI. */
+
 PHDRS
 {
   text PT_LOAD FLAGS(5);

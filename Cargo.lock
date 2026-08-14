@@ -607,7 +607,7 @@ dependencies = [
 name = "molt-hello"
 version = "0.1.0"
 dependencies = [
- "molt-user",
+ "molt-program",
 ]
 
 [[package]]
@@ -659,6 +659,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "molt-program"
+version = "0.1.0"
+dependencies = [
+ "molt-abi",
+]
+
+[[package]]
 name = "molt-riscv"
 version = "0.1.0"
 dependencies = [
@@ -689,8 +696,8 @@ version = "0.1.0"
 dependencies = [
  "molt-core",
  "molt-fs",
+ "molt-program",
  "molt-shell",
- "molt-user",
 ]
 
 [[package]]
@@ -708,13 +715,6 @@ version = "0.1.0"
 dependencies = [
  "molt-core",
  "molt-net",
-]
-
-[[package]]
-name = "molt-user"
-version = "0.1.0"
-dependencies = [
- "molt-abi",
 ]
 
 [[package]]

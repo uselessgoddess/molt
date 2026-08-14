@@ -13,8 +13,8 @@ mod site;
 
 const X86_64_TARGET: &str = "x86_64-unknown-none";
 const RISCV64_TARGET: &str = "riscv64gc-unknown-none-elf";
-const X86_64_DOMAIN_TARGET: &str = "targets/x86_64-unknown-molt-domain.json";
-const RISCV64_DOMAIN_TARGET: &str = "targets/riscv64gc-unknown-molt-domain.json";
+const X86_64_PROGRAM_TARGET: &str = "targets/x86_64-unknown-molt.json";
+const RISCV64_PROGRAM_TARGET: &str = "targets/riscv64gc-unknown-molt.json";
 
 /// The tree the smoke disk is built from, relative to the workspace root.
 const DISK_TREE: &str = "disk";
@@ -409,8 +409,8 @@ struct UserImages {
 
 fn build_user_image(root: &Path, kernel_target: &str) -> Result<UserImages, String> {
     let target = match kernel_target {
-        X86_64_TARGET => X86_64_DOMAIN_TARGET,
-        RISCV64_TARGET => RISCV64_DOMAIN_TARGET,
+        X86_64_TARGET => X86_64_PROGRAM_TARGET,
+        RISCV64_TARGET => RISCV64_PROGRAM_TARGET,
         other => return Err(format!("no user target for kernel target {other}")),
     };
     let target_name = Path::new(target)

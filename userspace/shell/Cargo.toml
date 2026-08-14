@@ -10,7 +10,7 @@ build = "build.rs"
 molt-core.workspace = true
 molt-fs.workspace = true
 molt-shell.workspace = true
-molt-user.workspace = true
+molt-program.workspace = true
 
 [lints]
 workspace = true

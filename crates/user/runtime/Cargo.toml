@@ -1,5 +1,5 @@
 [package]
-name = "molt-user"
+name = "molt-program"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

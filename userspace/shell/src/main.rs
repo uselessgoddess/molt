@@ -16,8 +16,8 @@ mod image {
     use molt_core::ring::{Completion, IoDriver, IoRing};
     use molt_core::{CpuId, task};
     use molt_fs::{Dir, FsDone, FsError, FsOp, Handle as FsHandle, Mount, Storage};
+    use molt_program::{Buffer, Client, Directory, File, Handle, Heap, Output, block_on, exit};
     use molt_shell::{Console, Session, Shell};
-    use molt_user::{Buffer, Client, Directory, File, Handle, Heap, Output, block_on, exit};
 
     const RING: usize = 4;
     const WINDOW: usize = 64;
@@ -163,7 +163,7 @@ mod image {
         complete(driver, id, result);
     }
 
-    fn remote(result: Result<i64, molt_user::Error>) -> Result<i64, FsError> {
+    fn remote(result: Result<i64, molt_program::Error>) -> Result<i64, FsError> {
         result
             .map_err(|_| FsError::Corrupt)
             .and_then(|value| if value < 0 { Err(FsError::Corrupt) } else { Ok(value) })
