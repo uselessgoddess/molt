@@ -1,0 +1,15 @@
+[package]
+name = "molt-user"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+molt-abi.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+bench = false

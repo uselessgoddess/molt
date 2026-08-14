@@ -583,12 +583,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "molt-domain"
+version = "0.1.0"
+
+[[package]]
 name = "molt-fs"
 version = "0.1.0"
 dependencies = [
  "criterion",
  "molt-block",
  "molt-core",
+]
+
+[[package]]
+name = "molt-hello"
+version = "0.1.0"
+dependencies = [
+ "molt-user",
 ]
 
 [[package]]
@@ -600,6 +611,7 @@ dependencies = [
  "molt-arch",
  "molt-block",
  "molt-core",
+ "molt-domain",
  "molt-fs",
  "molt-net",
  "molt-nvme",
@@ -664,6 +676,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "molt-shell-domain"
+version = "0.1.0"
+dependencies = [
+ "molt-core",
+ "molt-fs",
+ "molt-shell",
+ "molt-user",
+]
+
+[[package]]
 name = "molt-tcp"
 version = "0.1.0"
 dependencies = [
@@ -678,6 +700,13 @@ version = "0.1.0"
 dependencies = [
  "molt-core",
  "molt-net",
+]
+
+[[package]]
+name = "molt-user"
+version = "0.1.0"
+dependencies = [
+ "molt-abi",
 ]
 
 [[package]]
