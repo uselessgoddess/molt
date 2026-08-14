@@ -9,7 +9,8 @@ use crate::paging;
 const KICK: u64 = 0;
 const EXIT: u64 = 1;
 
-// Gateway data offsets. Registers x1..x31 begin at 0x80.
+// Gateway data offsets. User registers x1..x31 begin at 0x80; the kernel's
+// ABI-stable integer registers occupy 0x180..0x1f0 while user code is live.
 const DOMAIN_SATP: usize = 0x28;
 const REASON: usize = 0x30;
 const VALUE: usize = 0x38;
@@ -92,6 +93,20 @@ __molt_domain_trap:
     csrw stvec, t1
     ld t1, 0x20(t0)
     csrw sstatus, t1
+    ld gp, 0x180(t0)
+    ld tp, 0x188(t0)
+    ld s0, 0x190(t0)
+    ld s1, 0x198(t0)
+    ld s2, 0x1a0(t0)
+    ld s3, 0x1a8(t0)
+    ld s4, 0x1b0(t0)
+    ld s5, 0x1b8(t0)
+    ld s6, 0x1c0(t0)
+    ld s7, 0x1c8(t0)
+    ld s8, 0x1d0(t0)
+    ld s9, 0x1d8(t0)
+    ld s10, 0x1e0(t0)
+    ld s11, 0x1e8(t0)
     ld sp, 0x08(t0)
     ld ra, 0x10(t0)
     ret
@@ -107,6 +122,20 @@ __molt_domain_enter:
     sd t1, 0x18(t0)
     csrr t1, sstatus
     sd t1, 0x20(t0)
+    sd gp, 0x180(t0)
+    sd tp, 0x188(t0)
+    sd s0, 0x190(t0)
+    sd s1, 0x198(t0)
+    sd s2, 0x1a0(t0)
+    sd s3, 0x1a8(t0)
+    sd s4, 0x1b0(t0)
+    sd s5, 0x1b8(t0)
+    sd s6, 0x1c0(t0)
+    sd s7, 0x1c8(t0)
+    sd s8, 0x1d0(t0)
+    sd s9, 0x1d8(t0)
+    sd s10, 0x1e0(t0)
+    sd s11, 0x1e8(t0)
     la t1, __molt_domain_trap
     csrw stvec, t1
     ld t1, 0x58(t0)
