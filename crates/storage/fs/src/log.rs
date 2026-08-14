@@ -1,5 +1,7 @@
 //! File payload records in the append-only checkpoint log.
 
+use molt_bytes::{Bytes, BytesMut};
+
 use crate::FsError;
 use crate::layout::BLOCK;
 
@@ -74,9 +76,9 @@ impl Record {
         header.fill(0);
         header[..MAGIC.len()].copy_from_slice(&MAGIC);
         header[4] = WRITE;
-        put_u32(header, 8, self.bytes);
-        put_u32(header, 12, self.object);
-        put_u64(header, 20, self.offset);
+        header.write_le(8, self.bytes).unwrap();
+        header.write_le(12, self.object).unwrap();
+        header.write_le(20, self.offset).unwrap();
     }
 
     pub fn parse(header: &[u8]) -> Result<Self, FsError> {
@@ -84,7 +86,7 @@ impl Record {
         if header[..MAGIC.len()] != MAGIC {
             return Err(FsError::Corrupt);
         }
-        let payload = u32_at(header, 8);
+        let payload = header.read_le::<u32>(8).unwrap();
         if header[4] != WRITE
             || header[5..8].iter().any(|byte| *byte != 0)
             || header[16..20].iter().any(|byte| *byte != 0)
@@ -93,7 +95,11 @@ impl Record {
         {
             return Err(FsError::Corrupt);
         }
-        Ok(Self { object: u32_at(header, 12), offset: u64_at(header, 20), bytes: payload })
+        Ok(Self {
+            object: header.read_le::<u32>(12).unwrap(),
+            offset: header.read_le::<u64>(20).unwrap(),
+            bytes: payload,
+        })
     }
 }
 
@@ -115,22 +121,6 @@ pub fn headers_crc(bytes: &[u8]) -> Result<u32, FsError> {
         return Err(FsError::Corrupt);
     }
     Ok(crc.finish())
-}
-
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
-}
-
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
-}
-
-fn put_u32(bytes: &mut [u8], at: usize, value: u32) {
-    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-fn put_u64(bytes: &mut [u8], at: usize, value: u64) {
-    bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 #[cfg(test)]

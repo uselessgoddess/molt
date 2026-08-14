@@ -12,6 +12,8 @@
 #[cfg(test)]
 extern crate std;
 
+use molt_bytes::Bytes;
+
 const ELF_HEADER: usize = 64;
 const PROGRAM_HEADER: usize = 56;
 const LOAD: u32 = 1;
@@ -157,20 +159,21 @@ impl Image {
     fn parse(bytes: &[u8], architecture: Architecture) -> Result<Self, Error> {
         let header = bytes.get(..ELF_HEADER).ok_or(Error::Truncated)?;
         if header[..7] != [0x7f, b'E', b'L', b'F', 2, 1, 1]
-            || u16_at(header, 16)? != 2
-            || u32_at(header, 20)? != 1
-            || u16_at(header, 52)? as usize != ELF_HEADER
+            || header.read_le::<u16>(16).ok_or(Error::Truncated)? != 2
+            || header.read_le::<u32>(20).ok_or(Error::Truncated)? != 1
+            || header.read_le::<u16>(52).ok_or(Error::Truncated)? as usize != ELF_HEADER
         {
             return Err(Error::Format);
         }
-        if u16_at(header, 18)? != architecture.machine() {
+        if header.read_le::<u16>(18).ok_or(Error::Truncated)? != architecture.machine() {
             return Err(Error::Architecture);
         }
 
-        let entry = u64_at(header, 24)?;
-        let offset = usize::try_from(u64_at(header, 32)?).map_err(|_| Error::Truncated)?;
-        let size = u16_at(header, 54)? as usize;
-        let count = u16_at(header, 56)? as usize;
+        let entry = header.read_le::<u64>(24).ok_or(Error::Truncated)?;
+        let offset = usize::try_from(header.read_le::<u64>(32).ok_or(Error::Truncated)?)
+            .map_err(|_| Error::Truncated)?;
+        let size = header.read_le::<u16>(54).ok_or(Error::Truncated)? as usize;
+        let count = header.read_le::<u16>(56).ok_or(Error::Truncated)? as usize;
         if size != PROGRAM_HEADER || count == 0 {
             return Err(Error::Format);
         }
@@ -188,7 +191,7 @@ impl Image {
         for index in 0..count {
             let at = offset + index * size;
             let header = &bytes[at..at + size];
-            let kind = u32_at(header, 0)?;
+            let kind = header.read_le::<u32>(0).ok_or(Error::Truncated)?;
             if matches!(kind, DYNAMIC | INTERP) {
                 return Err(Error::Unsupported);
             }
@@ -199,12 +202,12 @@ impl Image {
                 return Err(Error::TooManySegments);
             }
 
-            let flags = u32_at(header, 4)?;
-            let file_offset = u64_at(header, 8)?;
-            let virtual_address = u64_at(header, 16)?;
-            let file_size = u64_at(header, 32)?;
-            let memory_size = u64_at(header, 40)?;
-            let alignment = u64_at(header, 48)?;
+            let flags = header.read_le::<u32>(4).ok_or(Error::Truncated)?;
+            let file_offset = header.read_le::<u64>(8).ok_or(Error::Truncated)?;
+            let virtual_address = header.read_le::<u64>(16).ok_or(Error::Truncated)?;
+            let file_size = header.read_le::<u64>(32).ok_or(Error::Truncated)?;
+            let memory_size = header.read_le::<u64>(40).ok_or(Error::Truncated)?;
+            let alignment = header.read_le::<u64>(48).ok_or(Error::Truncated)?;
             let file_end = file_offset.checked_add(file_size).ok_or(Error::Segment)?;
             let memory_end = virtual_address.checked_add(memory_size).ok_or(Error::Segment)?;
             let mapped_end = memory_end
@@ -251,33 +254,6 @@ impl Image {
     fn segments(&self) -> impl Iterator<Item = Segment> + '_ {
         self.segments[..self.count].iter().flatten().copied()
     }
-}
-
-fn u16_at(bytes: &[u8], offset: usize) -> Result<u16, Error> {
-    let field: [u8; 2] = bytes
-        .get(offset..offset + 2)
-        .ok_or(Error::Truncated)?
-        .try_into()
-        .map_err(|_| Error::Truncated)?;
-    Ok(u16::from_le_bytes(field))
-}
-
-fn u32_at(bytes: &[u8], offset: usize) -> Result<u32, Error> {
-    let field: [u8; 4] = bytes
-        .get(offset..offset + 4)
-        .ok_or(Error::Truncated)?
-        .try_into()
-        .map_err(|_| Error::Truncated)?;
-    Ok(u32::from_le_bytes(field))
-}
-
-fn u64_at(bytes: &[u8], offset: usize) -> Result<u64, Error> {
-    let field: [u8; 8] = bytes
-        .get(offset..offset + 8)
-        .ok_or(Error::Truncated)?
-        .try_into()
-        .map_err(|_| Error::Truncated)?;
-    Ok(u64::from_le_bytes(field))
 }
 
 #[cfg(test)]

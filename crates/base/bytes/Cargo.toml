@@ -1,5 +1,5 @@
 [package]
-name = "molt-domain"
+name = "molt-bytes"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,9 +7,6 @@ publish = false
 
 [lints]
 workspace = true
-
-[dependencies]
-molt-bytes.workspace = true
 
 [lib]
 bench = false

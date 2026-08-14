@@ -16,6 +16,8 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
+use molt_bytes::Bytes;
+
 use crate::bitmap::Bitmap;
 use crate::crc::Crc;
 use crate::layout::{BLOCK, Kind, MAX_NAME, Object, Super};
@@ -400,10 +402,10 @@ impl Node {
     }
 
     fn parse(spare: &mut Spare, block: &[u8; BLOCK]) -> Result<Unique<Self>, FsError> {
-        if block[..MAGIC.len()] != MAGIC || u32_at(block, 8) != 5 {
+        if block[..MAGIC.len()] != MAGIC || block.read_le::<u32>(8).unwrap() != 5 {
             return Err(FsError::Corrupt);
         }
-        if node_crc(block) != u32_at(block, 32) {
+        if node_crc(block) != block.read_le::<u32>(32).unwrap() {
             return Err(FsError::Checksum);
         }
         let level = block[12];
@@ -411,7 +413,7 @@ impl Node {
         if level as usize >= MAX_HEIGHT || len == 0 || len > CAPACITY {
             return Err(FsError::Corrupt);
         }
-        let mut node = Self::inner(spare, level, u64_at(block, 16))?;
+        let mut node = Self::inner(spare, level, block.read_le::<u64>(16).unwrap())?;
         node.len = len as u8;
         for at in 0..len {
             let start = HEADER + at * KEY_BYTES;
@@ -429,7 +431,7 @@ impl Node {
             }
         } else {
             for at in 0..=len {
-                node.children[at] = u64_at(block, values + at * 8);
+                node.children[at] = block.read_le::<u64>(values + at * 8).unwrap();
                 if node.children[at] == 0 {
                     return Err(FsError::Corrupt);
                 }
@@ -1056,14 +1058,6 @@ fn node_crc(block: &[u8; BLOCK]) -> u32 {
     crc.update(&[0; 4]);
     crc.update(&block[36..]);
     crc.finish()
-}
-
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("fixed node field"))
-}
-
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(bytes[at..at + 8].try_into().expect("fixed node field"))
 }
 
 const _: () = assert!(HEADER + CAPACITY * KEY_BYTES + (CAPACITY + 1) * VALUE_BYTES <= BLOCK);
