@@ -1,9 +1,9 @@
-//! What this crate's property sweeps share on top of [`molt_churn`].
+//! What this crate's property sweeps share on top of [`churn`].
 
 #![allow(dead_code)]
 
+pub use churn::{MOVES, Seen, sweep};
 use molt_arch::va::Class;
-pub use molt_churn::{MOVES, Seen, sweep};
 use proptest::prelude::*;
 
 /// A page class, uniformly. Every sweep here is over a space cut into one arena

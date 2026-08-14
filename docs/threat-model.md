@@ -108,7 +108,7 @@ harmless. It is, under this rule.
 An ASID keys TLB entries so a domain switch is a `satp` write and not a flush.
 It does not grant anything: two views with the same tag would alias, which is
 why tags are never reused without the generation check in
-[`crates/molt-arch/src/asid.rs`](../crates/molt-arch/src/asid.rs). `Asids::live`
+[`crates/sys/arch/src/asid.rs`](../crates/sys/arch/src/asid.rs). `Asids::live`
 compares the generation a tag was issued in against the current one; a tag from
 a previous generation is dead, and `assign` returns `Flush::Everything` on the
 wrap that makes it so.
@@ -149,12 +149,12 @@ design and does.
 Which domain an endpoint lands in is decided by the kernel and by nothing else,
 which is what keeps "one domain per endpoint" from being one domain per two.
 The identifier an endpoint is isolated by is
-[`Address::requester`](../crates/molt-pci/src/lib.rs) — bus, device, and
+[`Address::requester`](../crates/device/pci/src/lib.rs) — bus, device, and
 function packed into disjoint fields, read off where the function answered
 rather than out of anything it reported about itself, so two functions cannot
 become one endpoint by claiming the same name. The number it is attached to is
 the lowest one no live attachment holds, taken from the kernel's own table
-([`Domains::reserve`](../crates/molt-virtio/src/iommu.rs)), which refuses a
+([`Domains::reserve`](../crates/device/virtio/src/iommu.rs)), which refuses a
 second domain to a device that already has one and never hands out domain zero
 — the identifier an ATTACH request that was never encoded would carry.
 
@@ -174,7 +174,7 @@ is where a design review earns its keep.
 
 ### What today's ring does under a lying producer
 
-[`crates/molt-core/src/ring.rs`](../crates/molt-core/src/ring.rs) is an SPSC
+[`crates/sys/core/src/ring.rs`](../crates/sys/core/src/ring.rs) is an SPSC
 ring whose consumer end reads:
 
 ```rust
@@ -426,7 +426,7 @@ questions for every commit in Stage 5.0 and after:
 - **The ring validator is swept, not coverage-guided.** The parser has a
   libFuzzer target ([`fuzz/fuzz_targets/call_parse.rs`](../fuzz/fuzz_targets/call_parse.rs))
   and the hostile index sequences have a proptest sweep
-  ([`ring_churn.rs`](../crates/molt-abi/tests/ring_churn.rs), which moves `tail`
+  ([`ring_churn.rs`](../crates/base/abi/tests/ring_churn.rs), which moves `tail`
   and `head` to wherever it likes and floors its own coverage). What is missing
   is coverage guidance on the *indices*: a random walk reaches a wrap it was not
   steered towards less often than a fuzzer following new branches would.

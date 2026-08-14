@@ -13,8 +13,8 @@ use molt_arch::memory::{Rights, Span};
 use molt_arch::refcount::{self, Leaves, Run};
 use molt_arch::va::{Class, Extent, Region};
 use molt_arch::{BootInfo, FRAME_SIZE, Platform, PlatformError, SerialWriter, View, view};
-use molt_exec::Executor;
 use molt_kernel::report;
+use molt_rt::Executor;
 
 use crate::config::CONFIG;
 use crate::space;

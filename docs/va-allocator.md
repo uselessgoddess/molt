@@ -8,8 +8,8 @@ addresses cannot be handed out, recycled, and kept globally unique at a sane
 cost, the SASOS argument collapses and Molt is back to one page table per
 program.
 
-The code is [`crates/molt-arch/src/va.rs`](../crates/molt-arch/src/va.rs); the
-claims below are pinned by [`crates/molt-arch/tests/va.rs`](../crates/molt-arch/tests/va.rs).
+The code is [`crates/sys/arch/src/va.rs`](../crates/sys/arch/src/va.rs); the
+claims below are pinned by [`crates/sys/arch/tests/va.rs`](../crates/sys/arch/tests/va.rs).
 
 The host tests are not the whole evidence. `MOLT_VA_OK` runs the same round trip
 inside a booted kernel, over a `Space` cut from the width the hardware admitted
@@ -362,7 +362,7 @@ flushed through, which is the same shape as the shootdown protocol in
   ticket lock in [`kernel/src/space.rs`](../kernel/src/space.rs), and every
   consumer borrows it: the addresses in `MOLT_GRANT_OK` and `MOLT_FILE_MAP_OK`
   are cut there and mapped by
-  [`grant`](../crates/molt-arch/src/platform.rs). What is missing is a second
+  [`grant`](../crates/sys/arch/src/platform.rs). What is missing is a second
   claimant — until domains run, the uniqueness the lock protects is untested by
   anything but `contention.rs`.
 - **`O(holes)` search.** Fine at 64 slots, wrong at 64 000. If a real workload

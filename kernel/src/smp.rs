@@ -17,7 +17,7 @@ use core::task::Poll;
 use molt_arch::va::Epoch;
 use molt_arch::{CpuId, Local, Platform, Shootdown, Smp, Stack, Tlb};
 use molt_core::peers::Peers;
-use molt_exec::{Executor, Handle, Machine};
+use molt_rt::{Executor, Handle, Machine};
 
 /// Blocks the platforms keep, which is the ceiling on cores molt numbers.
 pub(crate) const MAX: usize = 8;

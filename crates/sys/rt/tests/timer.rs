@@ -4,7 +4,7 @@ use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 
-use molt_exec::{HORIZON, Machine, Sleep, Timers};
+use molt_rt::{HORIZON, Machine, Sleep, Timers};
 
 #[test]
 fn fires_at_deadline() {

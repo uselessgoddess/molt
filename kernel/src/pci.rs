@@ -3,9 +3,9 @@ use core::sync::atomic::{AtomicU16, Ordering};
 use molt_arch::memory::{Inventory, Rights};
 use molt_arch::{BootInfo, CpuId, Mmio, MsiMessage, Platform, SerialWriter, Sink};
 use molt_core::interrupt::{InterruptSlab, InterruptToken};
-use molt_exec::Handle;
 use molt_kernel::report;
 use molt_pci::{Bus, Command, Function, bus_span, preferred};
+use molt_rt::Handle;
 
 const LINES: usize = 16;
 

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread;
 
-use molt_exec::{Executor, Machine, Priority, Solo, SpawnError};
+use molt_rt::{Executor, Machine, Priority, Solo, SpawnError};
 
 static SOLO: Solo = Solo;
 static CLOCK: Clock = Clock(AtomicU64::new(0));

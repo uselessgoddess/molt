@@ -1,4 +1,4 @@
-use molt_churn::{Seen, sweep};
+use churn::{Seen, sweep};
 use molt_net::icmpv6::Message;
 use molt_net::ipv4::Packet as Ipv4;
 use molt_net::ipv6::Packet as Ipv6;

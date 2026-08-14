@@ -14,7 +14,7 @@ than an opinion.
 ## The shell already exists
 
 It is worth starting here, because it changes the shape of the question.
-`crates/molt-shell` is a `no_std` cell that acquires a directory capability,
+`crates/user/shell` is a `no_std` cell that acquires a directory capability,
 submits `molt_fs::FsOp` on a ring, and awaits `FsDone`. Its own module
 documentation states the rule it was written to:
 
@@ -131,7 +131,7 @@ path of least resistance.
 Nothing, deliberately. A `molt-user` crate: `no_std`, `alloc`, a global allocator
 over the sandbox's own heap, and typed wrappers over the `molt-abi` operations —
 `Handle`, the ring client, and futures that complete when a `RequestId` comes
-back. `molt-alloc` and `molt-exec` already exist and are already `no_std`, so
+back. `molt-alloc` and `molt-rt` already exist and are already `no_std`, so
 the sandbox runs the same allocator and the same executor as the kernel.
 
 Porting `std` instead would mean writing a platform layer, and a platform layer

@@ -129,7 +129,7 @@ Per-sandbox cost on riscv64 is 4 GiB plus a rounding error, not 44 GiB.
 earlier revision of this section said five.
 
 What is left of the budget question is total address space, and that is now
-answered in code: `crates/platforms/riscv/src/paging.rs` probes `satp` widest
+answered in code: `crates/platform/riscv/src/paging.rs` probes `satp` widest
 first and takes Sv57 where the hart has it, asserted in the smoke as
 `MOLT_SATP_MODE: sv57`. 512 GiB became 128 PiB, so sandbox count is not a
 constraint on either port.

@@ -10,8 +10,8 @@ cargo-fuzz = true
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"] }
 libfuzzer-sys = "0.4.11"
-molt-abi = { path = "../crates/molt-abi" }
-molt-net = { path = "../crates/molt-net" }
+molt-abi = { path = "../crates/base/abi" }
+molt-net = { path = "../crates/stack/net" }
 
 [[bin]]
 name = "call_parse"

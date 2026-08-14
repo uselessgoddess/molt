@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Instant;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use molt_exec::{Executor, Solo};
+use molt_rt::{Executor, Solo};
 
 static SOLO: Solo = Solo;
 

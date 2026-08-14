@@ -9,7 +9,7 @@ publish = false
 molt-core.workspace = true
 
 [dev-dependencies]
-molt-churn.workspace = true
+churn.workspace = true
 proptest.workspace = true
 
 [lints]

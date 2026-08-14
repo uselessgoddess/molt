@@ -61,7 +61,7 @@ the code once it is compiled for a target and run under a real interrupt
 controller. It raises confidence a long way; it does not replace running on
 hardware that actually reorders.
 
-**Shape of the integration.** `crates/molt-core/src/sync.rs` is a shim in the
+**Shape of the integration.** `crates/sys/core/src/sync.rs` is a shim in the
 style cordyceps and tokio use: the crate imports its atomics, `UnsafeCell` and
 `spin_loop` from `sync`, which re-exports either `core::sync::atomic` or
 `loom::sync::atomic` depending on `cfg(loom)`. Constructors use a direct
@@ -305,7 +305,7 @@ where QEMU is not installed.
 Stage 3 added a layer the table above does not name: a test that measures stack
 depth. The kernel gives the boot path 128 KiB and no guard page, so a call that
 spends 78 KiB of frame is a fault waiting for a deeper caller — and nothing in
-the type system says so. `crates/molt-fs/tests/stack.rs` paints a 96 KiB window
+the type system says so. `crates/storage/fs/tests/stack.rs` paints a 96 KiB window
 with `0xa5`, runs one filesystem call over the same frames, and reads back how
 far down the mark was disturbed. Mount and commit each get 16 KiB.
 
@@ -319,7 +319,7 @@ Miri coverage instead. See [the stack budget](fs.md#the-stack-budget).
 
 The heap has the same shape of problem: `molt-fs` returns `FsError::Memory`
 instead of panicking, and nothing exercises that path on a host with gigabytes
-free. `crates/molt-fs/tests/memory.rs` is a separate binary because it installs
+free. `crates/storage/fs/tests/memory.rs` is a separate binary because it installs
 a `#[global_allocator]` that refuses allocations of a kilobyte or more — block
 buffers and tree nodes, not the harness's own — and only on the thread that
 asked for the refusal, so the tests still run in parallel. It shows a mount
@@ -345,7 +345,7 @@ thought of rather than a byte nobody expected. So each sweep generates a *list
 of moves* and replays it against a model. A move is a value and not a call
 because control flow cannot be shrunk: when a list fails, proptest cuts it down
 until nothing more can be dropped, and what a failure prints is the shortest
-churn that still reaches the bug. `crates/molt-churn` holds what they share — the
+churn that still reaches the bug. `crates/base/churn` holds what they share — the
 runner, and the coverage floors below.
 
 **Bytes nobody shaped, mutated toward coverage: [cargo fuzz].** The wire is the
@@ -385,11 +385,11 @@ states it had to reach, and each is named for the thing it is trying to break:
 
 | Sweep | What it must not find |
 | --- | --- |
-| `crates/molt-arch/tests/va_churn.rs` | an address handed out twice, or an arena that does not come back whole |
-| `crates/molt-arch/tests/refcount_churn.rs` | a count the model disagrees with, after any order of grant, revoke, split and merge |
-| `crates/molt-abi/tests/ring_churn.rs` | a lying producer read past its fault, or a corrupt head starving the kernel end |
-| `crates/molt-arch/tests/shootdown_churn.rs` | a round nobody can close, or an address stuck in quarantine |
-| `crates/molt-net/tests/frame_churn.rs` | a parser reading past the frame, or one that will not re-emit what it just parsed |
+| `crates/sys/arch/tests/va_churn.rs` | an address handed out twice, or an arena that does not come back whole |
+| `crates/sys/arch/tests/refcount_churn.rs` | a count the model disagrees with, after any order of grant, revoke, split and merge |
+| `crates/base/abi/tests/ring_churn.rs` | a lying producer read past its fault, or a corrupt head starving the kernel end |
+| `crates/sys/arch/tests/shootdown_churn.rs` | a round nobody can close, or an address stuck in quarantine |
+| `crates/stack/net/tests/frame_churn.rs` | a parser reading past the frame, or one that will not re-emit what it just parsed |
 
 The refcount sweep carries a model that knows only which bytes are held how many
 times — no classes, no records — so anything the table does with either, a split
@@ -407,7 +407,7 @@ on a copy and the churn carries on from where it was.
 Every structure in `molt-arch` takes `&mut self`, which says what a call needs
 and not where it comes from. In the kernel it comes from behind a ticket lock,
 and the sweeps above run one core at a time, so neither says anything about the
-order eight of them produce. `crates/molt-arch/tests/contention.rs` closes that: eight
+order eight of them produce. `crates/sys/arch/tests/contention.rs` closes that: eight
 host threads share one `Spinlock<Machine>` holding the real `Space`, `Leaves`,
 `Windows` and `Shootdown`, and each runs the sequence a core runs — take a
 window of a file or fill it, count the grant, give it back, hand the addresses

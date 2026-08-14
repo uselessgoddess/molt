@@ -5,7 +5,7 @@ use std::task::{Context, Waker};
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use molt_exec::{Machine, Sleep, Timers};
+use molt_rt::{Machine, Sleep, Timers};
 
 static CLOCK: Clock = Clock(AtomicU64::new(0));
 

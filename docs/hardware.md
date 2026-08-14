@@ -41,7 +41,7 @@ Everything from Stage 2.2 onwards â€” PCI, VirtIO, NVMe, networking, the IOMMU â
 would not run on any board in this price class, for three independent reasons.
 
 **Molt's RISC-V port finds PCI in exactly one way.** `ECAM` in
-[`crates/platforms/riscv/src/fdt.rs`](../crates/platforms/riscv/src/fdt.rs)
+[`crates/platform/riscv/src/fdt.rs`](../crates/platform/riscv/src/fdt.rs)
 matches a single `compatible` string:
 
 ```rust

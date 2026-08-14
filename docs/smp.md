@@ -5,7 +5,7 @@ Status: Stage 4.0–4.3 decision record, July 2026.
 Why a core shares nothing with its neighbours, what the four questions an
 executor asks the machine are, and what "shared nothing" costs where it is not
 free. Written as the record for `molt-core::cpu`, `molt-core::peers`, the
-`molt-exec` crate, `molt-alloc::Global`, `molt-arch`'s `Local`/`Smp` traits and
+`molt-rt` crate, `molt-alloc::Global`, `molt-arch`'s `Local`/`Smp` traits and
 `kernel/src/smp.rs`.
 
 ## The decision
@@ -32,7 +32,7 @@ than devices. That is a measurement, not a design.
 
 ## Four questions
 
-`molt-exec` names the machine under it as a trait, and it is deliberately tiny:
+`molt-rt` names the machine under it as a trait, and it is deliberately tiny:
 
 ```rust
 fn cpu(&self) -> CpuId;

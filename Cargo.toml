@@ -1,46 +1,11 @@
 [workspace]
 resolver = "3"
-members = [
-    "crates/limen",
-    "crates/molt-abi",
-    "crates/molt-alloc",
-    "crates/molt-arch",
-    "xtask",
-    "crates/molt-block",
-    "crates/molt-churn",
-    "crates/molt-core",
-    "crates/molt-exec",
-    "crates/molt-fs",
-    "crates/molt-net",
-    "crates/molt-nvme",
-    "crates/molt-pci",
-    "crates/molt-shell",
-    "crates/molt-tcp",
-    "crates/molt-udp",
-    "crates/molt-virtio",
-    "crates/platforms/*",
-    "kernel",
-]
-default-members = [
-    "xtask",
-    "crates/limen",
-    "crates/molt-abi",
-    "crates/molt-alloc",
-    "crates/molt-arch",
-    "crates/molt-block",
-    "crates/molt-churn",
-    "crates/molt-core",
-    "crates/molt-exec",
-    "crates/molt-fs",
-    "crates/molt-net",
-    "crates/molt-nvme",
-    "crates/molt-pci",
-    "crates/molt-shell",
-    "crates/molt-tcp",
-    "crates/molt-udp",
-    "crates/molt-virtio",
-    "crates/platforms/*",
-]
+# A group under `crates/` is a level in the dependency graph: a package there
+# may only reach into groups below its own. Adding one is creating a directory,
+# not editing this list.
+members = ["crates/*/*", "kernel", "xtask"]
+# The kernel is the one member a host cannot build, so it is the one exclusion.
+default-members = ["crates/*/*", "xtask"]
 
 [workspace.package]
 version = "0.1.0"
@@ -48,24 +13,24 @@ edition = "2024"
 rust-version = "1.85"
 
 [workspace.dependencies]
-limen = { path = "crates/limen" }
-molt-abi = { path = "crates/molt-abi" }
-molt-alloc = { path = "crates/molt-alloc" }
-molt-arch = { path = "crates/molt-arch" }
-molt-block = { path = "crates/molt-block" }
-molt-churn = { path = "crates/molt-churn" }
-molt-core = { path = "crates/molt-core" }
-molt-exec = { path = "crates/molt-exec" }
-molt-fs = { path = "crates/molt-fs", default-features = false }
-molt-net = { path = "crates/molt-net" }
-molt-nvme = { path = "crates/molt-nvme" }
-molt-pci = { path = "crates/molt-pci" }
-molt-shell = { path = "crates/molt-shell" }
-molt-tcp = { path = "crates/molt-tcp" }
-molt-udp = { path = "crates/molt-udp" }
-molt-virtio = { path = "crates/molt-virtio" }
-molt-riscv = { path = "crates/platforms/riscv" }
-molt-x86_64 = { path = "crates/platforms/x86_64" }
+churn = { path = "crates/base/churn" }
+limen = { path = "crates/base/limen" }
+molt-abi = { path = "crates/base/abi" }
+molt-alloc = { path = "crates/base/alloc" }
+molt-arch = { path = "crates/sys/arch" }
+molt-block = { path = "crates/storage/block" }
+molt-core = { path = "crates/sys/core" }
+molt-fs = { path = "crates/storage/fs", default-features = false }
+molt-net = { path = "crates/stack/net" }
+molt-nvme = { path = "crates/device/nvme" }
+molt-pci = { path = "crates/device/pci" }
+molt-riscv = { path = "crates/platform/riscv" }
+molt-rt = { path = "crates/sys/rt" }
+molt-shell = { path = "crates/user/shell" }
+molt-tcp = { path = "crates/stack/tcp" }
+molt-udp = { path = "crates/stack/udp" }
+molt-virtio = { path = "crates/device/virtio" }
+molt-x86_64 = { path = "crates/platform/x86_64" }
 spin = { version = "0.12.2", default-features = false, features = ["once"] }
 # Only ever a dev-dependency: the property sweeps generate their moves with it
 # and shrink a counterexample down to the shortest list that still fails.

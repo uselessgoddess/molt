@@ -30,7 +30,7 @@ is really about.
 ## The queue is frames the kernel owns
 
 The queue is not allocated. It is *claimed*:
-[`Arena::claim`](../crates/molt-arch/src/dma.rs) takes a contiguous span of
+[`Arena::claim`](../crates/sys/arch/src/dma.rs) takes a contiguous span of
 frames from the same [`FrameAllocator`](memory.md) the kernel draws its own
 tables from, stamps them `Owner::Device(tag)` in a `FrameTable`, and hands
 regions out of that one span. So every byte the device can DMA into is a frame
@@ -49,18 +49,18 @@ silent overlap of two devices' DMA.
 The arena tracks its span a frame at a time, in the frame table it already
 keeps. A block read needs five regions — three ring structures, a
 request-header block, and a data buffer — and each claims the lowest free run
-long enough to hold it. [`release`](../crates/molt-arch/src/dma.rs) hands one
+long enough to hold it. [`release`](../crates/sys/arch/src/dma.rs) hands one
 region's frames back for the next region to use, so a driver that reprograms a
 queue reuses its span instead of running it down;
-[`reset`](../crates/molt-arch/src/dma.rs) evicts the tag wholesale, whatever is
+[`reset`](../crates/sys/arch/src/dma.rs) evicts the tag wholesale, whatever is
 still outstanding. Both are for a device already told to stop, which is the
 point the four semantics below are built around.
 
 ## Where a device address comes from
 
-The CPU reaches a [`Region`](../crates/molt-arch/src/dma.rs) through its private
-direct-map pointer, while a [`Mapper`](../crates/molt-arch/src/iommu.rs) turns
-the region's physical backing into a device-scoped [`Mapping`](../crates/molt-arch/src/iommu.rs).
+The CPU reaches a [`Region`](../crates/sys/arch/src/dma.rs) through its private
+direct-map pointer, while a [`Mapper`](../crates/sys/arch/src/iommu.rs) turns
+the region's physical backing into a device-scoped [`Mapping`](../crates/sys/arch/src/iommu.rs).
 The identity backend's IOVA equals the physical base; the VirtIO-IOMMU backend
 allocates a translated IOVA. The queue does not know or care which was chosen.
 
@@ -89,7 +89,7 @@ question a shared ring keeps asking — *who is allowed to touch this descriptor
 now* — and they are worth stating as promises.
 
 **Backpressure is the queue refusing, not the queue growing.** The free
-descriptor list is a fixed stack sized at [`MAX_SIZE`](../crates/molt-virtio/src/queue.rs);
+descriptor list is a fixed stack sized at [`MAX_SIZE`](../crates/device/virtio/src/queue.rs);
 `Queue::push` reserves a whole chain before writing any of it and returns
 `VirtioError::Full` when the chain will not fit. There is no heap to grow into
 and no blocking — `Full` is the signal a caller drains completions against
@@ -104,7 +104,7 @@ completed request. Only an empty final poll becomes `BlockError::Timeout`.
 
 **Cancellation gives up on a request without lying about its descriptors.**
 This is the subtle one. When `read` times out it calls
-[`Requests::cancel`](../crates/molt-virtio/src/request.rs) — but it does *not*
+[`Requests::cancel`](../crates/device/virtio/src/request.rs) — but it does *not*
 free the descriptor head. The device may still be about to write that buffer;
 handing the head back to the free list would let the next request reuse a
 descriptor the device is mid-DMA into. So the head and that request's bounce
@@ -127,7 +127,7 @@ a driver cannot submit through a block queue whose mappings it returned.
 
 ## Bringing the device up
 
-The handshake in [`config.rs`](../crates/molt-virtio/src/config.rs) is the
+The handshake in [`config.rs`](../crates/device/virtio/src/config.rs) is the
 modern one and has exactly one point of policy: `negotiate` always demands
 `VIRTIO_F_VERSION_1` and refuses a device that will not offer it. There is no
 legacy fallback. A device that clears `FEATURES_OK` after the driver writes it,

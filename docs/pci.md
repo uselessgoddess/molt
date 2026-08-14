@@ -30,7 +30,7 @@ you were not given.
 ## Authority is the window
 
 Everything in `molt-pci` operates on an
-[`Mmio`](../crates/molt-arch/src/mmio.rs) window the platform already mapped.
+[`Mmio`](../crates/sys/arch/src/mmio.rs) window the platform already mapped.
 The window *is* the authority: a caller who holds none cannot reach the bus,
 and one holding a function's window cannot reach the function beside it,
 because `Mmio::subwindow` only ever narrows.
@@ -56,7 +56,7 @@ design exists to avoid — `Bus::function` is a plain lending method.
 Nothing in `molt-pci` maps memory. The chain is:
 
 1. Firmware says where configuration space is —
-   [`ConfigSpace`](../crates/molt-arch/src/pci.rs), read from an ACPI `MCFG`
+   [`ConfigSpace`](../crates/sys/arch/src/pci.rs), read from an ACPI `MCFG`
    allocation on x86_64 and from a `pci-host-ecam-generic` node on RISC-V.
 2. `bus_span` turns "bus 0 of that space" into a `Span`, one bus at a time. A
    whole segment is 256 MiB of window for what is usually a handful of

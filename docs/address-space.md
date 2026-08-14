@@ -58,7 +58,7 @@ RISC-V port implemented Sv39 and only Sv39: 512 GiB, with device windows at
 
 ## What shipped with this document
 
-`crates/platforms/riscv/src/paging.rs` builds its tree three levels deep, as it
+`crates/platform/riscv/src/paging.rs` builds its tree three levels deep, as it
 always did, and then roots it as deep as the hart allows. Each level above Sv39
 costs one extra table whose entry 0 points at the root below, so two frames buy
 the option on both Sv48 and Sv57. The probe is the privileged spec's own rule:
@@ -250,11 +250,11 @@ once, given an address out of the same allocator everything else uses, and that
 address is what the window is called in every view that holds it. Handing it to a
 second domain adds a leaf and moves no bytes, so `copy_from_user` has nothing to
 do — the buffer is already at the address both ends name it by.
-[`crates/molt-arch/src/cache.rs`](../crates/molt-arch/src/cache.rs) is the
+[`crates/sys/arch/src/cache.rs`](../crates/sys/arch/src/cache.rs) is the
 bookkeeping and nothing more: which windows are cached, at which addresses, over
 which frames, and how many views hold each. Reading the bytes in stays the
 filesystem's, mapping them stays `Platform::grant`, and counting the leaves a
-grant shares stays [`refcount`](../crates/molt-arch/src/refcount.rs). Eviction
+grant shares stays [`refcount`](../crates/sys/arch/src/refcount.rs). Eviction
 hands the extent back out rather than dropping it, because the caller still owes
 the unmap, the shootdown, and the retire, in that order.
 
@@ -349,7 +349,7 @@ design does not have. This is the piece the whole tiering rests on, so it has
 its own design document — [`docs/va-allocator.md`](va-allocator.md) — covering
 the policy, why buddy and slab were both rejected, why compaction is never an
 option, and what happens to a freed address before it is reused. It is code and
-tests today ([`crates/molt-arch/src/va.rs`](../crates/molt-arch/src/va.rs)) and
+tests today ([`crates/sys/arch/src/va.rs`](../crates/sys/arch/src/va.rs)) and
 `MOLT_VA_OK` prints a live carve from a booted kernel.
 
 **TLB shootdown and ASID lifetime.** Revocation must reach every hart that could
@@ -378,7 +378,7 @@ against it.
 most on RV64, and the specification declines to say how many a hart implements:
 the field is WARL and its width is UNSPECIFIED. So the kernel writes ones into
 the whole field, reads back what stuck, and counts the low contiguous run —
-[`Asid::width`](../crates/platforms/riscv/src/satp.rs). Only the *contiguous*
+[`Asid::width`](../crates/platform/riscv/src/satp.rs). Only the *contiguous*
 run counts, because WARL lets a hart keep a high bit it does not decode, and two
 domains whose tags alias in the bits that do decode is worse than no tags at
 all. QEMU's `virt` answers 16, so 65 535 concurrent domains with tag 0 reserved
@@ -391,7 +391,7 @@ why the number the kernel prints is `CR4.PCIDE` read back after the write.
 worrying about: 32 harts, domains created and destroyed continuously. Tags are
 handed out until the space wraps; the wrap bumps a generation and every hart
 must flush, because there is no per-tag invalidate cheaper than the flush at
-that point ([`crates/molt-arch/src/asid.rs`](../crates/molt-arch/src/asid.rs)).
+that point ([`crates/sys/arch/src/asid.rs`](../crates/sys/arch/src/asid.rs)).
 So the cost is one all-hart flush per 65 535 domain creations. A workload that
 creates a domain every microsecond — which would be extraordinary, since a
 domain is a page table and a set of capabilities — reaches a rollover every

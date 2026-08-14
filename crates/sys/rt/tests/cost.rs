@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use molt_core::cpu::CpuId;
-use molt_exec::{Executor, Machine, Sleep, Solo, SpawnError, Timers};
+use molt_rt::{Executor, Machine, Sleep, Solo, SpawnError, Timers};
 
 #[global_allocator]
 static ALLOC: Counter = Counter;

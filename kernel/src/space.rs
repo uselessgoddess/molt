@@ -19,7 +19,7 @@ use core::cell::UnsafeCell;
 use molt_arch::Shootdown;
 use molt_arch::va::{Epoch, Extent, Hole, Space, Widths};
 use molt_core::lock::{Guard, Spinlock};
-use molt_exec::Executor;
+use molt_rt::Executor;
 
 use crate::config::HOLES;
 use crate::smp;

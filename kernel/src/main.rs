@@ -15,7 +15,7 @@ use molt_core::capability::{CapabilityError, CapabilityTable, ReadWrite};
 use molt_core::cell::{Cell, CellId, Handler, RestartHooks, Supervisor};
 use molt_core::completion::{CompletionError, CompletionSlab};
 use molt_core::ring::{Completion, IoRing, Submission};
-use molt_exec::Executor;
+use molt_rt::Executor;
 
 extern crate alloc;
 

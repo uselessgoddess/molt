@@ -37,9 +37,9 @@ which runs each libFuzzer target for a minute. It is not part of `just pre`
 because a search that found nothing in a minute is not a pass — give it longer
 (`just fuzz 600`) when the change is to the parsing itself rather than around
 it. Property sweeps live next to the code they churn, share their runner
-through `molt-churn`, and are expected to fail when the code is wrong — each was
+through `churn`, and are expected to fail when the code is wrong — each was
 checked by putting the bug back under it, which
 [`docs/testing.md`](docs/testing.md) records. The same applies to
-`molt-arch/tests/contention.rs`, which runs the
+`sys/arch/tests/contention.rs`, which runs the
 machine-wide tables under eight threads: a change to what those tables do while
 the lock is held belongs there rather than in a single-core test.

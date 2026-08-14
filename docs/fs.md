@@ -53,7 +53,7 @@ arrive here in the cheapest form that is still the real thing.
 **Checksums cover both metadata and payload.** Every tree node has its own
 crc32c. Each payload record has one crc32c per 4 KiB chunk, the superblock
 commits the ordered record-header stream, and the superblock has another crc32c
-over its own fields. [`Volume::mount`](../crates/molt-fs/src/volume.rs) verifies
+over its own fields. [`Volume::mount`](../crates/storage/fs/src/volume.rs) verifies
 the candidate's complete metadata tree and log structure before it becomes
 visible and falls back to the other superblock if either is damaged. Payload
 chunks are verified when read, so mounting does not scale with file-data size.
@@ -108,7 +108,7 @@ What was deliberately *not* taken:
 
 Two superblocks, one fixed tree arena, and three payload banks; all numbers are
 little-endian and all physical addresses are blocks.
-[`layout.rs`](../crates/molt-fs/src/layout.rs) is the definition; both the
+[`layout.rs`](../crates/storage/fs/src/layout.rs) is the definition; both the
 reader and `xtask mkfs` compile against it, so there is no second copy of the
 format to drift.
 
@@ -238,7 +238,7 @@ measured 78 912 bytes of stack and one `create` 98 304. On the host those frames
 are free; on the kernel stack they are two operations from an overflow that has
 no guard page under it.
 
-`crates/molt-fs/tests/stack.rs` is the record. It paints a 96 KiB window in a
+`crates/storage/fs/tests/stack.rs` is the record. It paints a 96 KiB window in a
 frame below the current one, runs a single mount or a single create/sync, and
 reads back how far the paint was disturbed. Both budgets are 16 KiB and both
 pass with room: in a debug build `Journal::mount` spends 10 264 bytes, a create
@@ -257,7 +257,7 @@ The trade is honest rather than free: a bounded array cannot fail, and a heap
 can. `FsError::Full` still reports the arena and log bounds, and an exhausted
 heap is `FsError::Memory` next to it — a filesystem that already answers errors
 has no business taking the machine down over one node it could not get.
-`crates/molt-fs/src/mem.rs` is where that mapping lives: `Box::try_new_zeroed`,
+`crates/storage/fs/src/mem.rs` is where that mapping lives: `Box::try_new_zeroed`,
 `Rc::try_new_zeroed`, and `try_reserve` behind names the call sites use, so no
 allocation in the crate reaches `handle_alloc_error`. `mkfs` is the exception
 and stays infallible — it runs on a host, behind a feature the kernel does not
@@ -272,7 +272,7 @@ with `shared()`.
 
 Bounding the filesystem's demand is still what keeps refusal rare: the cache is
 sixteen nodes reserved at mount, a path is `MAX_HEIGHT` block numbers, and a
-mutation allocates a replacement path, not a tree. `crates/molt-fs/tests/memory.rs`
+mutation allocates a replacement path, not a tree. `crates/storage/fs/tests/memory.rs`
 is the proof it is handled rather than merely typed — it replaces the global
 allocator with one that refuses large allocations on the calling thread, and
 shows a mount answering `FsError::Memory` and a refused create rolling back to
@@ -283,7 +283,7 @@ writes, and what the retired one parsed to is dead the moment it is: the cache
 hands the node back — when a write displaces its entry, or when `release`
 returns the block to the arena — and `Spare` keeps up to `MAX_HEIGHT + 1` of
 those allocations, zeroing one in place when the next node is asked for.
-`crates/molt-fs/tests/cost.rs` counts what an operation asks the allocator for
+`crates/storage/fs/tests/cost.rs` counts what an operation asks the allocator for
 rather than timing it: a read costs nothing at all, a write costs nothing of a
 block's size, and what is left of a write is the bitmaps its transaction opens
 with. Without the pool the same test measures 709 block-sized allocations over
@@ -398,7 +398,7 @@ it, and would find out only when a handle came back `Stale` — three operations
 later, from the middle of a command. Naming the *publication* instead means the
 service's restart hooks withdraw it, so the next `endpoint` call fails at the
 first hop with `CapabilityError::Stale` and the client re-acquires there. That is
-what [`molt_fs::Teardown`](../crates/molt-fs/src/restart.rs) does between
+what [`molt_fs::Teardown`](../crates/storage/fs/src/restart.rs) does between
 `cancel_requests` and the remount, and what `Fs::publish` restores afterwards.
 The mount is published for the service's own `CellId`, so revoking a *client*
 cannot take the publication down with it.
@@ -457,7 +457,7 @@ boundary that was already load-bearing rather than inventing one.
 session — the lease goes, the pending request is abandoned, and the completions
 still in the ring are drained so the next command does not read an answer to a
 question the previous epoch asked. Its supervisor's hooks are
-[`Disconnect`](../crates/molt-fs/src/restart.rs), which cancels what the shell
+[`Disconnect`](../crates/storage/fs/src/restart.rs), which cancels what the shell
 submitted and revokes what it held, because a cell that has stopped cannot close
 its own handles. That is the second half of the restart story: until now every
 revocation in the system was the service taking back what it had minted, and
@@ -663,7 +663,7 @@ a stream reach eight.
 machine, so they are a test rather than a benchmark: a 256 KiB file read through
 a 4 KiB window costs 97 fetches where the single-block window cost 255, and half
 the windows fetch nothing at all, because what they wanted landed while the
-window before them was being filled. `crates/molt-fs/tests/reads.rs` asserts
+window before them was being filled. `crates/storage/fs/tests/reads.rs` asserts
 both, and both fail on the commit before the ring.
 
 **What it cost, over loopback.** Medians of three interleaved rounds against the
@@ -838,7 +838,7 @@ line editor away and needs a serial `read` before it is worth writing.
   and it is a window, not a cache: it holds what one mount is doing now, and
   forgets it when the slot is worth more. A cache that outlives the operation is
   the page cache below. That cache now exists —
-  [`molt_arch::cache`](../crates/molt-arch/src/cache.rs), which remembers which
+  [`molt_arch::cache`](../crates/sys/arch/src/cache.rs), which remembers which
   window of which file is mapped at which address, so a second domain asking for
   it is told the address the first was told and no bytes move — but it is read
   only, and deliberately: a mapped window that a domain may write is a dirty page
@@ -947,7 +947,7 @@ was enough for a boot image and wrong for a filesystem: 255 is the limit every
 mainstream filesystem settled on, and the largest a one-byte inline length can
 hold. Version 5 stores that byte and the name directly in each `Dirent` key, so
 the tree's ordering is the directory's ordering and a lookup needs no second
-name arena read. The same inline [`Name`](../crates/molt-fs/src/name.rs) a ring
+name arena read. The same inline [`Name`](../crates/storage/fs/src/name.rs) a ring
 carries is 256 bytes, and with it every ring slot: `FsOp` and `FsDone` reach 272
 bytes each. The alternative considered was a `Cow`-shaped name —
 inline for short leaves, a registered-buffer reference for long ones — and it

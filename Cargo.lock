@@ -140,6 +140,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "churn"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "ciborium"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -539,7 +546,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "molt-abi"
 version = "0.1.0"
 dependencies = [
- "molt-churn",
+ "churn",
  "proptest",
 ]
 
@@ -554,7 +561,7 @@ dependencies = [
 name = "molt-arch"
 version = "0.1.0"
 dependencies = [
- "molt-churn",
+ "churn",
  "molt-core",
  "proptest",
 ]
@@ -568,27 +575,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "molt-churn"
-version = "0.1.0"
-dependencies = [
- "proptest",
-]
-
-[[package]]
 name = "molt-core"
 version = "0.1.0"
 dependencies = [
  "criterion",
  "limen",
-]
-
-[[package]]
-name = "molt-exec"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "limen",
- "molt-core",
 ]
 
 [[package]]
@@ -609,12 +600,12 @@ dependencies = [
  "molt-arch",
  "molt-block",
  "molt-core",
- "molt-exec",
  "molt-fs",
  "molt-net",
  "molt-nvme",
  "molt-pci",
  "molt-riscv",
+ "molt-rt",
  "molt-shell",
  "molt-tcp",
  "molt-udp",
@@ -626,7 +617,7 @@ dependencies = [
 name = "molt-net"
 version = "0.1.0"
 dependencies = [
- "molt-churn",
+ "churn",
  "molt-core",
  "proptest",
 ]
@@ -652,6 +643,15 @@ name = "molt-riscv"
 version = "0.1.0"
 dependencies = [
  "molt-arch",
+]
+
+[[package]]
+name = "molt-rt"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "limen",
+ "molt-core",
 ]
 
 [[package]]

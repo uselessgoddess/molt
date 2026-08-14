@@ -25,7 +25,7 @@ miri:
 
 loom:
     LOOM_MAX_PREEMPTIONS=2 RUSTFLAGS="--cfg loom" \
-        cargo test --package molt-core --package molt-exec --profile loom --lib
+        cargo test --package molt-core --package molt-rt --profile loom --lib
 
 x86_64-check:
     cargo clippy --package molt-kernel --target x86_64-unknown-none -- -D warnings
@@ -40,7 +40,7 @@ fuzz seconds="60":
     done
 
 bench-check:
-    cargo bench --package molt-core --package molt-exec --package molt-block --package molt-fs --no-run
+    cargo bench --package molt-core --package molt-rt --package molt-block --package molt-fs --no-run
 
 pre: fmt-check lint test doc x86_64-check riscv64gc-check bench-check loom
 

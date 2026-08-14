@@ -6,9 +6,9 @@
 //! the slot it owns or fault, and must fault only on a ring no honest producer
 //! could have published.
 
+use churn::{MOVES, Seen, sweep};
 use molt_abi::wire::APERTURE;
 use molt_abi::{Call, Channel, Fault, Handle, Next, Op, Region, Reply, SLOT_WORDS};
-use molt_churn::{MOVES, Seen, sweep};
 use proptest::prelude::*;
 use proptest::sample::Index;
 
