@@ -246,6 +246,13 @@ pub fn claim_ram(map: &dyn MemoryMap, count: u64) -> Result<Span, PlatformError>
     Ok(span)
 }
 
+/// Direct-map address of a span the caller already claimed.
+pub fn claimed_pointer(span: Span) -> Result<*mut u8, PlatformError> {
+    let state = active()?;
+    let address = state.offset.checked_add(span.start()).ok_or(address_error())?;
+    Ok(address as *mut u8)
+}
+
 /// Builds the kernel address space and returns its local APIC window.
 pub fn init(boot_info: &BootInfo<'_>) -> Result<u64, PlatformError> {
     let offset = boot_info.physical_offset().ok_or(PlatformError::MissingPhysicalMemoryMap)?;
@@ -549,7 +556,10 @@ pub fn grant(view: View, extent: &Extent, span: Span, rights: Rights) -> Result<
 
     let state = active()?;
     let root = state.views.root(view)?;
-    let flags = leaf_flags(rights, Cache::WriteBack);
+    // Every ordinary grant is a domain leaf. Gateway mappings use `map_leaf`
+    // directly without this bit, so ring 3 can reach exactly the admitted
+    // image and shared pages, never the supervisor trampoline.
+    let flags = leaf_flags(rights, Cache::WriteBack) | PageTableFlags::USER_ACCESSIBLE;
     let offset = state.offset;
     let mut frames = PoolFrames(&mut state.pool);
     for (address, frame) in backing {
@@ -630,6 +640,42 @@ pub fn resident(view: View, address: u64) -> Option<Leaf> {
     ViewWalk { offset: state.offset, root }.leaf(address)
 }
 
+/// Adds the supervisor-only entry stubs, context, and descriptor pages to
+/// `view`, then returns the tagged CR3 value used for user entry.
+pub(crate) fn prepare_domain(
+    view: View,
+    code: (u64, u64),
+    data: (u64, u64),
+    tables: &[(u64, u64)],
+) -> Result<u64, PlatformError> {
+    let state = active()?;
+    let root = state.views.root(view)?;
+    let offset = state.offset;
+    let executable = leaf_flags(Rights::READ_EXECUTE, Cache::WriteBack);
+    let writable = leaf_flags(Rights::READ_WRITE, Cache::WriteBack);
+    let readable = leaf_flags(Rights::READ, Cache::WriteBack);
+    for (range, flags) in [(code, executable), (data, writable)]
+        .into_iter()
+        .chain(tables.iter().copied().map(|range| (range, readable)))
+    {
+        let (mut address, end) = range;
+        if address % Size4KiB::SIZE != 0 || end % Size4KiB::SIZE != 0 || address >= end {
+            return Err(address_error());
+        }
+        while address < end {
+            let physical = match state.mapper().translate(VirtAddr::new(address)) {
+                TranslateResult::Mapped { frame, offset, .. } => {
+                    frame.start_address().as_u64() + offset
+                }
+                _ => return Err(PlatformError::Mapping(MappingError::Unmapped)),
+            };
+            map_leaf(offset, root, &mut PoolFrames(&mut state.pool), address, physical, flags, 0)?;
+            address += Size4KiB::SIZE;
+        }
+    }
+    Ok(root.start_address().as_u64() | u64::from(view.asid().value()))
+}
+
 /// Which entry of the level-`level` table covers `address`.
 const fn table_index(address: u64, level: usize) -> usize {
     ((address >> (12 + 9 * level)) & 0x1ff) as usize
@@ -654,7 +700,10 @@ fn map_leaf(
             let next = frames.allocate_frame().ok_or(out_of_frames())?;
             // SAFETY: a fresh pool frame, direct-mapped like every other.
             unsafe { &mut *table_pointer(offset, next) }.zero();
-            entry.set_frame(next, PageTableFlags::PRESENT | PageTableFlags::WRITABLE);
+            let pointer = PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | (flags & PageTableFlags::USER_ACCESSIBLE);
+            entry.set_frame(next, pointer);
         } else if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             // A larger leaf already covers this address; splitting one is not
             // something a grant is allowed to do behind the holder's back.

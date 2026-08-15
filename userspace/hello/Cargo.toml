@@ -1,0 +1,19 @@
+[package]
+name = "molt-hello"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+build = "build.rs"
+
+[dependencies]
+molt-program.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "molt-hello"
+path = "src/main.rs"
+test = false
+bench = false

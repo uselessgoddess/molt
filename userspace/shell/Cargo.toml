@@ -1,0 +1,22 @@
+[package]
+name = "molt-shell-image"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+build = "build.rs"
+
+[dependencies]
+molt-core.workspace = true
+molt-fs.workspace = true
+molt-shell.workspace = true
+molt-program.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "molt-shell"
+path = "src/main.rs"
+test = false
+bench = false

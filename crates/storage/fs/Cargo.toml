@@ -11,6 +11,7 @@ format = []
 
 [dependencies]
 molt-block.workspace = true
+molt-bytes.workspace = true
 molt-core.workspace = true
 
 [dev-dependencies]

@@ -287,10 +287,13 @@ rules a ring shared with a hostile domain has to obey — is
 [`docs/threat-model.md`](threat-model.md), written before the code so the code
 can be reviewed against it.
 
-**The kernel is not reachable.** Kernel memory is *absent* from a domain's view,
-not merely marked supervisor-only — no PTE, no address to speculate against, and
-`SUM` stays clear so even a kernel bug cannot casually dereference a domain
-address without meaning to.
+**The kernel is not reachable.** General kernel memory is *absent* from a
+domain's view, not merely marked supervisor-only — no physmap, heap, or kernel
+application data. A fixed supervisor-only transition island is the exception:
+both ports need entry code/context mapped under the active user root, and x86_64
+also needs the read-only descriptor pages the processor consults during a
+privilege change. They contain mechanism, not authority. `SUM` stays clear so a
+kernel bug cannot casually dereference a domain address without meaning to.
 
 **Another domain is not reachable by default.** A globally unique address is not
 a globally *present* one. An extent appears in a second view only when a
@@ -446,7 +449,10 @@ exists, the table above is a plan; after it, it is a property.
 | refcounts on the mapped leaf, not the frame | `MOLT_REFCOUNT_OK` | shipped: 100 GiB in 100 records, not 26 million |
 | a file mapped as an extent, read at its address | `MOLT_FILE_MAP_OK` | shipped: one window, two domains, one device read, no copy |
 | a second view with its own ASID | `MOLT_DOMAIN_OK` | shipped: tier 2 exists, with no kernel leaf in it |
-| a fault in a domain that stays there | `MOLT_DOMAIN_FAULT_OK` | the view is a boundary — needs the switch Stage 5.1 brings |
+| a writable-executable user image rejected before mapping | `MOLT_DOMAIN_WX_OK` | shipped: admission completes before mapper calls or execution |
+| a static binary enters user mode and exits | `MOLT_USER_HELLO_OK`, `MOLT_DOMAIN_EXIT_OK` | shipped on x86_64 and riscv64 through the same hostile ring ABI |
+| a fault in a domain that stays there | `MOLT_DOMAIN_FAULT_OK` | shipped: the view is a hardware-enforced boundary, exercised from inside |
+| the existing shell reaches a real filesystem through a domain | `MOLT_SHELL_DOMAIN_OK` | shipped: unchanged shell logic, domain adapter, mounted MoltFS |
 | grant and revoke of an extent between domains | `MOLT_GRANT_OK`, `MOLT_REVOKE_OK` | shipped: sharing needs a right, and taking it back needs an order |
 | a large leaf cut so part of it can be taken back | `MOLT_SPLIT_OK` | shipped: one leaf becomes 512 over the same frames, which is what a partial revoke costs |
 | an aperture inside a domain | `MOLT_SANDBOX_OK` | tier 1 nests in tier 2 |

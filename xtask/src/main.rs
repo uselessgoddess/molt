@@ -13,6 +13,8 @@ mod site;
 
 const X86_64_TARGET: &str = "x86_64-unknown-none";
 const RISCV64_TARGET: &str = "riscv64gc-unknown-none-elf";
+const X86_64_PROGRAM_TARGET: &str = "targets/x86_64-unknown-molt.json";
+const RISCV64_PROGRAM_TARGET: &str = "targets/riscv64gc-unknown-molt.json";
 
 /// The tree the smoke disk is built from, relative to the workspace root.
 const DISK_TREE: &str = "disk";
@@ -37,6 +39,11 @@ const BOOT_MARKERS: &[&str] = &[
     "MOLT_SPLIT_OK",
     "MOLT_REVOKE_OK",
     "MOLT_RING_FAULT_OK",
+    "MOLT_DOMAIN_WX_OK",
+    "MOLT_USER_HELLO_OK",
+    "MOLT_DOMAIN_EXIT_OK",
+    "MOLT_DOMAIN_FAULT_OK",
+    "MOLT_SHELL_DOMAIN_OK",
     "MOLT_TIMER_OK",
     "MOLT_CANCELLATION_OK",
     "MOLT_STALE_COMPLETION_OK",
@@ -368,6 +375,7 @@ fn build_images(case: Case) -> Result<Images, String> {
 
 fn build_kernel(target: &str, case: Case) -> Result<PathBuf, String> {
     let root = workspace_root();
+    let user = build_user_image(&root, target)?;
     let mut command = Command::new(cargo());
     command.current_dir(&root).args([
         "build",
@@ -377,6 +385,9 @@ fn build_kernel(target: &str, case: Case) -> Result<PathBuf, String> {
         target,
         "--release",
     ]);
+    command.env("MOLT_USER_IMAGE", &user.hello);
+    command.env("MOLT_SHELL_IMAGE", &user.shell);
+    command.env("MOLT_DOMAIN_DISK_IMAGE", &user.disk);
     for feature in case.features() {
         command.args(["--features", feature]);
     }
@@ -388,6 +399,58 @@ fn build_kernel(target: &str, case: Case) -> Result<PathBuf, String> {
         return Err(format!("kernel binary was not created at {}", kernel.display()));
     }
     Ok(kernel)
+}
+
+struct UserImages {
+    hello: PathBuf,
+    shell: PathBuf,
+    disk: PathBuf,
+}
+
+fn build_user_image(root: &Path, kernel_target: &str) -> Result<UserImages, String> {
+    let target = match kernel_target {
+        X86_64_TARGET => X86_64_PROGRAM_TARGET,
+        RISCV64_TARGET => RISCV64_PROGRAM_TARGET,
+        other => return Err(format!("no user target for kernel target {other}")),
+    };
+    let target_name = Path::new(target)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid user target {target}"))?;
+    let build = |package: &str, binary: &str| -> Result<PathBuf, String> {
+        let status = Command::new(cargo())
+            .current_dir(root)
+            .args([
+                "build",
+                "-Zbuild-std=core,alloc",
+                "-Zbuild-std-features=compiler-builtins-mem",
+                "-Zjson-target-spec",
+                "--package",
+                package,
+                "--target",
+                target,
+                "--release",
+            ])
+            .status()
+            .map_err(|error| format!("failed to start cargo: {error}"))?;
+        require_success(status, &format!("{package} image build"))?;
+        let image = target_dir(root).join(target_name).join("release").join(binary);
+        if !image.is_file() {
+            return Err(format!("user image was not created at {}", image.display()));
+        }
+        Ok(image)
+    };
+    let disk_dir = target_dir(root).join("molt");
+    fs::create_dir_all(&disk_dir)
+        .map_err(|error| format!("failed to create {}: {error}", disk_dir.display()))?;
+    let disk = disk_dir.join("molt-domain-disk.img");
+    fs::write(&disk, lay_out(&root.join(DISK_TREE))?)
+        .map_err(|error| format!("failed to write {}: {error}", disk.display()))?;
+    Ok(UserImages {
+        hello: build("molt-hello", "molt-hello")?,
+        shell: build("molt-shell-image", "molt-shell")?,
+        disk,
+    })
 }
 
 fn run_qemu_interactive(image: &Path) -> Result<(), String> {
