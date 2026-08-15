@@ -15,9 +15,6 @@
   "panic-strategy": "abort",
   "plt-by-default": false,
   "position-independent-executables": false,
-  "pre-link-args": {
-    "gnu-lld": ["-Ttargets/x86_64-unknown-molt.ld"]
-  },
   "relocation-model": "static",
   "rustc-abi": "softfloat",
   "stack-probes": { "kind": "inline" },

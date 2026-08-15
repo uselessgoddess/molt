@@ -16,9 +16,6 @@
   "os": "molt",
   "panic-strategy": "abort",
   "position-independent-executables": false,
-  "pre-link-args": {
-    "gnu-lld": ["-Ttargets/riscv64gc-unknown-molt.ld"]
-  },
   "relocation-model": "static",
   "target-pointer-width": 64,
   "vendor": "unknown"
