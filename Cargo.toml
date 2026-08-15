@@ -19,7 +19,7 @@ molt-abi = { path = "crates/base/abi" }
 molt-alloc = { path = "crates/base/alloc" }
 molt-arch = { path = "crates/sys/arch" }
 molt-block = { path = "crates/storage/block" }
-molt-bytes = { path = "crates/base/bytes" }
+repr = { path = "crates/base/repr" }
 molt-core = { path = "crates/sys/core" }
 molt-domain = { path = "crates/sys/domain" }
 molt-fs = { path = "crates/storage/fs", default-features = false }

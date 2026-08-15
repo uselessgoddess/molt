@@ -9,7 +9,7 @@ publish = false
 workspace = true
 
 [dependencies]
-molt-bytes.workspace = true
+repr.workspace = true
 
 [lib]
 bench = false

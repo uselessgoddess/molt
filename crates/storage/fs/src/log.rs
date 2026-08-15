@@ -1,6 +1,6 @@
 //! File payload records in the append-only checkpoint log.
 
-use molt_bytes::{Bytes, BytesMut};
+use repr::{Field, FieldMut};
 
 use crate::FsError;
 use crate::layout::BLOCK;
@@ -76,17 +76,17 @@ impl Record {
         header.fill(0);
         header[..MAGIC.len()].copy_from_slice(&MAGIC);
         header[4] = WRITE;
-        header.write_le(8, self.bytes).unwrap();
-        header.write_le(12, self.object).unwrap();
-        header.write_le(20, self.offset).unwrap();
+        header.put_le::<u32, 8>(self.bytes);
+        header.put_le::<u32, 12>(self.object);
+        header.put_le::<u64, 20>(self.offset);
     }
 
     pub fn parse(header: &[u8]) -> Result<Self, FsError> {
-        let header = header.get(..HEADER).ok_or(FsError::Corrupt)?;
+        let header = header.first_chunk::<HEADER>().ok_or(FsError::Corrupt)?;
         if header[..MAGIC.len()] != MAGIC {
             return Err(FsError::Corrupt);
         }
-        let payload = header.read_le::<u32>(8).unwrap();
+        let payload = header.field_le::<u32, 8>();
         if header[4] != WRITE
             || header[5..8].iter().any(|byte| *byte != 0)
             || header[16..20].iter().any(|byte| *byte != 0)
@@ -96,8 +96,8 @@ impl Record {
             return Err(FsError::Corrupt);
         }
         Ok(Self {
-            object: header.read_le::<u32>(12).unwrap(),
-            offset: header.read_le::<u64>(20).unwrap(),
+            object: header.field_le::<u32, 12>(),
+            offset: header.field_le::<u64, 20>(),
             bytes: payload,
         })
     }

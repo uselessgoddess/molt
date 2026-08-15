@@ -12,7 +12,7 @@
 #[cfg(test)]
 extern crate std;
 
-use molt_bytes::Bytes;
+use repr::{Field, records};
 
 const ELF_HEADER: usize = 64;
 const PROGRAM_HEADER: usize = 56;
@@ -157,23 +157,24 @@ struct Image {
 
 impl Image {
     fn parse(bytes: &[u8], architecture: Architecture) -> Result<Self, Error> {
-        let header = bytes.get(..ELF_HEADER).ok_or(Error::Truncated)?;
+        // The one length the image gets to decide. Every field below sits at a
+        // constant offset inside this window, so none of them can run off it.
+        let header = bytes.first_chunk::<ELF_HEADER>().ok_or(Error::Truncated)?;
         if header[..7] != [0x7f, b'E', b'L', b'F', 2, 1, 1]
-            || header.read_le::<u16>(16).ok_or(Error::Truncated)? != 2
-            || header.read_le::<u32>(20).ok_or(Error::Truncated)? != 1
-            || header.read_le::<u16>(52).ok_or(Error::Truncated)? as usize != ELF_HEADER
+            || header.field_le::<u16, 16>() != 2
+            || header.field_le::<u32, 20>() != 1
+            || header.field_le::<u16, 52>() as usize != ELF_HEADER
         {
             return Err(Error::Format);
         }
-        if header.read_le::<u16>(18).ok_or(Error::Truncated)? != architecture.machine() {
+        if header.field_le::<u16, 18>() != architecture.machine() {
             return Err(Error::Architecture);
         }
 
-        let entry = header.read_le::<u64>(24).ok_or(Error::Truncated)?;
-        let offset = usize::try_from(header.read_le::<u64>(32).ok_or(Error::Truncated)?)
-            .map_err(|_| Error::Truncated)?;
-        let size = header.read_le::<u16>(54).ok_or(Error::Truncated)? as usize;
-        let count = header.read_le::<u16>(56).ok_or(Error::Truncated)? as usize;
+        let entry = header.field_le::<u64, 24>();
+        let offset = usize::try_from(header.field_le::<u64, 32>()).map_err(|_| Error::Truncated)?;
+        let size = header.field_le::<u16, 54>() as usize;
+        let count = header.field_le::<u16, 56>() as usize;
         if size != PROGRAM_HEADER || count == 0 {
             return Err(Error::Format);
         }
@@ -188,10 +189,10 @@ impl Image {
         let mut image = Self { segments: [None; SEGMENTS], count: 0, entry };
         let mut prior_end = 0;
         let mut executable_entry = false;
-        for index in 0..count {
-            let at = offset + index * size;
-            let header = &bytes[at..at + size];
-            let kind = header.read_le::<u32>(0).ok_or(Error::Truncated)?;
+        // `size` was checked against `PROGRAM_HEADER` and `end` against the
+        // image, so the table divides exactly and holds `count` of them.
+        for header in records::<PROGRAM_HEADER>(&bytes[offset..end]) {
+            let kind = header.field_le::<u32, 0>();
             if matches!(kind, DYNAMIC | INTERP) {
                 return Err(Error::Unsupported);
             }
@@ -202,12 +203,12 @@ impl Image {
                 return Err(Error::TooManySegments);
             }
 
-            let flags = header.read_le::<u32>(4).ok_or(Error::Truncated)?;
-            let file_offset = header.read_le::<u64>(8).ok_or(Error::Truncated)?;
-            let virtual_address = header.read_le::<u64>(16).ok_or(Error::Truncated)?;
-            let file_size = header.read_le::<u64>(32).ok_or(Error::Truncated)?;
-            let memory_size = header.read_le::<u64>(40).ok_or(Error::Truncated)?;
-            let alignment = header.read_le::<u64>(48).ok_or(Error::Truncated)?;
+            let flags = header.field_le::<u32, 4>();
+            let file_offset = header.field_le::<u64, 8>();
+            let virtual_address = header.field_le::<u64, 16>();
+            let file_size = header.field_le::<u64, 32>();
+            let memory_size = header.field_le::<u64, 40>();
+            let alignment = header.field_le::<u64, 48>();
             let file_end = file_offset.checked_add(file_size).ok_or(Error::Segment)?;
             let memory_end = virtual_address.checked_add(memory_size).ok_or(Error::Segment)?;
             let mapped_end = memory_end

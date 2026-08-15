@@ -1,5 +1,5 @@
 [package]
-name = "molt-bytes"
+name = "repr"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
