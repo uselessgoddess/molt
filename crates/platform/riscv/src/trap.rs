@@ -148,7 +148,11 @@ extern "C" fn molt_trap_handler() {
 fn fatal(kind: &str, cause: usize) -> ! {
     let mut serial = SbiSerial::new();
     serial.init();
-    let _ =
-        writeln!(SerialWriter::new(&mut serial), "MOLT_EXCEPTION: {kind} scause=0x{cause:016x}");
+    let pc = csr::sepc();
+    let address = csr::stval();
+    let _ = writeln!(
+        SerialWriter::new(&mut serial),
+        "MOLT_EXCEPTION: {kind} scause=0x{cause:016x} sepc=0x{pc:016x} stval=0x{address:016x}"
+    );
     sbi::shutdown(false)
 }

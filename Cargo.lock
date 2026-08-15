@@ -583,12 +583,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "molt-domain"
+version = "0.1.0"
+dependencies = [
+ "repr",
+]
+
+[[package]]
 name = "molt-fs"
 version = "0.1.0"
 dependencies = [
  "criterion",
  "molt-block",
  "molt-core",
+ "repr",
+]
+
+[[package]]
+name = "molt-hello"
+version = "0.1.0"
+dependencies = [
+ "molt-program",
 ]
 
 [[package]]
@@ -600,6 +615,7 @@ dependencies = [
  "molt-arch",
  "molt-block",
  "molt-core",
+ "molt-domain",
  "molt-fs",
  "molt-net",
  "molt-nvme",
@@ -639,6 +655,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "molt-program"
+version = "0.1.0"
+dependencies = [
+ "molt-abi",
+]
+
+[[package]]
 name = "molt-riscv"
 version = "0.1.0"
 dependencies = [
@@ -661,6 +684,16 @@ dependencies = [
  "molt-block",
  "molt-core",
  "molt-fs",
+]
+
+[[package]]
+name = "molt-shell-image"
+version = "0.1.0"
+dependencies = [
+ "molt-core",
+ "molt-fs",
+ "molt-program",
+ "molt-shell",
 ]
 
 [[package]]
@@ -911,6 +944,10 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "repr"
+version = "0.1.0"
 
 [[package]]
 name = "rustix"

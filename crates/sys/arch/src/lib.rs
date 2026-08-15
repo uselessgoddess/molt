@@ -7,6 +7,7 @@ pub mod audit;
 pub mod cache;
 pub mod cpu;
 pub mod dma;
+pub mod domain;
 pub mod iommu;
 pub mod irq;
 pub mod memory;
@@ -24,6 +25,7 @@ use core::fmt;
 pub use molt_core::cpu::CpuId;
 
 pub use crate::cpu::Local;
+pub use crate::domain::{DomainExit, DomainState};
 pub use crate::irq::{FabricError, InterruptFabric, MsiMessage, Sink};
 pub use crate::memory::Cache;
 pub use crate::mmio::{DeviceMapper, Mmio, MmioError};

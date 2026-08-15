@@ -9,6 +9,8 @@
 mod ap;
 #[cfg(target_arch = "riscv64")]
 mod csr;
+#[cfg(target_arch = "riscv64")]
+mod domain;
 // SBI error decoding remains host-testable.
 mod error;
 // Reading a device tree is byte parsing, so it stays testable on the host too.
@@ -50,13 +52,13 @@ mod imp {
     use molt_arch::audit::Leaf;
     use molt_arch::memory::{Device, Rights, Span};
     use molt_arch::{
-        BootInfo, ConfigSpace, CpuId, DeviceMapper, Entry, ExitStatus, FRAME_SIZE, FabricError,
-        FrameCursor, InterruptFabric, Local, MappingError, MemoryMap, MemoryRegion,
-        MemoryRegionKind, Mmio, MsiMessage, Platform, PlatformError, SerialPort, SerialWriter,
-        Sink, Smp, SmpError, Stack, Tlb, View, va,
+        BootInfo, ConfigSpace, CpuId, DeviceMapper, DomainExit, DomainState, Entry, ExitStatus,
+        FRAME_SIZE, FabricError, FrameCursor, InterruptFabric, Local, MappingError, MemoryMap,
+        MemoryRegion, MemoryRegionKind, Mmio, MsiMessage, Platform, PlatformError, SerialPort,
+        SerialWriter, Sink, Smp, SmpError, Stack, Tlb, View, va,
     };
 
-    use crate::{ap, csr, fdt, paging, percpu, sbi, trap};
+    use crate::{ap, csr, domain, fdt, paging, percpu, sbi, trap};
 
     /// End of the QEMU `virt` board's default RAM, used only when there is no
     /// device tree to read it from.
@@ -420,6 +422,10 @@ _start:
             paging::claim_ram(boot_info, count)
         }
 
+        fn claimed_pointer(&mut self, span: Span) -> Result<*mut u8, PlatformError> {
+            paging::claimed_pointer(span)
+        }
+
         fn open_view(&mut self, asid: Asid) -> Result<View, PlatformError> {
             paging::open_view(asid)
         }
@@ -444,6 +450,10 @@ _start:
 
         fn resident(&self, view: View, address: u64) -> Option<Leaf> {
             paging::resident(view, address)
+        }
+
+        fn enter_domain(&mut self, state: &mut DomainState) -> Result<DomainExit, PlatformError> {
+            domain::enter(state)
         }
 
         fn terminate(&mut self, status: ExitStatus) -> ! {

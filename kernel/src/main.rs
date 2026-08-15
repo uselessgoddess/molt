@@ -97,6 +97,9 @@ fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
     domain::smoke(boot_info, platform, exec);
     ring::smoke(platform);
 
+    #[cfg(molt_user_image)]
+    domain::user_smoke(boot_info, platform);
+
     run_timer_future(exec);
     report!(platform, "MOLT_TIMER_OK");
 

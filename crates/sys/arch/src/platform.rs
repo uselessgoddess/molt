@@ -9,8 +9,8 @@ use crate::audit::Leaf;
 use crate::irq::{FabricError, Sink};
 use crate::mmio::DeviceMapper;
 use crate::{
-    BootInfo, ConfigSpace, FrameCursor, InterruptFabric, Local, MappingError, RunError, SerialPort,
-    SerialWriter, Smp, View, asid, memory, va, view,
+    BootInfo, ConfigSpace, DomainExit, DomainState, FrameCursor, InterruptFabric, Local,
+    MappingError, RunError, SerialPort, SerialWriter, Smp, View, asid, memory, va, view,
 };
 
 /// Interrupt routing implemented by a concrete architecture crate.
@@ -201,6 +201,20 @@ pub trait Platform: DeviceMapper + InterruptFabric + Local + Smp {
     /// domain marker evidence about the hardware rather than about intent.
     fn resident(&self, _view: View, _address: u64) -> Option<Leaf> {
         None
+    }
+
+    /// Direct-map address of RAM already returned by [`claim_ram`](Self::claim_ram).
+    ///
+    /// A raw pointer because the kernel and the domain intentionally alias ring
+    /// pages. The caller still owns the claimed span and decides when either
+    /// side may access it.
+    fn claimed_pointer(&mut self, _span: memory::Span) -> Result<*mut u8, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    /// Enters or resumes a user context in its hardware-protected view.
+    fn enter_domain(&mut self, _state: &mut DomainState) -> Result<DomainExit, PlatformError> {
+        Err(PlatformError::Unsupported)
     }
 
     fn terminate(&mut self, status: ExitStatus) -> !;
