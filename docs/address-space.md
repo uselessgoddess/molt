@@ -452,6 +452,7 @@ exists, the table above is a plan; after it, it is a property.
 | a writable-executable user image rejected before mapping | `MOLT_DOMAIN_WX_OK` | shipped: admission completes before mapper calls or execution |
 | a static binary enters user mode and exits | `MOLT_USER_HELLO_OK`, `MOLT_DOMAIN_EXIT_OK` | shipped on x86_64 and riscv64 through the same hostile ring ABI |
 | a fault in a domain that stays there | `MOLT_DOMAIN_FAULT_OK` | shipped: the view is a hardware-enforced boundary, exercised from inside |
+| a domain that outlasts a tick and still exits | `MOLT_DOMAIN_UNINTERRUPTED_OK` | shipped: cooperative means masked, not merely unscheduled — the entry cost above is what a switch costs when nothing interrupts it |
 | the existing shell reaches a real filesystem through a domain | `MOLT_SHELL_DOMAIN_OK` | shipped: unchanged shell logic, domain adapter, mounted MoltFS |
 | grant and revoke of an extent between domains | `MOLT_GRANT_OK`, `MOLT_REVOKE_OK` | shipped: sharing needs a right, and taking it back needs an order |
 | a large leaf cut so part of it can be taken back | `MOLT_SPLIT_OK` | shipped: one leaf becomes 512 over the same frames, which is what a partial revoke costs |

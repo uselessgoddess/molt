@@ -6,8 +6,12 @@ use molt_arch::{DomainExit, DomainState, PlatformError};
 
 use crate::{interrupts, memory};
 
+/// Runtime calls, as `molt_program` numbers them in `rax`.
 const KICK: u64 = 0;
 const EXIT: u64 = 1;
+
+/// Which gateway path produced the exit. Written by the gateway, not the domain.
+const FROM_CALL: u64 = 0;
 
 const DOMAIN_CR3: usize = 0x40;
 const REASON: usize = 0x48;
@@ -25,6 +29,15 @@ const RSI: usize = 0xb0;
 const RDI: usize = 0xb8;
 const R8: usize = 0xc8;
 const R9: usize = 0xd0;
+/// The user register file, `rax` first, as the gateway saves and restores it.
+/// 0x108 holds the kernel's `RFLAGS` while the domain runs, and only the
+/// gateway reads it back.
+const REGISTERS: usize = 0x90;
+const REGISTER_SLOTS: usize = 15;
+/// The runtime call number a domain asked for, when the exit came from a call.
+const CALL: usize = 0x110;
+/// What the gateway reports through, cleared with the file it belongs to.
+const REPORTS: [usize; 5] = [REASON, VALUE, CAUSE, ADDRESS, CALL];
 
 type ExceptionEntries<const N: usize> = [(u8, u64); N];
 
@@ -58,7 +71,11 @@ __molt_domain_call:
     movq %r10, __molt_domain_gateway_data+0x78(%rip)
     movq 24(%rsp), %r10
     movq %r10, __molt_domain_gateway_data+0x70(%rip)
-    movq %rax, __molt_domain_gateway_data+0x48(%rip)
+    // Which family this exit belongs to is decided by the path that ran, never
+    // by a register the domain filled in: a call cannot dress itself as a fault
+    // and be handed a cause the processor never raised.
+    movq $0, __molt_domain_gateway_data+0x48(%rip)
+    movq %rax, __molt_domain_gateway_data+0x110(%rip)
     movq %rdi, __molt_domain_gateway_data+0x50(%rip)
     jmp __molt_domain_return
 
@@ -119,18 +136,20 @@ __molt_domain_exception:
     movq %r10, __molt_domain_gateway_data+0x78(%rip)
     movq 40(%rsp), %r10
     movq %r10, __molt_domain_gateway_data+0x70(%rip)
-    movq $2, __molt_domain_gateway_data+0x48(%rip)
+    movq $1, __molt_domain_gateway_data+0x48(%rip)
     movq 0(%rsp), %r10
     movq %r10, __molt_domain_gateway_data+0x58(%rip)
     movq 8(%rsp), %r10
     movq %r10, __molt_domain_gateway_data+0x60(%rip)
     jmp __molt_domain_return
 
+// A kernel-side exception on one of the vectors this gateway took over. Before
+// the gateway existed these escalated into the double fault, which said so on
+// the serial line; halting mutely would leave the smoke with a timeout and no
+// diagnosis, which is the one thing a fatal path must not do.
 __molt_kernel_domain_exception:
     cli
-3:
-    hlt
-    jmp 3b
+    jmp __molt_kernel_domain_fatal
 
 .global __molt_domain_page_fault
 __molt_domain_page_fault:
@@ -157,7 +176,7 @@ __molt_domain_page_fault:
     movq %r10, __molt_domain_gateway_data+0x78(%rip)
     movq 32(%rsp), %r10
     movq %r10, __molt_domain_gateway_data+0x70(%rip)
-    movq $2, __molt_domain_gateway_data+0x48(%rip)
+    movq $1, __molt_domain_gateway_data+0x48(%rip)
     movq 0(%rsp), %r10
     movq %r10, __molt_domain_gateway_data+0x58(%rip)
     movq %cr2, %r10
@@ -173,10 +192,24 @@ __molt_domain_return:
     movq __molt_domain_gateway_data+0x30(%rip), %r14
     movq __molt_domain_gateway_data+0x38(%rip), %r15
     movq __molt_domain_gateway_data+0x08(%rip), %rsp
+    // Every way into this gateway is an interrupt or trap gate, so `IF` is
+    // clear on arrival. Without this the kernel would resume with ticks stopped
+    // and stay that way until something happened to park. Last, so that what it
+    // re-enables lands on a fully restored kernel context.
+    pushq __molt_domain_gateway_data+0x108(%rip)
+    popfq
     retq
 
 .global __molt_domain_enter
 __molt_domain_enter:
+    // The CR3 below leaves the kernel unmapped for a dozen instructions that
+    // still run at CPL 0. An APIC tick there would vector into kernel text that
+    // is no longer present, fault into a handler that is also absent, and
+    // triple-fault without a marker. `IF` comes back in `__molt_domain_return`.
+    pushfq
+    popq %r10
+    movq %r10, __molt_domain_gateway_data+0x108(%rip)
+    cli
     movq %cr3, %r10
     movq %r10, __molt_domain_gateway_data+0x00(%rip)
     movq %rsp, __molt_domain_gateway_data+0x08(%rip)
@@ -285,6 +318,17 @@ pub fn exception_entries() -> (ExceptionEntries<9>, ExceptionEntries<6>) {
     (no_error, with_error)
 }
 
+/// Reports a kernel fault on a gateway vector, then stops.
+///
+/// Reached with interrupts already off and the faulting frame still on the
+/// stack; it reads nothing from it, because the one thing worth saying is that
+/// the kernel — not a domain — is where this came from.
+#[unsafe(no_mangle)]
+extern "C" fn __molt_kernel_domain_fatal() -> ! {
+    crate::emergency_write("MOLT_EXCEPTION: kernel fault on a domain gateway vector\n");
+    crate::halt_forever()
+}
+
 pub fn gateway_stack_top() -> u64 {
     (&raw const __molt_domain_gateway_data_end) as u64
 }
@@ -299,6 +343,15 @@ pub fn enter(state: &mut DomainState) -> Result<DomainExit, PlatformError> {
         );
         let cr3 = memory::prepare_domain(state.view(), code, data, &interrupts::domain_tables())?;
         let (code, data) = interrupts::user_selectors();
+        // The register file is shared by every domain, and the gateway restores
+        // all of it. A domain that began holding the last one's registers would
+        // read across a boundary `docs/threat-model.md` says it cannot.
+        for slot in 0..REGISTER_SLOTS {
+            write(REGISTERS + slot * 8, 0);
+        }
+        for offset in REPORTS {
+            write(offset, 0);
+        }
         write(DOMAIN_CR3, cr3);
         write(USER_RIP, state.entry());
         write(USER_RSP, state.stack());
@@ -315,8 +368,11 @@ pub fn enter(state: &mut DomainState) -> Result<DomainExit, PlatformError> {
     // names an admitted ring-3 image, stack, and user selectors.
     unsafe { __molt_domain_enter() };
     Ok(match read(REASON) {
-        KICK => DomainExit::Ring,
-        EXIT => DomainExit::Exited(read(VALUE) as i64),
+        FROM_CALL => match read(CALL) {
+            KICK => DomainExit::Ring,
+            EXIT => DomainExit::Exited(read(VALUE) as i64),
+            call => DomainExit::Unknown(call),
+        },
         _ => DomainExit::Fault { cause: read(CAUSE), address: read(ADDRESS) },
     })
 }

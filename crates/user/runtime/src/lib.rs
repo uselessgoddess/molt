@@ -286,6 +286,12 @@ unsafe impl GlobalAlloc for Heap {
         }
     }
 
+    /// Nothing is returned, deliberately.
+    ///
+    /// A domain's heap dies with the domain, and a program that outlives its
+    /// heap wants an allocator with a free list rather than one that pretends.
+    /// Making this a bump allocator and saying so is the honest version of the
+    /// tradeoff; a long-lived domain is the point at which it stops being one.
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
 }
 

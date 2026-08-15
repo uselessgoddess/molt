@@ -12,6 +12,13 @@ mod image {
     const RING: usize = 4;
     const MESSAGE: &[u8] = b"hello from a Molt domain\n";
 
+    /// Asks for the spin probe rather than the ring, in the argument the fault
+    /// probe already overloads.
+    const SPIN: u64 = u64::MAX - 1;
+
+    /// Chosen to outrun the 10 ms tick under emulation, where the smoke runs.
+    const SPIN_ITERATIONS: u64 = 8_000_000;
+
     #[global_allocator]
     static HEAP: Heap = Heap::empty();
 
@@ -33,6 +40,15 @@ mod image {
             // smoke can prove the processor returns the fault to the kernel
             // without taking the kernel or another domain down with it.
             unsafe { core::ptr::read_volatile(0x1000 as *const u8) };
+        }
+        if output == SPIN {
+            // Long enough to outlast a scheduling tick on either port. A domain
+            // is not preemptible, so the only correct outcome is this exit: a
+            // tick delivered here would come back as a fault instead.
+            for _ in 0..SPIN_ITERATIONS {
+                core::hint::spin_loop();
+            }
+            exit(0)
         }
         // SAFETY: bootstrap passes a page-aligned, initialized Channel<RING> which
         // stays mapped for this image's lifetime.

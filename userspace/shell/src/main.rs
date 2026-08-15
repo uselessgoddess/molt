@@ -116,16 +116,16 @@ mod image {
                 remote(block_on(client.open(Handle::<Directory>::from_raw(dir.raw()), name)))
                     .and_then(|raw| {
                         let raw = raw as u64;
+                        // The tag stays on: it is part of the slot name the
+                        // kernel answers to, and carrying it back is what lets
+                        // a file handle be refused where a directory is meant.
                         if raw & FILE_RESULT != 0 {
-                            // SAFETY: this typed value came from the kernel's open completion.
-                            Ok(FsDone::Opened(FsHandle::File(unsafe {
-                                Capability::from_raw(raw & !FILE_RESULT)
-                            })))
+                            // SAFETY: a name from the kernel's own completion. It
+                            // is authority nowhere but in the table that issued it.
+                            Ok(FsDone::Opened(FsHandle::File(unsafe { Capability::from_raw(raw) })))
                         } else if raw & DIR_RESULT != 0 {
-                            // SAFETY: this typed value came from the kernel's open completion.
-                            Ok(FsDone::Opened(FsHandle::Dir(unsafe {
-                                Capability::from_raw(raw & !DIR_RESULT)
-                            })))
+                            // SAFETY: as above.
+                            Ok(FsDone::Opened(FsHandle::Dir(unsafe { Capability::from_raw(raw) })))
                         } else {
                             Err(FsError::Corrupt)
                         }

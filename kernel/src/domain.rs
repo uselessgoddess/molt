@@ -17,6 +17,8 @@ use molt_arch::va::{Class, Extent, Region};
 use molt_arch::{BootInfo, FRAME_SIZE, Platform, PlatformError, SerialWriter, View, view};
 #[cfg(molt_user_image)]
 use molt_arch::{DomainExit, DomainState, SerialPort};
+#[cfg(molt_user_image)]
+use molt_core::capability::Capability;
 use molt_kernel::report;
 use molt_rt::Executor;
 
@@ -307,6 +309,15 @@ pub fn user_smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
         Rights::READ_WRITE,
         false,
     );
+    // One gateway page holds the register file for whichever domain is running,
+    // so two cores entering at once would overwrite each other's saved context.
+    // Entry is serialized on the boot core; this is what notices if it stops
+    // being, before a second core has to be given its own gateway.
+    assert_eq!(crate::smp::here(), 0, "a domain was entered off the boot core");
+    // The arena hands out consecutive extents, so without this the page under
+    // the stack is the shared channel and an overflow would rewrite the ABI
+    // instead of faulting. Reserved and never granted, it is absent in the view.
+    let _guard = space::global().allocate(Class::Page, FRAME_SIZE).expect("a stack guard page");
     let (stack_address, _) = allocate_mapping(
         boot_info,
         platform,
@@ -357,6 +368,7 @@ pub fn user_smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
             }
             DomainExit::Exited(0) => break,
             DomainExit::Exited(status) => panic!("hello domain exited with {status}"),
+            DomainExit::Unknown(call) => panic!("hello domain asked for runtime call {call}"),
             DomainExit::Fault { cause, address } => {
                 panic!("hello domain faulted: cause={cause:#x} address={address:#x}")
             }
@@ -377,6 +389,29 @@ pub fn user_smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
         }
         DomainExit::Ring => panic!("fault probe reached its ring"),
         DomainExit::Exited(status) => panic!("fault probe exited with {status}"),
+        DomainExit::Unknown(call) => panic!("fault probe asked for runtime call {call}"),
+    }
+
+    // A domain holds its hart until it yields, so a probe that outlasts a
+    // scheduling tick has to come back as its own exit and not as a fault. The
+    // masking that makes this true is in the gateway; this is what notices when
+    // it stops being true.
+    let mut spin = DomainState::new(
+        view,
+        entry,
+        stack,
+        [channel_address, base, u64::MAX - 1, heap_address, USER_HEAP, 0],
+    );
+    match platform.enter_domain(&mut spin).expect("spinning domain entry and return") {
+        DomainExit::Exited(0) => {
+            report!(platform, "MOLT_DOMAIN_UNINTERRUPTED_OK: outlasted a tick and exited");
+        }
+        DomainExit::Fault { cause, address } => {
+            panic!("a tick reached the spinning domain: cause={cause:#x} address={address:#x}")
+        }
+        DomainExit::Ring => panic!("spin probe reached its ring"),
+        DomainExit::Exited(status) => panic!("spin probe exited with {status}"),
+        DomainExit::Unknown(call) => panic!("spin probe asked for runtime call {call}"),
     }
 
     let current = mappings.last().expect("the hello heap mapping").extent.end();
@@ -419,6 +454,15 @@ fn shell_smoke<P: Platform, Q: molt_block::Queue>(
         Rights::READ_WRITE,
         false,
     );
+    // One gateway page holds the register file for whichever domain is running,
+    // so two cores entering at once would overwrite each other's saved context.
+    // Entry is serialized on the boot core; this is what notices if it stops
+    // being, before a second core has to be given its own gateway.
+    assert_eq!(crate::smp::here(), 0, "a domain was entered off the boot core");
+    // The arena hands out consecutive extents, so without this the page under
+    // the stack is the shared channel and an overflow would rewrite the ABI
+    // instead of faulting. Reserved and never granted, it is absent in the view.
+    let _guard = space::global().allocate(Class::Page, FRAME_SIZE).expect("a stack guard page");
     let (stack_address, _) = allocate_mapping(
         boot_info,
         platform,
@@ -447,12 +491,12 @@ fn shell_smoke<P: Platform, Q: molt_block::Queue>(
     // SAFETY: the channel was initialized immediately above and its mapping is retained.
     let channel = unsafe { &*channel_pointer.cast::<molt_abi::Channel<USER_RING>>() };
     let (mut submissions, mut completions) = channel.kernel();
-    let mut handles = ShellHandles::new(root.raw());
+    let mut handles = ShellHandles::new(root);
     let mut state = DomainState::new(
         view,
         entry,
         stack_address + USER_STACK,
-        [channel_address, base, 1, heap_address, USER_HEAP, root.raw()],
+        [channel_address, base, 1, heap_address, USER_HEAP, SHELL_DIR_RESULT],
     );
     loop {
         match platform.enter_domain(&mut state).expect("shell domain entry and return") {
@@ -473,6 +517,7 @@ fn shell_smoke<P: Platform, Q: molt_block::Queue>(
             }
             DomainExit::Exited(0) => break,
             DomainExit::Exited(status) => panic!("shell domain exited with {status}"),
+            DomainExit::Unknown(call) => panic!("shell domain asked for runtime call {call}"),
             DomainExit::Fault { cause, address } => {
                 panic!("shell domain faulted: cause={cause:#x} address={address:#x}")
             }
@@ -505,37 +550,66 @@ struct Mapping {
 }
 
 #[cfg(molt_user_image)]
+/// The shell domain's own handle space.
+///
+/// A domain names a slot here and never a kernel capability, which is what
+/// keeps [`Capability`] unforgeable across a boundary the type system stops at:
+/// a number the domain invents indexes a table the kernel owns, and a slot it
+/// never received is empty. Nothing the domain sends is ever restored into
+/// authority — the authority never left.
 struct ShellHandles {
-    directories: [Option<u64>; 4],
-    files: [Option<u64>; 4],
+    directories: [Option<Capability<molt_fs::Dir>>; 4],
+    files: [Option<Capability<molt_fs::File>>; 4],
 }
 
 #[cfg(molt_user_image)]
 impl ShellHandles {
-    const fn new(root: u64) -> Self {
+    /// Seeds slot zero with the one directory the domain starts holding.
+    const fn new(root: Capability<molt_fs::Dir>) -> Self {
         Self { directories: [Some(root), None, None, None], files: [None; 4] }
     }
 
-    fn directory(&self, raw: u64) -> bool {
-        self.directories.iter().flatten().any(|&allowed| allowed == raw)
+    /// Resolves a slot the domain named into the capability the kernel put there.
+    ///
+    /// The domain names slots and never capabilities, which is what keeps
+    /// [`molt_core::capability::Capability`] unforgeable across the boundary: a
+    /// number it invents indexes a table the kernel owns, and a slot it never
+    /// received is empty. No kernel name crosses in either direction.
+    fn directory(&self, handle: u64) -> Option<Capability<molt_fs::Dir>> {
+        *self.directories.get(Self::slot(handle, SHELL_DIR_RESULT)?)?
     }
 
-    fn file(&self, raw: u64) -> bool {
-        self.files.iter().flatten().any(|&allowed| allowed == raw)
+    fn file(&self, handle: u64) -> Option<Capability<molt_fs::File>> {
+        *self.files.get(Self::slot(handle, SHELL_FILE_RESULT)?)?
     }
 
-    fn remember(&mut self, raw: u64, directory: bool) -> bool {
-        let handles = if directory { &mut self.directories } else { &mut self.files };
-        let Some(slot) = handles.iter_mut().find(|slot| slot.is_none()) else {
-            return false;
-        };
-        *slot = Some(raw);
-        true
+    /// Strips the kind tag the domain was handed back, refusing the other kind.
+    fn slot(handle: u64, tag: u64) -> Option<usize> {
+        if handle & (SHELL_DIR_RESULT | SHELL_FILE_RESULT) != tag {
+            return None;
+        }
+        usize::try_from(handle & !tag).ok()
     }
 
-    fn forget_file(&mut self, raw: u64) {
-        if let Some(slot) = self.files.iter_mut().find(|slot| **slot == Some(raw)) {
-            *slot = None;
+    /// Puts a freshly opened handle in a slot and names that slot to the domain.
+    fn remember(&mut self, handle: molt_fs::Handle) -> Option<u64> {
+        match handle {
+            molt_fs::Handle::Dir(dir) => Self::place(&mut self.directories, dir, SHELL_DIR_RESULT),
+            molt_fs::Handle::File(file) => Self::place(&mut self.files, file, SHELL_FILE_RESULT),
+        }
+    }
+
+    fn place<R>(slots: &mut [Option<Capability<R>>], held: Capability<R>, tag: u64) -> Option<u64> {
+        let slot = slots.iter().position(Option::is_none)?;
+        slots[slot] = Some(held);
+        Some(slot as u64 | tag)
+    }
+
+    fn forget_file(&mut self, handle: u64) {
+        if let Some(entry) =
+            Self::slot(handle, SHELL_FILE_RESULT).and_then(|slot| self.files.get_mut(slot))
+        {
+            *entry = None;
         }
     }
 }
@@ -692,34 +766,36 @@ fn shell_open<Q: molt_block::Queue>(
     directory: molt_abi::Handle,
     name: molt_abi::Region,
 ) -> i64 {
-    if !handles.directory(directory.get()) {
+    let Some(directory) = handles.directory(directory.get()) else {
         return -1;
-    }
+    };
     let Some(bytes) = resolve_region(mappings, base, aperture, name) else {
         return -1;
     };
     let Ok(name) = molt_fs::Name::new(bytes) else {
         return -1;
     };
-    // SAFETY: this is only a typed transport name. `Fs::apply` validates its
-    // index, generation, and rights before using it.
-    let directory = unsafe { molt_core::capability::Capability::from_raw(directory.get()) };
     let mut buffers = molt_core::buffer::BufferRegistry::<1>::new();
     match filesystem.apply(
         molt_core::CellId::new(3),
         molt_fs::FsOp::Open { dir: directory, name },
         &mut buffers,
     ) {
-        Ok(molt_fs::FsDone::Opened(molt_fs::Handle::File(file)))
-            if handles.remember(file.raw(), false) =>
-        {
-            (file.raw() | SHELL_FILE_RESULT) as i64
-        }
-        Ok(molt_fs::FsDone::Opened(molt_fs::Handle::Dir(dir)))
-            if handles.remember(dir.raw(), true) =>
-        {
-            (dir.raw() | SHELL_DIR_RESULT) as i64
-        }
+        Ok(molt_fs::FsDone::Opened(opened)) => match handles.remember(opened) {
+            Some(handle) => handle as i64,
+            // A table with no room must not strand what was just opened. The
+            // capability goes back before the refusal does, or the slot it
+            // holds is lost for as long as the filesystem lives.
+            None => {
+                let mut buffers = molt_core::buffer::BufferRegistry::<1>::new();
+                let _ = filesystem.apply(
+                    molt_core::CellId::new(3),
+                    molt_fs::FsOp::Close(opened),
+                    &mut buffers,
+                );
+                -1
+            }
+        },
         _ => -1,
     }
 }
@@ -735,9 +811,9 @@ fn shell_read<Q: molt_block::Queue>(
     offset: u64,
     buffer: molt_abi::Region,
 ) -> i64 {
-    if !handles.file(file.get()) {
+    let Some(file) = handles.file(file.get()) else {
         return -1;
-    }
+    };
     let Some(bytes) = resolve_region_mut(mappings, base, aperture, buffer) else {
         return -1;
     };
@@ -745,8 +821,6 @@ fn shell_read<Q: molt_block::Queue>(
     let Ok(registered) = buffers.register_write(molt_core::CellId::new(3), bytes) else {
         return -1;
     };
-    // SAFETY: the filesystem capability table validates this transported name.
-    let file = unsafe { molt_core::capability::Capability::from_raw(file.get()) };
     let operation = molt_core::buffer::BufferOperation::new(registered, 0, buffer.len() as usize);
     match filesystem.apply(
         molt_core::CellId::new(3),
@@ -764,12 +838,9 @@ fn shell_close<Q: molt_block::Queue>(
     handles: &mut ShellHandles,
     handle: molt_abi::Handle,
 ) -> i64 {
-    if !handles.file(handle.get()) {
+    let Some(file) = handles.file(handle.get()) else {
         return -1;
-    }
-    // SAFETY: the shell only opens `hello.txt` in this smoke, so this transported
-    // handle is a file. The table, not this type restoration, validates it.
-    let file = unsafe { molt_core::capability::Capability::from_raw(handle.get()) };
+    };
     let mut buffers = molt_core::buffer::BufferRegistry::<1>::new();
     match filesystem.apply(
         molt_core::CellId::new(3),

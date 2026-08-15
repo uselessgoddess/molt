@@ -709,6 +709,13 @@ fn map_leaf(
             // something a grant is allowed to do behind the holder's back.
             return Err(PlatformError::Mapping(MappingError::Backend));
         }
+        // Ring 3 needs the bit at every level, so a table first built for a
+        // supervisor-only range would otherwise make a user leaf underneath it
+        // unreachable — silently, and only when the two share a slot. Widening
+        // here grants nothing on its own: the leaf's own bit still decides.
+        if flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+            entry.set_flags(entry.flags() | PageTableFlags::USER_ACCESSIBLE);
+        }
         frame = PhysFrame::containing_address(entry.addr());
     }
     let flags = if level == 0 { flags } else { flags | PageTableFlags::HUGE_PAGE };

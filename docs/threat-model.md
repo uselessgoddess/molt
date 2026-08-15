@@ -429,6 +429,23 @@ questions for every commit in Stage 5.0 and after:
   through `satp`/`CR3`, exit, fault, and use the hostile ring, but execution is
   cooperative. A domain that never reaches the ring, exits, or faults can keep
   the hart until metering or timer-driven preemption is added.
+
+  Cooperative here means *masked*, which is a stronger statement than
+  unscheduled and had to be made true on both ports. The gateway zeroes `sie`
+  on RISC-V, because S-level interrupts are delivered whenever the hart runs
+  below S whatever `sstatus.SIE` says, and clears `IF` before the `CR3` switch
+  on x86_64, where the window between that switch and `iretq` still runs at CPL
+  0 with the kernel absent. An interrupt in either place is not a preemption
+  Molt would have handled — it is a fault report the hardware never raised, or a
+  triple fault. `MOLT_DOMAIN_UNINTERRUPTED_OK` is what keeps this honest: a
+  domain spins past a tick and the only correct outcome is its own exit.
+- **A domain's handle space is the kernel's, and small.** What crosses the ring
+  is a slot in a per-domain table, never a `Capability`. The table is what makes
+  authority unforgeable where the type system stops: a number the domain invents
+  indexes slots the kernel filled, and one it never received is empty. The
+  register file is zeroed for a fresh domain for the same reason — the file is
+  shared, and inheriting the last domain's registers would read across exactly
+  the boundary this document says holds.
 - **The ring validator is swept, not coverage-guided.** The parser has a
   libFuzzer target ([`fuzz/fuzz_targets/call_parse.rs`](../fuzz/fuzz_targets/call_parse.rs))
   and the hostile index sequences have a proptest sweep

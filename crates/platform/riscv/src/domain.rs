@@ -6,11 +6,16 @@ use molt_arch::{DomainExit, DomainState, PlatformError};
 
 use crate::paging;
 
+/// Runtime calls, as `molt_program` numbers them in `a7`.
 const KICK: u64 = 0;
 const EXIT: u64 = 1;
 
+/// Which gateway path produced the exit. Written by the gateway, not the domain.
+const FROM_CALL: u64 = 0;
+
 // Gateway data offsets. User registers x1..x31 begin at 0x80; the kernel's
 // ABI-stable integer registers occupy 0x180..0x1f0 while user code is live.
+// 0x60 holds the kernel's `sie` while the domain runs with every source masked.
 const DOMAIN_SATP: usize = 0x28;
 const REASON: usize = 0x30;
 const VALUE: usize = 0x38;
@@ -18,7 +23,15 @@ const CAUSE: usize = 0x40;
 const ADDRESS: usize = 0x48;
 const USER_SEPC: usize = 0x50;
 const USER_SSTATUS: usize = 0x58;
+/// The runtime call number a domain asked for, when the exit came from a call.
+const CALL: usize = 0x68;
+/// Whether a view switch on this hart has to flush, which only an untagged one does.
+const FLUSH: usize = 0x70;
 const REGISTERS: usize = 0x80;
+/// `x1` through `x31`, as the gateway saves and restores them.
+const REGISTER_SLOTS: usize = 31;
+/// What the gateway reports through, cleared with the file it belongs to.
+const REPORTS: [usize; 5] = [REASON, VALUE, CAUSE, ADDRESS, CALL];
 
 global_asm!(
     r#"
@@ -77,18 +90,28 @@ __molt_domain_trap:
     ld t1, 0x50(t0)
     addi t1, t1, 4
     sd t1, 0x50(t0)
+    // Which family this exit belongs to is decided by the path that ran, never
+    // by a register the domain filled in: a call cannot dress itself as a fault
+    // and be handed a cause the hart never raised.
+    sd zero, 0x30(t0)
     ld t1, 0x108(t0)
-    sd t1, 0x30(t0)
+    sd t1, 0x68(t0)
     ld t1, 0xd0(t0)
     sd t1, 0x38(t0)
     j 2f
 1:
-    li t1, 2
+    li t1, 1
     sd t1, 0x30(t0)
 2:
     ld t1, 0x00(t0)
     csrw satp, t1
+    // A tagged hart keeps both views in the TLB, so the switch is the `satp`
+    // write `docs/address-space.md` prices it at. Only a hart with no ASID bits
+    // pays a flush, and it pays it because it has to.
+    ld t2, 0x70(t0)
+    beqz t2, 9f
     sfence.vma
+9:
     ld t1, 0x18(t0)
     csrw stvec, t1
     ld t1, 0x20(t0)
@@ -109,6 +132,11 @@ __molt_domain_trap:
     ld s11, 0x1e8(t0)
     ld sp, 0x08(t0)
     ld ra, 0x10(t0)
+    // Sources come back last. Until this instruction `sie` is zero, so the
+    // kernel's own `sstatus.SIE` above enables nothing and a tick cannot land
+    // on a half-restored `gp`/`tp`.
+    ld t1, 0x60(t0)
+    csrw sie, t1
     ret
 
 .global __molt_domain_enter
@@ -122,6 +150,14 @@ __molt_domain_enter:
     sd t1, 0x18(t0)
     csrr t1, sstatus
     sd t1, 0x20(t0)
+    // A domain is not preemptible: `docs/architecture.md` has nothing preempt a
+    // cell, and S-level interrupts are delivered whenever the hart runs below S
+    // whatever `sstatus.SIE` says, so masking has to be `sie` and not `SPIE`.
+    // Zeroing it also covers the window below, where `stvec` already points at
+    // this gateway while the hart is still in S-mode.
+    csrr t1, sie
+    sd t1, 0x60(t0)
+    csrw sie, zero
     sd gp, 0x180(t0)
     sd tp, 0x188(t0)
     sd s0, 0x190(t0)
@@ -144,7 +180,13 @@ __molt_domain_enter:
     csrw sepc, t1
     ld t1, 0x28(t0)
     csrw satp, t1
+    // A tagged hart keeps both views in the TLB, so the switch is the `satp`
+    // write `docs/address-space.md` prices it at. Only a hart with no ASID bits
+    // pays a flush, and it pays it because it has to.
+    ld t2, 0x70(t0)
+    beqz t2, 9f
     sfence.vma
+9:
 
     ld x1,  0x88(t0)
     ld x2,  0x90(t0)
@@ -212,15 +254,27 @@ pub fn enter(state: &mut DomainState) -> Result<DomainExit, PlatformError> {
             &raw const __molt_domain_gateway_data,
             &raw const __molt_domain_gateway_data_end,
         );
+        // The register file is shared by every domain, and the gateway restores
+        // all of it. A domain that began holding the last one's registers would
+        // read across a boundary `docs/threat-model.md` says it cannot.
+        for slot in 1..=REGISTER_SLOTS {
+            write(register(slot), 0);
+        }
+        for offset in REPORTS {
+            write(offset, 0);
+        }
         let satp = paging::prepare_domain(state.view(), code, data)?;
         write(DOMAIN_SATP, satp);
+        write(FLUSH, u64::from(paging::asid_bits().unwrap_or(0) == 0));
         write(USER_SEPC, state.entry());
         let mut status: usize;
-        // SAFETY: reading sstatus has no side effects. SPP and SPIE are cleared
-        // below so `sret` enters U-mode with interrupts masked.
+        // SAFETY: reading sstatus has no side effects.
         unsafe {
             asm!("csrr {status}, sstatus", status = out(reg) status, options(nomem, nostack))
         };
+        // SPP selects the privilege `sret` returns to and SPIE what `sstatus.SIE`
+        // becomes there. Neither masks anything: what keeps the domain
+        // uninterrupted is the gateway zeroing `sie`.
         write(USER_SSTATUS, (status & !((1 << 8) | (1 << 5))) as u64);
         write(register(2), state.stack());
         for (number, value) in (10..16).zip(state.arguments()) {
@@ -232,11 +286,12 @@ pub fn enter(state: &mut DomainState) -> Result<DomainExit, PlatformError> {
     // SAFETY: the gateway pages are present supervisor-only in both roots, and
     // the saved context names admitted user pages.
     unsafe { __molt_domain_enter() };
-    let reason = read(REASON);
-    let value = read(VALUE);
-    Ok(match reason {
-        KICK => DomainExit::Ring,
-        EXIT => DomainExit::Exited(value as i64),
+    Ok(match read(REASON) {
+        FROM_CALL => match read(CALL) {
+            KICK => DomainExit::Ring,
+            EXIT => DomainExit::Exited(read(VALUE) as i64),
+            call => DomainExit::Unknown(call),
+        },
         _ => DomainExit::Fault { cause: read(CAUSE), address: read(ADDRESS) },
     })
 }

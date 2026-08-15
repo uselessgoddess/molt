@@ -53,6 +53,12 @@ pub enum DomainExit {
     Ring,
     /// Normal program termination.
     Exited(i64),
+    /// A runtime call this ABI does not define.
+    ///
+    /// Separate from [`Fault`](Self::Fault) because the processor took no
+    /// exception: reporting it as one would let a domain choose the moment its
+    /// supervisor reads a cause the hardware never produced.
+    Unknown(u64),
     /// A processor exception contained to this view.
     Fault { cause: u64, address: u64 },
 }
