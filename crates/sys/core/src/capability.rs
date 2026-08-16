@@ -73,6 +73,17 @@ impl<R> Capability<R> {
         self.raw
     }
 
+    /// Reconstructs a typed name received from a trusted capability transport.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must have been issued for `R` by the table which will validate it.
+    /// The table still checks the index, generation, and rights on every use;
+    /// this constructor only restores the compile-time resource kind.
+    pub const unsafe fn from_raw(raw: u64) -> Self {
+        Self { raw, rights: PhantomData }
+    }
+
     const fn index(self) -> usize {
         self.raw as u32 as usize
     }

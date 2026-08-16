@@ -16,6 +16,8 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
+use repr::{Field, FieldMut};
+
 use crate::bitmap::Bitmap;
 use crate::crc::Crc;
 use crate::layout::{BLOCK, Kind, MAX_NAME, Object, Super};
@@ -74,7 +76,7 @@ impl Key {
     pub fn object(object: u32) -> Self {
         let mut key = Self::default();
         key.bytes[0] = OBJECT;
-        key.bytes[1..5].copy_from_slice(&object.to_le_bytes());
+        key.bytes.put_le::<u32, 1>(object);
         key
     }
 
@@ -88,7 +90,7 @@ impl Key {
     pub fn dirent_start(parent: u32) -> Self {
         let mut key = Self::default();
         key.bytes[0] = DIRENT;
-        key.bytes[1..5].copy_from_slice(&parent.to_le_bytes());
+        key.bytes.put_le::<u32, 1>(parent);
         key
     }
 
@@ -97,8 +99,8 @@ impl Key {
     pub fn extent(object: u32, end: u64) -> Self {
         let mut key = Self::default();
         key.bytes[0] = EXTENT;
-        key.bytes[1..5].copy_from_slice(&object.to_le_bytes());
-        key.bytes[8..16].copy_from_slice(&end.to_le_bytes());
+        key.bytes.put_le::<u32, 1>(object);
+        key.bytes.put_le::<u64, 8>(end);
         key
     }
 
@@ -107,7 +109,7 @@ impl Key {
     }
 
     fn object_id(&self) -> u32 {
-        u32::from_le_bytes(self.bytes[1..5].try_into().unwrap())
+        self.bytes.at_le::<u32, 1>()
     }
 
     pub fn as_object(&self) -> Option<u32> {
@@ -133,7 +135,7 @@ impl Key {
 
     /// One past the last byte an extent key covers.
     pub fn end(&self) -> u64 {
-        u64::from_le_bytes(self.bytes[8..16].try_into().expect("fixed key field"))
+        self.bytes.at_le::<u64, 8>()
     }
 
     pub fn name(&self) -> Result<Name, FsError> {
@@ -289,23 +291,23 @@ impl Value {
     pub fn object(object: Object) -> Self {
         let mut value = Self::default();
         value.bytes[0] = object.kind.byte();
-        value.bytes[4..8].copy_from_slice(&object.count.to_le_bytes());
-        value.bytes[8..16].copy_from_slice(&object.size.to_le_bytes());
+        value.bytes.put_le::<u32, 4>(object.count);
+        value.bytes.put_le::<u64, 8>(object.size);
         value
     }
 
     pub fn dirent(object: u32) -> Self {
         let mut value = Self::default();
-        value.bytes[..4].copy_from_slice(&object.to_le_bytes());
+        value.bytes.put_le::<u32, 0>(object);
         value
     }
 
     /// A slice of one checksummed write record's payload.
     pub fn extent(at: u64, skip: u32, len: u32) -> Self {
         let mut value = Self::default();
-        value.bytes[..8].copy_from_slice(&at.to_le_bytes());
-        value.bytes[8..12].copy_from_slice(&skip.to_le_bytes());
-        value.bytes[12..16].copy_from_slice(&len.to_le_bytes());
+        value.bytes.put_le::<u64, 0>(at);
+        value.bytes.put_le::<u32, 8>(skip);
+        value.bytes.put_le::<u32, 12>(len);
         value
     }
 
@@ -321,23 +323,15 @@ impl Value {
             1 => Kind::File,
             _ => return Err(FsError::Corrupt),
         };
-        Ok(Object {
-            kind,
-            count: u32::from_le_bytes(self.bytes[4..8].try_into().unwrap()),
-            size: u64::from_le_bytes(self.bytes[8..16].try_into().unwrap()),
-        })
+        Ok(Object { kind, count: self.bytes.at_le::<u32, 4>(), size: self.bytes.at_le::<u64, 8>() })
     }
 
     pub fn as_dirent(self) -> u32 {
-        u32::from_le_bytes(self.bytes[..4].try_into().unwrap())
+        self.bytes.at_le::<u32, 0>()
     }
 
     pub fn as_extent(self) -> (u64, u32, u32) {
-        (
-            u64::from_le_bytes(self.bytes[..8].try_into().unwrap()),
-            u32::from_le_bytes(self.bytes[8..12].try_into().unwrap()),
-            u32::from_le_bytes(self.bytes[12..16].try_into().unwrap()),
-        )
+        (self.bytes.at_le::<u64, 0>(), self.bytes.at_le::<u32, 8>(), self.bytes.at_le::<u32, 12>())
     }
 }
 
@@ -400,10 +394,10 @@ impl Node {
     }
 
     fn parse(spare: &mut Spare, block: &[u8; BLOCK]) -> Result<Unique<Self>, FsError> {
-        if block[..MAGIC.len()] != MAGIC || u32_at(block, 8) != 5 {
+        if block[..MAGIC.len()] != MAGIC || block.at_le::<u32, 8>() != 5 {
             return Err(FsError::Corrupt);
         }
-        if node_crc(block) != u32_at(block, 32) {
+        if node_crc(block) != block.at_le::<u32, 32>() {
             return Err(FsError::Checksum);
         }
         let level = block[12];
@@ -411,7 +405,7 @@ impl Node {
         if level as usize >= MAX_HEIGHT || len == 0 || len > CAPACITY {
             return Err(FsError::Corrupt);
         }
-        let mut node = Self::inner(spare, level, u64_at(block, 16))?;
+        let mut node = Self::inner(spare, level, block.at_le::<u64, 16>())?;
         node.len = len as u8;
         for at in 0..len {
             let start = HEADER + at * KEY_BYTES;
@@ -428,9 +422,10 @@ impl Node {
                 node.values[at].bytes.copy_from_slice(&block[start..start + VALUE_BYTES]);
             }
         } else {
-            for at in 0..=len {
-                node.children[at] = u64_at(block, values + at * 8);
-                if node.children[at] == 0 {
+            let table = repr::records::<8>(&block[values..]);
+            for (child, bytes) in node.children[..=len].iter_mut().zip(table) {
+                *child = bytes.at_le::<u64, 0>();
+                if *child == 0 {
                     return Err(FsError::Corrupt);
                 }
             }
@@ -441,10 +436,10 @@ impl Node {
     fn encode(&self, block: &mut [u8; BLOCK]) {
         block.fill(0);
         block[..MAGIC.len()].copy_from_slice(&MAGIC);
-        block[8..12].copy_from_slice(&5u32.to_le_bytes());
+        block.put_le::<u32, 8>(5);
         block[12] = self.level;
         block[13] = self.len;
-        block[16..24].copy_from_slice(&self.generation.to_le_bytes());
+        block.put_le::<u64, 16>(self.generation);
         for at in 0..self.len as usize {
             let start = HEADER + at * KEY_BYTES;
             block[start..start + KEY_BYTES].copy_from_slice(&self.keys[at].bytes);
@@ -456,13 +451,13 @@ impl Node {
                 block[start..start + VALUE_BYTES].copy_from_slice(&self.values[at].bytes);
             }
         } else {
-            for at in 0..=self.len as usize {
-                block[values + at * 8..values + at * 8 + 8]
-                    .copy_from_slice(&self.children[at].to_le_bytes());
+            let table = repr::records_mut::<8>(&mut block[values..]);
+            for (child, bytes) in self.children[..=self.len as usize].iter().zip(table) {
+                bytes.put_le::<u64, 0>(*child);
             }
         }
         let checksum = node_crc(block);
-        block[32..36].copy_from_slice(&checksum.to_le_bytes());
+        block.put_le::<u32, 32>(checksum);
     }
 }
 
@@ -1056,14 +1051,6 @@ fn node_crc(block: &[u8; BLOCK]) -> u32 {
     crc.update(&[0; 4]);
     crc.update(&block[36..]);
     crc.finish()
-}
-
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("fixed node field"))
-}
-
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(bytes[at..at + 8].try_into().expect("fixed node field"))
 }
 
 const _: () = assert!(HEADER + CAPACITY * KEY_BYTES + (CAPACITY + 1) * VALUE_BYTES <= BLOCK);

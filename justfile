@@ -33,6 +33,14 @@ x86_64-check:
 riscv64gc-check:
     cargo clippy --package molt-kernel --target riscv64gc-unknown-none-elf -- -D warnings
 
+user-check:
+    cargo build --package molt-hello --package molt-shell-image \
+        --target targets/x86_64-unknown-molt.json \
+        -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
+    cargo build --package molt-hello --package molt-shell-image \
+        --target targets/riscv64gc-unknown-molt.json \
+        -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
+
 fuzz seconds="60":
     for target in $(cargo fuzz list); do \
         cargo fuzz run --target "$(rustc -vV | sed -n 's/^host: //p')" "$target" \
@@ -42,7 +50,7 @@ fuzz seconds="60":
 bench-check:
     cargo bench --package molt-core --package molt-rt --package molt-block --package molt-fs --no-run
 
-pre: fmt-check lint test doc x86_64-check riscv64gc-check bench-check loom
+pre: fmt-check lint test doc x86_64-check riscv64gc-check user-check bench-check loom
 
 image:
     cargo image

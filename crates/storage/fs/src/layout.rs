@@ -2,6 +2,8 @@
 
 use alloc::boxed::Box;
 
+use repr::{Field, FieldMut};
+
 use crate::crc::crc32c;
 use crate::{FsError, mem};
 
@@ -69,6 +71,8 @@ mod field {
 /// One region descriptor: where it starts, how long it is, what it hashes to.
 const REGION_BYTES: usize = 24;
 
+const _: () = assert!(field::REGIONS + Area::ALL.len() * REGION_BYTES <= field::LOG_BLOCKS);
+
 /// The longest name a directory entry may carry.
 pub const MAX_NAME: usize = 255;
 
@@ -130,42 +134,39 @@ impl Super {
     /// rejected here rather than by whatever the region offsets would have
     /// pointed at.
     pub fn parse(block: &[u8]) -> Result<Self, FsError> {
-        let block = block.get(..SUPER_BYTES).ok_or(FsError::Corrupt)?;
+        // The only length a torn block can get wrong. Past it every field is a
+        // constant offset in a window of constant size.
+        let block = block.first_chunk::<SUPER_BYTES>().ok_or(FsError::Corrupt)?;
         if block[field::MAGIC..field::MAGIC + MAGIC.len()] != MAGIC {
             return Err(FsError::Magic);
         }
-        if crc32c(&block[..field::CRC]) != u32_at(block, field::CRC) {
+        if crc32c(&block[..field::CRC]) != block.at_le::<u32, { field::CRC }>() {
             return Err(FsError::Checksum);
         }
 
-        let version = u32_at(block, field::VERSION);
+        let version = block.at_le::<u32, { field::VERSION }>();
         if version != VERSION {
             return Err(FsError::Version(version));
         }
-        if u32_at(block, field::BLOCK_SIZE) as usize != BLOCK {
+        if block.at_le::<u32, { field::BLOCK_SIZE }>() as usize != BLOCK {
             return Err(FsError::Corrupt);
         }
 
         let mut parsed = Self {
-            generation: u64_at(block, field::GENERATION),
-            blocks: u64_at(block, field::BLOCKS),
-            root: u32_at(block, field::ROOT),
-            log_blocks: u32_at(block, field::LOG_BLOCKS),
-            tree_at: u64_at(block, field::TREE_AT),
-            tree_blocks: u32_at(block, field::TREE_BLOCKS),
-            tree_root: u64_at(block, field::TREE_ROOT),
+            generation: block.at_le::<u64, { field::GENERATION }>(),
+            blocks: block.at_le::<u64, { field::BLOCKS }>(),
+            root: block.at_le::<u32, { field::ROOT }>(),
+            log_blocks: block.at_le::<u32, { field::LOG_BLOCKS }>(),
+            tree_at: block.at_le::<u64, { field::TREE_AT }>(),
+            tree_blocks: block.at_le::<u32, { field::TREE_BLOCKS }>(),
+            tree_root: block.at_le::<u64, { field::TREE_ROOT }>(),
             regions: [Region::default(); Area::ALL.len()],
         };
-        for area in Area::ALL {
-            let at = field::REGIONS + area.index() * REGION_BYTES;
-            parsed.set_region(
-                area,
-                Region {
-                    at: u64_at(block, at),
-                    bytes: u64_at(block, at + 8),
-                    crc: u32_at(block, at + 16),
-                },
-            );
+        let table = repr::records::<REGION_BYTES>(&block[field::REGIONS..]);
+        for (area, region) in Area::ALL.into_iter().zip(table) {
+            let (at, bytes, crc) =
+                (region.at_le::<u64, 0>(), region.at_le::<u64, 8>(), region.at_le::<u32, 16>());
+            parsed.set_region(area, Region { at, bytes, crc });
         }
         parsed.check()?;
         Ok(parsed)
@@ -175,26 +176,27 @@ impl Super {
     ///
     /// The image builder writes both initial copies; sync writes one new copy.
     pub fn encode(&self, block: &mut [u8]) {
-        let block = &mut block[..SUPER_BYTES];
+        let (block, _) =
+            block.split_first_chunk_mut::<SUPER_BYTES>().expect("room for a superblock");
         block.fill(0);
         block[field::MAGIC..field::MAGIC + MAGIC.len()].copy_from_slice(&MAGIC);
-        put_u32(block, field::VERSION, VERSION);
-        put_u32(block, field::BLOCK_SIZE, BLOCK as u32);
-        put_u64(block, field::GENERATION, self.generation);
-        put_u64(block, field::BLOCKS, self.blocks);
-        put_u32(block, field::ROOT, self.root);
-        put_u32(block, field::LOG_BLOCKS, self.log_blocks);
-        put_u64(block, field::TREE_AT, self.tree_at);
-        put_u32(block, field::TREE_BLOCKS, self.tree_blocks);
-        put_u64(block, field::TREE_ROOT, self.tree_root);
-        for area in Area::ALL {
+        block.put_le::<u32, { field::VERSION }>(VERSION);
+        block.put_le::<u32, { field::BLOCK_SIZE }>(BLOCK as u32);
+        block.put_le::<u64, { field::GENERATION }>(self.generation);
+        block.put_le::<u64, { field::BLOCKS }>(self.blocks);
+        block.put_le::<u32, { field::ROOT }>(self.root);
+        block.put_le::<u32, { field::LOG_BLOCKS }>(self.log_blocks);
+        block.put_le::<u64, { field::TREE_AT }>(self.tree_at);
+        block.put_le::<u32, { field::TREE_BLOCKS }>(self.tree_blocks);
+        block.put_le::<u64, { field::TREE_ROOT }>(self.tree_root);
+        let table = repr::records_mut::<REGION_BYTES>(&mut block[field::REGIONS..]);
+        for (area, bytes) in Area::ALL.into_iter().zip(table) {
             let region = self.region(area);
-            let at = field::REGIONS + area.index() * REGION_BYTES;
-            put_u64(block, at, region.at);
-            put_u64(block, at + 8, region.bytes);
-            put_u32(block, at + 16, region.crc);
+            bytes.put_le::<u64, 0>(region.at);
+            bytes.put_le::<u64, 8>(region.bytes);
+            bytes.put_le::<u32, 16>(region.crc);
         }
-        put_u32(block, field::CRC, crc32c(&block[..field::CRC]));
+        block.put_le::<u32, { field::CRC }>(crc32c(&block[..field::CRC]));
     }
 
     /// Rejects a superblock whose regions do not fit the volume it describes.
@@ -264,28 +266,10 @@ pub struct Object {
     pub size: u64,
 }
 
-pub(crate) fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    let mut word = [0; 4];
-    word.copy_from_slice(&bytes[at..at + 4]);
-    u32::from_le_bytes(word)
-}
-
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
-    let mut word = [0; 8];
-    word.copy_from_slice(&bytes[at..at + 8]);
-    u64::from_le_bytes(word)
-}
-
-fn put_u32(bytes: &mut [u8], at: usize, value: u32) {
-    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-fn put_u64(bytes: &mut [u8], at: usize, value: u64) {
-    bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
-}
-
 #[cfg(test)]
 mod tests {
+    use repr::FieldMut;
+
     use super::{Area, BLOCK, Region, Super, field};
     use crate::FsError;
 
@@ -334,7 +318,7 @@ mod tests {
         volume().encode(&mut block);
         block[field::VERSION] = 9;
         let crc = super::crc32c(&block[..field::CRC]);
-        super::put_u32(&mut block, field::CRC, crc);
+        block.put_le::<u32, { field::CRC }>(crc);
 
         assert_eq!(Super::parse(&block), Err(FsError::Version(9)));
     }

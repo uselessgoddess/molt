@@ -7,17 +7,50 @@
 //! kernel. Tier 2 of `docs/address-space.md`, marker by marker.
 
 use alloc::boxed::Box;
+#[cfg(molt_user_image)]
+use alloc::vec::Vec;
 
 use molt_arch::asid::{Asids, Flush};
 use molt_arch::memory::{Rights, Span};
 use molt_arch::refcount::{self, Leaves, Run};
 use molt_arch::va::{Class, Extent, Region};
 use molt_arch::{BootInfo, FRAME_SIZE, Platform, PlatformError, SerialWriter, View, view};
+#[cfg(molt_user_image)]
+use molt_arch::{DomainExit, DomainState, SerialPort};
+#[cfg(molt_user_image)]
+use molt_core::capability::Capability;
 use molt_kernel::report;
 use molt_rt::Executor;
 
 use crate::config::CONFIG;
 use crate::space;
+
+#[cfg(molt_user_image)]
+static USER_IMAGE: &[u8] = include_bytes!(env!("MOLT_USER_IMAGE"));
+#[cfg(molt_user_image)]
+static SHELL_IMAGE: &[u8] = include_bytes!(env!("MOLT_SHELL_IMAGE"));
+#[cfg(molt_user_image)]
+static DOMAIN_DISK_IMAGE: &[u8] = include_bytes!(env!("MOLT_DOMAIN_DISK_IMAGE"));
+
+#[cfg(all(molt_user_image, target_arch = "x86_64"))]
+const USER_ARCHITECTURE: molt_domain::Architecture = molt_domain::Architecture::X86_64;
+#[cfg(all(molt_user_image, target_arch = "riscv64"))]
+const USER_ARCHITECTURE: molt_domain::Architecture = molt_domain::Architecture::RiscV;
+
+#[cfg(molt_user_image)]
+const USER_RING: usize = 4;
+#[cfg(molt_user_image)]
+const USER_STACK: u64 = 64 * 1024;
+#[cfg(molt_user_image)]
+const USER_HEAP: u64 = 64 * 1024;
+#[cfg(all(molt_user_image, target_arch = "x86_64"))]
+const SHELL_BASE: u64 = 0x0000_6000_0010_0000;
+#[cfg(all(molt_user_image, target_arch = "riscv64"))]
+const SHELL_BASE: u64 = 0x00c0_0000_0010_0000;
+#[cfg(molt_user_image)]
+const SHELL_FILE_RESULT: u64 = 1 << 62;
+#[cfg(molt_user_image)]
+const SHELL_DIR_RESULT: u64 = 1 << 61;
 
 /// What the tier-2 example in `docs/address-space.md` asks for: a log analyzer
 /// that wants a hundred gigabytes of logs addressable at once.
@@ -246,6 +279,666 @@ pub fn smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P, exec: &Exe
         opened.index(),
         retired.get(),
     );
+}
+
+/// Admits a normal static binary, runs it in user mode, and contains a second
+/// instance's deliberate fault. The only shared memory is the hostile ABI
+/// channel; every other byte is private to the view.
+#[cfg(molt_user_image)]
+pub fn user_smoke<P: Platform>(boot_info: &BootInfo<'_>, platform: &mut P) {
+    rejected_image_never_maps();
+    report!(platform, "MOLT_DOMAIN_WX_OK: rejected image mapped zero executable pages");
+
+    let widths = platform.address_space().expect("the platform probed its own translation");
+    let mut asids = Asids::new(widths.asid());
+    let view = platform.open_view(asids.assign().asid()).expect("a root for the user image");
+    let mut mappings = Vec::new();
+    let entry = {
+        let mut mapper = ImageMapper { boot_info, platform, view, mappings: &mut mappings };
+        molt_domain::load(USER_IMAGE, USER_ARCHITECTURE, &mut mapper)
+            .expect("the build-produced user ELF passes admission")
+    };
+    let base = mappings.first().expect("one admitted load segment").extent.start();
+
+    let (channel_address, channel_pointer) = allocate_mapping(
+        boot_info,
+        platform,
+        view,
+        &mut mappings,
+        FRAME_SIZE,
+        Rights::READ_WRITE,
+        false,
+    );
+    // One gateway page holds the register file for whichever domain is running,
+    // so two cores entering at once would overwrite each other's saved context.
+    // Entry is serialized on the boot core; this is what notices if it stops
+    // being, before a second core has to be given its own gateway.
+    assert_eq!(crate::smp::here(), 0, "a domain was entered off the boot core");
+    // The arena hands out consecutive extents, so without this the page under
+    // the stack is the shared channel and an overflow would rewrite the ABI
+    // instead of faulting. Reserved and never granted, it is absent in the view.
+    let _guard = space::global().allocate(Class::Page, FRAME_SIZE).expect("a stack guard page");
+    let (stack_address, _) = allocate_mapping(
+        boot_info,
+        platform,
+        view,
+        &mut mappings,
+        USER_STACK,
+        Rights::READ_WRITE,
+        true,
+    );
+    let (heap_address, _) = allocate_mapping(
+        boot_info,
+        platform,
+        view,
+        &mut mappings,
+        USER_HEAP,
+        Rights::READ_WRITE,
+        true,
+    );
+    let aperture = mappings.last().expect("the heap mapping").extent.end() - base;
+    assert!(aperture <= molt_abi::wire::APERTURE, "the domain escaped its four-GiB ABI aperture");
+
+    // SAFETY: the page is freshly claimed, zeroed, aligned, and exclusively
+    // owned by this domain bootstrap until the kernel and user ring ends borrow it.
+    unsafe {
+        channel_pointer.cast::<molt_abi::Channel<USER_RING>>().write(molt_abi::Channel::new())
+    };
+    // SAFETY: initialized in the preceding statement and retained by `mappings`.
+    let channel = unsafe { &*channel_pointer.cast::<molt_abi::Channel<USER_RING>>() };
+    let (mut submissions, mut completions) = channel.kernel();
+    let stack = stack_address + USER_STACK;
+    let arguments = [channel_address, base, 1, heap_address, USER_HEAP, 0];
+    let mut state = DomainState::new(view, entry, stack, arguments);
+
+    loop {
+        match platform.enter_domain(&mut state).expect("domain entry and return") {
+            DomainExit::Ring => {
+                if !drive_user_ring(
+                    platform,
+                    &mappings,
+                    base,
+                    aperture,
+                    &mut submissions,
+                    &mut completions,
+                ) {
+                    report!(platform, "MOLT_USER_RING_FAULT: stopped hostile domain ring");
+                    return;
+                }
+            }
+            DomainExit::Exited(0) => break,
+            DomainExit::Exited(status) => panic!("hello domain exited with {status}"),
+            DomainExit::Unknown(call) => panic!("hello domain asked for runtime call {call}"),
+            DomainExit::Fault { cause, address } => {
+                panic!("hello domain faulted: cause={cause:#x} address={address:#x}")
+            }
+        }
+    }
+    report!(platform, "MOLT_USER_HELLO_OK: ring write from user mode");
+    report!(platform, "MOLT_DOMAIN_EXIT_OK: status=0");
+
+    let mut fault = DomainState::new(
+        view,
+        entry,
+        stack,
+        [channel_address, base, u64::MAX, heap_address, USER_HEAP, 0],
+    );
+    match platform.enter_domain(&mut fault).expect("faulting domain entry and return") {
+        DomainExit::Fault { cause, address } => {
+            report!(platform, "MOLT_DOMAIN_FAULT_OK: cause={cause:#x} address={address:#x}");
+        }
+        DomainExit::Ring => panic!("fault probe reached its ring"),
+        DomainExit::Exited(status) => panic!("fault probe exited with {status}"),
+        DomainExit::Unknown(call) => panic!("fault probe asked for runtime call {call}"),
+    }
+
+    // A domain holds its hart until it yields, so a probe that outlasts a
+    // scheduling tick has to come back as its own exit and not as a fault. The
+    // masking that makes this true is in the gateway; this is what notices when
+    // it stops being true.
+    let mut spin = DomainState::new(
+        view,
+        entry,
+        stack,
+        [channel_address, base, u64::MAX - 1, heap_address, USER_HEAP, 0],
+    );
+    match platform.enter_domain(&mut spin).expect("spinning domain entry and return") {
+        DomainExit::Exited(0) => {
+            report!(platform, "MOLT_DOMAIN_UNINTERRUPTED_OK: outlasted a tick and exited");
+        }
+        DomainExit::Fault { cause, address } => {
+            panic!("a tick reached the spinning domain: cause={cause:#x} address={address:#x}")
+        }
+        DomainExit::Ring => panic!("spin probe reached its ring"),
+        DomainExit::Exited(status) => panic!("spin probe exited with {status}"),
+        DomainExit::Unknown(call) => panic!("spin probe asked for runtime call {call}"),
+    }
+
+    let current = mappings.last().expect("the hello heap mapping").extent.end();
+    assert!(current < SHELL_BASE, "hello image overlapped the shell image slot");
+    let padding = space::global()
+        .allocate(Class::Page, SHELL_BASE - current)
+        .expect("the reserved shell slot");
+    assert_eq!(padding.end(), SHELL_BASE, "the shell slot did not end at its link address");
+
+    let device = molt_block::Loopback::read(DOMAIN_DISK_IMAGE).expect("aligned built-in disk");
+    let mut filesystem = molt_fs::Fs::<_, 4>::mount(molt_block::Serial::new(device))
+        .expect("the build-produced MoltFS image mounts");
+    let root = filesystem.root(molt_core::CellId::new(3)).expect("a shell root capability");
+    shell_smoke(boot_info, platform, asids.assign().asid(), &mut filesystem, root);
+}
+
+#[cfg(molt_user_image)]
+fn shell_smoke<P: Platform, Q: molt_block::Queue>(
+    boot_info: &BootInfo<'_>,
+    platform: &mut P,
+    asid: molt_arch::asid::Asid,
+    filesystem: &mut molt_fs::Fs<Q, 4>,
+    root: molt_core::capability::Capability<molt_fs::Dir>,
+) {
+    let view = platform.open_view(asid).expect("a root for the shell image");
+    let mut mappings = Vec::new();
+    let entry = {
+        let mut mapper = ImageMapper { boot_info, platform, view, mappings: &mut mappings };
+        molt_domain::load(SHELL_IMAGE, USER_ARCHITECTURE, &mut mapper)
+            .expect("the build-produced shell ELF passes admission")
+    };
+    let base = mappings.first().expect("one admitted shell segment").extent.start();
+    assert_eq!(base, SHELL_BASE, "the shell was not linked into its reserved slot");
+    let (channel_address, channel_pointer) = allocate_mapping(
+        boot_info,
+        platform,
+        view,
+        &mut mappings,
+        FRAME_SIZE,
+        Rights::READ_WRITE,
+        false,
+    );
+    // One gateway page holds the register file for whichever domain is running,
+    // so two cores entering at once would overwrite each other's saved context.
+    // Entry is serialized on the boot core; this is what notices if it stops
+    // being, before a second core has to be given its own gateway.
+    assert_eq!(crate::smp::here(), 0, "a domain was entered off the boot core");
+    // The arena hands out consecutive extents, so without this the page under
+    // the stack is the shared channel and an overflow would rewrite the ABI
+    // instead of faulting. Reserved and never granted, it is absent in the view.
+    let _guard = space::global().allocate(Class::Page, FRAME_SIZE).expect("a stack guard page");
+    let (stack_address, _) = allocate_mapping(
+        boot_info,
+        platform,
+        view,
+        &mut mappings,
+        USER_STACK,
+        Rights::READ_WRITE,
+        true,
+    );
+    let (heap_address, _) = allocate_mapping(
+        boot_info,
+        platform,
+        view,
+        &mut mappings,
+        USER_HEAP,
+        Rights::READ_WRITE,
+        true,
+    );
+    let aperture = mappings.last().expect("the shell heap mapping").extent.end() - base;
+    assert!(aperture <= molt_abi::wire::APERTURE, "the shell escaped its ABI aperture");
+
+    // SAFETY: this is a fresh, aligned, exclusively owned shared-ring page.
+    unsafe {
+        channel_pointer.cast::<molt_abi::Channel<USER_RING>>().write(molt_abi::Channel::new())
+    };
+    // SAFETY: the channel was initialized immediately above and its mapping is retained.
+    let channel = unsafe { &*channel_pointer.cast::<molt_abi::Channel<USER_RING>>() };
+    let (mut submissions, mut completions) = channel.kernel();
+    let mut handles = ShellHandles::new(root);
+    let mut state = DomainState::new(
+        view,
+        entry,
+        stack_address + USER_STACK,
+        [channel_address, base, 1, heap_address, USER_HEAP, SHELL_DIR_RESULT],
+    );
+    loop {
+        match platform.enter_domain(&mut state).expect("shell domain entry and return") {
+            DomainExit::Ring => {
+                if !drive_shell_ring(
+                    platform,
+                    filesystem,
+                    &mut handles,
+                    &mappings,
+                    base,
+                    aperture,
+                    &mut submissions,
+                    &mut completions,
+                ) {
+                    report!(platform, "MOLT_SHELL_RING_FAULT: stopped hostile domain ring");
+                    return;
+                }
+            }
+            DomainExit::Exited(0) => break,
+            DomainExit::Exited(status) => panic!("shell domain exited with {status}"),
+            DomainExit::Unknown(call) => panic!("shell domain asked for runtime call {call}"),
+            DomainExit::Fault { cause, address } => {
+                panic!("shell domain faulted: cause={cause:#x} address={address:#x}")
+            }
+        }
+    }
+    report!(platform, "MOLT_SHELL_DOMAIN_OK: unmodified shell completed through FsOp ring");
+}
+
+#[cfg(molt_user_image)]
+#[derive(Debug)]
+enum ImageMapError {
+    Address,
+    Platform,
+}
+
+#[cfg(molt_user_image)]
+impl From<PlatformError> for ImageMapError {
+    fn from(_error: PlatformError) -> Self {
+        Self::Platform
+    }
+}
+
+#[cfg(molt_user_image)]
+struct Mapping {
+    extent: Extent,
+    _physical: Span,
+    pointer: *mut u8,
+    rights: Rights,
+    payload: bool,
+}
+
+#[cfg(molt_user_image)]
+/// The shell domain's own handle space.
+///
+/// A domain names a slot here and never a kernel capability, which is what
+/// keeps [`Capability`] unforgeable across a boundary the type system stops at:
+/// a number the domain invents indexes a table the kernel owns, and a slot it
+/// never received is empty. Nothing the domain sends is ever restored into
+/// authority — the authority never left.
+struct ShellHandles {
+    directories: [Option<Capability<molt_fs::Dir>>; 4],
+    files: [Option<Capability<molt_fs::File>>; 4],
+}
+
+#[cfg(molt_user_image)]
+impl ShellHandles {
+    /// Seeds slot zero with the one directory the domain starts holding.
+    const fn new(root: Capability<molt_fs::Dir>) -> Self {
+        Self { directories: [Some(root), None, None, None], files: [None; 4] }
+    }
+
+    /// Resolves a slot the domain named into the capability the kernel put there.
+    ///
+    /// The domain names slots and never capabilities, which is what keeps
+    /// [`molt_core::capability::Capability`] unforgeable across the boundary: a
+    /// number it invents indexes a table the kernel owns, and a slot it never
+    /// received is empty. No kernel name crosses in either direction.
+    fn directory(&self, handle: u64) -> Option<Capability<molt_fs::Dir>> {
+        *self.directories.get(Self::slot(handle, SHELL_DIR_RESULT)?)?
+    }
+
+    fn file(&self, handle: u64) -> Option<Capability<molt_fs::File>> {
+        *self.files.get(Self::slot(handle, SHELL_FILE_RESULT)?)?
+    }
+
+    /// Strips the kind tag the domain was handed back, refusing the other kind.
+    fn slot(handle: u64, tag: u64) -> Option<usize> {
+        if handle & (SHELL_DIR_RESULT | SHELL_FILE_RESULT) != tag {
+            return None;
+        }
+        usize::try_from(handle & !tag).ok()
+    }
+
+    /// Puts a freshly opened handle in a slot and names that slot to the domain.
+    fn remember(&mut self, handle: molt_fs::Handle) -> Option<u64> {
+        match handle {
+            molt_fs::Handle::Dir(dir) => Self::place(&mut self.directories, dir, SHELL_DIR_RESULT),
+            molt_fs::Handle::File(file) => Self::place(&mut self.files, file, SHELL_FILE_RESULT),
+        }
+    }
+
+    fn place<R>(slots: &mut [Option<Capability<R>>], held: Capability<R>, tag: u64) -> Option<u64> {
+        let slot = slots.iter().position(Option::is_none)?;
+        slots[slot] = Some(held);
+        Some(slot as u64 | tag)
+    }
+
+    fn forget_file(&mut self, handle: u64) {
+        if let Some(entry) =
+            Self::slot(handle, SHELL_FILE_RESULT).and_then(|slot| self.files.get_mut(slot))
+        {
+            *entry = None;
+        }
+    }
+}
+
+#[cfg(molt_user_image)]
+struct ImageMapper<'a, 'boot, P> {
+    boot_info: &'a BootInfo<'boot>,
+    platform: &'a mut P,
+    view: View,
+    mappings: &'a mut Vec<Mapping>,
+}
+
+#[cfg(molt_user_image)]
+impl<P: Platform> molt_domain::Mapper for ImageMapper<'_, '_, P> {
+    type Error = ImageMapError;
+
+    fn map(&mut self, segment: molt_domain::Segment, file: &[u8]) -> Result<(), Self::Error> {
+        let bytes = segment.mapped_size();
+        let extent =
+            space::global().allocate(Class::Page, bytes).map_err(|_| ImageMapError::Address)?;
+        if extent.start() != segment.virtual_address() {
+            return Err(ImageMapError::Address);
+        }
+        let physical = self.platform.claim_ram(self.boot_info, bytes / FRAME_SIZE)?;
+        let pointer = self.platform.claimed_pointer(physical)?;
+        // SAFETY: `claim_ram` exclusively transferred `bytes` initialized RAM
+        // to the loader, and `file` was bounds-checked before mapping began.
+        unsafe {
+            pointer.write_bytes(0, bytes as usize);
+            pointer.copy_from_nonoverlapping(file.as_ptr(), file.len());
+        }
+        let protection = segment.protection();
+        let rights =
+            Rights::new(protection.is_read(), protection.is_write(), protection.is_execute())
+                .map_err(|_| ImageMapError::Address)?;
+        self.platform.grant(self.view, &extent, physical, rights)?;
+        self.mappings.push(Mapping { extent, _physical: physical, pointer, rights, payload: true });
+        Ok(())
+    }
+}
+
+#[cfg(molt_user_image)]
+fn allocate_mapping<P: Platform>(
+    boot_info: &BootInfo<'_>,
+    platform: &mut P,
+    view: View,
+    mappings: &mut Vec<Mapping>,
+    bytes: u64,
+    rights: Rights,
+    payload: bool,
+) -> (u64, *mut u8) {
+    let extent = space::global().allocate(Class::Page, bytes).expect("room in the page arena");
+    let address = extent.start();
+    let physical = platform
+        .claim_ram(boot_info, extent.bytes() / FRAME_SIZE)
+        .expect("RAM to back a domain mapping");
+    let pointer = platform.claimed_pointer(physical).expect("claimed RAM in the direct map");
+    // SAFETY: the freshly claimed span contains `extent.bytes()` writable bytes.
+    unsafe { pointer.write_bytes(0, extent.bytes() as usize) };
+    platform.grant(view, &extent, physical, rights).expect("an absent domain range");
+    mappings.push(Mapping { extent, _physical: physical, pointer, rights, payload });
+    (address, pointer)
+}
+
+#[cfg(molt_user_image)]
+fn drive_user_ring<P: Platform>(
+    platform: &mut P,
+    mappings: &[Mapping],
+    base: u64,
+    aperture: u64,
+    submissions: &mut molt_abi::Submissions<'_, USER_RING>,
+    completions: &mut molt_abi::Completions<'_, USER_RING>,
+) -> bool {
+    loop {
+        let reply = match submissions.take() {
+            Err(_) => return false,
+            Ok(molt_abi::Next::Empty) => return true,
+            Ok(molt_abi::Next::Rejected { id, reject }) => molt_abi::Reply::rejected(id, reject),
+            Ok(molt_abi::Next::Ready(call)) => {
+                let result = match call.op() {
+                    molt_abi::Op::Timer { .. } => 0,
+                    molt_abi::Op::Write { cap, offset: 0, buf } if cap.get() == 1 => {
+                        match resolve_region(mappings, base, aperture, buf) {
+                            Some(bytes) => {
+                                platform.serial().write_bytes(bytes);
+                                bytes.len() as i64
+                            }
+                            None => -1,
+                        }
+                    }
+                    _ => -1,
+                };
+                molt_abi::Reply::new(call.id(), result)
+            }
+        };
+        if completions.publish(reply).is_err() {
+            return false;
+        }
+    }
+}
+
+#[cfg(molt_user_image)]
+fn drive_shell_ring<P: Platform, Q: molt_block::Queue>(
+    platform: &mut P,
+    filesystem: &mut molt_fs::Fs<Q, 4>,
+    handles: &mut ShellHandles,
+    mappings: &[Mapping],
+    base: u64,
+    aperture: u64,
+    submissions: &mut molt_abi::Submissions<'_, USER_RING>,
+    completions: &mut molt_abi::Completions<'_, USER_RING>,
+) -> bool {
+    loop {
+        let reply = match submissions.take() {
+            Err(_) => return false,
+            Ok(molt_abi::Next::Empty) => return true,
+            Ok(molt_abi::Next::Rejected { id, reject }) => molt_abi::Reply::rejected(id, reject),
+            Ok(molt_abi::Next::Ready(call)) => {
+                let result = match call.op() {
+                    molt_abi::Op::Write { cap, offset: 0, buf } if cap.get() == 1 => {
+                        match resolve_region(mappings, base, aperture, buf) {
+                            Some(bytes) => {
+                                platform.serial().write_bytes(bytes);
+                                bytes.len() as i64
+                            }
+                            None => -1,
+                        }
+                    }
+                    molt_abi::Op::Open { dir, name } => {
+                        shell_open(filesystem, handles, mappings, base, aperture, dir, name)
+                    }
+                    molt_abi::Op::Read { cap, offset, buf } => {
+                        shell_read(filesystem, handles, mappings, base, aperture, cap, offset, buf)
+                    }
+                    molt_abi::Op::Close { cap } => shell_close(filesystem, handles, cap),
+                    _ => -1,
+                };
+                molt_abi::Reply::new(call.id(), result)
+            }
+        };
+        if completions.publish(reply).is_err() {
+            return false;
+        }
+    }
+}
+
+#[cfg(molt_user_image)]
+fn shell_open<Q: molt_block::Queue>(
+    filesystem: &mut molt_fs::Fs<Q, 4>,
+    handles: &mut ShellHandles,
+    mappings: &[Mapping],
+    base: u64,
+    aperture: u64,
+    directory: molt_abi::Handle,
+    name: molt_abi::Region,
+) -> i64 {
+    let Some(directory) = handles.directory(directory.get()) else {
+        return -1;
+    };
+    let Some(bytes) = resolve_region(mappings, base, aperture, name) else {
+        return -1;
+    };
+    let Ok(name) = molt_fs::Name::new(bytes) else {
+        return -1;
+    };
+    let mut buffers = molt_core::buffer::BufferRegistry::<1>::new();
+    match filesystem.apply(
+        molt_core::CellId::new(3),
+        molt_fs::FsOp::Open { dir: directory, name },
+        &mut buffers,
+    ) {
+        Ok(molt_fs::FsDone::Opened(opened)) => match handles.remember(opened) {
+            Some(handle) => handle as i64,
+            // A table with no room must not strand what was just opened. The
+            // capability goes back before the refusal does, or the slot it
+            // holds is lost for as long as the filesystem lives.
+            None => {
+                let mut buffers = molt_core::buffer::BufferRegistry::<1>::new();
+                let _ = filesystem.apply(
+                    molt_core::CellId::new(3),
+                    molt_fs::FsOp::Close(opened),
+                    &mut buffers,
+                );
+                -1
+            }
+        },
+        _ => -1,
+    }
+}
+
+#[cfg(molt_user_image)]
+fn shell_read<Q: molt_block::Queue>(
+    filesystem: &mut molt_fs::Fs<Q, 4>,
+    handles: &ShellHandles,
+    mappings: &[Mapping],
+    base: u64,
+    aperture: u64,
+    file: molt_abi::Handle,
+    offset: u64,
+    buffer: molt_abi::Region,
+) -> i64 {
+    let Some(file) = handles.file(file.get()) else {
+        return -1;
+    };
+    let Some(bytes) = resolve_region_mut(mappings, base, aperture, buffer) else {
+        return -1;
+    };
+    let mut buffers = molt_core::buffer::BufferRegistry::<1>::new();
+    let Ok(registered) = buffers.register_write(molt_core::CellId::new(3), bytes) else {
+        return -1;
+    };
+    let operation = molt_core::buffer::BufferOperation::new(registered, 0, buffer.len() as usize);
+    match filesystem.apply(
+        molt_core::CellId::new(3),
+        molt_fs::FsOp::Read { file, buffer: operation, offset },
+        &mut buffers,
+    ) {
+        Ok(molt_fs::FsDone::Read(read)) => read as i64,
+        _ => -1,
+    }
+}
+
+#[cfg(molt_user_image)]
+fn shell_close<Q: molt_block::Queue>(
+    filesystem: &mut molt_fs::Fs<Q, 4>,
+    handles: &mut ShellHandles,
+    handle: molt_abi::Handle,
+) -> i64 {
+    let Some(file) = handles.file(handle.get()) else {
+        return -1;
+    };
+    let mut buffers = molt_core::buffer::BufferRegistry::<1>::new();
+    match filesystem.apply(
+        molt_core::CellId::new(3),
+        molt_fs::FsOp::Close(molt_fs::Handle::File(file)),
+        &mut buffers,
+    ) {
+        Ok(molt_fs::FsDone::Closed) => {
+            handles.forget_file(handle.get());
+            0
+        }
+        _ => -1,
+    }
+}
+
+#[cfg(molt_user_image)]
+fn resolve_region<'a>(
+    mappings: &'a [Mapping],
+    base: u64,
+    aperture: u64,
+    region: molt_abi::Region,
+) -> Option<&'a [u8]> {
+    if !region.fits(aperture) {
+        return None;
+    }
+    let region = region.within(aperture);
+    let start = base + u64::from(region.offset());
+    let end = start + u64::from(region.len());
+    let mapping = mappings.iter().find(|mapping| {
+        mapping.payload
+            && mapping.rights.is_read()
+            && mapping.extent.start() <= start
+            && end <= mapping.extent.end()
+    })?;
+    let offset = usize::try_from(start - mapping.extent.start()).ok()?;
+    // SAFETY: the masked range lies wholly within the still-owned physical span.
+    Some(unsafe { core::slice::from_raw_parts(mapping.pointer.add(offset), region.len() as usize) })
+}
+
+#[cfg(molt_user_image)]
+fn resolve_region_mut<'a>(
+    mappings: &'a [Mapping],
+    base: u64,
+    aperture: u64,
+    region: molt_abi::Region,
+) -> Option<&'a mut [u8]> {
+    if !region.fits(aperture) {
+        return None;
+    }
+    let region = region.within(aperture);
+    let start = base + u64::from(region.offset());
+    let end = start + u64::from(region.len());
+    let mapping = mappings.iter().find(|mapping| {
+        mapping.payload
+            && mapping.rights.is_write()
+            && mapping.extent.start() <= start
+            && end <= mapping.extent.end()
+    })?;
+    let offset = usize::try_from(start - mapping.extent.start()).ok()?;
+    // SAFETY: the domain is stopped, this masked range is wholly inside one
+    // owned mapping, and the borrow prevents a second kernel user of the slice.
+    Some(unsafe {
+        core::slice::from_raw_parts_mut(mapping.pointer.add(offset), region.len() as usize)
+    })
+}
+
+#[cfg(molt_user_image)]
+fn rejected_image_never_maps() {
+    struct Counter(u32);
+    impl molt_domain::Mapper for Counter {
+        type Error = ();
+
+        fn map(&mut self, _segment: molt_domain::Segment, _file: &[u8]) -> Result<(), Self::Error> {
+            self.0 += 1;
+            Ok(())
+        }
+    }
+
+    let mut hostile = USER_IMAGE.to_vec();
+    let header = hostile.get(32..40).expect("ELF program-header offset");
+    let phoff = u64::from_le_bytes(header.try_into().expect("eight-byte ELF field")) as usize;
+    let count =
+        u16::from_le_bytes(hostile[56..58].try_into().expect("two-byte ELF program-header count"))
+            as usize;
+    let executable = (0..count)
+        .map(|index| phoff + index * 56)
+        .find(|&at| hostile[at..at + 4] == 1u32.to_le_bytes() && hostile[at + 4] & 1 != 0)
+        .expect("one executable load segment");
+    hostile[executable + 4] |= 2;
+
+    let mut counter = Counter(0);
+    assert!(
+        matches!(
+            molt_domain::load(&hostile, USER_ARCHITECTURE, &mut counter),
+            Err(molt_domain::LoadError::Image(molt_domain::Error::WriteExecute))
+        ),
+        "a writable executable image passed admission"
+    );
+    assert_eq!(counter.0, 0, "a rejected image reached the mapper");
 }
 
 /// Whether the platform refused a call because a view could not answer it.

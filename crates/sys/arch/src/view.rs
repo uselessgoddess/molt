@@ -30,7 +30,7 @@ use crate::va::Extent;
 /// How many roots a port stores inline. Not the domain budget — that is the tag
 /// width, thousands on any machine with ASIDs — and running out is
 /// [`Error::Capacity`] rather than corruption.
-pub const VIEWS: usize = 4;
+pub const VIEWS: usize = 8;
 
 /// What can go wrong naming or filling a view.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

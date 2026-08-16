@@ -54,14 +54,18 @@ layouts are what both sides think they are (asserted by host tests, per
 
 ## Four mechanisms, and what each one actually stops
 
-### 1. Absence, not permission
+### 1. Absence, except for the transition island
 
-A domain's root table does not contain the kernel. Not "contains it with the
-user bit clear" — *does not contain it*. The distinction is the entire Meltdown
-family: a supervisor-only PTE is a translation that exists, and a translation
-that exists can be walked speculatively and its data forwarded to a transient
-instruction that leaks it. A missing translation forwards nothing, because
-there is nothing to forward.
+A domain's root table does not contain the general kernel. The one unavoidable
+exception once a domain becomes runnable is a page-aligned transition island:
+supervisor-only entry code and context on both ports, plus read-only IDT, GDT,
+and TSS pages on x86_64 because the processor reads them through the active
+`CR3` while changing privilege. Those pages contain no kernel heap, physmap,
+capability table, or application data; their addresses and descriptor contents
+are not secrets. Everything outside that fixed island is absent, not merely
+marked supervisor-only. The distinction limits the entire Meltdown family: a
+missing translation forwards nothing because there is nothing to forward, and
+the few necessary supervisor translations expose only the return machinery.
 
 Two consequences that future code must respect, because both are easy to break
 by accident:
@@ -81,7 +85,8 @@ by accident:
 This is checkable rather than assertable, and the checker already exists:
 `Audit::cover` / `Audit::accepts` ([`docs/testing.md`](testing.md)) walks *live*
 page tables. Pointed at a domain's tree it answers "is any kernel leaf present
-here" directly — that is `MOLT_DOMAIN_ABSENT_OK` below.
+here" directly. `MOLT_DOMAIN_ABSENT_OK` checks the fresh view before activation;
+the entry path then adds only the explicitly bounded transition ranges.
 
 ### 2. Uniqueness is not presence, and an address is not a secret
 
@@ -376,7 +381,10 @@ is a claim, and [`docs/testing.md`](testing.md) is why that is the standard.
 | `MOLT_REFCOUNT_OK` | a shared leaf is counted per leaf, so no frame is reclaimed while a second view still names it | **shipped** |
 | `MOLT_DOMAIN_OK` | a second view exists with its own tag | **shipped** |
 | `MOLT_DOMAIN_ABSENT_OK` | `Audit` walks a domain's live tree and finds no kernel leaf — including the physmap | **shipped** |
-| `MOLT_DOMAIN_FAULT_OK` | a domain touching an absent address faults, and the fault stays in the domain | planned |
+| `MOLT_DOMAIN_WX_OK` | a writable-executable ELF is rejected before the mapper sees a segment | **shipped** |
+| `MOLT_USER_HELLO_OK`, `MOLT_DOMAIN_EXIT_OK` | a static image entered hardware user mode, crossed the hostile ring, and returned normally | **shipped** |
+| `MOLT_DOMAIN_FAULT_OK` | a domain touching an absent address faults, and the fault stays in the domain | **shipped** |
+| `MOLT_SHELL_DOMAIN_OK` | the existing shell's filesystem traffic crossed a hostile domain ring into a mounted MoltFS | **shipped** |
 | `MOLT_RING_FAULT_OK` | a published tail the producer never earned is a protocol fault, not an `assume_init_read` | **shipped** |
 | `MOLT_GRANT_OK` | an extent becomes reachable in a second view only through a grant | **shipped** |
 | `MOLT_REVOKE_OK` | after revoke, the second view faults — before the address is reissued to anyone | **shipped** |
@@ -389,19 +397,20 @@ which is the argument for having written it before the code rather than after �
 and both now print out of a booted kernel, which is the part that makes the
 argument worth anything.
 
-`MOLT_DOMAIN_FAULT_OK` is the one left, and deliberately: it is the only claim
-here that cannot be checked from the kernel's side of the boundary, because it
-needs a switch into the domain and a trap taken inside it. Everything above it
-is checked by reading the domain's live tables, which is evidence about the
-tables. The fault is evidence about the hardware.
+`MOLT_DOMAIN_FAULT_OK` supplies the evidence the table walk could not: both
+ports switch to a fresh user view, take a trap on an absent address, restore the
+kernel view before touching the kernel stack, and report the fault without a
+kernel panic. `MOLT_USER_HELLO_OK` exercises the normal return path through the
+same gateways.
 
 ## The constraints this leaves on future code
 
 A threat model that does not constrain anything is prose. These are the review
 questions for every commit in Stage 5.0 and after:
 
-- Does the domain's root table contain any kernel mapping, including the
-  physmap? It must not, and `Audit` can answer it.
+- Does the domain's root table contain any kernel mapping outside the fixed
+  transition island, especially the physmap? It must not, and `Audit` can
+  answer it.
 - Is `SUM`/SMAP clear outside an explicit, bounded window?
 - Is the order unmap → shootdown → `retire` unbroken? No path may hand out an
   address whose epoch has not been swept.
@@ -416,13 +425,27 @@ questions for every commit in Stage 5.0 and after:
 
 ## What is not done yet
 
-- **Nothing runs inside a domain yet.** The views exist, and grant, revoke,
-  shootdown, refcounts, the ring validator, and the mapped file are all checked
-  from a booted kernel — but every one of those checks is made from the outside,
-  by reading tables the kernel owns. No cell has been entered through a domain's
-  `satp`/`CR3`, so `MOLT_DOMAIN_FAULT_OK` stays open and the boundary is
-  evidenced structurally rather than by a trap. That switch is Stage 5.1's, with
-  the sandbox.
+- **There is still no preemptive domain scheduler.** Tier-2 binaries now enter
+  through `satp`/`CR3`, exit, fault, and use the hostile ring, but execution is
+  cooperative. A domain that never reaches the ring, exits, or faults can keep
+  the hart until metering or timer-driven preemption is added.
+
+  Cooperative here means *masked*, which is a stronger statement than
+  unscheduled and had to be made true on both ports. The gateway zeroes `sie`
+  on RISC-V, because S-level interrupts are delivered whenever the hart runs
+  below S whatever `sstatus.SIE` says, and clears `IF` before the `CR3` switch
+  on x86_64, where the window between that switch and `iretq` still runs at CPL
+  0 with the kernel absent. An interrupt in either place is not a preemption
+  Molt would have handled — it is a fault report the hardware never raised, or a
+  triple fault. `MOLT_DOMAIN_UNINTERRUPTED_OK` is what keeps this honest: a
+  domain spins past a tick and the only correct outcome is its own exit.
+- **A domain's handle space is the kernel's, and small.** What crosses the ring
+  is a slot in a per-domain table, never a `Capability`. The table is what makes
+  authority unforgeable where the type system stops: a number the domain invents
+  indexes slots the kernel filled, and one it never received is empty. The
+  register file is zeroed for a fresh domain for the same reason — the file is
+  shared, and inheriting the last domain's registers would read across exactly
+  the boundary this document says holds.
 - **The ring validator is swept, not coverage-guided.** The parser has a
   libFuzzer target ([`fuzz/fuzz_targets/call_parse.rs`](../fuzz/fuzz_targets/call_parse.rs))
   and the hostile index sequences have a proptest sweep

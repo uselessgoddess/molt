@@ -515,8 +515,8 @@ came first anyway, because the executor could not be made faster without it.
       neither got a copy (`MOLT_FILE_MAP_OK`)
 - [x] a second view with no kernel leaf in it (`MOLT_DOMAIN_OK`,
       `MOLT_DOMAIN_ABSENT_OK`)
-- [ ] a fault inside that view that stays inside it (`MOLT_DOMAIN_FAULT_OK`),
-      which needs the switch into the view that Stage 5.1 brings
+- [x] a fault inside that view that stays inside it (`MOLT_DOMAIN_FAULT_OK`),
+      entered and returned through the architecture's user-mode gateway
 - [x] extent grant and revoke between domains, in the order a revoke has to go
       in (`MOLT_GRANT_OK`, `MOLT_REVOKE_OK`), and a large leaf cut into the 512
       below it so part of one can be taken back (`MOLT_SPLIT_OK`)
@@ -550,7 +550,14 @@ new invention.
       `-Z build-std`, no compiler fork, and no `uutils` in the kernel
 - [x] measured in [`docs/userspace.md`](userspace.md): stock rustc holds back
       the registers LFI-RISCV reserves
-- [ ] `molt-abi` with asserted layouts, and `molt-user` over it
+- [x] `molt-abi` with asserted layouts, and typed `molt-program` handles, requests,
+      allocator, and ring boundary over it
+- [x] tier-2 target names for both ports, static ELF admission with reject-before-
+      map W^X enforcement (`MOLT_DOMAIN_WX_OK`), and real user entry/return
+      (`MOLT_USER_HELLO_OK`, `MOLT_DOMAIN_EXIT_OK`)
+- [x] a contained tier-2 user fault on both ports (`MOLT_DOMAIN_FAULT_OK`)
+- [x] the existing `molt-shell` logic running as a domain against a mounted
+      MoltFS through its existing `FsOp` ring (`MOLT_SHELL_DOMAIN_OK`)
 - [ ] a verifier in Rust, agreeing with the reference on its own corpus
 - [ ] a sandbox that loads, runs, and exits (`MOLT_SANDBOX_OK`)
 - [ ] a rejected image that never becomes executable
